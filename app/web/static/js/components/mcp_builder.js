@@ -61,7 +61,13 @@
     try {
       var keep = JSON.parse(JSON.stringify(draft));
       delete keep.secret_value;   // a credential does not belong in localStorage
-      window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ draft: keep, conv: conv }));
+      /* The ENGINE travels with the transcript it produced. Without it a
+         restored conversation came back with `convEngine = null`, so a
+         transcript of canned replies rendered with no scripted-stand-in
+         notice above it at all — the one state the notice exists to prevent,
+         reached by nothing more exotic than reloading the page. */
+      window.localStorage.setItem(DRAFT_KEY,
+        JSON.stringify({ draft: keep, conv: conv, engine: convEngine }));
     } catch (e) { /* quota or private mode — soft-fail, same as /skills */ }
   }
   function restoreDraft() {
@@ -343,19 +349,29 @@
             // `readOnlyHint` as the server gave it: true, false, or absent.
             // Absent stays absent — it is not a claim of safety.
             read_only: (t && typeof t.read_only === 'boolean') ? t.read_only : null,
+            /* Where that reading came from, which decides what the row is
+               entitled to SAY. A live connection can tell "the server
+               declared a write" from "the server declared nothing"; the
+               stored `mutating` boolean the edit path reads back cannot. */
+            read_only_origin: 'server',
           };
         });
-        /* Read-only tools arrive ON; anything that can change data upstream
-           arrives OFF and has to be chosen.
+        /* Read-only tools arrive ON; anything else arrives OFF and has to be
+           chosen.
 
            Every tool used to arrive on, under a section that says "Turn off
            anything agents should not call" — so the sentence described a
            review nobody performs and the default did the opposite. The grant
            below is source-wide, and on a real instance the realistic group is
            Everyone, which made the fast path hand every user's agents every
-           destructive tool the server offers. An unannotated tool counts as a
-           write here for the same reason it registers as mutating: the server
-           saying nothing is not the server saying it is safe. */
+           destructive tool the server offers. An unannotated tool arrives off
+           for the same reason it registers as mutating: the server saying
+           nothing is not the server saying it is safe.
+
+           `=== true` and not `!== false`, so the default keeps its nerve on
+           an absent annotation. Off is where an unmarked tool belongs; being
+           CALLED a write is a separate claim, and `toolMark` below does not
+           make it. */
         draft.enabled = {};
         draft.tools.forEach(function (t) { draft.enabled[t.name] = t.read_only === true; });
         draft.introspected = true;
@@ -557,10 +573,19 @@
   function registerLabel() {
     var tools = enabledTools();
     if (!draft.groups.length || !tools.length) return 'Register source';
-    var writes = tools.filter(function (t) { return t.read_only !== true; }).length;
+    /* Declared writes and unmarked tools are counted apart, because they are
+       different facts and the button used to merge them into one. A server
+       that publishes no annotations at all — the common case — had every one
+       of its tools counted under "can write", so the button asserted
+       something the server never said, at the moment of committing it. */
+    var writes = tools.filter(function (t) { return t.read_only === false; }).length;
+    var unmarked = tools.filter(function (t) { return t.read_only !== true && t.read_only !== false; }).length;
     var who = draft.groups.length === 1 ? draft.groups[0].name : draft.groups.length + ' groups';
+    var notes = [];
+    if (writes) notes.push(writes + ' can write');
+    if (unmarked) notes.push(unmarked + ' unmarked');
     return 'Register and give ' + who + ' ' + tools.length + ' tool' + (tools.length === 1 ? '' : 's') +
-      (writes ? ' (' + writes + ' can write)' : '');
+      (notes.length ? ' (' + notes.join(', ') + ')' : '');
   }
 
   function save() {
@@ -840,6 +865,57 @@
     return body;
   }
 
+  /* What the row may say about a tool, and on whose authority.
+
+     The whole safety decision used to rest on an admin eyeballing an unmarked
+     list, so the row was given a badge — and the badge then said "writes"
+     about every tool that had not declared itself read-only. Most public MCP
+     servers publish no `annotations` at all, so the common case was Agnes
+     asserting a write the server never mentioned, right next to a tooltip
+     admitting it ("Unmarked tools count as writes"). An admin who reads
+     `read_wiki_contents · writes` either stops believing the badge or turns
+     the tool off for a reason that is not true.
+
+     Three states, because the annotation has three:
+
+       read_only === true    the server vouches for it     no badge,   arrives on
+       read_only === false   the server declares a write   "writes",   arrives off
+       read_only absent      the server said nothing       "unmarked", arrives off
+
+     Only the LABEL is three-valued. Unmarked stays off, and registers as
+     `mutating`, exactly as before — the third state is not a third permission,
+     and treating silence as safety is the bug this must not introduce.
+
+     `read_only_origin` is the honest asterisk. On the edit path `read_only` is
+     reconstructed from the stored `mutating` boolean, which cannot tell a
+     declared write from an unmarked tool, so that path says "writes" — the
+     conservative reading — and its tooltip admits which of the two it is
+     unable to distinguish. */
+  function toolMark(t) {
+    if (t.read_only === true) return null;
+    // The origin is read BEFORE the value, because on the edit path the value
+    // is a reconstruction: `false` there means "stored as write-capable", not
+    // "the server declared a write", and only this branch knows the difference.
+    if (t.read_only_origin === 'registered') {
+      return {
+        cls: 'mcp-writes', text: 'writes',
+        title: 'Registered as write-capable. What is stored is one flag, so it cannot say whether the ' +
+          'server declared a write or declared nothing at all — Agnes took the safer reading.',
+      };
+    }
+    if (t.read_only === false) {
+      return {
+        cls: 'mcp-writes', text: 'writes',
+        title: 'The server declares this tool can change data on it (readOnlyHint is false).',
+      };
+    }
+    return {
+      cls: 'mcp-unmarked', text: 'unmarked',
+      title: 'The server said nothing about this tool — it declares no readOnlyHint. Agnes does not ' +
+        'read silence as safety, so it starts off. Turn it on if you know what it does.',
+    };
+  }
+
   function toolsBody() {
     var check = '<button type="button" class="ag-addrow" data-mcp-check' +
       (checking ? ' disabled' : '') + '>' +
@@ -863,14 +939,13 @@
     }
     var rows = draft.tools.map(function (t) {
       var on = draft.enabled[t.name] !== false;
-      // The whole safety decision used to rest on an admin eyeballing an
-      // unmarked list. Say which ones can change data upstream.
-      var writes = t.read_only !== true
-        ? ' <span class="mcp-writes" title="This tool can change data on the server. Unmarked tools count as writes.">writes</span>'
+      var m = toolMark(t);
+      var mark = m
+        ? ' <span class="' + m.cls + '" title="' + esc(m.title) + '">' + esc(m.text) + '</span>'
         : '';
       return '<div class="ag-row">' +
         '<div class="ag-row-body">' +
-          '<div class="ag-row-name">' + esc(t.name) + writes + '</div>' +
+          '<div class="ag-row-name">' + esc(t.name) + mark + '</div>' +
           (t.description ? '<div class="ag-row-desc">' + esc(t.description) + '</div>' : '') +
         '</div>' +
         '<button type="button" class="ag-tglbtn' + (on ? ' on' : '') + '" ' +
@@ -950,11 +1025,22 @@
     if (!slots.length) return '';
     var known = slots.filter(function (s) { return s.known; }).length;
     var open = slots.filter(function (s) { return !s.known; });
-    return '<div class="ag-prog">' +
-      '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
-      '<span class="ag-prog-t">' + (open.length
-        ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
-        : 'nothing missing — ready to save') + '</span>' +
+    /* The NEXT thing, not every open thing. Spelled out in full this line
+       read "still to settle: where it lives, how it authenticates, a name,
+       which tools to expose" — which does not fit the pane, so it truncated
+       mid-word and lost the sentence. The full list is the tooltip. And DONE
+       gets its own state: a count that has run out is not the same claim as
+       "this is ready to register". */
+    var done = !open.length;
+    var full = open.length
+      ? 'Still open: ' + open.map(function (s) { return s.label; }).join(', ')
+      : 'Nothing left to settle.';
+    return '<div class="ag-prog' + (done ? ' ag-prog--done' : '') + '" title="' + esc(full) + '">' +
+      (done ? window.BuilderShell.TICK_SVG : '') +
+      '<span class="ag-prog-n">' + (done ? 'Ready' : known + ' of ' + slots.length) + '</span>' +
+      '<span class="ag-prog-t">' + (done
+        ? 'nothing left to settle'
+        : 'next: ' + esc(open[0].label)) + '</span>' +
     '</div>';
   }
 
@@ -979,10 +1065,11 @@
         key: 'tools', no: 3, title: 'Tools', note: 'what it exposes',
         collapsed: !!collapsed.tools,
         sub: editing
-          ? 'What this source exposes. Tools marked "writes" can change data upstream — a tool the server ' +
-            'does not vouch for counts as one.'
-          : 'What the server actually offers, read from the server itself. Read-only tools are on; anything ' +
-            'that can change data upstream is off until you turn it on.',
+          ? 'What this source exposes. A tool marked "writes" is registered as write-capable — either the ' +
+            'server declared that, or it declared nothing and Agnes took the safer reading.'
+          : 'What the server actually offers, read from the server itself. Tools the server vouches for as ' +
+            'read-only are on. Tools it declares can write, and tools it says nothing about, are off until ' +
+            'you turn them on.',
         summary: toolSummary(),
         body: toolsBody(),
       }) +
@@ -1004,6 +1091,27 @@
       }) : '');
   }
 
+  /* What an MCP source IS, at the head of the transcript — the same block in
+     the same position as /skills, /agents and the package builder. It was a
+     four-line paragraph in the configuration header, under a title, a
+     subtitle and a progress line. */
+  /* `tools` from the canonical set (macros/_icon.html) — the glyph this UI
+     already uses for the tool-server idea, in the rail's "Take Agnes to your
+     tools" and on /profile. Transcribed rather than imported because this is
+     a JS component; keep it byte-equal to the macro. */
+  var ABOUT_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg>';
+
+  function aboutHtml() {
+    return window.BuilderShell.about({
+      iconSvg: ABOUT_ICO,
+      html: '<p>An <strong>MCP source</strong> is an outside tool server Agnes dials on your behalf — a CRM, ' +
+        'a ticket tracker, a docs search. The tools you approve become callable by agents, and by analysts ' +
+        'in Claude Code, for the groups you grant.</p>',
+    });
+  }
+
   function leftHtml() {
     var opening = editing
       // Editing: the four things are already answered, and repeating the
@@ -1017,14 +1125,14 @@
        error under it, and a live composer + chips — every one of which failed
        identically. One standing notice instead. */
     var notice = llmUnavailable
-      ? '<div class="ag-note ag-note--warn">No AI credential is configured on this instance, so the ' +
-        'assistant cannot draft anything. The configuration on the right is editable by hand and ' +
-        'Register source works normally — or ask an admin to set a model up.</div>'
+      ? '<div class="ag-note ag-note--warn">No AI credential is configured, so the assistant cannot ' +
+        'draft anything. Fill the configuration on the right by hand — Register source works normally.</div>'
       : window.BuilderShell.engineNotice(convEngine);
     return notice +
       window.BuilderShell.conversation({
         id: 'mcp-conv', rows: llmUnavailable && !conv.length ? [] : rows, busy: convBusy,
         busyText: conv.length ? 'Thinking…' : 'Getting started…',
+        about: aboutHtml(),
         err: llmUnavailable ? null : convErr,
       }) +
       (convPatchNote && !convBusy ? '<p class="sk-patch-note">' + esc(convPatchNote) + '</p>' : '') +
@@ -1042,6 +1150,9 @@
 
   function render() {
     if (!mount) return;
+    /* See BuilderShell.keepCfgScroll — a full rebuild would otherwise send
+       the configuration column back to the top on every re-render. */
+    window.BuilderShell.keepCfgScroll('mcp-steps', function () {
     mount.innerHTML =
       window.BuilderShell.head({
         backLabel: 'Library',
@@ -1068,18 +1179,15 @@
         left: leftHtml(),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this source is, editable by hand',
-        /* The durable definition. The only orientation was inside the
-           conversation — which disappears entirely on an instance with no
-           model, leaving a title, a warning, and no statement of what an MCP
-           source IS or what registering one does to this instance. */
-        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>' +
-          '<p class="ag-cfg-blurb">An MCP source is an outside tool server — a CRM, a ticket tracker, a docs ' +
-          'search — that Agnes dials on your behalf. Register one and the tools you approve become callable by ' +
-          'agents, and by analysts in Claude Code, for the groups you grant.</p>',
+        /* How much of the source is still unsettled. The definition that
+           used to sit under it is at the head of the transcript now — see
+           aboutHtml. */
+        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>',
         cfgBodyId: 'mcp-steps',
         cfg: panelHtml(),
       }) +
       '<div id="mcp-picker"></div>';
+    });
     renderPicker();
     document.body.classList.add('ag-building');
   }
@@ -1213,8 +1321,13 @@
             input_schema: t.input_schema || null,
             // `mutating` is what registration wrote from the upstream's
             // readOnlyHint; reading it back the same way keeps the "writes"
-            // marker honest instead of re-guessing it.
-            read_only: t.mutating === false ? true : null,
+            // marker honest instead of re-guessing it. One boolean cannot
+            // carry three states, so `read_only_origin` says so out loud
+            // rather than letting the badge claim the server declared a write
+            // — or, worse the other way, call a declared destructive tool
+            // "unmarked" because the distinction was lost in the row.
+            read_only: t.mutating === false,
+            read_only_origin: 'registered',
           };
         });
         /* The STORED flag, not `true`. Marking every returned tool enabled
@@ -1268,6 +1381,8 @@
       var saved = restoreDraft();
       draft = saved ? Object.assign(newDraft(), saved.draft) : newDraft();
       conv = (saved && Array.isArray(saved.conv)) ? saved.conv : [];
+      // Restore the transcript's provenance with it — see persistDraft.
+      if (saved && saved.engine) convEngine = saved.engine;
       wire();
       render();
       /* Greet only a blank page. A resumed draft already answers "what are you

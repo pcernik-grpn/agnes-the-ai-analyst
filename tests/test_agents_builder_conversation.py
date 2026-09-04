@@ -171,11 +171,21 @@ class TestThePanelShowsOnlyWhatIsConnected:
 
     def test_selecting_in_the_picker_does_not_tear_the_picker_down(self, markup):
         """A full renderBuilder would rebuild #ag-picker under the pointer,
-        closing the modal after every single pick."""
+        closing the modal after every single pick.
+
+        It does not even re-render the ROWS any more: FilterToolbar drives
+        that list and captured those row elements when the picker opened, so
+        a fresh set is a list it is no longer filtering. `syncPickerRow`
+        updates the row that changed, in place — the same rule, one notch
+        stricter.
+        """
         block = re.search(r"function afterIngredientChange\(\) \{(.*?)\n  \}", markup, re.S)
         assert block, "afterIngredientChange not found"
         body = block.group(1)
-        assert "if (picker)" in body and "renderPickerRows()" in body
+        assert "if (picker)" in body and "syncPickerRow()" in body
+        assert "renderPickerRows()" not in body, (
+            "the picker's rows are rebuilt again — the filter engine's row references go stale"
+        )
         # ...and both toggles route through it rather than re-rendering directly.
         for attr in ("data-ag-kn", "data-ag-cap"):
             handler = re.search(r"t\.hasAttribute\('" + attr + r"'\) && a\) \{(.*?)\n    \}", markup, re.S)

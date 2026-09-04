@@ -242,6 +242,63 @@ class CorpusFilesPgRepository:
             rows = conn.execute(sa.text("SELECT corpus_id, COUNT(*) AS n FROM corpus_files GROUP BY corpus_id")).all()
         return {r[0]: int(r[1]) for r in rows}
 
+    def search_across_corpora(self, q: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Mirrors the DuckDB sibling — see its docstring."""
+        q_norm = (q or "").strip()
+        if not q_norm:
+            return []
+        pattern = f"%{self._escape_like(q_norm)}%"
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT * FROM corpus_files "
+                        "WHERE LOWER(filename) LIKE LOWER(:q) ESCAPE '\\' OR LOWER(path) LIKE LOWER(:q) ESCAPE '\\' "
+                        "ORDER BY LOWER(filename) ASC, id ASC LIMIT :limit"
+                    ),
+                    {"q": pattern, "limit": limit},
+                )
+                .mappings()
+                .all()
+            )
+        return [self._decode_row(dict(r)) for r in rows]
+
+    def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{corpus_id: {processing_status: count}}`` for exactly the given
+        corpus ids, in ONE query. Mirrors the DuckDB sibling — see its
+        docstring for why this exists (the per-scope N+1 it replaces)."""
+        if not corpus_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT corpus_id, processing_status, COUNT(*) AS n FROM corpus_files "
+                    "WHERE corpus_id = ANY(:ids) GROUP BY corpus_id, processing_status"
+                ),
+                {"ids": list(corpus_ids)},
+            ).all()
+        out: Dict[str, Dict[str, int]] = {}
+        for corpus_id, status, n in rows:
+            out.setdefault(corpus_id, {})[status or "pending"] = int(n)
+        return out
+
+    def top_folder_status_counts(self, corpus_id: str) -> Dict[str, Dict[str, int]]:
+        """Mirrors the DuckDB sibling — see its docstring."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT CASE WHEN path IS NOT NULL AND strpos(path, '/') > 0 "
+                    "THEN split_part(path, '/', 1) ELSE '' END AS top_folder, "
+                    "processing_status, COUNT(*) AS n FROM corpus_files "
+                    "WHERE corpus_id = :id GROUP BY top_folder, processing_status"
+                ),
+                {"id": corpus_id},
+            ).all()
+        out: Dict[str, Dict[str, int]] = {}
+        for top_folder, status, n in rows:
+            out.setdefault(top_folder, {})[status or "pending"] = int(n)
+        return out
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         with self._engine.connect() as conn:
@@ -339,4 +396,15 @@ class CorpusFilesPgRepository:
                     "path": path,
                     "id": file_id,
                 },
+            )
+
+    def update_path(self, file_id: str, *, path: Optional[str], filename: str) -> None:
+        """Postgres twin of the DuckDB ``update_path`` — see its docstring."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE corpus_files SET filename = :filename, path = :path, "
+                    "    updated_at = CURRENT_TIMESTAMP WHERE id = :id"
+                ),
+                {"filename": filename, "path": path, "id": file_id},
             )

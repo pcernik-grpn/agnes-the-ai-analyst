@@ -144,6 +144,59 @@ model attached — a guardrail that must guess should guess in the direction
 that stops sooner. It is a soft guardrail, not a billing ledger; this
 endpoint is the ledger.
 
+## Knowledge packaging — worker job, single-run, checkpointed
+
+```bash
+agnes admin knowledge packaging run                # enqueue a pass
+agnes admin knowledge packaging status              # last run, running?, next due
+agnes admin knowledge packaging status --json
+```
+
+Per-collection `knowledge.duckdb` artifacts (K3, #798) are rebuilt by the
+`knowledge-packaging` worker job kind (LIGHT lane,
+`app/worker/kinds.py::_run_knowledge_packaging`), not inline inside an HTTP
+request. TCRD-296 synthesis C.15: it used to run synchronously behind
+`POST /api/admin/run-knowledge-packaging`, bounded only by the scheduler's
+own client timeout — a pass slower than that timeout let the next scheduler
+tick fire a second, overlapping call, and two overlapping in-process runs
+raced hard enough to OOM the app.
+
+**Single-run.** The scheduler's tick (`SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL`,
+default 15 min) still calls `POST /api/admin/run-knowledge-packaging`, but the
+endpoint is now a thin, idempotency-keyed enqueue: a second tick while one run
+is still `queued`/`running` gets back the SAME job id as a `409` (expected
+under a fast cadence, not an error to page on) instead of starting a redundant
+run. Belt-and-braces on top of that dedupe, the job handler also takes a
+non-blocking Postgres advisory lock (`src.db_pg.knowledge_packaging_lease`,
+no-op on the frozen DuckDB app-state backend, which is single-process by
+construction) before running — a stray manual `POST /api/jobs` enqueue with a
+different idempotency key skips cleanly instead of racing the in-flight run.
+
+**Bounded and resumable.** One run is capped at a 20-minute wall-clock budget
+(`_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S`, a plain constant — the incident was
+an *unbounded* run, not a mistuned number). `run_packaging_pass` checkpoints
+`state.json` after every collection it finishes, so hitting the deadline
+mid-sweep loses progress on at most the ONE collection in flight; the result
+carries `interrupted_reason: "timeout"` and the next scheduled run picks up
+where it left off (an already-recorded, unchanged fingerprint is a skip, not a
+rebuild). Reads are bounded too: `build_artifact`/`corpus_fingerprint` page
+through a corpus's chunks (`CorpusChunksRepository.list_for_corpus_batch`,
+keyset-paginated by id) rather than materializing the whole corpus's rows —
+including every 384-dim embedding — in one call.
+
+**No worker role, no silent black hole.** `POST /api/admin/run-knowledge-packaging`
+checks `role_enabled(Role.WORKER)` before enqueueing — a process/instance with
+no worker role has no loop that will ever claim the job, and enqueueing anyway
+would leave it `queued` forever with no visible error. That case answers a
+typed `501` (`{"error": "requires_worker_role"}`) instead.
+
+`GET /api/admin/knowledge-packaging/status` (`agnes admin knowledge packaging
+status`) reports the last run's outcome — including
+`built`/`skipped`/`pruned`/`errors`/`interrupted_reason`/`duration_s`/
+`collections_total`/`collections_processed` — whether one is running right
+now, and a best-effort `next_due` estimate read from the scheduler's own
+durable last-run marker.
+
 ## Audit log volume — how much does audit logging cost you
 
 The audit-coverage work (wave 1 + wave 2 of the audit-full-coverage plan)

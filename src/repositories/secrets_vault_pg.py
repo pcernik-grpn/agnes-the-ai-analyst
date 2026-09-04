@@ -335,6 +335,19 @@ class ConnectionSecretsPgRepository:
             ).fetchone()
         return row is not None
 
+    def has_many(self, connection_ids: list[str]) -> set[str]:
+        """The subset of ``connection_ids`` that have a stored vault secret,
+        in ONE query. Mirrors the DuckDB sibling — see its docstring for the
+        per-row ``has()`` N+1 it replaces."""
+        if not connection_ids:
+            return set()
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT DISTINCT connection_id FROM connection_secrets WHERE connection_id = ANY(:ids)"),
+                {"ids": list(connection_ids)},
+            ).all()
+        return {r[0] for r in rows}
+
     def updated_at(self, connection_id: str) -> Optional[str]:
         """See ``app.secrets_vault.ConnectionSecretsRepository.updated_at``."""
         with self._engine.connect() as conn:
@@ -343,3 +356,27 @@ class ConnectionSecretsPgRepository:
                 {"connection_id": connection_id},
             ).fetchone()
         return str(row[0]) if row and row[0] is not None else None
+
+    def copy_secret(self, source_connection_id: str, target_connection_id: str) -> bool:
+        """See ``app.secrets_vault.ConnectionSecretsRepository.copy_secret``
+        — signature-compatible, same verbatim-ciphertext-copy contract (no
+        decrypt/re-encrypt)."""
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text("SELECT ciphertext FROM connection_secrets WHERE connection_id = :connection_id"),
+                {"connection_id": source_connection_id},
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                sa.text(
+                    """INSERT INTO connection_secrets
+                           (connection_id, ciphertext, updated_at)
+                       VALUES (:connection_id, :ciphertext, CURRENT_TIMESTAMP)
+                       ON CONFLICT (connection_id) DO UPDATE SET
+                           ciphertext = EXCLUDED.ciphertext,
+                           updated_at = EXCLUDED.updated_at"""
+                ),
+                {"connection_id": target_connection_id, "ciphertext": row[0]},
+            )
+        return True

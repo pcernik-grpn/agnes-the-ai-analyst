@@ -2599,8 +2599,48 @@ def _library_child_row(
 #: How many files a Library folder row reveals when it is expanded inline.
 #: Deliberately a PEEK: the expansion carries no search, filter or pager, so
 #: past a dozen rows it is a wall rather than an answer — and the collection
-#: page it links on to has all three (#2141 item 2).
+#: page it links on to has all three (#2141 item 2). Round 2 (incident
+#: follow-up, 2026-09-03): a folder's peek rows are now fetched on first
+#: expand (`GET /library/{slug}/peek`) rather than pre-rendered hidden in the
+#: index response — see that route and `_library_child_row`. The FIRST cut
+#: of the peek (#2141) rendered it inline for every folder at or under a
+#: separate size cap, which fixed the everything-visible-at-once byte blowup
+#: but not the cost of listing (and embedding a `data-search` value built
+#: from) a folder's files at INDEX render time at all: on a live instance
+#: (~392 collections, active SharePoint crawls) that alone was 19.6 MB for a
+#: page whose live DOM, after the browser discarded the raw markup's
+#: indentation, was 1.09 MB — the index card is now the count/name/
+#: description alone (`_catalog_card_upload`, `_library_row_base`'s own
+#: `c.search`), never a per-file fetch, however small the folder.
 _LIBRARY_FOLDER_PEEK = 10
+
+#: How many collections `library_page` reads in its one flat
+#: `file_corpora_repo().list()` call. NOT a render cap — round 4 of the
+#: 2026-09-03 incident removed the render cap (`_LIBRARY_SECTION_PAGE_CAP`,
+#: `?files_limit=`, the "Show more collections" link) entirely: it applied
+#: to the RAW fetch, before the caller's owned-or-granted filter ran, so
+#: "Show more" appeared whenever the INSTANCE had more than the cap's worth
+#: of collections, never whether the CALLER could see more than that — on a
+#: live instance where one admin owned/was granted only 2 of 397
+#: collections, the link "led nowhere" no matter how far `?files_limit=` was
+#: raised, because raising it only fetched more of the same ~395 invisible
+#: rows. Every collection the caller may see now renders, in one list — no
+#: other Library section paginates either, and a collection's own render
+#: cost is bounded regardless of count now that its peek is fetched lazily
+#: (round 2) and its facet menu is capped server-side (round 3). This
+#: constant exists only so the ONE flat query has an explicit ceiling
+#: instead of `file_corpora_repo().list()`'s own default (200), which would
+#: otherwise silently truncate the visible-set computation on a large
+#: instance before ownership/grants are even checked.
+_LIBRARY_COLLECTIONS_FETCH_CAP = 5000
+
+#: How many values EACH entity facet (client/industry/offering/document
+#: type) offers in the Filter menu — round 3 of the 2026-09-03 incident.
+#: `facet_top_values_for_collections` picks the top this-many by document
+#: count, in SQL; `GET /library/facets/{facet}` (below) is the "search
+#: facets" typeahead for reaching a value past this cap without ever
+#: inlining the full vocabulary.
+_LIBRARY_ENTITY_FACET_LIMIT = 25
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -2633,9 +2673,21 @@ async def library_page(
 
     Scope is grant-aware: items you OWN plus anything shared into a group you
     belong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the
-    toolbar can slice by ownership. Deliberately NOT admin god-mode — an admin
-    still sees their own Library, not every item in the instance (the audit
-    view is /admin/access).
+    toolbar can slice by ownership. The grant-backed kinds — data packages,
+    memory domains, recipes, marketplace plugins — stay grant-scoped even for
+    an admin: an admin's OWN Library still only lists what an admin (possibly
+    themselves) has granted a group of theirs, matching ``/admin/access``'s
+    grant model.
+
+    Artefacts are the one exception, matching ``can_access_collection``
+    (``app/auth/access.py``): an admin sees every live collection here, not
+    just the ones they own or were granted, so a live instance where 395 of
+    397 collections sat ungranted no longer reads as "1238 files" to the one
+    person who could actually reach all of them via URL. A collection an
+    admin can only see through admin authority — no ownership, no grant — is
+    tagged ``ownership="admin_visible"`` and carries a "Not shared with you"
+    note in its meta line, so the admin can tell at a glance what an ordinary
+    user in this same Library would NOT see.
 
     Every row carries its real visibility (Private / Shared / Workspace) and,
     for the grant-backed kinds, a Share action writing through
@@ -2659,6 +2711,10 @@ async def library_page(
 
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
+    # Artefacts get admin god-mode (see the handler docstring); the
+    # grant-backed kinds below do not, so this is read ONCE here and reused
+    # everywhere the artefacts section needs it — never re-derived per row.
+    caller_is_admin = is_user_admin(uid, conn)
 
     # ── What could not be read ────────────────────────────────────────────
     # Every content block below is wrapped so one broken source cannot take the
@@ -2748,7 +2804,14 @@ async def library_page(
     try:
         fc_repo = file_corpora_repo()
         cf_repo = corpus_files_repo()
-        _all_cols = fc_repo.list()
+        # Every collection up to `_LIBRARY_COLLECTIONS_FETCH_CAP`, in ONE
+        # flat query — round 4 of the 2026-09-03 incident removed the
+        # render cap that used to apply here (see that constant's
+        # docstring). The owned-or-granted filter below decides what
+        # actually renders; nothing here narrows the fetch by visibility,
+        # so there is nothing left that could turn the caller's OWN visible
+        # count into a truncated, misleading one.
+        _all_cols = fc_repo.list(limit=_LIBRARY_COLLECTIONS_FETCH_CAP)
     except Exception as e:
         _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
@@ -2758,19 +2821,37 @@ async def library_page(
     # once — visibility still decided inside the repo, never here.
     _fact_counts: dict = {}
     if facts_repo_ is not None:
-        _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
+        # Admin god-mode widens this to EVERY collection (not just owned or
+        # granted) so an admin-visible-only card's "N facts" is the real
+        # count, never a silent 0 from a set the card-visibility filter below
+        # no longer matches.
+        _visible_ids = [
+            c["id"] for c in _all_cols if caller_is_admin or c.get("created_by") == uid or c["id"] in granted_to_me
+        ]
         try:
-            _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
+            if caller_is_admin:
+                # `count_visible_facts_for_collections` is a Python-level batch
+                # over an exact, per-caller visibility CTE — but that CTE is
+                # still ONE STATEMENT PER COLLECTION (its own docstring says
+                # so), and on an admin Library that sees every collection
+                # (390 here) that alone cost minutes (incident, 2026-09-03).
+                # `approximate_counts_for_collections` is a single flat
+                # `GROUP BY corpus_id` and is scoped, by its own contract, to
+                # exactly this caller shape — `_readable_ids(caller) is None`
+                # — which `caller_is_admin` stands in for without importing the
+                # repo's private RBAC resolver here.
+                approx = facts_repo_.approximate_counts_for_collections(_visible_ids)
+                _fact_counts = {cid: counts.get("facts", 0) for cid, counts in approx.items()}
+            else:
+                _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
         except Exception as e:
             logger.warning("/library: fact counts failed: %s", e)
-    # Same one-batch-call idea as `_fact_counts` just above: every card below
-    # still needs the FULL file list when a collection is non-empty (it is
-    # searched by every contained filename, its per-format facets, and the
-    # single "file_id" a one-file card links straight to) — only an empty
-    # collection can skip the per-collection query entirely, and this bulk
-    # `count_by_corpus()` is what tells us, in one query, which ones those
-    # are instead of finding out via a `list_for_corpus` call that returns
-    # nothing.
+    # `file_count` per collection, in ONE query — replaces the per-collection
+    # `list_for_corpus` fetch every card used to pay to learn its own count.
+    # The only per-collection file read the index still does is the single
+    # bounded `limit=1` fetch below, for the one-file "this card IS the file"
+    # case — a folder's own rows are never listed here at all now, however
+    # small (round 2 of the incident fix — see `_LIBRARY_FOLDER_PEEK`).
     _file_counts: dict = {}
     if cf_repo is not None:
         try:
@@ -2778,15 +2859,30 @@ async def library_page(
         except Exception as e:
             logger.warning("/library: file counts failed: %s", e)
     # What each collection is ABOUT — the values its entity facets slice on.
-    # One batch call beside the counts above, for the same reason: the
-    # caller's readable set is the expensive half and it resolves once.
+    # Two bounded batch calls beside the counts above (round 3 of the
+    # 2026-09-03 incident: the exact per-caller `facet_values_for_collections`
+    # has no cap of its own, so tallying it across every rendered row built
+    # an 18 MB facet MENU and cost seconds even for a caller whose own visible
+    # set was small — the unbounded CANDIDATE SCAN, not the output size, was
+    # the expensive part). `facet_top_values_for_collections` picks the menu's
+    # own vocabulary — top `_LIBRARY_ENTITY_FACET_LIMIT` per type by document
+    # count, bounded IN SQL. `facet_membership_for_collections` then asks,
+    # for exactly those (already small) values, which of THIS page's rows
+    # carry one — a row only needs to declare membership in a value the menu
+    # can actually offer, so this is naturally as bounded as the menu is.
     _entity_facets = _entity_facet_spec()
     _entity_values: dict = {}
+    _entity_top: dict = {}
     if facts_repo_ is not None and _entity_facets:
         try:
-            _entity_values = facts_repo_.facet_values_for_collections(
-                user, _visible_ids, types=[t for t, _k, _lbl in _entity_facets]
+            _entity_top = facts_repo_.facet_top_values_for_collections(
+                _visible_ids,
+                types=[t for t, _k, _lbl in _entity_facets],
+                limit_per_type=_LIBRARY_ENTITY_FACET_LIMIT,
             )
+            _menu_fact_ids = [v["fact_id"] for vals in _entity_top.values() for v in vals]
+            if _menu_fact_ids:
+                _entity_values = facts_repo_.facet_membership_for_collections(_visible_ids, _menu_fact_ids)
         except Exception as e:
             # Fails soft exactly as the type map does: the facets are a
             # refinement on a page whose job is the inventory, so a graph
@@ -2795,23 +2891,39 @@ async def library_page(
     try:
         for col in _all_cols:
             owned = col.get("created_by") == uid
-            if not owned and col["id"] not in granted_to_me:
-                continue  # not yours and not shared with you -> invisible here
+            granted = col["id"] in granted_to_me
+            # Admin god-mode (see the handler docstring): a caller who is
+            # neither the owner nor granted access still sees the row when
+            # they are an admin. `admin_only` marks exactly that case, so the
+            # ownership tag and card meta below can label it rather than
+            # silently reading as an ordinary grant.
+            admin_only = False
+            if not owned and not granted:
+                if not caller_is_admin:
+                    continue  # not yours and not shared with you -> invisible here
+                admin_only = True
+            # `file_count` is the batched, exact count from `_file_counts` —
+            # never `len(files)`. `files` is fetched — one bounded row,
+            # `limit=1` — ONLY for the one-file case, to get that file's own
+            # filename/type/size (the card reads as "this IS the file", not
+            # "a folder holding one file"). A folder's rows are never listed
+            # at index-render time regardless of its size: its peek is
+            # fetched lazily on first expand (`GET /library/{slug}/peek`).
+            file_count = _file_counts.get(col["id"], 0)
             files: list = []
-            if _file_counts.get(col["id"], 0):
-                try:
-                    files = cf_repo.list_for_corpus(col["id"])
-                except Exception:
-                    files = []
-            file_count = len(files)
             first_file = None
             if file_count == 1:
-                f0 = files[0]
-                first_file = {
-                    "filename": f0.get("filename"),
-                    "file_type": f0.get("file_type"),
-                    "size_bytes": f0.get("size_bytes"),
-                }
+                try:
+                    files = cf_repo.list_for_corpus(col["id"], limit=1)
+                except Exception:
+                    files = []
+                if files:
+                    f0 = files[0]
+                    first_file = {
+                        "filename": f0.get("filename"),
+                        "file_type": f0.get("file_type"),
+                        "size_bytes": f0.get("size_bytes"),
+                    }
             fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
@@ -2824,8 +2936,18 @@ async def library_page(
                     "fact_count": fact_count,
                 }
             )
+            if admin_only:
+                # A user in this same Library would not see this card at
+                # all — say so on the card itself, not just in an audit log
+                # somewhere else, so the admin can tell admin-only visibility
+                # apart from an ordinary grant at a glance.
+                _not_shared_note = "Not shared with you"
+                c["meta_text"] = f"{c['meta_text']} · {_not_shared_note}" if c.get("meta_text") else _not_shared_note
             shared = col["id"] in shared_ids
-            if not owned:
+            if admin_only:
+                ownership = "admin_visible"
+                owner_label = owner_name.get(col.get("created_by"), "Someone")
+            elif not owned:
                 ownership = "shared_with_me"
                 owner_label = owner_name.get(col.get("created_by"), "Someone")
             elif shared:
@@ -2839,17 +2961,16 @@ async def library_page(
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
             is_folder = file_count != 1
-            # What this row can be FOUND by. Nobody searches for the folder —
-            # they search for the file inside it ("kpis"), and until now the
-            # engine saw only the folder's own name, so a file sitting visibly
-            # on screen answered "Nothing matches these filters". A folder is
-            # therefore searchable by every filename it holds; the client then
-            # opens it and hides the siblings, so the hit reads as the file.
-            fname = (
-                " ".join(f.get("filename") or "" for f in files)
-                if is_folder
-                else (first_file.get("filename") if first_file else "")
-            )
+            # What this row can be FOUND by, beyond its own name/description
+            # (`_library_row_base` folds those into `c.search` unconditionally
+            # — see there). A one-file card additionally carries that file's
+            # own filename, since the card reads as the file, not a folder
+            # holding one. A multi-file folder carries nothing further here —
+            # `files` is never fetched for it at index-render time (round 2 of
+            # the incident fix, `_LIBRARY_FOLDER_PEEK`) — so searching by a
+            # filename INSIDE a folder now means opening it, same as searching
+            # by anything else on its detail page.
+            fname = first_file.get("filename") if first_file else ""
             row = _library_row_base(
                 item_id=col["id"],
                 kind="artifact",
@@ -2920,15 +3041,12 @@ async def library_page(
             row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
             # `file_format` is what the row PRINTS (a folder prints its file
             # count instead, so it has none). `format_keys` is what the row can
-            # be FILTERED by, which for a folder is every format inside it —
-            # the same reason its search text holds every filename. Keeping the
-            # two apart is what lets a folder answer "show me PDFs" without
-            # claiming to be a PDF.
-            row["format_keys"] = (
-                sorted({fmt for f in files if (fmt := _artefact_format(f))})
-                if is_folder
-                else ([row["file_format"]] if row["file_format"] else [])
-            )
+            # be FILTERED by — for a one-file card, that one file's own format.
+            # A folder offers no format facet at the index any more: it would
+            # need every file's format, and `files` is never fetched for a
+            # folder here (round 2 of the incident fix). The format facet
+            # still works over a folder's OWN contents on its detail page.
+            row["format_keys"] = [row["file_format"]] if row["file_format"] else []
             # A loose file's ROW id is its collection id (a single-file artifact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2944,36 +3062,16 @@ async def library_page(
             # to travel separately for the client-side 1-file transition to restore
             # it (the file default differs from the collection default).
             row["own_description"] = col.get("description") or ""
+            # A folder's children are NEVER rendered here, however small —
+            # `GET /library/{slug}/peek` fetches them, lazily, the first time
+            # the reader expands the row (round 2 of the incident fix). This
+            # is pure arithmetic on the already-batched `file_count`, no
+            # per-collection query: what the peek WOULD leave out, so the
+            # "Browse all N files" row (`folder_more_row`) can render up
+            # front — 0 means a click reveals the whole folder and no such
+            # row is needed.
             row["children"] = []
-            # How many files a folder shows INLINE before it hands the reader
-            # over to its own page. A crawled source collection runs to
-            # thousands of files, and the expansion rendered every one of them:
-            # a flat wall of machine-named rows with no search box, no filter
-            # and no pager — the one place the list is actually met, and the
-            # only place it could not be narrowed (#2141 item 2). The
-            # collection page HAS that search, so the expansion is a PEEK with
-            # a way through to it. It also stops the Library from carrying
-            # thousands of hidden <tr>s it never shows.
-            peek = files[:_LIBRARY_FOLDER_PEEK] if is_folder else []
-            # What the peek left out. Drives the "Browse all N files" row; 0
-            # means the expansion is the whole folder and no such row renders.
-            row["children_hidden"] = max(0, file_count - len(peek)) if is_folder else 0
-            if is_folder:
-                for f in peek:
-                    row["children"].append(
-                        _library_child_row(
-                            f,
-                            col,
-                            origin=origin,
-                            owner_label=owner_label,
-                            ownership=ownership,
-                            owner_key="me" if owned else (col.get("created_by") or ""),
-                            visibility=file_visibility(f["id"]),
-                            stack_state=row["stack_state"],
-                            stack_title=row["stack_title"],
-                            stack_pill=row["stack_pill"],
-                        )
-                    )
+            row["children_hidden"] = max(0, file_count - _LIBRARY_FOLDER_PEEK) if is_folder else 0
             items.append(row)
     except Exception as e:
         _lost("files and collections", e)
@@ -4182,8 +4280,10 @@ async def library_page(
     else:
         library_active_tab = _TAB_KNOWLEDGE
 
-    # WHICH emptiness, when there is nothing to list. This page is grant-scoped
-    # and deliberately NOT admin god-mode (see the handler docstring), so a
+    # WHICH emptiness, when there is nothing to list. The grant-backed kinds
+    # this branch is about (data packages, memory, recipes, plugins) stay
+    # grant-scoped and deliberately NOT admin god-mode even for an admin
+    # (see the handler docstring — artefacts are the one exception), so a
     # fully stocked workspace still renders nothing here for a caller no admin
     # has granted anything to. The page had ONE empty state for both cases and
     # it said "your library is empty — upload a file", i.e. it framed the
@@ -4326,6 +4426,65 @@ async def library_page(
         library_connected=_has_connected_tools(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
+
+
+#: Result cap for the facet typeahead below — the caller-supplied `limit` is
+#: clamped into this range so a copy-pasted URL can never turn the route
+#: back into an unbounded dump.
+_LIBRARY_FACET_SEARCH_MAX = 200
+
+
+@router.get("/library/facets/{facet}")
+def library_facet_search(
+    facet: str,
+    q: str = "",
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """ "Search facets" typeahead for one entity facet (client / industry /
+    offering / document type) — the way to reach a value past the index's
+    own top-`_LIBRARY_ENTITY_FACET_LIMIT` menu (round 3 of the 2026-09-03
+    incident) without ever inlining the full vocabulary. Bounded, ranked by
+    document count exactly like the menu itself, through the SAME
+    `facet_top_values_for_collections` query.
+
+    RBAC: the same boundary `/library` itself uses — every value returned is
+    scoped to collections `accessible_collection_ids` says this caller can
+    see (`None` for an admin, meaning no filter), never the whole graph.
+    An unknown `facet` name is a 404: the four legal keys come from
+    `_entity_facet_spec()`, the same source the index's own menu columns do,
+    so this route can never offer a category the page does not have.
+
+    Plain ``def``, not ``async def`` — purely blocking `facts_pg` /
+    `accessible_collection_ids` DB work, zero ``await``s (Tier-1
+    convention, `tests/test_event_loop_offload_guard.py`).
+    """
+    facts_repo_ = _facts_repo_if_available()
+    if facts_repo_ is None:
+        return {"values": []}
+    _spec = {k: t for t, k, _lbl in _entity_facet_spec()}
+    fact_type = _spec.get(facet)
+    if fact_type is None:
+        raise HTTPException(status_code=404, detail="unknown_facet")
+
+    from app.auth.access import accessible_collection_ids
+
+    readable = accessible_collection_ids(user, conn)
+    corpus_ids = list(readable) if readable is not None else None
+    limit_norm = max(1, min(limit, _LIBRARY_FACET_SEARCH_MAX))
+    try:
+        top = facts_repo_.facet_top_values_for_collections(
+            corpus_ids, types=[fact_type], limit_per_type=limit_norm, q=q
+        )
+    except Exception as e:
+        logger.warning("/library/facets/%s: search failed: %s", facet, e)
+        return {"values": []}
+    return {
+        "values": [
+            {"value": v["label"], "label": v["label"], "count": v["document_count"]} for v in top.get(fact_type, [])
+        ]
+    }
 
 
 @router.get("/artefacts", include_in_schema=False)
@@ -5628,66 +5787,23 @@ _CORPUS_FILE_STATUSES = ("indexed", "processing", "pending", "needs_review", "re
 _LIBRARY_MATCH_LIMIT = 25
 
 
-@router.get("/library/{slug}/matching-files", response_class=HTMLResponse)
-async def library_matching_file_rows(
-    slug: str,
-    request: Request,
-    q: str = "",
-    user: dict = Depends(get_current_user),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
-    """The file rows of one collection that match ``q`` — as Library child rows.
+def _library_child_row_context(col: dict, uid: str) -> dict:
+    """The folder-level facts every child row of ``col`` inherits, resolved
+    once per fragment request — shared by ``library_folder_peek_rows`` and
+    ``library_matching_file_rows`` so the two child-row fragment endpoints
+    cannot derive ownership/sharing/stack state differently. Each failure
+    falls to the conservative value rather than taking the fragment down — a
+    row that says "Private" when it cannot prove otherwise is safe; the
+    opposite is not.
 
-    Why this exists: the Library expands a folder to a PEEK of its files
-    (``_LIBRARY_FOLDER_PEEK``), and its search box is live and client-side. A
-    folder is searchable by every filename it holds, so typing a filename
-    finds the folder — but if that file is not in the ten the peek rendered,
-    the folder opened onto nothing and the reader had to click through to the
-    collection page to see the file they had already named (#2141 item 2,
-    review). The page asks this route for the rows instead, so the match is
-    the answer rather than a signpost to it.
-
-    Renders through the SAME ``library_row`` macro the page uses, from the
-    same ``_library_child_row`` dict — a fragment endpoint precisely so the
-    markup and the sharing vocabulary have one source, not a second copy in
-    JavaScript that would drift from the first.
-
-    RBAC: collection access, admins exempt — the same gate as
-    ``/library/{slug}``, because that is what this lists. Deliberately NOT the
-    wider per-file rule ``library_file_detail`` uses: a caller holding a grant
-    on one file inside a folder may open that file, and must not be able to
-    enumerate its siblings. 404 for missing AND for no-access, matching the
-    collection contract.
-
-    An empty ``q`` returns nothing: this route answers a search, and a blank
-    search is what the peek already renders.
+    Returns ``owned``, ``ownership``, ``owner_label``, ``in_stack``, and a
+    ``visibility(file_id)`` callable for that file's OWN (independent)
+    sharing state.
     """
-    from app.auth.access import can_access_collection
     from app.resource_types import ResourceType
     from src.db import SYSTEM_EVERYONE_GROUP
 
-    q_norm = (q or "").strip()
-    if not q_norm:
-        return HTMLResponse("")
-
-    col = file_corpora_repo().get_by_slug(slug)
-    if not col:
-        raise HTTPException(status_code=404, detail="collection_not_found")
-    is_admin = is_user_admin(user["id"], conn)
-    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
-        raise HTTPException(status_code=404, detail="collection_not_found")
-
-    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_MATCH_LIMIT, q=q_norm, order="newest")
-    if not files:
-        return HTMLResponse("")
-
-    uid = user["id"]
     owned = col.get("created_by") == uid
-    # The folder-level facts a child inherits. Resolved the same way
-    # `library_page` resolves them, and each failure falls to the
-    # conservative value rather than taking the fragment down — a row that
-    # says "Private" when it cannot prove otherwise is safe; the opposite
-    # is not.
     try:
         shared_ids = set(resource_grants_repo().list_resource_ids_for_user(uid, ResourceType.COLLECTION.value))
     except Exception:
@@ -5706,7 +5822,7 @@ async def library_matching_file_rows(
     except Exception:
         in_stack = False
 
-    # Each matched file's OWN sharing, batched — one grant read for the whole
+    # Each file's OWN sharing, batched — one grant read for the whole
     # fragment rather than one per row.
     file_groups: dict[str, set] = {}
     try:
@@ -5720,7 +5836,7 @@ async def library_matching_file_rows(
     except Exception:
         everyone_id = None
 
-    def _vis(file_id: str) -> str:
+    def visibility(file_id: str) -> str:
         groups = file_groups.get(file_id)
         if not groups:
             return "private"
@@ -5728,17 +5844,34 @@ async def library_matching_file_rows(
             return "workspace"
         return "shared"
 
+    return {
+        "owned": owned,
+        "ownership": ownership,
+        "owner_label": owner_label,
+        "in_stack": in_stack,
+        "visibility": visibility,
+    }
+
+
+def _library_child_rows_response(request: Request, user: dict, conn, col: dict, files: list) -> HTMLResponse:
+    """``files`` (raw ``corpus_files`` rows) -> the rendered child-row
+    fragment, through the SAME ``library_row`` macro and ``_library_child_row``
+    dict the full page uses — one source for a file row's markup and sharing
+    vocabulary, never a second copy. Shared tail of both child-row fragment
+    routes below."""
+    uid = user["id"]
+    ctx_facts = _library_child_row_context(col, uid)
     rows = [
         _library_child_row(
             f,
             col,
             origin=col.get("origin") or "uploaded",
-            owner_label=owner_label,
-            ownership=ownership,
-            owner_key="me" if owned else (col.get("created_by") or ""),
-            visibility=_vis(f["id"]),
-            stack_state="in_stack" if in_stack else "available",
-            stack_title=_AGENT_HAS_TOOLTIP if in_stack else _AGENT_ADD_TOOLTIP,
+            owner_label=ctx_facts["owner_label"],
+            ownership=ctx_facts["ownership"],
+            owner_key="me" if ctx_facts["owned"] else (col.get("created_by") or ""),
+            visibility=ctx_facts["visibility"](f["id"]),
+            stack_state="in_stack" if ctx_facts["in_stack"] else "available",
+            stack_title=_AGENT_HAS_TOOLTIP if ctx_facts["in_stack"] else _AGENT_ADD_TOOLTIP,
             stack_pill=_AGENT_HAS,
         )
         for f in files
@@ -5747,7 +5880,7 @@ async def library_matching_file_rows(
         request,
         user=user,
         conn=conn,
-        is_admin=is_admin,
+        is_admin=is_user_admin(uid, conn),
         rows=rows,
         # The page-level values `library_row` reads off the context. Empty
         # here on purpose: the entity facets are a MENU the fragment has no
@@ -5757,6 +5890,103 @@ async def library_matching_file_rows(
         library_active_tab="knowledge",
     )
     return templates.TemplateResponse(request, "library_matching_file_rows.html", ctx)
+
+
+@router.get("/library/{slug}/peek", response_class=HTMLResponse)
+def library_folder_peek_rows(
+    slug: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The first ``_LIBRARY_FOLDER_PEEK`` files of one collection, as Library
+    child rows — fetched lazily the first time the Library expands a folder
+    row.
+
+    Round 2 of the incident fix (2026-09-03): the index used to render this
+    same peek inline, hidden, for every folder at or under a size cap — which
+    bounded what RENDERED but not what the index FETCHED (a `list_for_corpus`
+    call per non-empty collection, however small) or embedded into the
+    folder's own row (a `data-search` value built from every one of those
+    filenames). On a live instance (~392 collections, active crawls) that
+    alone cost 19.6 MB of HTML whose live DOM, after the browser discarded
+    the markup's indentation, was 1.09 MB. The index card is now the
+    count/name/description alone (`library_page`); this route is the ONLY
+    place a folder's own files are read, and only on demand.
+
+    Same shape as `library_matching_file_rows` (renders through the same
+    macro and dict, same RBAC, same 404-for-missing-and-no-access contract)
+    — the two share `_library_child_row_context` and
+    `_library_child_rows_response` rather than a third copy of either.
+
+    Plain ``def``, not ``async def``: the body is purely blocking
+    ``file_corpora_repo``/`corpus_files_repo`` DB work with zero ``await``s,
+    so FastAPI dispatches it to the thread pool instead of running it on the
+    single event loop (Tier-1 convention, `tests/test_event_loop_offload_
+    guard.py`; Devin Review on #2173).
+    """
+    from app.auth.access import can_access_collection
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_FOLDER_PEEK)
+    if not files:
+        return HTMLResponse("")
+    return _library_child_rows_response(request, user, conn, col, files)
+
+
+@router.get("/library/{slug}/matching-files", response_class=HTMLResponse)
+async def library_matching_file_rows(
+    slug: str,
+    request: Request,
+    q: str = "",
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The file rows of one collection that match ``q`` — as Library child rows.
+
+    Why this exists: the Library expands a folder to a PEEK of its files
+    (``_LIBRARY_FOLDER_PEEK``, fetched by `library_folder_peek_rows` above),
+    and its search box is live and client-side. A capped folder's peek is not
+    its whole contents, so a search naming a file outside the peek would
+    otherwise find the folder (its name/description matched, or an earlier
+    peek fetch is already in the DOM) and show nothing for it — the reader
+    had named a file and was handed a folder with no sign of it (#2141 item 2,
+    review). This route asks the SERVER for the matching rows instead, so the
+    match is the answer rather than a signpost to it.
+
+    RBAC: collection access, admins exempt — the same gate as
+    ``/library/{slug}``, because that is what this lists. Deliberately NOT the
+    wider per-file rule ``library_file_detail`` uses: a caller holding a grant
+    on one file inside a folder may open that file, and must not be able to
+    enumerate its siblings. 404 for missing AND for no-access, matching the
+    collection contract.
+
+    An empty ``q`` returns nothing: this route answers a search, and a blank
+    search is what the peek endpoint already answers.
+    """
+    from app.auth.access import can_access_collection
+
+    q_norm = (q or "").strip()
+    if not q_norm:
+        return HTMLResponse("")
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_MATCH_LIMIT, q=q_norm, order="newest")
+    if not files:
+        return HTMLResponse("")
+    return _library_child_rows_response(request, user, conn, col, files)
 
 
 @router.get("/library/{slug}", response_class=HTMLResponse)
@@ -9215,6 +9445,28 @@ async def admin_tables(
     return templates.TemplateResponse(request, "admin_tables.html", ctx)
 
 
+@router.get("/admin/extraction", response_class=HTMLResponse)
+async def admin_extraction_fleet_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The SharePoint extraction fleet dashboard (2026-09-02): one screen for
+    an operator running several connections' crawl + facts passes at once —
+    is it on pace, is anything stuck, what is it costing.
+
+    Off-nav (see ``ADMIN_NAV_OFFNAV`` in ``app/web/admin_nav.py``), reached
+    from a source card's extraction status on ``/admin/data-sources`` — the
+    same posture ``/admin/sync`` and ``/admin/semantic-layer`` already take.
+    Shell-only: the table is fetched client-side from
+    ``GET /api/admin/sharepoint/extraction/runs`` (PG-only — a DuckDB-backed
+    instance gets the typed ``501`` explained inline rather than a page that
+    silently renders empty, the same posture ``/admin/semantic-layer`` takes
+    for its own PG-only report).
+    """
+    ctx = _build_context(request, user=user)
+    return templates.TemplateResponse(request, "admin_extraction.html", ctx)
+
+
 @router.get("/admin/sync", response_class=HTMLResponse)
 async def admin_sync_page(
     request: Request,
@@ -9273,7 +9525,7 @@ async def admin_datasource_credentials_page(
 
 
 @router.get("/admin/data-sources", response_class=HTMLResponse)
-async def admin_data_sources_page(
+def admin_data_sources_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
@@ -9290,6 +9542,17 @@ async def admin_data_sources_page(
     render the same blocking banner as /admin/datasource-credentials when
     ``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without
     it).
+
+    Plain ``def`` (not ``async def``, zero ``await``s below): every call
+    this handler makes — ``_build_context``, ``_source_inventory`` and
+    everything it fans out to — is blocking, synchronous SQLAlchemy I/O, so
+    FastAPI dispatches it to the anyio thread pool instead of running it on
+    the single event loop (Tier-1 convention,
+    ``tests/test_event_loop_offload_guard.py``). On an instance with a large
+    SharePoint corpus this handler alone could run for over ten seconds; as
+    ``async def`` that monopolized the event loop for the whole duration,
+    stalling every OTHER concurrent request in the process — including
+    unrelated ones — for as long as it ran.
     """
     # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
     # guards on the former (app/api/admin_source_connections.py), and the
@@ -9742,6 +10005,38 @@ def _source_inventory(user: dict | None = None) -> dict:
         except Exception:
             return False
 
+    # ── SharePoint batched precomputation, once for every connection on the
+    # page rather than once PER connection (which itself used to mean once
+    # PER SCOPE — up to ~180 on a real connection). See
+    # `_sharepoint_pipeline_cell`'s docstring for what each precomputed dict
+    # replaces.
+    sharepoint_conns = [c for c in connections if (c.get("source_type") or "") == "sharepoint"]
+    all_sp_scope_ids: set[str] = set()
+    for c in sharepoint_conns:
+        try:
+            raw_scopes = (c.get("config") or {}).get("scopes") or []
+            all_sp_scope_ids.update(
+                s["collection_id"] for s in raw_scopes if isinstance(s, dict) and s.get("collection_id")
+            )
+        except Exception as e:
+            logger.debug("data-sources pipelines: could not resolve scope collections for %s: %s", c.get("id"), e)
+    corpus_status_counts: dict[str, dict[str, int]] = {}
+    collection_grants_by_id: dict[str, set] = {}
+    if sharepoint_conns:
+        try:
+            from src.repositories import corpus_files_repo
+
+            corpus_status_counts = corpus_files_repo().status_counts_for_corpora(sorted(all_sp_scope_ids))
+        except Exception as e:
+            logger.warning("data-sources pipelines: corpus file status counts unavailable: %s", e)
+        try:
+            from src.repositories import resource_grants_repo
+
+            for g in resource_grants_repo().list_all(resource_type="collection"):
+                collection_grants_by_id.setdefault(g["resource_id"], set()).add(g["group_id"])
+        except Exception as e:
+            logger.warning("data-sources pipelines: collection grants unavailable: %s", e)
+
     now = datetime.now(UTC)
     for conn in [*connections, *derived]:
         cid = conn["id"]
@@ -9849,7 +10144,12 @@ def _source_inventory(user: dict | None = None) -> dict:
         # `_sharepoint_pipeline_cell` for what each sub-block means and its
         # honesty notes (placeholder cost, interim scope heuristic).
         if stype == "sharepoint":
-            cells["file_source"] = _sharepoint_pipeline_cell(conn, user)
+            cells["file_source"] = _sharepoint_pipeline_cell(
+                conn,
+                user,
+                corpus_status_counts=corpus_status_counts,
+                collection_grants_by_id=collection_grants_by_id,
+            )
 
         # ── Feeds: packages holding this source's tables → groups granted →
         # people reached. The end of the chain the redesign cares about; a
@@ -9900,64 +10200,70 @@ def _source_inventory(user: dict | None = None) -> dict:
 _VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
 
 
-def _resolve_sharepoint_rejection_doc(doc_id: str) -> dict | None:
-    """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
+def _resolve_sharepoint_rejection_doc_labels(doc_ids: list[str]) -> dict[str, dict]:
+    """Resolve "Last run" rejection rows' ``doc_id``s (the crawler's
     ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
-    file name + collection name it belongs to, for the card's drawer — a
+    file name + collection name each belongs to, for the card's drawer — a
     bare hash "tells nobody anything" (live-use feedback, TCRD-240/241
     follow-up).
 
-    ``None`` for an id this instance has never seen (`corpus_file_sources`
-    carries no row for it) — the caller renders that as the honest
-    "not in any collection" fallback next to the raw sha16, never a guess.
-    Also ``None`` on any lookup failure (PG-only `corpus_file_sources` on a
-    DuckDB-backed instance, a deleted collection, …) — resolution is a
-    read-only display nicety, never worth a 500 for the card.
+    ONE batched call (:meth:`corpus_file_sources_repo().resolve_doc_labels`)
+    for every id at once — this used to be 3 round trips PER unique doc_id
+    (a mapping lookup, a corpus_files get, a file_corpora get), which on a
+    run with hundreds of rejected/deferred claims dominated this cell's own
+    query count. An id this instance has never seen, or any lookup failure
+    (PG-only ``corpus_file_sources`` on a DuckDB-backed instance, …), is
+    simply absent from the returned dict — the caller renders that as the
+    honest "not in any collection" fallback next to the raw sha16, never a
+    guess, and never a 500 for the card (resolution is a read-only display
+    nicety).
     """
+    if not doc_ids:
+        return {}
     try:
-        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+        from src.repositories import corpus_file_sources_repo
 
-        source_row = corpus_file_sources_repo().get_by_source_doc_id(doc_id)
-        if source_row is None:
-            return None
-        file_row = corpus_files_repo().get(source_row["corpus_file_id"])
-        if file_row is None:
-            return None
-        collection = file_corpora_repo().get(file_row["corpus_id"])
-        return {
-            "name": file_row.get("filename"),
-            "collection": collection.get("name") if collection else None,
-        }
+        return corpus_file_sources_repo().resolve_doc_labels(doc_ids)
     except Exception as e:
-        logger.debug("sharepoint pipeline cell: doc_id resolution failed for %s: %s", doc_id, e)
-        return None
+        logger.debug("sharepoint pipeline cell: doc_id resolution failed: %s", e)
+        return {}
 
 
-def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
+def _enrich_sharepoint_rejection_rows(rows: list[dict], doc_labels: dict[str, dict] | None = None) -> list[dict]:
     """Add a resolved ``doc`` key (``{name, collection}`` or ``None``) to
-    each "Last run" rejection/deferred row, memoizing the lookup per
-    ``doc_id`` so a run with many claims against the same document does not
-    re-resolve it once per row. Every original key (``row``, ``reason``,
-    ``doc_id``, …) is preserved untouched — this only adds information, it
-    never replaces the raw fields the drawer's category counts and any
-    other reader of this cell already depend on.
+    each "Last run" rejection/deferred row. Every original key (``row``,
+    ``reason``, ``doc_id``, …) is preserved untouched — this only adds
+    information, it never replaces the raw fields the drawer's category
+    counts and any other reader of this cell already depend on.
+
+    ``doc_labels``, when the caller precomputed it via ONE
+    :func:`_resolve_sharepoint_rejection_doc_labels` call spanning EVERY
+    rejection category for this run (not just this one list — the same
+    doc_id can recur across ``rejected_quotes``/``deferred``/…), is reused
+    as-is. ``None`` (a caller with just one list, e.g. a direct unit test)
+    resolves this list's own doc_ids in one batched call — the same shape,
+    at the one-list cost.
     """
-    doc_cache: dict[str, dict | None] = {}
+    if doc_labels is None:
+        doc_labels = _resolve_sharepoint_rejection_doc_labels(
+            sorted({row.get("doc_id") for row in rows if row.get("doc_id")})
+        )
     enriched = []
     for row in rows:
         row = dict(row)
         doc_id = row.get("doc_id")
-        if doc_id:
-            if doc_id not in doc_cache:
-                doc_cache[doc_id] = _resolve_sharepoint_rejection_doc(doc_id)
-            row["doc"] = doc_cache[doc_id]
-        else:
-            row["doc"] = None
+        row["doc"] = doc_labels.get(doc_id) if doc_id else None
         enriched.append(row)
     return enriched
 
 
-def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
+def _sharepoint_pipeline_cell(
+    conn: dict,
+    user: dict | None,
+    *,
+    corpus_status_counts: dict[str, dict[str, int]] | None = None,
+    collection_grants_by_id: dict[str, set] | None = None,
+) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
     (spec §13.2 "Source card"): crawl → text extraction + scan transcription
     → facts → graph counts, a queue-cost PLACEHOLDER (see the constant
@@ -9965,6 +10271,14 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     never the value), the identity-matching row, and the LAST persisted
     ingest run's error badges — each carrying its itemized detail for the
     admin's filtered drawer.
+
+    `corpus_status_counts`/`collection_grants_by_id` are optional PRECOMPUTED
+    batched reads: `_source_inventory` builds each ONCE across every
+    SharePoint connection on the page (rather than once per connection, per
+    scope) and passes them down. Omitting either (any direct/isolated call,
+    e.g. a unit test) falls back to computing it for just this connection —
+    the same answer, at the one-connection cost this function used to pay
+    for every connection on the page.
 
     **"Scope collections" is this connection's OWN scope mapping** — every
     confirmed scope's `collection_id` off `conn["config"]["scopes"]`, the
@@ -10013,38 +10327,49 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── crawl / extract: corpus_files across scope collections, bucketed by
     # processing_status (the five-state lifecycle: pending | processing |
     # indexed | needs_review | rejected).
+    #
+    # `corpus_status_counts`, when the caller (`_source_inventory`) already
+    # computed it for every SharePoint connection's scopes in one batched
+    # `corpus_files_repo().status_counts_for_corpora()` call, is reused
+    # as-is — this used to call `list_for_corpus(scope_id)` once PER SCOPE
+    # (up to ~180 on a real connection), which made this cell's query count
+    # scale with scope count instead of staying flat. `None` (a caller that
+    # hasn't precomputed it — e.g. a direct unit-test call) falls back to
+    # doing that one batched call itself, scoped to this connection alone.
     documents = 0
     extracted: dict[str, int] = {}
     if scope_ids:
         try:
-            from src.repositories import corpus_files_repo
+            if corpus_status_counts is None:
+                from src.repositories import corpus_files_repo
 
-            cf_repo = corpus_files_repo()
+                corpus_status_counts = corpus_files_repo().status_counts_for_corpora(scope_ids)
             for scope_id in scope_ids:
-                for f in cf_repo.list_for_corpus(scope_id):
-                    documents += 1
-                    status = f.get("processing_status") or "pending"
-                    extracted[status] = extracted.get(status, 0) + 1
+                for status, n in corpus_status_counts.get(scope_id, {}).items():
+                    documents += n
+                    extracted[status] = extracted.get(status, 0) + n
         except Exception as e:
             logger.warning("sharepoint pipeline cell: could not list corpus files: %s", e)
     cell["crawl"] = {"documents": documents}
     cell["extract"] = extracted
 
-    # ── facts / graph: caller-scoped (spec §5) — needs the real admin `user`
-    # this request authenticated as; with none supplied (a legacy call site)
-    # the numbers are simply unavailable, same "degrade, don't guess" rule.
-    facts_count = 0
-    edges_count = 0
-    if scope_ids and user is not None:
-        try:
-            from src.repositories import facts_repo
-
-            fr = facts_repo()
-            facts_count = sum(fr.count_visible_facts_for_collections(user, scope_ids).values())
-            edges_count = sum(fr.count_visible_edges_for_collections(user, scope_ids).values())
-        except Exception as e:
-            logger.debug("sharepoint pipeline cell: facts/edges counts unavailable: %s", e)
-    cell["graph"] = {"facts": facts_count, "edges": edges_count}
+    # ── facts / graph: NOT computed here (perf follow-up, 2026-09-03 live
+    # finding). `count_visible_facts_for_collections`/`count_visible_edges_
+    # for_collections` run one query EACH per corpus_id — correct and
+    # deliberate (see their own docstrings: the caller's readable set
+    # resolves once, but the per-collection COUNT is a genuinely separate,
+    # security-scoped read every time), but that means 2 statements per
+    # scope. Summed across every SharePoint connection's scopes on the page
+    # (up to ~180 each), that dominated the page's own render time on a live
+    # instance — 22 of ~28 samples of a page load's `pg_stat_activity` were
+    # exactly these two statements. This cell fold must cost ZERO
+    # `claims`-touching statements (`tests/test_admin_data_sources_page.py`'s
+    # bounded-queries guard), so `cell["graph"]` is `None` here — the strip
+    # fetches it lazily, per connection, via
+    # `GET /api/admin/sharepoint/connections/{id}/facts-graph-counts`
+    # (`app/api/admin_sharepoint.py::facts_graph_counts`) once the card has
+    # painted, never blocking the page response.
+    cell["graph"] = None
 
     # ── the last persisted run report (see facts_ingest_runs_pg.py) — the
     # error badges' source, and this cell's only input for the cost
@@ -10075,13 +10400,24 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # rendering arrives with operator-configured pricing (extraction
         # observability spec §5) — until then no `$` is shown here at all.
         cell["queue"] = {"items": queue_items}
+        # One doc_id resolution pass across ALL FOUR categories — a doc_id
+        # rejected on one claim and deferred on another otherwise resolves
+        # twice. See `_resolve_sharepoint_rejection_doc_labels`.
+        all_doc_ids = sorted(
+            {
+                row.get("doc_id")
+                for row in (*rejected_quotes, *deferred, *protocol_errors, *source_urls_rejected)
+                if row.get("doc_id")
+            }
+        )
+        doc_labels = _resolve_sharepoint_rejection_doc_labels(all_doc_ids)
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
-            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
-            "deferred": _enrich_sharepoint_rejection_rows(deferred),
-            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
-            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
+            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes, doc_labels),
+            "deferred": _enrich_sharepoint_rejection_rows(deferred, doc_labels),
+            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors, doc_labels),
+            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected, doc_labels),
         }
     else:
         cell["queue"] = {"items": 0}
@@ -10233,13 +10569,22 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     collections_total = len(scope_ids)
     if scope_ids:
         try:
-            from src.repositories import resource_grants_repo
+            # `collection_grants_by_id`, when the caller precomputed it, is
+            # the FULL grants-by-collection map across every scope on the
+            # page — reused as-is rather than re-reading
+            # `resource_grants_repo().list_all()` (a full table scan) once
+            # per SharePoint connection. `None` (no caller-precomputed map)
+            # falls back to reading it here, scoped to nothing since a
+            # single read_all has no narrower form — same cost this always
+            # paid for a lone connection.
+            by_collection = collection_grants_by_id
+            if by_collection is None:
+                from src.repositories import resource_grants_repo
 
-            by_collection: dict[str, set] = {}
-            for g in resource_grants_repo().list_all(resource_type="collection"):
-                if g["resource_id"] in scope_ids:
+                by_collection = {}
+                for g in resource_grants_repo().list_all(resource_type="collection"):
                     by_collection.setdefault(g["resource_id"], set()).add(g["group_id"])
-            groups_matched = len({gid for gids in by_collection.values() for gid in gids})
+            groups_matched = len({gid for scope_id in scope_ids for gid in by_collection.get(scope_id, ())})
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
@@ -10253,35 +10598,18 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # reused through `admin_sharepoint._scope_out` so the card renders
     # exactly the connect wizard's own step-3 "Share" shape — one source of
     # truth for what a scope row looks like, not a second projection that
-    # can drift from it. Each row degrades independently (a deleted
-    # collection, an unavailable grants repo) to its raw shape rather than
-    # dropping the row or failing the whole cell; a repo-wide failure
-    # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
-    # all rather than a 500 for the whole card — same posture as every
-    # other sub-block here. Reads `config.scopes` a second time rather than
-    # projecting from `scope_ids` above: that one is a bare set of collection
-    # ids, this one needs the full row (`source_scope_id`, `display_path`,
-    # `anonymize`) `_scope_out` renders — two projections of the SAME field,
-    # not two different sources of truth for it.
-    scopes: list[dict[str, Any]] = []
-    try:
-        from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
-
-        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
-        for raw_scope in (conn.get("config") or {}).get("scopes") or []:
-            if not isinstance(raw_scope, dict):
-                continue
-            try:
-                scopes.append(_scope_out(raw_scope, declared_corpus_ids, conn))
-            except Exception as e:
-                logger.debug(
-                    "sharepoint pipeline cell: scope row resolution failed for %s: %s",
-                    raw_scope.get("source_scope_id"),
-                    e,
-                )
-    except Exception as e:
-        logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
-    cell["scopes"] = scopes
+    # can drift from it — but NOT rendered here (perf follow-up, 2026-09-03,
+    # second finding on the same live instance): `cell["scopes"]` used to
+    # carry every confirmed scope's ENRICHED row (path, collection, group
+    # grants) for every SharePoint connection on the page at once — even
+    # capped at `_CARD_SCOPES_CAP`, 8 connections x 50 scopes each still
+    # inlined ~170 KB of JSON nothing on first paint reads (the identity
+    # cell above already carries the honest summary counts a card needs at a
+    # glance). The full, per-scope enriched list is now ALWAYS fetched
+    # lazily by the card — `GET .../scopes` (`admin_sharepoint.list_scopes`,
+    # the SAME `_scope_out` projection) — the instant it is expanded, never
+    # baked into the page response. Only the cheap count survives here.
+    cell["scopes_total"] = sum(1 for s in (conn.get("config") or {}).get("scopes") or [] if isinstance(s, dict))
 
     # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
     # own confirmed scopes marked anonymize=true, read straight off `conn` —

@@ -90,6 +90,28 @@ Zones live in the connection's OWN top-level ``config["acl_zones"]`` key —
 never inside ``scopes`` rows (that stays the wizard's own automated-writer
 boundary, spec §5's race contract) — and are exported via :func:`zone_rows`
 / :func:`active_zone_rows` for every other task to read.
+
+**2026-09 fixes (live-tenant readiness pass — a read-only audit found these
+because no scope had ever been ``mirrored`` in practice, so none had fired).**
+Four to this module specifically: (1) ``classify_permissions`` now honors a
+``grantedToV2.siteUser`` grantee (a claims-based membership-provider user)
+when it resolves to an email, instead of falling into the generic
+``unknown`` kind; (2) an optional ``site_group_map`` parameter honors a
+SharePoint site group (Owners/Members/Visitors, or custom — never
+enumerable through the app-only Graph surface this connector uses) mapped
+to existing Agnes group(s) via the connection's own
+``config["acl_site_group_map"]`` (``app/api/admin_sharepoint.py``'s
+``set_acl_site_group_map``); (3) :func:`_sync_scope` no longer reconciles
+its own collection's grants — :func:`_sync_connection` accumulates every
+scope's (and zone's) honored group set per ``collection_id`` across a whole
+run and reconciles each collection exactly ONCE against the union, fixing
+two mirrored scopes sharing one collection (a bulk-add ``collection_id``
+target) flip-flopping each other's grants; (4) ``entra_group_name`` moved to
+:mod:`src.entra_identity`, the single naming rule this module and the
+login-time Microsoft Entra ID group sync (``app.auth.microsoft_group_sync``)
+now BOTH use, so the same Entra group converges on one ``user_groups`` row
+regardless of which writer sees it first — see that module's own docstring
+for the full identity-scheme unification and its legacy-key migration.
 """
 
 from __future__ import annotations
@@ -108,6 +130,7 @@ from connectors.sharepoint import graph_client
 from connectors.sharepoint.graph_client import SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.audit_helpers import log_safe
+from src.entra_identity import entra_group_name
 from src.repositories import (
     RequiresPostgresBackend,
     corpus_file_sources_repo,
@@ -163,14 +186,6 @@ carry-forward already covers it; only the genuinely NEW top-level keys
 above need adding."""
 
 
-def entra_group_name(oid: str) -> str:
-    """Canonical ``user_groups.name`` for an Entra security/M365 group found
-    on a scope's role assignments. Deliberately the same naming the parent
-    spec reserves for the later ``/me/memberOf`` sync, so the two converge
-    on the same row instead of creating parallel near-duplicates."""
-    return f"entra:{oid}"
-
-
 def direct_group_name(source_scope_id: str) -> str:
     """Canonical ``user_groups.name`` for the synthetic group that collects
     a scope's direct (non-group) user role assignments — one group per
@@ -195,6 +210,10 @@ class Classified:
 
     entra_group_oids: List[str] = field(default_factory=list)
     direct_user_emails: List[str] = field(default_factory=list)
+    #: Agnes ``user_groups.id`` values honored via a ``site_group_map``
+    #: match (see :func:`classify_permissions`) — these are ALREADY Agnes
+    #: group ids (an admin's own mapping), never names to ``ensure()``.
+    site_group_ids: List[str] = field(default_factory=list)
     unhonored: List[Dict[str, str]] = field(default_factory=list)
 
 
@@ -204,6 +223,24 @@ def _permission_email(user: Dict[str, Any]) -> Optional[str]:
     case-insensitive join downstream absorbs any case drift between it and
     the Agnes account's login email)."""
     return user.get("email") or user.get("mail") or user.get("userPrincipalName") or None
+
+
+def _site_user_email(site_user: Dict[str, Any]) -> Optional[str]:
+    """Best-effort email for a ``grantedToV2.siteUser`` grantee.
+
+    ``email``/``mail`` (when Graph includes them) win outright. Otherwise
+    fall back to the claims-based ``loginName`` SharePoint always sets for a
+    membership-provider user — ``i:0#.f|membership|user@example.com`` — and
+    take the segment after the last ``|``. A Windows-claims login name
+    (``i:0#.w|domain\\user``) has no ``@`` in that segment and is refused
+    rather than guessed at (fail-closed, same posture as an email-less
+    ``user`` grantee)."""
+    email = site_user.get("email") or site_user.get("mail")
+    if email:
+        return str(email)
+    login_name = str(site_user.get("loginName") or "")
+    candidate = login_name.rsplit("|", 1)[-1].strip()
+    return candidate if "@" in candidate else None
 
 
 def _dedupe(values: List[str]) -> List[str]:
@@ -217,21 +254,32 @@ def _dedupe(values: List[str]) -> List[str]:
     return out
 
 
-def classify_permissions(perms: List[Dict[str, Any]]) -> Classified:
+def classify_permissions(
+    perms: List[Dict[str, Any]],
+    *,
+    site_group_map: Optional[Dict[str, List[str]]] = None,
+) -> Classified:
     """Classify one scope root's Graph ``permission`` objects per the §8.2
     table.
 
-    Honored: a direct user role assignment with a resolvable email, and an
-    Entra security/M365 group assignment. Out — counted, never granted
-    (fail closed): SharePoint site groups (not enumerable through the
-    app-only Graph surface this connector uses), sharing links ("specific
-    people" and "people in your organization"), anonymous links,
-    external/guest users (``userPrincipalName`` containing ``#EXT#``),
-    application principals, and a user grantee with no resolvable email.
+    Honored: a direct user role assignment with a resolvable email, a
+    ``siteUser`` grantee whose claims ``loginName`` (or ``email``/``mail``)
+    yields an email, an Entra security/M365 group assignment, and — only
+    when ``site_group_map`` names it — a SharePoint site group (Owners/
+    Members/Visitors or a custom one) whose ``displayName`` is an EXACT key
+    in the map; the mapped value is one or more Agnes ``user_groups.id``
+    values granted directly (never synthesized/``ensure``d — an admin
+    picked those groups). Out — counted, never granted (fail closed): an
+    UNMAPPED site group, sharing links ("specific people" and "people in
+    your organization"), anonymous links, external/guest users
+    (``userPrincipalName`` containing ``#EXT#``), application principals,
+    and a user/siteUser grantee with no resolvable email.
     """
     entra_group_oids: List[str] = []
     direct_user_emails: List[str] = []
+    site_group_ids: List[str] = []
     unhonored: List[Dict[str, str]] = []
+    site_group_map = site_group_map or {}
 
     for perm in perms:
         link = perm.get("link")
@@ -254,8 +302,23 @@ def classify_permissions(perms: List[Dict[str, Any]]) -> Classified:
 
         if "siteGroup" in granted:
             site_group = granted.get("siteGroup") or {}
-            detail = site_group.get("displayName") or site_group.get("id") or "site group"
+            display_name = str(site_group.get("displayName") or "")
+            mapped = site_group_map.get(display_name)
+            if mapped:
+                site_group_ids.extend(mapped)
+                continue
+            detail = display_name or site_group.get("id") or "site group"
             unhonored.append({"kind": "site_group", "detail": str(detail)})
+            continue
+
+        if "siteUser" in granted:
+            site_user = granted.get("siteUser") or {}
+            email = _site_user_email(site_user)
+            if not email:
+                detail = site_user.get("displayName") or site_user.get("id") or "site user"
+                unhonored.append({"kind": "site_user_no_email", "detail": str(detail)})
+                continue
+            direct_user_emails.append(email)
             continue
 
         if "application" in granted:
@@ -291,6 +354,7 @@ def classify_permissions(perms: List[Dict[str, Any]]) -> Classified:
     return Classified(
         entra_group_oids=_dedupe(entra_group_oids),
         direct_user_emails=_dedupe(direct_user_emails),
+        site_group_ids=_dedupe(site_group_ids),
         unhonored=unhonored,
     )
 
@@ -450,10 +514,27 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     ``source_connections_repo().config_patch`` (re-reads ``config`` fresh
     inside its own transaction), so a nightly sync and the daily sweep
     landing together on one connection can never drop each other's
-    just-written key (never grants — those live in ``resource_grants``)."""
+    just-written key (never grants — those live in ``resource_grants``).
+
+    **Shared-collection reconcile (2026-09 fix).** More than one mirrored
+    scope (a bulk-add ``collection_id`` target) or a zone re-homed onto a
+    scope's own collection can route to the SAME ``collection_id``.
+    ``_sync_scope`` no longer reconciles that collection's grants itself —
+    it only reports its OWN honored ``target_group_ids``; this function
+    accumulates every scope's and zone's contribution per ``collection_id``
+    (``honored_by_collection``) and calls :func:`_reconcile_grants` exactly
+    ONCE per collection, against the UNION of everyone who routed to it
+    this run. The single-scope-per-collection case (still the overwhelming
+    majority) degrades to exactly the old behavior — a union of one set is
+    that set. A collection with ANY scope/zone that errored this run
+    (``uncertain_collections``) is skipped entirely, same fail-closed
+    posture ``_sync_scope`` always had for its OWN collection: no partial
+    diff is ever applied, and a collection this run could not fully read is
+    left with whatever grants the last successful run computed."""
     connection_id = connection["id"]
     scopes = _mirrored_scopes(connection)
     zones = active_zone_rows(connection)
+    site_group_map = (connection.get("config") or {}).get("acl_site_group_map") or {}
     t0 = time.monotonic()
 
     error: Optional[str] = None
@@ -469,12 +550,24 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     matched_total = 0
     unmatched_total = 0
     unhonored_all: List[Dict[str, Any]] = []
-    grant_deltas: Dict[str, Dict[str, List[str]]] = {}
     stale_scopes: List[str] = []
+    honored_by_collection: Dict[str, set] = {}
+    first_scope_by_collection: Dict[str, str] = {}
+    uncertain_collections: set = set()
+
+    def _accumulate(report: Dict[str, Any]) -> None:
+        collection_id = report.get("collection_id")
+        if not collection_id:
+            return
+        if report.get("error"):
+            uncertain_collections.add(collection_id)
+            return
+        honored_by_collection.setdefault(collection_id, set()).update(report.get("target_group_ids") or [])
+        first_scope_by_collection.setdefault(collection_id, report.get("source_scope_id"))
 
     if token is not None:
         for scope in scopes:
-            scope_report = await _sync_scope(connection_id, scope, token)
+            scope_report = await _sync_scope(connection_id, scope, token, site_group_map=site_group_map)
             matched_total += scope_report["matched"]
             unmatched_total += scope_report["unmatched"]
             unhonored_all.extend(
@@ -482,8 +575,7 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
             )
             if scope_report.get("stale"):
                 stale_scopes.append(scope_report["source_scope_id"])
-            if scope_report.get("grant_delta"):
-                grant_deltas[scope_report["collection_id"]] = scope_report["grant_delta"]
+            _accumulate(scope_report)
             if scope_report.get("error") and error is None:
                 error = scope_report["error"]
 
@@ -491,15 +583,15 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
         # synced as its own pseudo-scope, keyed on the zone's OWN item id
         # and collection. `_sync_scope` needs no change to support this —
         # `direct_group_name(zone_item_id)` already yields a unique
-        # `sp-direct:<zone_item_id>` group and `_reconcile_grants` already
-        # scopes strictly to the collection it is passed.
+        # `sp-direct:<zone_item_id>` group, and its contribution accumulates
+        # into the same per-collection union as every real scope's.
         for zone in zones:
             pseudo_scope = {
                 "source_scope_id": zone.get("zone_item_id"),
                 "collection_id": zone.get("collection_id"),
                 "drive_id": zone.get("drive_id"),
             }
-            zone_report = await _sync_scope(connection_id, pseudo_scope, token)
+            zone_report = await _sync_scope(connection_id, pseudo_scope, token, site_group_map=site_group_map)
             matched_total += zone_report["matched"]
             unmatched_total += zone_report["unmatched"]
             unhonored_all.extend(
@@ -508,10 +600,17 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
             )
             if zone_report.get("stale"):
                 stale_scopes.append(zone_report["source_scope_id"])
-            if zone_report.get("grant_delta"):
-                grant_deltas[zone_report["collection_id"]] = zone_report["grant_delta"]
+            _accumulate(zone_report)
             if zone_report.get("error") and error is None:
                 error = zone_report["error"]
+
+    grant_deltas: Dict[str, Dict[str, List[str]]] = {}
+    for collection_id, group_ids in honored_by_collection.items():
+        if collection_id in uncertain_collections:
+            continue
+        delta = _reconcile_grants(collection_id, sorted(group_ids), first_scope_by_collection.get(collection_id))
+        if delta:
+            grant_deltas[collection_id] = delta
 
     ok = error is None
     now = datetime.now(timezone.utc)
@@ -569,12 +668,26 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     return {"scopes": len(scopes), "matched": matched_total, "unmatched": unmatched_total, "error": error}
 
 
-async def _sync_scope(connection_id: str, scope: Dict[str, Any], token: str) -> Dict[str, Any]:
-    """Sync one mirrored scope: read → classify → resolve → diff → write.
+async def _sync_scope(
+    connection_id: str,
+    scope: Dict[str, Any],
+    token: str,
+    *,
+    site_group_map: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, Any]:
+    """Sync one mirrored scope: read → classify → resolve group membership.
+
+    Does NOT reconcile this scope's collection's grants — it only reports
+    its own honored ``target_group_ids``; :func:`_sync_connection`
+    accumulates every scope's (and zone's) contribution per
+    ``collection_id`` and reconciles ONCE per collection after everything
+    this run has been read (see that function's own docstring, "Shared-
+    collection reconcile").
 
     Returns a report dict with ``source_scope_id``, ``collection_id``,
     ``matched``, ``unmatched``, ``unhonored``, ``stale``, ``error`` and
-    ``grant_delta`` (``None`` when nothing changed).
+    ``target_group_ids`` (this scope's own honored Agnes ``user_groups.id``
+    values — empty on any error).
     """
     source_scope_id = scope.get("source_scope_id")
     collection_id = scope.get("collection_id")
@@ -588,7 +701,7 @@ async def _sync_scope(connection_id: str, scope: Dict[str, Any], token: str) -> 
         "unhonored": [],
         "stale": False,
         "error": None,
-        "grant_delta": None,
+        "target_group_ids": [],
     }
 
     if not drive_id:
@@ -607,7 +720,7 @@ async def _sync_scope(connection_id: str, scope: Dict[str, Any], token: str) -> 
     except SharePointGraphError as exc:
         return {**base, "error": str(exc), "stale": True}
 
-    classified = classify_permissions(perms)
+    classified = classify_permissions(perms, site_group_map=site_group_map)
 
     groups_repo = user_groups_repo()
     members_repo = user_group_members_repo()
@@ -669,7 +782,11 @@ async def _sync_scope(connection_id: str, scope: Dict[str, Any], token: str) -> 
 
         _replace_membership_and_audit(members_repo, group_id, matched_ids, source_scope_id)
 
-    grant_delta = _reconcile_grants(collection_id, target_group_ids, source_scope_id) if collection_id else None
+    # Site-group-mapped grants (2026-09 fix): already Agnes group ids an
+    # admin picked, never synthesized — no `ensure()`/membership sync, just
+    # honored directly. Contributes no matched/unmatched principal count
+    # (there is no per-user membership to resolve here).
+    target_group_ids.extend(classified.site_group_ids)
 
     return {
         **base,
@@ -677,7 +794,7 @@ async def _sync_scope(connection_id: str, scope: Dict[str, Any], token: str) -> 
         "unmatched": unmatched,
         "unhonored": classified.unhonored,
         "stale": stale,
-        "grant_delta": grant_delta,
+        "target_group_ids": target_group_ids,
     }
 
 

@@ -74,6 +74,7 @@ MigrationTask = GenericCopyTask
 # map for tables whose PK is NOT a single column named "id".
 _PK_COLUMNS: Dict[str, List[str]] = {
     "chat_broker_tickets": ["token"],
+    "facts_llm_cache": ["cache_key"],  # 0097: content-hash LLM response cache (PG-only, but keep the map honest)
     "user_group_members": ["user_id", "group_id"],
     "sync_state": ["table_id"],
     "instance_templates": ["key"],
@@ -145,6 +146,16 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     # identity table's PK IS the bound user (one external identity per
     # user), and sso_config keeps its default "id" PK.
     "user_external_identities": ["user_id"],
+    # SharePoint crawl/facts per-connection state (0096) — PG-only with no
+    # DuckDB source; PK is (connection_id, kind), not "id".
+    "sharepoint_connection_state": ["connection_id", "kind"],
+    # per-collection fact stats (0105) — PG-only with no DuckDB source; the
+    # summary row is keyed by the collection alone, the two membership
+    # tables by (collection, fact) / (collection, edge). `extraction_
+    # conditions` (0104) keeps a plain "id" PK and needs no entry.
+    "fact_collection_stats": ["corpus_id"],
+    "fact_collection_membership": ["corpus_id", "fact_id"],
+    "edge_collection_membership": ["corpus_id", "edge_id"],
 }
 
 

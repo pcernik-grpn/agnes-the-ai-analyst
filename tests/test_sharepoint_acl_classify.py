@@ -107,6 +107,87 @@ def test_dedupe_preserves_order():
     assert c.direct_user_emails == ["a@example.com"]
 
 
+def test_site_group_honored_when_mapped():
+    c = classify_permissions(
+        [_perm(grantedToV2={"siteGroup": {"id": "3", "displayName": "Members"}})],
+        site_group_map={"Members": ["agnes-group-1", "agnes-group-2"]},
+    )
+    assert c.site_group_ids == ["agnes-group-1", "agnes-group-2"]
+    assert c.unhonored == []
+
+
+def test_site_group_unmapped_stays_unhonored():
+    c = classify_permissions(
+        [_perm(grantedToV2={"siteGroup": {"id": "3", "displayName": "Owners"}})],
+        site_group_map={"Members": ["agnes-group-1"]},
+    )
+    assert c.site_group_ids == []
+    assert c.unhonored == [{"kind": "site_group", "detail": "Owners"}]
+
+
+def test_site_group_dedupes_across_permissions():
+    c = classify_permissions(
+        [
+            _perm(grantedToV2={"siteGroup": {"id": "3", "displayName": "Members"}}),
+            _perm(grantedToV2={"siteGroup": {"id": "3", "displayName": "Members"}}),
+        ],
+        site_group_map={"Members": ["agnes-group-1"]},
+    )
+    assert c.site_group_ids == ["agnes-group-1"]
+
+
+def test_site_user_honored_via_claims_login_name():
+    c = classify_permissions(
+        [
+            _perm(
+                grantedToV2={
+                    "siteUser": {
+                        "id": "su1",
+                        "loginName": "i:0#.f|membership|user@example.com",
+                    }
+                }
+            )
+        ]
+    )
+    assert c.direct_user_emails == ["user@example.com"]
+    assert c.unhonored == []
+
+
+def test_site_user_email_field_wins_over_login_name():
+    c = classify_permissions(
+        [
+            _perm(
+                grantedToV2={
+                    "siteUser": {
+                        "id": "su1",
+                        "email": "explicit@example.com",
+                        "loginName": "i:0#.f|membership|other@example.com",
+                    }
+                }
+            )
+        ]
+    )
+    assert c.direct_user_emails == ["explicit@example.com"]
+
+
+def test_site_user_windows_claims_login_name_is_unhonored():
+    c = classify_permissions(
+        [
+            _perm(
+                grantedToV2={
+                    "siteUser": {
+                        "id": "su1",
+                        "displayName": "DOMAIN\\user",
+                        "loginName": r"i:0#.w|domain\user",
+                    }
+                }
+            )
+        ]
+    )
+    assert c.direct_user_emails == []
+    assert c.unhonored == [{"kind": "site_user_no_email", "detail": "DOMAIN\\user"}]
+
+
 def test_group_naming_and_sentinel_constants():
     from connectors.sharepoint.acl_sync import (
         ACL_SYNC_SENTINEL,

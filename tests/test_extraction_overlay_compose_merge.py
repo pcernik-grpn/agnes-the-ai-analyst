@@ -273,6 +273,27 @@ def test_coordination_env_reaches_app_and_worker_via_env_file(project: Path):
     assert env.get("AGNES_REDIS_URL") == "redis://redis:6379/0"
 
 
+def test_overlay_pins_blas_threads_to_one(project: Path):
+    """Live finding: numpy's OpenBLAS backend sizes per-thread scratch
+    buffers by the HOST's CPU count. On a 64-vCPU host that blew the
+    ~1.5 GiB RLIMIT_AS ceiling of a single-document conversion child, and
+    `import markitdown` died reading as "not installed". A single-document
+    child never benefits from more than one BLAS thread on any host size —
+    this overlay pins it directly (belt) alongside app/worker/runtime.py's
+    own `os.environ.setdefault` guard (suspenders, for every worker role
+    that never runs through this overlay at all)."""
+    cfg = _compose_config(project, BASE_CHAIN + ["docker-compose.extraction.yml"])
+    env = cfg["services"]["extraction-worker"]["environment"]
+    assert env.get("OPENBLAS_NUM_THREADS") == "1"
+    assert env.get("OMP_NUM_THREADS") == "1"
+    assert env.get("MKL_NUM_THREADS") == "1"
+    assert env.get("NUMEXPR_NUM_THREADS") == "1"
+    # Additive merge, not a replacement: the base service's own environment
+    # keys must survive alongside the four new ones.
+    assert env.get("AGNES_ROLE") == "worker"
+    assert env.get("AGNES_WORKER_LANES") == "extraction"
+
+
 def test_redis_is_internal_and_ephemeral(project: Path):
     cfg = _compose_config(project, BASE_CHAIN + ["docker-compose.extraction.yml"])
     redis = cfg["services"]["redis"]

@@ -180,6 +180,23 @@ class UserGroupsRepository:
         existing = self.get(group_id)
         if existing and existing.get("is_system") and name is not None and name != existing["name"]:
             raise SystemGroupProtected(f"group {existing.get('name')!r} is a system group and cannot be renamed")
+
+        renaming = name is not None and existing is not None and name != existing.get("name")
+        if renaming and self._has_children(group_id):
+            # DuckDB engine limitation, not an Agnes logic bug: an UPDATE
+            # that touches `name` (UNIQUE-constrained) on a table with
+            # incoming FOREIGN KEY references (`resource_grants`,
+            # `user_group_members`) raises a false "Violates foreign key
+            # constraint ... still referenced ... in a different table" —
+            # DuckDB implements a unique-column UPDATE as an internal
+            # delete+reinsert, and the transient delete trips the FK check
+            # even though `id` (the actual FK target) never changes. A
+            # `description`-only update never touches `name`, so it never
+            # hits this and stays on the fast path below. Verified against
+            # DuckDB 1.5.2; see this method's own tests.
+            self._rename_with_children(group_id, name=name, description=description)
+            return
+
         sets: List[str] = []
         params: List[Any] = []
         if name is not None:
@@ -192,6 +209,67 @@ class UserGroupsRepository:
             return
         params.append(group_id)
         self.conn.execute(f"UPDATE user_groups SET {', '.join(sets)} WHERE id = ?", params)
+
+    def _has_children(self, group_id: str) -> bool:
+        """Whether any row in `resource_grants` or `user_group_members`
+        currently references `group_id` — the condition under which a
+        `name` UPDATE hits the DuckDB limitation `update()` works around
+        (see its own comment)."""
+        row = self.conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM resource_grants WHERE group_id = ?) "
+            "OR EXISTS(SELECT 1 FROM user_group_members WHERE group_id = ?)",
+            [group_id, group_id],
+        ).fetchone()
+        return bool(row and row[0])
+
+    def _rename_with_children(self, group_id: str, *, name: str, description: Optional[str]) -> None:
+        """Rename a group that has `resource_grants`/`user_group_members`
+        children, working around the DuckDB limitation `update()`
+        documents: move this row's children out, rename against now-zero
+        references (the same UPDATE that already works when a group has NO
+        children), then reinsert the children — same `id`, same rows'
+        `resource_type`/`resource_id`/`assigned_by`/`source`/`added_by`,
+        so grants and memberships survive the rename. `resource_grants.id`
+        and both tables' timestamp columns are NOT preserved byte-for-byte
+        (`ensure_grant`/`add_member` mint fresh ones) — immaterial to what
+        callers of `update()` actually depend on: WHICH resources/users are
+        granted/members, not the grant row's own synthetic id or the exact
+        instant it was (re)written. A grant carrying a non-default
+        `requirement` (Required-tier) is restored explicitly below, since
+        `ensure_grant` itself has no such parameter.
+        """
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+
+        grants_repo = ResourceGrantsRepository(self.conn)
+        members_repo = UserGroupMembersRepository(self.conn)
+
+        grant_rows = grants_repo.list_all(group_id=group_id)
+        member_rows = members_repo.list_members_for_group(group_id)
+
+        if grant_rows:
+            grants_repo.delete_all_for_group(group_id)
+        if member_rows:
+            members_repo.delete_all_for_group(group_id)
+
+        sets = ["name = ?"]
+        params: List[Any] = [name]
+        if description is not None:
+            sets.append("description = ?")
+            params.append(description)
+        params.append(group_id)
+        self.conn.execute(f"UPDATE user_groups SET {', '.join(sets)} WHERE id = ?", params)
+
+        for g in grant_rows:
+            grants_repo.ensure_grant(group_id, g["resource_type"], g["resource_id"], assigned_by=g.get("assigned_by"))
+            if g.get("requirement") and g["requirement"] != "available":
+                self.conn.execute(
+                    "UPDATE resource_grants SET requirement = ? "
+                    "WHERE group_id = ? AND resource_type = ? AND resource_id = ?",
+                    [g["requirement"], group_id, g["resource_type"], g["resource_id"]],
+                )
+        for m in member_rows:
+            members_repo.add_member(m["id"], group_id, source=m.get("source"), added_by=m.get("added_by"))
 
     def delete(self, group_id: str) -> None:
         existing = self.get(group_id)
