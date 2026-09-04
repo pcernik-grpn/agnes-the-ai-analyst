@@ -930,8 +930,10 @@ class TestSharePointFactsExtractionHandler:
     def _stub_run(self, monkeypatch, *, report=None, boom=None):
         calls: list = []
 
-        def _fake(connection_id, *, doc_ids=None, timeout_s=None):
-            calls.append({"connection_id": connection_id, "doc_ids": doc_ids, "timeout_s": timeout_s})
+        def _fake(connection_id, *, doc_ids=None, timeout_s=None, partition=None):
+            calls.append(
+                {"connection_id": connection_id, "doc_ids": doc_ids, "timeout_s": timeout_s, "partition": partition}
+            )
             if boom is not None:
                 raise boom
             return report if report is not None else {"docs_extracted": 0}
@@ -957,8 +959,21 @@ class TestSharePointFactsExtractionHandler:
 
         result = handler({"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120})
 
-        assert calls == [{"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120}]
+        assert calls == [{"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120, "partition": None}]
         assert result == {"docs_extracted": 5}
+
+    def test_a_partition_in_the_payload_is_forwarded_as_a_tuple(self, monkeypatch):
+        """TCRD-296 gap #67: a fanned-out pass carries ``partition``
+        ``{"index", "count"}`` in its payload; the handler hands it to the
+        pass as an ``(index, count)`` pair so N jobs over one connection
+        each take a disjoint slice of the ledger."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "partition": {"index": 2, "count": 4}})
+
+        assert calls[0]["partition"] == (2, 4)
 
     def test_doc_ids_and_timeout_s_are_optional(self, monkeypatch):
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
@@ -967,7 +982,7 @@ class TestSharePointFactsExtractionHandler:
 
         handler({"connection_id": "conn1"})
 
-        assert calls == [{"connection_id": "conn1", "doc_ids": None, "timeout_s": None}]
+        assert calls == [{"connection_id": "conn1", "doc_ids": None, "timeout_s": None, "partition": None}]
 
     def test_the_gate_from_run_standalone_facts_extraction_propagates(self, monkeypatch):
         """`FactsExtractionDisabled` (either cost/surface switch off) is
