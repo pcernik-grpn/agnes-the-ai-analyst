@@ -91,7 +91,7 @@ def test_open_session_writes_the_url_from_session_has_turns():
     js = _chat_js()
     body = _slice(
         js,
-        "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+        "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
         # The copy helpers that used to sit here moved to chat_errors.js
         # (one home for the sentences, shared with /_debug/error-surfaces),
         # so handleFrame is openSession's neighbour now.
