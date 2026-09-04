@@ -411,17 +411,26 @@ async def list_root_children(access_token: str, drive_id: str) -> List[Dict[str,
 
 
 async def list_root_children_with_url(access_token: str, drive_id: str) -> List[Dict[str, Any]]:
-    """Root-level items of one drive, carrying each item's ``webUrl`` — a
-    thin sibling of :func:`list_root_children` for the site-split planner
-    (``app.api.admin_sharepoint``'s ``GET …/split-plan`` / ``POST …/splits``):
-    a folder's ``webUrl`` is what lets :func:`search_document_count` scope a
-    Graph Search query to it via a KQL ``path:`` filter, without a second
-    round trip per folder to look the URL up.
+    """Root-level items of one drive, carrying each item's ``webUrl`` AND
+    ``child_count`` — a thin sibling of :func:`list_root_children` for the
+    site-split planner (``app.api.admin_sharepoint``'s ``GET …/split-plan`` /
+    ``POST …/splits``) and the automatic shard planner
+    (``connectors.sharepoint.shard_plan``): a folder's ``webUrl`` is what
+    lets :func:`search_document_count` scope a Graph Search query to it via a
+    KQL ``path:`` filter, and its ``child_count`` is the cheap, already-
+    fetched balancing signal the shard planner prefers over a Search call
+    (2026-09-04 finding #65: a large multi-scope connection drove Graph
+    Search into a sustained 429 storm at planning time; ``child_count``
+    riding this SAME listing call is what lets most folders skip Search
+    entirely). Both were previously TWO separate calls (this one for
+    ``webUrl``, :func:`list_root_children` for ``child_count``) — folded into
+    one ``$select`` so a caller needing both pays for one listing, not two.
 
     Not folded into :func:`list_root_children` itself: that function's own
-    tests pin an exact ``{id, name, is_folder, child_count}`` dict, and nothing
-    else calls for ``webUrl`` there. Pages the full ``@odata.nextLink`` chain,
-    same as :func:`list_root_children`.
+    tests pin an exact ``{id, name, is_folder, child_count}`` dict shaped for
+    its OWN callers (the ACL subtree sweep, the wizard tree), and adding
+    ``web_url`` there would be a payload no caller of that function wants.
+    Pages the full ``@odata.nextLink`` chain, same as :func:`list_root_children`.
     """
     rows = await _graph_get_all_pages(
         access_token,
@@ -434,6 +443,7 @@ async def list_root_children_with_url(access_token: str, drive_id: str) -> List[
             "name": item.get("name") or item["id"],
             "is_folder": "folder" in item,
             "web_url": item.get("webUrl"),
+            "child_count": (item.get("folder") or {}).get("childCount"),
         }
         for item in rows
     ]
@@ -484,12 +494,13 @@ async def get_root_web_url(access_token: str, drive_id: str) -> Optional[str]:
 
 
 async def list_item_children_with_url(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
-    """Children of an arbitrary folder, carrying each item's ``webUrl`` —
-    the shard planner's "fold a folder still over target one level deeper"
-    step (2026-09-03 auto-parallel-crawl design §4.1 point 3): the same
-    ``webUrl`` :func:`list_root_children_with_url` exposes for a top-level
-    folder, generalized past the drive root the same way
-    :func:`list_item_children` generalizes :func:`list_root_children`.
+    """Children of an arbitrary folder, carrying each item's ``webUrl`` AND
+    ``child_count`` — the shard planner's "fold a folder still over target
+    one level deeper" step (2026-09-03 auto-parallel-crawl design §4.1
+    point 3): the same ``webUrl``/``child_count`` pair
+    :func:`list_root_children_with_url` exposes for a top-level folder,
+    generalized past the drive root the same way :func:`list_item_children`
+    generalizes :func:`list_root_children`.
 
     Pages the full ``@odata.nextLink`` chain, same as every other listing
     helper in this module.
@@ -505,6 +516,7 @@ async def list_item_children_with_url(access_token: str, drive_id: str, item_id:
             "name": item.get("name") or item["id"],
             "is_folder": "folder" in item,
             "web_url": item.get("webUrl"),
+            "child_count": (item.get("folder") or {}).get("childCount"),
         }
         for item in rows
     ]

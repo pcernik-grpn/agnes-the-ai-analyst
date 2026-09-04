@@ -983,12 +983,14 @@ class TestListRootChildrenWithUrl:
                 "name": "Contracts",
                 "is_folder": True,
                 "web_url": "https://example.sharepoint.com/sites/s/Shared Documents/Contracts",
+                "child_count": 5,
             },
             {
                 "id": "f2",
                 "name": "notes.txt",
                 "is_folder": False,
                 "web_url": "https://example.sharepoint.com/sites/s/Shared Documents/notes.txt",
+                "child_count": None,
             },
         ]
 
@@ -1013,6 +1015,32 @@ class TestListRootChildrenWithUrl:
         items = asyncio.run(gc.list_root_children_with_url("tok", "drv1"))
         assert [i["id"] for i in items] == ["f1", "f2"]
         assert len(calls) == 2
+
+
+class TestListItemChildrenWithUrl:
+    """``list_item_children_with_url`` — the shard planner's one-level-deeper
+    fold (2026-09-04 finding #65): same ``webUrl``/``child_count`` pair as
+    :func:`list_root_children_with_url`, generalized past the drive root."""
+
+    def test_maps_folders_and_files_with_web_url_and_child_count(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/items/f1/children"
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {"id": "s1", "name": "Sub1", "folder": {"childCount": 3}, "webUrl": "https://x/f1/Sub1"},
+                        {"id": "s2", "name": "doc.pdf", "file": {}, "webUrl": "https://x/f1/doc.pdf"},
+                    ]
+                },
+            )
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_item_children_with_url("tok", "drv1", "f1"))
+        assert items == [
+            {"id": "s1", "name": "Sub1", "is_folder": True, "web_url": "https://x/f1/Sub1", "child_count": 3},
+            {"id": "s2", "name": "doc.pdf", "is_folder": False, "web_url": "https://x/f1/doc.pdf", "child_count": None},
+        ]
 
 
 class TestGetItemWebUrl:

@@ -124,7 +124,17 @@ function phaseCell(run) {
     : outcome === "running" ? "badge--info"
     : outcome === "interrupted" ? "badge--warn"
     : "badge--success";
-  return `<span class="badge ${cls}">${esc(outcome)}</span> <span class="ext-sub">${esc(phase)}</span>`;
+  // 2026-09-04 finding #65 item 3: a large site used to plan for 20+
+  // minutes with NOTHING to show here (no run row existed yet). Once the
+  // parent row opens as `phase="planning"` before any Graph call, name how
+  // far it got instead of a bare "planning" label.
+  let sub = phase;
+  if (phase === "planning" && run.planning_progress) {
+    const done = run.planning_progress.folders_done || 0;
+    const total = run.planning_progress.folders_total || 0;
+    sub = `planning ${done}/${total} folder${total === 1 ? "" : "s"}`;
+  }
+  return `<span class="badge ${cls}">${esc(outcome)}</span> <span class="ext-sub">${esc(sub)}</span>`;
 }
 
 /* Every reprocessing action an operator would otherwise need the shell for

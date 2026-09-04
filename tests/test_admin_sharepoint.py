@@ -2625,6 +2625,25 @@ class TestExtractionTrigger:
         job = jobs_repo().get(r.json()["job_id"])
         assert job["payload_json"] == {"connection_id": conn_id, "resync": True}
 
+    def test_force_replan_option_rides_in_the_payload(self, seeded_app, monkeypatch):
+        """2026-09-04 finding #65 item 2 — re-balance a large site's shards
+        without touching any cursor (unlike `resync`): no key when unset,
+        `force_replan: true` when the admin asks for one."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-replan")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"force_replan": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "force_replan": True}
+
     def test_force_reprocess_option_rides_in_the_payload(self, seeded_app, monkeypatch):
         """The stronger 're-process everything' control (unlike `resync`,
         also ignores cTags — see `connectors.sharepoint.crawler._process_

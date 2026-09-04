@@ -349,6 +349,8 @@ def _run(
     force_reprocess: bool = False,
     retry_failed: bool = False,
     retry_empty: bool = False,
+    resync: bool = False,
+    force_replan: bool = False,
 ) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
@@ -363,6 +365,10 @@ def _run(
         payload["retry_failed"] = True
     if retry_empty:
         payload["retry_empty"] = True
+    if resync:
+        payload["resync"] = True
+    if force_replan:
+        payload["force_replan"] = True
     return crawler.run_builtin_crawl(payload)
 
 
@@ -4406,6 +4412,10 @@ class FakeRunsRepo:
         #: — mirrors `ExtractionRunsPgRepository.finish_shard`'s return.
         self.shards: Dict[str, Dict[str, Any]] = {}
         self.finalize_claims: List[str] = []
+        #: `mark_planned` calls — 2026-09-04 finding #65 item 3: the parent
+        #: row opens BEFORE `shards_total` is known, so it is set later,
+        #: separately from `start`.
+        self.marked_planned: List[Dict[str, Any]] = []
 
     def start(
         self,
@@ -4418,8 +4428,10 @@ class FakeRunsRepo:
         shard_label=None,
         shards_total=None,
     ):
+        run_id = f"er_fake{len(self.started) + 1}"
         self.started.append(
             {
+                "run_id": run_id,
                 "connection_id": connection_id,
                 "job_id": job_id,
                 "phase": phase,
@@ -4429,10 +4441,18 @@ class FakeRunsRepo:
                 "shards_total": shards_total,
             }
         )
-        run_id = f"er_fake{len(self.started)}"
         if shards_total is not None:
             self.shards[run_id] = {"shards_done": 0, "shards_total": shards_total}
         return run_id
+
+    def mark_planned(self, run_id, *, shards_total):
+        self.marked_planned.append({"run_id": run_id, "shards_total": shards_total})
+        for row in self.started:
+            if row.get("run_id") == run_id:
+                row["shards_total"] = shards_total
+                row["phase"] = "plan"
+                break
+        self.shards[run_id] = {"shards_done": 0, "shards_total": shards_total}
 
     def checkpoint(self, run_id, **kwargs):
         self.checkpoints.append({"run_id": run_id, **kwargs})
@@ -4482,6 +4502,7 @@ class TestRunRecording:
 
         assert runs.started == [
             {
+                "run_id": "er_fake1",
                 "connection_id": "conn1",
                 "job_id": None,
                 "phase": "crawl",
@@ -4773,7 +4794,7 @@ class TestRunRecording:
 
         from src.repositories.extraction_runs_pg import ExtractionRunsPgRepository
 
-        for name in ("start", "checkpoint", "finish", "abandon_stale_running"):
+        for name in ("start", "checkpoint", "finish", "abandon_stale_running", "mark_planned"):
             real = set(inspect.signature(getattr(ExtractionRunsPgRepository, name)).parameters)
             fake = set(inspect.signature(getattr(FakeRunsRepo, name)).parameters)
             # The fake absorbs the rest through **kwargs; what must match is
@@ -7016,6 +7037,133 @@ class TestAutoParallelCrawlPlanner:
 
         assert report["mode"] == "builtin"
         assert jobs.enqueued == []
+
+
+class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
+    """2026-09-04 finding #65 — visibility (item 3) and plan persistence /
+    reuse (item 2)."""
+
+    def test_parent_row_opens_as_planning_before_the_first_graph_call(self, crawl_env, monkeypatch):
+        runs, _jobs, _store = self._install_env(monkeypatch)
+        phase_at_first_call: Dict[str, Any] = {}
+        inner = self._handler()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "phase" not in phase_at_first_call:
+                phase_at_first_call["phase"] = runs.started[0]["phase"] if runs.started else None
+            return inner(request)
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        assert phase_at_first_call["phase"] == "planning"
+        # By the time planning finished, the SAME row moved on to "plan".
+        assert runs.started[0]["phase"] == "plan"
+
+    def test_plan_is_persisted_and_reused_on_the_next_trigger_with_no_new_graph_calls(self, crawl_env, monkeypatch):
+        runs, jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        first = _run(_connection([_drive_scope()]), monkeypatch)
+        assert first["mode"] == "sharded"
+        graph_calls_after_first = len(seen)
+        assert graph_calls_after_first > 0
+
+        second = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert second["mode"] == "sharded"
+        assert second["shards_total"] == first["shards_total"]
+        assert second["parent_run_id"] != first["parent_run_id"]
+        # The reused trigger made NO new Graph calls at all.
+        assert len(seen) == graph_calls_after_first
+        assert len(runs.started) == 2
+        assert len(jobs.enqueued) == first["shards_total"] + second["shards_total"]
+        assert store.get("crawl", "conn1")["shard_plan"]["parent_run_id"] == second["parent_run_id"]
+
+        # A THIRD trigger must ALSO reuse — re-persisting the reused plan
+        # must carry its own fingerprint forward, not just fast-path the
+        # ONE trigger right after the plan was originally built.
+        third = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert third["mode"] == "sharded"
+        assert len(seen) == graph_calls_after_first
+        assert len(runs.started) == 3
+
+    def test_resync_forces_a_fresh_plan(self, crawl_env, monkeypatch):
+        _runs, _jobs, _store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+        graph_calls_after_first = len(seen)
+
+        _run(_connection([_drive_scope()]), monkeypatch, resync=True)
+
+        assert len(seen) > graph_calls_after_first, "resync must trigger a fresh plan, not reuse the persisted one"
+
+    def test_force_replan_forces_a_fresh_plan_without_resync(self, crawl_env, monkeypatch):
+        _runs, _jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+        graph_calls_after_first = len(seen)
+        state_before = store.get("crawl", "conn1")
+
+        _run(_connection([_drive_scope()]), monkeypatch, force_replan=True)
+
+        assert len(seen) > graph_calls_after_first, "force_replan must trigger a fresh plan"
+        # Unlike resync, force_replan never touches delta cursors.
+        assert state_before.get("delta_links") == store.get("crawl", "conn1").get("delta_links")
+
+    def test_a_scope_set_change_invalidates_the_persisted_plan(self, crawl_env, monkeypatch):
+        _runs, _jobs, _store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+        graph_calls_after_first = len(seen)
+
+        # A second, differently-identified drive scope — the connection's
+        # confirmed scope SET changed since the plan was built.
+        _run(
+            _connection([_drive_scope(), _drive_scope(source_scope_id="b!drive2", collection_id="col2")]),
+            monkeypatch,
+        )
+
+        assert len(seen) > graph_calls_after_first, "a changed scope set must invalidate the persisted plan"
+
+    def test_a_planning_budget_exhaustion_falls_back_to_inline_and_closes_the_planning_row(
+        self, crawl_env, monkeypatch
+    ):
+        """Finding #65 item 4: a plan balanced on nothing but a 429 storm is
+        worse than no plan — the planner must fall back to the inline crawl
+        cleanly, never leave the job silent or the parent row stuck
+        ``running``."""
+        runs, jobs, _store = self._install_env(monkeypatch)
+
+        async def _raise_budget_exhausted(*args: Any, **kwargs: Any) -> Any:
+            raise crawler.PlanningBudgetExhausted("search budget (120s) exhausted with no usable signal")
+
+        monkeypatch.setattr(crawler, "compute_shard_plan", _raise_budget_exhausted)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "builtin"  # fell back to the ordinary inline crawl
+        assert jobs.enqueued == []
+        # TWO rows: the planning row this fell back FROM (closed, done, names
+        # the fallback), and the inline crawl's own fresh row.
+        assert len(runs.started) == 2
+        assert runs.started[0]["phase"] == "planning"
+        planning_run_id = runs.started[0]["run_id"]
+        closed = [f for f in runs.finished if f["run_id"] == planning_run_id]
+        assert len(closed) == 1
+        assert closed[0]["status"] == "done"
+        assert closed[0]["report"]["mode"] == "inline (planner fallback)"
 
 
 class TestShardPlanPreview(TestAutoParallelCrawlPlanner):

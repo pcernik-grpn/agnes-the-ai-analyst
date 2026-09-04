@@ -4738,7 +4738,7 @@
         "type": "object"
       },
       "ExtractionRunOptions": {
-        "description": "Optional per-run overrides for one manual extraction trigger. Both\nfields default to the CONFIGURED values (`extraction.crawler.concurrency`\n/ `extraction.timeout_s`) when absent \u2014 the body itself is optional, so\nthe pre-options `POST` with no body keeps working unchanged. Bounds\nmirror the crawler's own clamps so a value the run would silently\nre-clamp is refused here instead, where the admin can see why.\n\nOn a site large enough to auto-shard (2026-09-03 auto-parallel-crawl\ndesign \u2014 `extraction.crawler.shard_target_docs`, PG-only), every option\nbelow except `shards` fans out UNCHANGED to every shard child\n(`connectors.sharepoint.crawler.run_shard_crawl`'s own payload\npass-through): `resync` drops every `crawl:*` state row (the\nconnection-level one AND every shard's own \u2014 see\n`connectors.sharepoint.crawler._apply_resync`) and forces the NEXT\ntrigger to re-plan from scratch (this planner never persists a plan to\nreuse \u2014 see `_plan_or_run_inline`'s own docstring); `timeout_s` bounds\nEACH child independently, not the site as a whole, so a huge shard\ngetting more time never steals a small one's turn.",
+        "description": "Optional per-run overrides for one manual extraction trigger. Both\nfields default to the CONFIGURED values (`extraction.crawler.concurrency`\n/ `extraction.timeout_s`) when absent \u2014 the body itself is optional, so\nthe pre-options `POST` with no body keeps working unchanged. Bounds\nmirror the crawler's own clamps so a value the run would silently\nre-clamp is refused here instead, where the admin can see why.\n\nOn a site large enough to auto-shard (2026-09-03 auto-parallel-crawl\ndesign \u2014 `extraction.crawler.shard_target_docs`, PG-only), every option\nbelow except `shards` fans out UNCHANGED to every shard child\n(`connectors.sharepoint.crawler.run_shard_crawl`'s own payload\npass-through). The planner PERSISTS its plan and reuses it on the next\ntrigger (2026-09-04 finding #65 item 2 \u2014 a live 388-scope connection's\nplanning window alone took 20+ minutes; a reused plan starts children\nwithin seconds instead) UNLESS the scope set changed since it was\nbuilt, `resync` is set, or `force_replan` is: `resync` drops every\n`crawl:*` state row (the connection-level one AND every shard's own \u2014\nsee `connectors.sharepoint.crawler._apply_resync`) AND the persisted\nplan, forcing the NEXT trigger to re-plan from scratch; `force_replan`\ndoes the SAME to the plan alone, without touching any cursor \u2014 the\ntargeted control for \"re-balance the shards\" with no data re-read.\n`timeout_s` bounds EACH child independently, not the site as a whole,\nso a huge shard getting more time never steals a small one's turn.",
         "properties": {
           "concurrency": {
             "anyOf": [
@@ -4753,6 +4753,18 @@
             ],
             "description": "Files of one delta page pipelined at once for this run (1 = sequential).",
             "title": "Concurrency"
+          },
+          "force_replan": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "On a site large enough to auto-shard, re-plan from scratch instead of reusing the connection's persisted shard plan \u2014 WITHOUT touching any cursor (unlike `resync`, every drive still resumes incrementally). The targeted control for re-balancing shards after the site's own shape changed enough that the old plan's grouping no longer fits well, without paying a full re-enumeration. A no-op on a connection too small to shard, or on a DuckDB-backed instance.",
+            "title": "Force Replan"
           },
           "force_reprocess": {
             "anyOf": [

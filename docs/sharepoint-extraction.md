@@ -131,26 +131,64 @@ spot-check shows pseudonyms, not names.
   today's pre-2026-09 behaviour, and is what a DuckDB-backed instance
   always does — this feature is PG-only, A3 ratchet), the very next
   `POST …/extract` becomes a short PLANNER instead of crawling itself: it
-  packs the site into K shards (top-level folders grouped by a live Graph
-  Search document count, one held back as a "remainder" shard for loose
-  root files and anything created after planning), opens ONE parent
+  packs the site into K shards, one held back as a "remainder" shard for
+  loose root files and anything created after planning, opens ONE parent
   `extraction_runs` row, and enqueues K `corpus-extraction-shard` child
   jobs — each with its OWN convert pool, its OWN per-delta-unit crawl
   state, and its OWN run row — that write into the connection's EXISTING
   collection. No clone, no consolidate, one connection to watch.
 
+  **Sizing signals, cheapest first (2026-09-04 finding #65).** A live
+  388-scope connection sharing one drive once drove Graph Search into a
+  sustained 429 storm at planning time — 20+ minutes with no run row and
+  no log line, degrading to a zero-balanced plan. The planner now tries,
+  in order, for each top-level folder: **(a)** a caller-supplied count from
+  `corpus_files` — a whole-drive scope whose collection already holds
+  indexed documents gets its per-folder counts from ONE grouped query, no
+  Graph call at all; **(b)** `folder.childCount` from the SAME listing
+  call that discovers the folder in the first place (no extra round trip);
+  **(c)** Graph Search — the LAST resort, only for a folder with neither,
+  at concurrency 2 (was 8) and bounded by a shared wall-clock search
+  budget (120s default) after which any still-unresolved folder just takes
+  childCount (even 0) instead of queuing another Search call. Every
+  folder/shard records which signal sized it
+  (`known`/`child_count`/`search`/`none`) so the UI can say "≈" honestly
+  per shard, not just for the plan as a whole. If the budget runs out with
+  NO usable signal anywhere, planning gives up cleanly and the run falls
+  back to the inline crawl instead of enqueueing a plan balanced on
+  nothing but a 429 storm — the report on that (now closed) planning row
+  names `mode: "inline (planner fallback)"` and why.
+
+  **Visibility from the first second.** The parent `extraction_runs` row
+  opens with `phase="planning"` BEFORE any Graph call — the fleet
+  dashboard and source card show "planning k/N folders" (checkpointed as
+  folders resolve, logged at INFO every 50) instead of nothing for the
+  whole planning window, which used to be silent.
+
+  **The plan is persisted and reused.** A re-trigger reuses the
+  connection's LAST persisted plan — starting children within seconds —
+  unless the confirmed scope SET changed since it was built, `resync` is
+  set (which also drops every cursor), or `force_replan` is set (the
+  targeted "re-balance the shards" control that touches NO cursor —
+  `agnes admin sharepoint extract <id> --replan` / `POST …/extract
+  {"force_replan": true}`).
+
   Preview what a trigger would plan right now, without triggering
-  anything: `GET /api/admin/sharepoint/connections/{id}/shard-plan
+  anything (and without consulting the persisted plan — a preview always
+  computes fresh): `GET /api/admin/sharepoint/connections/{id}/shard-plan
   [?min_modified=YYYY-MM-DD]` (`agnes admin sharepoint shard-plan
   <connection_id> [--min-modified YYYY-MM-DD] [--json]`), or the source
   card's **Parallel crawl — preview shards…** control. Response:
   `{mode: "inline"|"sharded", target_docs, signal, shards: [{drive_id,
-  index, label, expected, targets_count}], loose_root_files}` —
+  index, label, signal, expected, targets_count}], loose_root_files}` —
   `expected` is a live count, always shown "≈", never exact.
 
   **Per-site operator controls fan out to every shard unchanged:**
   - `resync` drops every shard's cursor AND the persisted plan itself, so
     the next trigger both re-enumerates from scratch and re-plans fresh.
+  - `force_replan` drops only the persisted plan, without touching any
+    cursor — for re-balancing shards after the site's own shape changed
+    enough that the old grouping no longer fits well.
   - `force_reprocess` / `retry_failed` / `retry_empty` / `concurrency` /
     `timeout_s` on `POST …/extract` fan out to every child as-is —
     `retry_failed`/`retry_empty` replay each shard's OWN backlog (scoped

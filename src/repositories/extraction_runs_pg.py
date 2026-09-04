@@ -218,6 +218,30 @@ class ExtractionRunsPgRepository:
                 },
             )
 
+    def mark_planned(self, run_id: str, *, shards_total: int) -> None:
+        """Set ``shards_total`` and flip ``phase`` to ``"plan"`` on a row
+        that opened BEFORE the plan it now describes was built (2026-09-04
+        finding #65 item 3: the parent row opens with ``phase="planning"``
+        at :meth:`start` time, before any Graph call — ``shards_total`` is
+        not yet known then). Scoped to ``status = 'running'``, same "a late
+        write can never resurrect a finalized row" rule every other write
+        here applies.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE extraction_runs SET shards_total = :shards_total, phase = 'plan', "
+                    "  checkpoint_at = :checkpoint_at "
+                    "WHERE id = :id AND status = :running"
+                ),
+                {
+                    "id": run_id,
+                    "shards_total": int(shards_total),
+                    "checkpoint_at": _now(),
+                    "running": RUNNING,
+                },
+            )
+
     def finish(
         self,
         run_id: str,
