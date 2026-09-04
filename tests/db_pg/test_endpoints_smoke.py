@@ -429,6 +429,7 @@ class TestRBACSmoke:
         "POST /api/admin/grants",
         "PUT /api/admin/grants/{grant_id}",
         "DELETE /api/admin/grants/{grant_id}",
+        "POST /api/admin/grants/reconcile-everyone-scope",
         "GET /api/admin/access-overview",
         "GET /api/admin/access/resources/{resource_type}/search",
         "GET /api/admin/resource-types",
@@ -449,6 +450,53 @@ class TestRBACSmoke:
     def test_grants_list(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/grants", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200
+
+    def test_everyone_scope_reconcile_reports_without_guessing(self, seeded_app_both):
+        """The reconciler answers on Postgres and fails clean on DuckDB.
+
+        Asserted per backend rather than as `in (200, 501)`: accepting either
+        status on either backend would pass just as happily if the endpoint
+        started 501-ing on Postgres, which is the one outcome that would make
+        it useless. On DuckDB the 501 must be the TYPED one — the frozen ladder
+        has no `scope` column, so there is no half-converted state to close
+        there, and a raw 500 would be a different bug wearing the same colour.
+
+        What a freshly seeded instance reports is deliberately NOT pinned to
+        one status: the seed leaves people outside the `Everyone` group, so the
+        widening guard legitimately fires and the answer is `blocked`. The
+        invariant that matters here is that the report is well-formed and
+        always carries BOTH guard counts, so an operator can see which arm to
+        work down. The three statuses and each guard's write-nothing behaviour
+        are pinned in tests/db_pg/test_everyone_scope_reconcile.py.
+        """
+        r = seeded_app_both["client"].post(
+            "/api/admin/grants/reconcile-everyone-scope",
+            headers=_admin_headers(seeded_app_both),
+        )
+        if seeded_app_both["backend"] != "pg":
+            assert r.status_code == 501, r.text
+            assert r.json()["error"] == "requires_postgres_backend", r.text
+            return
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] in ("converted", "nothing_to_do", "blocked"), body
+        assert isinstance(body["people_outside_group"], int), body
+        assert isinstance(body["non_people_inside_group"], int), body
+        assert body["dry_run"] is False, body
+
+    def test_everyone_scope_reconcile_is_admin_only(self, seeded_app_both):
+        """An analyst cannot flip grant scopes — the gate, not the backend.
+
+        Checked on BOTH backends: the refusal must come from `require_admin`
+        before the repository is ever reached, so a non-admin gets 401/403 on
+        DuckDB too, never the 501 that would mean the gate let them through and
+        the backend stopped them by accident.
+        """
+        r = seeded_app_both["client"].post(
+            "/api/admin/grants/reconcile-everyone-scope",
+            headers=_analyst_headers(seeded_app_both),
+        )
+        assert r.status_code in (401, 403), r.status_code
 
     def test_resource_types(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/resource-types", headers=_admin_headers(seeded_app_both))

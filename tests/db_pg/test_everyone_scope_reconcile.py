@@ -17,6 +17,7 @@ out access the migration deliberately refused.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from pathlib import Path
@@ -301,3 +302,58 @@ def test_the_duckdb_backend_fails_clean_rather_than_pretending():
     with pytest.raises(RequiresPostgresBackend) as exc:
         ResourceGrantsRepository.reconcile_everyone_scope(object())  # type: ignore[arg-type]
     assert "everyone-scope" in exc.value.feature
+
+
+def test_a_run_is_actually_written_to_the_audit_log(seeded_app_both):
+    """The audit row exists — read back, not inferred from a 200.
+
+    This test exists because the first version of the endpoint passed
+    `details=` to `log_safe`, and NEITHER backend's `AuditRepository.log()`
+    has ever had that kwarg. `log_safe` swallows the TypeError on purpose (a
+    failed audit write must not fail the request it describes), so the
+    endpoint answered 200 with the docstring still promising a trail and no
+    row behind it. Any test that stops at the status code passes that bug.
+
+    Postgres only: the DuckDB sibling raises before it could audit anything,
+    which `test_the_duckdb_backend_fails_clean_rather_than_pretending` and the
+    smoke test's typed-501 assertion already cover.
+    """
+    if seeded_app_both["backend"] != "pg":
+        pytest.skip("PG-only endpoint; the DuckDB 501 path never reaches the audit write")
+
+    import sqlalchemy as sa
+    from src.db_pg import get_engine
+
+    r = seeded_app_both["client"].post(
+        "/api/admin/grants/reconcile-everyone-scope",
+        headers={"Authorization": f"Bearer {seeded_app_both['admin_token']}"},
+    )
+    assert r.status_code == 200, r.text
+    reported = r.json()
+
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            sa.text(
+                "SELECT user_id, action, result, params FROM audit_log "
+                "WHERE action = 'resource_grant.everyone_scope_reconciled' "
+                "ORDER BY timestamp DESC LIMIT 1"
+            )
+        ).mappings().first()
+
+    assert row is not None, (
+        "no audit_log row for resource_grant.everyone_scope_reconciled — the write is being "
+        "swallowed by log_safe again (check the kwargs against AuditRepository.log)"
+    )
+    assert row["user_id"] == "admin1"
+    assert row["result"] == reported["status"]
+
+    params = row["params"]
+    if isinstance(params, str):
+        params = json.loads(params)
+    # Both guard counts must be in the trail, not just the outcome: an
+    # operator reading the log needs to see WHICH arm blocked, which is the
+    # whole reason a blocked run is audited at all.
+    assert params["status"] == reported["status"]
+    assert params["people_outside_group"] == reported["people_outside_group"]
+    assert params["non_people_inside_group"] == reported["non_people_inside_group"]
+    assert params["dry_run"] is False

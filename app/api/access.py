@@ -1266,10 +1266,19 @@ async def reconcile_everyone_scope(
     # Audited even on a blocked or no-op run: "an admin asked whether the
     # conversion could complete, and the answer was no" is exactly the trail
     # an operator needs while working the membership down.
+    # `params=`, NOT `details=`: neither backend's `log()` has ever had a
+    # `details` kwarg, and `log_safe` swallows the resulting TypeError by
+    # design (a failed audit write must not fail the request it describes) —
+    # so the first version of this call returned 200 while writing no audit
+    # row at all, on either backend. Pinned by
+    # tests/db_pg/test_everyone_scope_reconcile.py::
+    # test_a_run_is_actually_written_to_the_audit_log, which reads the row
+    # back instead of trusting the status code.
     log_safe(
         user_id=user.get("id"),
         action="resource_grant.everyone_scope_reconciled",
-        details={
+        result=report["status"],
+        params={
             "status": report["status"],
             "converted": report["converted"],
             "would_convert": report["would_convert"],
