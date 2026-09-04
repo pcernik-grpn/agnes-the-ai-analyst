@@ -1101,6 +1101,74 @@ def test_a_multi_batch_pass_reports_each_batchs_own_spend(pg_env, monkeypatch):
     assert sum(per_batch) == report["facts_usage"]["input_tokens"]
 
 
+def test_a_multi_batch_pass_sweeps_orphans_exactly_once(pg_env, monkeypatch):
+    """TCRD-296 C.12: a 3-batch pass calls ``sweep_orphans()`` exactly
+    ONCE, after the whole pass has shipped — not once per batch (the live
+    finding: 7 parallel passes each sweeping per batch deleted 75,447
+    subjects against 10,784 created in 30 minutes, ~13% of documents
+    failing on a foreign-key violation). A pre-existing, genuinely stale
+    orphan proves the single sweep that DOES run is a real one, not a
+    no-op — and the pass report carries the count."""
+    import connectors.sharepoint.facts_extraction as stage
+    from src.db_pg import get_engine
+    from src.repositories import facts_repo
+    from src.repositories.facts_pg import FactsPgRepository
+
+    monkeypatch.setattr(stage, "DEFAULT_BATCH_DOCUMENTS", 1)  # one batch per document
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    for i in range(3):
+        _seed_document(file_id=f"cf_{i}", doc_id=f"doc{i}", text=f"The rollout number {i} began in March.")
+
+    stale_id = facts_repo().create_fact(type="engagement", natural_key="engagement:pre-existing-orphan")
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": stale_id},
+        )
+
+    calls = {"n": 0}
+    real_sweep = FactsPgRepository.sweep_orphans
+
+    def _counting_sweep(self, **kwargs):
+        calls["n"] += 1
+        return real_sweep(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "sweep_orphans", _counting_sweep)
+
+    def reply(message: str) -> str:
+        doc_id = json.loads(message.split("```json\n", 1)[1].split("\n```", 1)[0])["doc_id"]
+        index = doc_id.removeprefix("doc")
+        return _stream(
+            {
+                "id": f"engagement:rollout-{index}",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": f"rollout number {index} began in March"}],
+            }
+        )
+
+    class Scripted(StubExtractor):
+        def call(self, user_message: str) -> str:
+            self.seen.append(user_message)
+            self.usage["calls"] += 1
+            self.usage["input_tokens"] += 1000
+            return reply(user_message)
+
+    report = _run(Scripted([]), concurrency=1)
+
+    assert report["ingest_batches"] == 3
+    assert calls["n"] == 1, "sweep_orphans() must run once per PASS, not once per batch"
+    assert report["orphans_swept"] >= 1
+    assert report["orphans_sweep_skipped"] is False
+
+    with get_engine().connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": stale_id}).scalar()
+    assert still_there is None, "the pass's own single end-of-pass sweep must still reap a real orphan"
+
+
 def test_an_expired_deadline_stops_between_documents_and_keeps_what_it_paid_for(pg_env):
     """The crawl that preceded this pass genuinely finished, so the run is
     not failed — the block says `interrupted: timeout`, whatever was

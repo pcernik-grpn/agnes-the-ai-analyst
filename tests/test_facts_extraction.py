@@ -1317,10 +1317,13 @@ def test_flush_reverts_ledger_entries_when_ingest_is_refused(monkeypatch):
     shipper = _shipper(docs_state)
     shipper.add(file_id="cf_1", document=_shipper_document(), nodes=[], edges=[], claim_count=0)
 
-    def _raise(body, *, user):
+    def _raise(body, *, user, run_orphan_sweep=True):
         raise HTTPException(status_code=403, detail={"reason": "anonymization_not_declared"})
 
-    monkeypatch.setattr("app.api.facts.facts_ingest", _raise)
+    # `_BatchShipper.flush` calls `_facts_ingest_core` directly (TCRD-296
+    # C.12 — `run_orphan_sweep=False` on every batch), not the route
+    # function `facts_ingest` thinly wraps it in.
+    monkeypatch.setattr("app.api.facts._facts_ingest_core", _raise)
 
     with pytest.raises(fe._IngestRefused):
         shipper.flush(usage={}, model="claude-haiku-4-5")
@@ -1334,7 +1337,7 @@ def test_flush_corrects_the_ledger_after_a_successful_zero_claim_ingest(monkeypa
     shipper = _shipper(docs_state)
     shipper.add(file_id="cf_1", document=_shipper_document(), nodes=[], edges=[], claim_count=0)
 
-    def _fake_ingest(body, *, user):
+    def _fake_ingest(body, *, user, run_orphan_sweep=True):
         return {
             "claims_written": 0,
             "claims_written_by_doc": {},
@@ -1343,7 +1346,7 @@ def test_flush_corrects_the_ledger_after_a_successful_zero_claim_ingest(monkeypa
             "edges_skipped_missing_endpoint": 0,
         }
 
-    monkeypatch.setattr("app.api.facts.facts_ingest", _fake_ingest)
+    monkeypatch.setattr("app.api.facts._facts_ingest_core", _fake_ingest)
 
     shipper.flush(usage={}, model="claude-haiku-4-5")
 

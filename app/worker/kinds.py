@@ -296,6 +296,16 @@ _DEFAULT_EXTRACTION_TIMEOUT_S = 3600
 # It is now the same heartbeat-protected default as every other
 # long-running kind, entirely independent of extraction.timeout_s.
 _DEFAULT_EXTRACTION_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
+# TCRD-296 C.11 — the extraction kinds' JobKind.transient_retry_in_seconds:
+# a raised handler exception that `src.db_transient.is_transient_db_error`
+# classifies as a connection-pool/deadlock/serialization hiccup requeues
+# after this delay instead of finalizing on its first attempt (see
+# `app/worker/runtime.py::_run_one`). Short relative to `retry_in_seconds`
+# elsewhere in this module (300s) on purpose: this is a DB-layer blip, not a
+# tenant-throttle or an outage worth minutes of backoff — long enough for
+# connection-pool pressure to plausibly subside before the whole run
+# restarts from its persisted per-document/per-item state.
+_TRANSIENT_INGEST_RETRY_S = 60
 # 2026-08-30 plan, Task 7: a full sharepoint-subtree-sweep pass (probing
 # hasUniqueRoleAssignments over every folder in a mirrored scope) is
 # multi-hour on a large library (spec §6.2's ~98k-folder reference) — that
@@ -1754,6 +1764,9 @@ def register_all_kinds() -> None:
             # error, an exhausted throttle budget) needs an operator to look
             # at it, not an unattended re-run a few minutes later.
             retry_in_seconds=None,
+            # ...UNLESS the raised exception is a TRANSIENT infrastructure
+            # fault (TCRD-296 C.11) — see `_TRANSIENT_INGEST_RETRY_S`.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     register_kind(
@@ -1771,6 +1784,8 @@ def register_all_kinds() -> None:
             # possible via `POST …/extract` with `shards: [index]` —
             # app/api/admin_sharepoint.py, Task 5.)
             retry_in_seconds=None,
+            # Same TCRD-296 C.11 opt-in as corpus-extraction above.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     register_kind(
@@ -1818,6 +1833,8 @@ def register_all_kinds() -> None:
             # from the persisted per-document state anyway, same rationale
             # as corpus-extraction above.
             retry_in_seconds=None,
+            # Same TCRD-296 C.11 opt-in as corpus-extraction above.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     from app.chat.manager import get_current_chat_manager

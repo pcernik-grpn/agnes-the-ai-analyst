@@ -2611,6 +2611,73 @@ class _Ingestor:
         return True
 
 
+#: Ingest-step transient-DB retry policy (TCRD-296 C.11 — live finding,
+#: 2026-09: a pool-starved worker raised ``sqlalchemy.exc.TimeoutError:
+#: QueuePool limit ...`` from :meth:`_Ingestor.ingest`, and the worker's own
+#: exception path finalizes a raised error on the FIRST attempt by design
+#: (``app/worker/runtime.py::_run_one``) — so a 30-second connection-pool
+#: hiccup turned a 4-hour crawl into one ``failed`` run). Deliberately
+#: shorter than :class:`GraphTransport`'s own retry policy above: a DB
+#: hiccup resolves in seconds, not the minutes a throttled tenant can take.
+_INGEST_RETRY_ATTEMPTS = 5
+_INGEST_RETRY_BASE_S = 1.0
+_INGEST_RETRY_MAX_S = 16.0
+
+
+def _ingest_retry_sleep(seconds: float) -> None:
+    """The ingest-retry helper's only wall-clock wait, behind one seam — a
+    test can monkeypatch this to assert the retry COUNT without spending
+    the seconds. Synchronous (unlike the transport's own :func:`_sleep`):
+    :func:`_ingest_with_retry` always runs OFF the event loop (see
+    :func:`_run_blocking` — inline at concurrency 1, on the worker pool
+    otherwise), so a blocking ``time.sleep`` here never stalls anything
+    else this crawl is doing.
+    """
+    time.sleep(seconds)
+
+
+def _ingest_with_retry(ingestor: "_Ingestor", **kwargs: Any) -> Tuple[str, bool]:
+    """Call ``ingestor.ingest(**kwargs)`` with bounded retry for a
+    TRANSIENT infrastructure fault only (TCRD-296 C.11 — see
+    :data:`_INGEST_RETRY_ATTEMPTS`'s docstring for the live finding).
+
+    :func:`src.db_transient.is_transient_db_error` is the closed set worth
+    retrying — a SQLAlchemy pool-wait timeout, a dropped/reset connection, a
+    deadlock, or a serialization failure. Never for
+    ``IntegrityError``/``DataError``/a programming error: those are a bad
+    row or a bad statement, and retrying either only delays a failure that
+    will never resolve itself.
+
+    A non-transient failure raises IMMEDIATELY (attempt 1, no retry) — the
+    exact pre-existing behavior. A transient one that survives every retry
+    also raises, once :data:`_INGEST_RETRY_ATTEMPTS` is exhausted — the
+    caller (:func:`_process_item`) still records it as ``ingest_failed`` in
+    ``failed_items`` and the crawl continues (module docstring's "A
+    per-item failure never advances past itself"); this function only ever
+    turns a SHORT infrastructure hiccup into an in-process wait instead of
+    losing the item to that same handling.
+    """
+    from src.db_transient import is_transient_db_error
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return ingestor.ingest(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — reclassified immediately below
+            if attempt >= _INGEST_RETRY_ATTEMPTS or not is_transient_db_error(exc):
+                raise
+            wait = min(_INGEST_RETRY_BASE_S * (2 ** (attempt - 1)), _INGEST_RETRY_MAX_S) + random.uniform(0, 1)
+            logger.warning(
+                "sharepoint crawl: transient ingest error (%s) — retry %d/%d in %.1fs",
+                type(exc).__name__,
+                attempt,
+                _INGEST_RETRY_ATTEMPTS,
+                wait,
+            )
+            _ingest_retry_sleep(wait)
+
+
 # --------------------------------------------------------------------------
 # The crawl
 # --------------------------------------------------------------------------
@@ -4282,7 +4349,8 @@ async def _process_item(
         try:
             _file_id, was_new = await _run_blocking(
                 pool,
-                ingestor.ingest,
+                _ingest_with_retry,
+                ingestor,
                 collection_id=collection_id,
                 stable_id=stable_id,
                 # RESOLVED values from `_prepare_document` — the real
