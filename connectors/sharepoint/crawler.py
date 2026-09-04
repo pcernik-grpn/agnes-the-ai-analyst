@@ -5781,13 +5781,11 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
     moment into it for the rest of the process (a test's fake, in the
     cross-test leak this fixed).
     """
-    from app.worker.registry import job_max_attempts
     from connectors.sharepoint.facts_extraction import (
-        facts_extraction_idempotency_key,
+        enqueue_facts_extraction_passes,
         facts_extraction_readiness,
         streamed_pass_suppressed_by_provider_limit,
     )
-    from src.repositories import jobs_repo
 
     try:
         usable, _error = facts_extraction_readiness()
@@ -5808,29 +5806,28 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
                 condition.get("provider"),
             )
             return
-        job = jobs_repo().enqueue(
-            _FACTS_EXTRACTION_JOB_KIND,
-            {"connection_id": connection_id},
-            idempotency_key=facts_extraction_idempotency_key(connection_id),
-            max_attempts=job_max_attempts(_FACTS_EXTRACTION_JOB_KIND),
-        )
+        # TCRD-296 gap #67: fanned out into however many partitions the
+        # current backlog justifies — a single job (today's shape) for the
+        # common case, several for a backlog large enough to need them.
+        jobs = enqueue_facts_extraction_passes(connection_id)
     except Exception as exc:  # noqa: BLE001 — a bonus pass must never fail the crawl
         logger.debug(
             "sharepoint crawl: connection %s — could not enqueue a streamed facts pass: %s", connection_id, exc
         )
         return
-    if job.get("deduped"):
+    if all(job.get("deduped") for job in jobs):
         logger.debug(
-            "sharepoint crawl: connection %s — streamed facts pass already queued/running (job %s), not piling up",
+            "sharepoint crawl: connection %s — streamed facts pass already queued/running (job(s) %s), not piling up",
             connection_id,
-            job.get("id"),
+            ", ".join(job.get("id", "") for job in jobs),
         )
     else:
         logger.info(
-            "sharepoint crawl: connection %s — streamed facts-extraction job %s enqueued "
-            "(extraction.facts.stream_every)",
+            "sharepoint crawl: connection %s — streamed facts-extraction job(s) %s enqueued "
+            "(extraction.facts.stream_every, %d partition(s))",
             connection_id,
-            job.get("id"),
+            ", ".join(job.get("id", "") for job in jobs),
+            len(jobs),
         )
 
 

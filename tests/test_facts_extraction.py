@@ -1881,6 +1881,61 @@ def test_the_crawl_seam_still_runs_for_a_different_connection_while_one_is_locke
 
 
 # ---------------------------------------------------------------------------
+# Partitioned locks / merge_docs — DuckDB fallback (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def test_duckdb_fallback_partitions_never_contend_with_each_other():
+    from connectors.sharepoint.state_store import facts_pass_lock
+
+    with facts_pass_lock("conn-parts", partition=(0, 3)):
+        with facts_pass_lock("conn-parts", partition=(1, 3)):
+            pass  # must not raise — distinct dict keys
+
+
+def test_duckdb_fallback_same_partition_twice_is_refused():
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    with facts_pass_lock("conn-samepart", partition=(2, 4)):
+        with pytest.raises(FactsPassLocked):
+            with facts_pass_lock("conn-samepart", partition=(2, 4)):
+                pass
+
+
+def test_duckdb_fallback_any_facts_pass_running_sees_a_partition():
+    from connectors.sharepoint.state_store import any_facts_pass_running, facts_pass_lock
+
+    assert any_facts_pass_running("conn-anyrun") is False
+    with facts_pass_lock("conn-anyrun", partition=(1, 5)):
+        assert any_facts_pass_running("conn-anyrun") is True
+    assert any_facts_pass_running("conn-anyrun") is False
+
+
+def test_duckdb_fallback_merge_docs_is_a_per_document_upsert(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from connectors.sharepoint.state_store import get as state_get
+    from connectors.sharepoint.state_store import merge_docs
+
+    merge_docs("facts", "conn-merge", set_entries={"cf_1": {"status": "done"}}, removed=[])
+    merge_docs("facts", "conn-merge", set_entries={"cf_2": {"status": "done"}}, removed=[])
+    docs = state_get("facts", "conn-merge")["docs"]
+    assert docs == {"cf_1": {"status": "done"}, "cf_2": {"status": "done"}}
+
+
+def test_duckdb_fallback_merge_docs_removal(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from connectors.sharepoint.state_store import get as state_get
+    from connectors.sharepoint.state_store import merge_docs
+
+    merge_docs(
+        "facts", "conn-merge-rm", set_entries={"cf_1": {"status": "done"}, "cf_2": {"status": "done"}}, removed=[]
+    )
+    merge_docs("facts", "conn-merge-rm", set_entries={}, removed=["cf_1"])
+    docs = state_get("facts", "conn-merge-rm")["docs"]
+    assert docs == {"cf_2": {"status": "done"}}
+
+
+# ---------------------------------------------------------------------------
 # Standalone trigger — run a pass without a crawl, over an already-indexed
 # corpus (`run_standalone_facts_extraction`, the seam
 # `sharepoint-facts-extraction`/``POST …/facts-extract``/``agnes admin
@@ -1983,10 +2038,11 @@ def test_standalone_run_delegates_with_doc_ids_and_a_deadline_from_timeout_s(mon
     monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
     seen = {}
 
-    def _fake_run(connection_id, *, doc_ids=None, deadline=None):
+    def _fake_run(connection_id, *, doc_ids=None, deadline=None, partition=None):
         seen["connection_id"] = connection_id
         seen["doc_ids"] = doc_ids
         seen["deadline"] = deadline
+        seen["partition"] = partition
         return {"docs_extracted": 0}
 
     monkeypatch.setattr("connectors.sharepoint.facts_extraction.run_facts_extraction", _fake_run)
@@ -2001,6 +2057,7 @@ def test_standalone_run_delegates_with_doc_ids_and_a_deadline_from_timeout_s(mon
     # `extraction.timeout_s`.
     assert seen["deadline"].timeout_s == 42
     assert seen["deadline"].expired() is False
+    assert seen["partition"] is None
 
 
 def test_standalone_run_falls_back_to_the_configured_timeout_when_none_given(monkeypatch):
@@ -2012,7 +2069,7 @@ def test_standalone_run_falls_back_to_the_configured_timeout_when_none_given(mon
     seen = {}
     monkeypatch.setattr(
         "connectors.sharepoint.facts_extraction.run_facts_extraction",
-        lambda connection_id, *, doc_ids=None, deadline=None: seen.update(deadline=deadline) or {},
+        lambda connection_id, *, doc_ids=None, deadline=None, partition=None: seen.update(deadline=deadline) or {},
     )
 
     run_standalone_facts_extraction("conn1")
@@ -2793,6 +2850,26 @@ def test_retry_listing_is_unbounded_for_a_stub_without_char_budget():
 
 
 # ---------------------------------------------------------------------------
+# Partitioned passes (TCRD-296 gap #67) — stable assignment, no database
+# ---------------------------------------------------------------------------
+
+
+def test_partition_of_is_stable_across_repeated_calls():
+    assert fe._partition_of("corpus-file-abc", 4) == fe._partition_of("corpus-file-abc", 4)
+
+
+def test_partition_of_stays_in_range_and_uses_every_partition():
+    count = 4
+    seen = {fe._partition_of(f"cf_{i}", count) for i in range(200)}
+    assert seen == set(range(count))
+
+
+def test_partition_of_count_one_is_always_zero():
+    for i in range(20):
+        assert fe._partition_of(f"cf_{i}", 1) == 0
+
+
+# ---------------------------------------------------------------------------
 # `_plan_documents` — the token-safe bound end to end, without a database
 # ---------------------------------------------------------------------------
 
@@ -2904,3 +2981,86 @@ def test_ordinary_prose_under_the_cap_is_untouched(monkeypatch):
     assert report.docs_truncated == 0
     assert report.docs_skipped_garbled_text == 0
     assert report.docs_skipped_too_large_tabular == 0
+
+
+# ---------------------------------------------------------------------------
+# `_plan_documents`'s `partition` filter (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_documents_partition_filter_is_disjoint_and_exhaustive(monkeypatch):
+    from connectors.sharepoint.facts_extraction import _Report, _partition_of, _plan_documents
+
+    monkeypatch.setattr(fe, "_document_text", lambda file_id: (["hello"], "hello"))  # noqa: ARG005
+    connection = {"config": {"scopes": [{"source_scope_id": "s1", "collection_id": "col_a"}]}}
+    rows = [
+        {
+            "id": f"cf_{i}",
+            "path": f"p{i}.md",
+            "filename": f"f{i}.md",
+            "processing_status": "indexed",
+            "sha256": f"sha{i}",
+        }
+        for i in range(12)
+    ]
+    files_repo = _FakeFilesRepo(rows)
+    sources_repo = _FakeSourcesRepo({r["id"]: {"source_doc_id": f"doc-{r['id']}"} for r in rows})
+    count = 3
+
+    seen_by_partition: dict[int, list[str]] = {}
+    for index in range(count):
+        report = _Report()
+        works = list(
+            _plan_documents(
+                connection=connection,
+                docs_state={},
+                report=report,
+                files_repo=files_repo,
+                sources_repo=sources_repo,
+                wanted_doc_ids=None,
+                model="claude-haiku-4-5",
+                fingerprint="fp",
+                max_doc_chars=fe.DEFAULT_MAX_DOC_CHARS,
+                partition=(index, count),
+            )
+        )
+        seen_by_partition[index] = sorted(w.file_id for w in works)
+
+    all_seen = sorted(fid for ids in seen_by_partition.values() for fid in ids)
+    assert all_seen == sorted(r["id"] for r in rows)  # exhaustive, no file dropped
+    for index in range(count):
+        assert seen_by_partition[index] == sorted(r["id"] for r in rows if _partition_of(r["id"], count) == index)
+    # Disjoint by construction (each id appears in exactly one bucket above),
+    # and at least two buckets are non-empty for this input size — otherwise
+    # the test would pass trivially without the filter ever doing anything.
+    assert sum(1 for ids in seen_by_partition.values() if ids) >= 2
+
+
+def test_plan_documents_with_no_partition_sees_every_file(monkeypatch):
+    """``partition=None`` (the default, every existing caller) is untouched
+    — every file is planned regardless of its hash."""
+    from connectors.sharepoint.facts_extraction import _Report, _plan_documents
+
+    monkeypatch.setattr(fe, "_document_text", lambda file_id: (["hello"], "hello"))  # noqa: ARG005
+    connection = {"config": {"scopes": [{"source_scope_id": "s1", "collection_id": "col_a"}]}}
+    rows = [
+        {"id": f"cf_{i}", "path": f"p{i}.md", "filename": f"f{i}.md", "processing_status": "indexed", "sha256": f"s{i}"}
+        for i in range(8)
+    ]
+    files_repo = _FakeFilesRepo(rows)
+    sources_repo = _FakeSourcesRepo({r["id"]: {"source_doc_id": f"doc-{r['id']}"} for r in rows})
+    report = _Report()
+    works = list(
+        _plan_documents(
+            connection=connection,
+            docs_state={},
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=None,
+            model="claude-haiku-4-5",
+            fingerprint="fp",
+            max_doc_chars=fe.DEFAULT_MAX_DOC_CHARS,
+        )
+    )
+    assert sorted(w.file_id for w in works) == sorted(r["id"] for r in rows)

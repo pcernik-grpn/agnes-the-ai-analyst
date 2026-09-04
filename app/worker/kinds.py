@@ -1524,6 +1524,12 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
         problem a standalone trigger with its own budget avoids (observed
         live: a 900s crawl left the chained pass an already-expired
         deadline, stopping it after 3 documents).
+      - ``partition`` (optional ``{"index": int, "count": int}``, TCRD-296
+        gap #67) — this job is one PARTITION of a fanned-out pass
+        (``connectors.sharepoint.facts_extraction
+        .enqueue_facts_extraction_passes``); absent (every job enqueued
+        before this feature existed, or a fan-out that resolved to a
+        single partition) runs exactly today's whole-connection pass.
 
     Returns the pass report (see
     ``connectors.sharepoint.facts_extraction._Report.render``). When this
@@ -1551,7 +1557,13 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
     connection_id = str(payload["connection_id"])
     doc_ids = payload.get("doc_ids")
     timeout_s = payload.get("timeout_s")
-    return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s)
+    partition_field = payload.get("partition") or {}
+    partition = (
+        (int(partition_field.get("index") or 0), int(partition_field["count"]))
+        if partition_field.get("count")
+        else None
+    )
+    return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s, partition=partition)
 
 
 #: Kinds whose payload gets this claimed job's own ``id`` merged in before

@@ -728,6 +728,11 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
             ("concurrency", 1, _FACTS_CONCURRENCY_MAX),
             ("stream_every", 0, 1_000_000),
             ("run_timeout_s", _EXTRACTION_TIMEOUT_MIN, _EXTRACTION_TIMEOUT_MAX),
+            # TCRD-296 gap #67 — the ceiling on how many partitions a facts
+            # fan-out (connectors.sharepoint.facts_extraction
+            # .enqueue_facts_extraction_passes) ever enqueues at once; same
+            # clamp as `concurrency` above.
+            ("concurrency_passes", 1, _FACTS_CONCURRENCY_MAX),
         ):
             value = facts.get(key)
             if value is None:
@@ -1497,6 +1502,21 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Time budget of ONE standalone facts pass, seconds. A pass that hits "
                         "it stops between documents, keeps everything already shipped, and "
                         "the next pass resumes — a small budget just means more passes."
+                    ),
+                },
+                "concurrency_passes": {
+                    "kind": "int",
+                    "default": 4,
+                    "hint": (
+                        "Ceiling on how many PARTITIONS one facts-extraction trigger fans out "
+                        "into at most — each partition is its own worker-lane job over a "
+                        "disjoint slice of the connection's pending documents, run in "
+                        "parallel. Also capped by the backlog itself (never more than "
+                        "ceil(pending / 2000) partitions). A live finding measured 7 "
+                        "connections running facts extraction in parallel at ~11,800 "
+                        "documents/hour, versus ~1,400/hour once merged into one connection "
+                        "(one lock, one job) — throughput scales with concurrent passes, not "
+                        "corpus size. 1 disables fan-out entirely."
                     ),
                 },
                 "transport": {

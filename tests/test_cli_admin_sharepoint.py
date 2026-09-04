@@ -1708,6 +1708,41 @@ class TestFmtFactsBacklogSuffix:
         assert "backlog, not running" not in rendered
 
 
+class TestFmtFactsThroughputSuffix:
+    """`_fmt_facts` — TCRD-296 gap #67's throughput/ETA suffix, additive
+    after the backlog suffix above."""
+
+    def test_a_single_partition_pass_adds_nothing(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {"docs_done": 5, "facts_passes_total": 1, "facts_passes_running": 1}
+        assert _fmt_facts(facts) == "5 (0 pending)"
+
+    def test_a_fanned_out_pass_reports_passes_throughput_and_eta(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {
+            "docs_done": None,
+            "facts_passes_total": 4,
+            "facts_passes_running": 3,
+            "facts_docs_per_hour": 1400.0,
+            "facts_eta_seconds": 3720,
+        }
+        rendered = _fmt_facts(facts)
+        assert "3/4 passes running" in rendered
+        assert "1,400.0 docs/h" in rendered
+        assert "ETA ~1h 2m" in rendered
+
+    def test_no_throughput_signal_yet_omits_the_docs_per_hour_and_eta(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {"docs_done": None, "facts_passes_total": 3, "facts_passes_running": 2}
+        rendered = _fmt_facts(facts)
+        assert "2/3 passes running" in rendered
+        assert "docs/h" not in rendered
+        assert "ETA" not in rendered
+
+
 class TestRuns:
     """`agnes admin sharepoint runs` — CLI counterpart to
     `GET /api/admin/sharepoint/extraction/runs`."""

@@ -152,6 +152,49 @@ def test_facts_pass_lock_releases_after_the_block(pg_env):
 
 
 # ---------------------------------------------------------------------------
+# Partitioned passes through the seam (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def test_facts_pass_lock_partitions_dispatch_to_postgres(pg_env):
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    with facts_pass_lock("conn-a", partition=(0, 3)):
+        with facts_pass_lock("conn-a", partition=(1, 3)):
+            pass  # distinct partitions never contend
+        with pytest.raises(FactsPassLocked):
+            with facts_pass_lock("conn-a", partition=(0, 3)):
+                pass  # same partition twice does
+
+
+def test_any_facts_pass_running_dispatches_to_postgres(pg_env):
+    from connectors.sharepoint.state_store import any_facts_pass_running, facts_pass_lock
+
+    assert any_facts_pass_running("conn-a") is False
+    with facts_pass_lock("conn-a", partition=(2, 5)):
+        assert any_facts_pass_running("conn-a") is True
+    assert any_facts_pass_running("conn-a") is False
+
+
+def test_merge_docs_through_the_seam_dispatches_to_postgres(pg_env):
+    from connectors.sharepoint.state_store import get as state_get
+    from connectors.sharepoint.state_store import merge_docs
+
+    merge_docs("facts", "conn-a", set_entries={"cf_1": {"status": "done"}}, removed=[])
+    merge_docs("facts", "conn-a", set_entries={"cf_2": {"status": "done"}}, removed=[])
+    docs = state_get("facts", "conn-a")["docs"]
+    assert docs == {"cf_1": {"status": "done"}, "cf_2": {"status": "done"}}
+
+
+def test_merge_docs_empty_call_never_touches_postgres(pg_env):
+    from connectors.sharepoint.state_store import get as state_get
+    from connectors.sharepoint.state_store import merge_docs
+
+    merge_docs("facts", "conn-never-touched", set_entries={}, removed=[])
+    assert state_get("facts", "conn-never-touched") is None
+
+
+# ---------------------------------------------------------------------------
 # End-to-end through the crawler's / facts_extraction's own load_state /
 # save_state — the actual call sites, not the seam directly.
 # ---------------------------------------------------------------------------

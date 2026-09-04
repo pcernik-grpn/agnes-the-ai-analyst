@@ -1146,3 +1146,62 @@ def test_a_plain_inline_run_reports_inline_mode_through_every_endpoint(tmp_path,
     row = next(r for r in fleet["connections"] if r["connection_id"] == conn_id)
     assert row["run"]["mode"] == "inline"
     assert row["run"]["shards"] is None
+
+
+# ---------------------------------------------------------------------------
+# Partitioned facts passes (TCRD-296 gap #67) — fleet/status additive fields
+# ---------------------------------------------------------------------------
+
+
+def test_status_reports_every_partition_job_and_throughput_eta(tmp_path, monkeypatch, pg_engine):
+    from datetime import timedelta
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-partitioned")
+
+    from src.repositories import facts_ingest_runs_repo, jobs_repo, source_connections_repo
+
+    source_connections_repo().update(conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_a"}]})
+
+    jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        {"connection_id": conn_id, "partition": {"index": 0, "count": 2}},
+        idempotency_key=f"sharepoint-facts-extraction:{conn_id}:0/2",
+    )
+    jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        {"connection_id": conn_id, "partition": {"index": 1, "count": 2}},
+        idempotency_key=f"sharepoint-facts-extraction:{conn_id}:1/2",
+    )
+    run_id = facts_ingest_runs_repo().create(
+        corpus_ids=["col_a"],
+        caller="scheduler@system.local",
+        documents_seen=20,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+    )
+    with pg_engine.begin() as conn:
+        import sqlalchemy as sa
+
+        from datetime import datetime, timezone
+
+        conn.execute(
+            sa.text("UPDATE facts_ingest_runs SET created_at = :ts WHERE id = :id"),
+            {"ts": datetime.now(timezone.utc) - timedelta(minutes=1), "id": run_id},
+        )
+
+    status = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert status["facts_passes_total"] == 2
+    assert status["facts_passes_running"] == 0
+    assert [j["partition_index"] for j in status["facts_jobs"]] == [0, 1]
+    assert status["facts_docs_per_hour"] == 120.0  # 20 documents in 10 minutes -> *6
+
+    fleet = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in fleet["connections"] if r["connection_id"] == conn_id)
+    assert row["facts"]["facts_passes_total"] == 2
+    assert len(row["facts"]["facts_jobs"]) == 2
+    assert row["facts"]["facts_docs_per_hour"] == 120.0

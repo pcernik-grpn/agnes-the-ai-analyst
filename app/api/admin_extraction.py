@@ -97,7 +97,7 @@ import os
 import threading
 import time
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -681,6 +681,15 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     # in this shape.
     "facts_pending_documents": None,
     "facts_pass_running": False,
+    # TCRD-296 gap #67 — every in-flight partition (or the single legacy
+    # job) of this connection's own pass, plus the throughput/ETA line
+    # ("3/4 passes running, 1,400 docs/h, ETA") the fleet view renders
+    # from it. See `_facts_jobs_in_flight`/`_facts_throughput_and_eta`.
+    "facts_jobs": [],
+    "facts_passes_running": 0,
+    "facts_passes_total": None,
+    "facts_docs_per_hour": None,
+    "facts_eta_seconds": None,
     # TCRD-296 synthesis F.25 — always overwritten by `_fleet_facts`'s own
     # final assignment; listed here purely so this dict documents the
     # complete shape of one row's `facts` object.
@@ -725,7 +734,11 @@ def _matching_provider_limit_condition(connection: Dict[str, Any]) -> Optional[D
 
 
 def _fleet_facts(
-    run: Optional[Dict[str, Any]], connection_id: str, *, provider_limit: Optional[Dict[str, Any]] = None
+    run: Optional[Dict[str, Any]],
+    connection_id: str,
+    *,
+    connection: Optional[Dict[str, Any]] = None,
+    provider_limit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The facts stage's own numbers for one connection's latest run — read
     off the SAME row the crawl side already reads, never a second
@@ -761,6 +774,18 @@ def _fleet_facts(
     here so a fleet page rendering N connections looks the active
     conditions up ONCE, not once per row. The source card renders it as
     "paused: provider limit".
+
+    ``facts_jobs``/``facts_passes_running``/``facts_passes_total``
+    (TCRD-296 gap #67) are the same "properties of the CONNECTION, not
+    the run" story as ``facts_pending_documents`` above, extended for a
+    fanned-out pass: every currently in-flight partition
+    (:func:`_facts_jobs_in_flight`), how many of them are actually
+    ``running`` right now, and the generation's total partition count
+    (``None`` when nothing is in flight — a finished/never-run connection
+    has no "total" to report). ``facts_docs_per_hour``/``facts_eta_seconds``
+    (:func:`_facts_throughput_and_eta`) need ``connection`` (the full row,
+    not just its id) to resolve its own collections — omitted (``None``
+    for both) when the caller has no connection dict handy.
     """
     out = dict(_EMPTY_FLEET_FACTS)
     if run:
@@ -789,8 +814,15 @@ def _fleet_facts(
         # The priced usage for JUST this stage — see `_run_total_cost_usd`
         # for why it is only known once the run has finished.
         out["usage"] = (run.get("usage") or {}).get("facts") or {}
-    out["facts_pending_documents"] = _facts_pending_documents(connection_id)
+    pending = _facts_pending_documents(connection_id)
+    out["facts_pending_documents"] = pending
     out["facts_pass_running"] = _facts_job_in_flight(connection_id) is not None
+    jobs = _facts_jobs_in_flight(connection_id)
+    out["facts_jobs"] = jobs
+    out["facts_passes_running"] = sum(1 for job in jobs if job["status"] == "running")
+    out["facts_passes_total"] = max((job["partition_count"] or 1 for job in jobs), default=None)
+    if connection is not None:
+        out.update(_facts_throughput_and_eta(connection, pending=pending))
     out["provider_limit"] = provider_limit
     return out
 
@@ -929,7 +961,9 @@ def fleet_extraction_runs(
         )
 
         effective_provider, _provider_source = resolve_effective_provider(connection)
-        facts = _fleet_facts(run, connection_id, provider_limit=conditions_by_provider.get(effective_provider))
+        facts = _fleet_facts(
+            run, connection_id, connection=connection, provider_limit=conditions_by_provider.get(effective_provider)
+        )
         cost = _run_total_cost_usd(run)
         backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
 
@@ -1177,6 +1211,98 @@ def _facts_pending_documents(connection_id: str) -> int:
     return count_pending_documents(connection_id)
 
 
+def _facts_jobs_in_flight(connection_id: str) -> List[Dict[str, Any]]:
+    """Every queued/running ``sharepoint-facts-extraction`` job for this
+    connection — ANY partition of a fanned-out pass (TCRD-296 gap #67), or
+    the single legacy job — each projected like :func:`_facts_job_in_flight`
+    plus ``partition_index``/``partition_count`` (both ``None`` for a
+    legacy, un-partitioned job). Sorted by partition index (legacy/``None``
+    first) so the fleet/status payload always lists partitions in order.
+
+    Matched by PAYLOAD (``connection_id``), not by a single idempotency
+    key — a partitioned pass mints a DIFFERENT key per partition, so
+    :func:`_facts_job_in_flight`'s exact-key lookup only ever finds ONE of
+    several live partitions. Same payload-scan pattern
+    ``connectors.sharepoint.crawler._standalone_facts_pass_in_flight``
+    already uses for the identical reason. ``_facts_job_in_flight`` itself
+    is left unchanged (still used for the existing, singular ``facts_job``
+    field) — this is an ADDITIVE reader, not a replacement.
+    """
+    from src.repositories import jobs_repo
+
+    repo = jobs_repo()
+    out: List[Dict[str, Any]] = []
+    for status in _FACTS_JOB_LIVE_STATUSES:
+        for job in repo.list(status=status, kind=_FACTS_JOB_KIND, limit=200):
+            payload = job.get("payload_json") or {}
+            if str(payload.get("connection_id")) != str(connection_id):
+                continue
+            partition = payload.get("partition") or {}
+            out.append(
+                {
+                    "id": job["id"],
+                    "status": job["status"],
+                    "created_at": _iso_or_none(job.get("created_at")),
+                    "started_at": _iso_or_none(job.get("started_at")),
+                    "partition_index": partition.get("index"),
+                    "partition_count": partition.get("count"),
+                }
+            )
+    out.sort(key=lambda j: (j["partition_index"] is None, j["partition_index"] or 0))
+    return out
+
+
+#: Trailing window (minutes) :func:`_facts_throughput_and_eta` sums
+#: ``facts_ingest_runs.documents_seen`` over — short enough that a fleet
+#: view reflects the CURRENT pace of a multi-partition pass (not a
+#: multi-hour average that would hide a stalled partition), long enough to
+#: smooth over one connection's own batch-flush cadence
+#: (``DEFAULT_BATCH_DOCUMENTS`` = 25 documents per flush).
+_FACTS_THROUGHPUT_WINDOW_MINUTES = 10
+
+
+def _facts_throughput_and_eta(connection: Dict[str, Any], *, pending: int) -> Dict[str, Optional[float]]:
+    """``{"facts_docs_per_hour", "facts_eta_seconds"}`` — the fleet view's
+    "3/4 passes running, 1,400 docs/h, ETA" line (TCRD-296 gap #67).
+
+    Throughput is documents ingested in the trailing
+    :data:`_FACTS_THROUGHPUT_WINDOW_MINUTES` minutes, summed across every
+    ``facts_ingest_runs`` row (any partition, any run) whose ``corpus_ids``
+    overlaps this connection's OWN collections
+    (``connectors.sharepoint.facts_extraction.collection_ids_for``) —
+    connection-scoped the same way ``_sharepoint_pipeline_cell`` already
+    resolves a connection's crawl/extract/facts counts, since a run report
+    itself carries no connection id (see
+    :meth:`~src.repositories.facts_ingest_runs_pg.FactsIngestRunsPgRepository
+    .documents_done_since`'s docstring). ``None`` for both fields when
+    there is no throughput signal yet — no recent run, an unresolvable
+    connection, or a DuckDB-backed instance (``facts_ingest_runs_repo()``
+    is PG-only, A3 ratchet) — never a fabricated ``0``/ETA. ``facts_eta_seconds``
+    is additionally ``None`` whenever ``pending`` is already ``0`` (nothing
+    left to estimate), even though throughput itself may still be
+    reported (a pass finishing its LAST few documents).
+
+    Best-effort: any failure resolving either number is swallowed and
+    answers "no signal" — this is observability, never load-bearing.
+    """
+    try:
+        from connectors.sharepoint.facts_extraction import collection_ids_for
+        from src.repositories import facts_ingest_runs_repo
+
+        corpus_ids = collection_ids_for(connection)
+        if not corpus_ids:
+            return {"facts_docs_per_hour": None, "facts_eta_seconds": None}
+        since = datetime.now(timezone.utc) - timedelta(minutes=_FACTS_THROUGHPUT_WINDOW_MINUTES)
+        documents = facts_ingest_runs_repo().documents_done_since(corpus_ids, since)
+    except Exception:  # noqa: BLE001 — observability, never load-bearing
+        return {"facts_docs_per_hour": None, "facts_eta_seconds": None}
+    if documents <= 0:
+        return {"facts_docs_per_hour": None, "facts_eta_seconds": None}
+    docs_per_hour = documents * (60.0 / _FACTS_THROUGHPUT_WINDOW_MINUTES)
+    eta_seconds = round((pending / docs_per_hour) * 3600.0) if pending > 0 else None
+    return {"facts_docs_per_hour": round(docs_per_hour, 1), "facts_eta_seconds": eta_seconds}
+
+
 @router.get("/connections/{connection_id}/extraction/status")
 async def extraction_status(
     connection_id: str,
@@ -1271,6 +1397,8 @@ async def extraction_status(
 
     backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
     facts_job = _facts_job_in_flight(connection_id)
+    facts_pending = _facts_pending_documents(connection_id)
+    facts_jobs = _facts_jobs_in_flight(connection_id)
     return {
         "connection_id": connection_id,
         "running": running_out,
@@ -1289,8 +1417,16 @@ async def extraction_status(
         # "pending · continuing" vs. "pending · not running" instead of
         # a silent gap. See `maybe_continue_pass` for the auto-chain that
         # normally keeps the second one true whenever the first is > 0.
-        "facts_pending_documents": _facts_pending_documents(connection_id),
+        "facts_pending_documents": facts_pending,
         "facts_pass_running": facts_job is not None,
+        # TCRD-296 gap #67 — every in-flight partition of a fanned-out
+        # pass (or the single legacy job), plus the throughput/ETA line
+        # the source card renders as "3/4 passes running, 1,400 docs/h,
+        # ETA ~40m". See `_facts_jobs_in_flight`/`_facts_throughput_and_eta`.
+        "facts_jobs": facts_jobs,
+        "facts_passes_running": sum(1 for job in facts_jobs if job["status"] == "running"),
+        "facts_passes_total": max((job["partition_count"] or 1 for job in facts_jobs), default=None),
+        **_facts_throughput_and_eta(connection, pending=facts_pending),
         # TCRD-296 synthesis F.25 — the active `provider_limit` condition
         # matching THIS connection's resolved facts provider, or `null`.
         # The source card renders it as "paused: provider limit" on the

@@ -181,7 +181,33 @@ function _extFactsPendingLine(status) {
   const continuing = !!status.facts_pass_running;
   const cls = continuing ? "" : " ext-warn";
   const state = continuing ? "continuing" : "not running";
-  return `<div class="ext-sub${cls}">${_extNum(n)} document${n === 1 ? "" : "s"} pending facts extraction · ${state}</div>`;
+  const throughput = _extFactsThroughputNote(status);
+  return `<div class="ext-sub${cls}">${_extNum(n)} document${n === 1 ? "" : "s"} pending facts extraction · ${state}${throughput}</div>`;
+}
+
+/* TCRD-296 gap #67 — "· 3/4 passes running, 1,400 docs/h, ETA ~40m",
+   appended to `_extFactsPendingLine` above. Empty string when nothing is
+   partitioned/measured yet, so a single-partition connection's line reads
+   exactly as it did before this feature existed. */
+function _extFactsEta(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  if (seconds < 60) return "<1m";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours > 0 ? `~${hours}h ${minutes}m` : `~${minutes}m`;
+}
+
+function _extFactsThroughputNote(status) {
+  const parts = [];
+  if (status.facts_passes_total !== null && status.facts_passes_total !== undefined && status.facts_passes_total > 1) {
+    parts.push(`${status.facts_passes_running || 0}/${status.facts_passes_total} passes running`);
+  }
+  if (status.facts_docs_per_hour !== null && status.facts_docs_per_hour !== undefined) {
+    parts.push(`${_extNum(status.facts_docs_per_hour)} docs/h`);
+  }
+  const eta = _extFactsEta(status.facts_eta_seconds);
+  if (eta !== null) parts.push(`ETA ${eta}`);
+  return parts.length ? ` · ${parts.join(", ")}` : "";
 }
 
 function _extRunLine(run) {

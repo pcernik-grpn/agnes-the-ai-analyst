@@ -1268,3 +1268,60 @@ class TestFactsJobInFlight:
             "idempotency key + kind — the two surfaces have drifted apart"
         )
         assert found["id"] == job["id"]
+
+
+class TestFactsJobsInFlight:
+    """``_facts_jobs_in_flight`` (TCRD-296 gap #67) — the PLURAL,
+    payload-scanning sibling of ``_facts_job_in_flight`` that finds every
+    partition of a fanned-out pass, not just the one matching a single
+    idempotency key."""
+
+    KIND = "sharepoint-facts-extraction"
+
+    @staticmethod
+    def _enqueue(connection_id: str, *, index: int, count: int):
+        from src.repositories import jobs_repo
+
+        return jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": connection_id, "partition": {"index": index, "count": count}},
+            idempotency_key=f"sharepoint-facts-extraction:{connection_id}:{index}/{count}",
+        )
+
+    def test_no_jobs_is_an_empty_list(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+
+        assert _facts_jobs_in_flight("sp-empty") == []
+
+    def test_every_partition_is_found_and_sorted_by_index(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+
+        self._enqueue("sp-fanout", index=2, count=3)
+        self._enqueue("sp-fanout", index=0, count=3)
+        self._enqueue("sp-fanout", index=1, count=3)
+
+        found = _facts_jobs_in_flight("sp-fanout")
+        assert [j["partition_index"] for j in found] == [0, 1, 2]
+        assert all(j["partition_count"] == 3 for j in found)
+        assert all(j["status"] == "queued" for j in found)
+
+    def test_a_legacy_un_partitioned_job_has_null_partition_fields(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": "sp-legacy"},
+            idempotency_key="sharepoint-facts-extraction:sp-legacy",
+        )
+        found = _facts_jobs_in_flight("sp-legacy")
+        assert len(found) == 1
+        assert found[0]["partition_index"] is None
+        assert found[0]["partition_count"] is None
+
+    def test_another_connections_partitions_are_not_this_ones(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+
+        self._enqueue("sp-other", index=0, count=2)
+        self._enqueue("sp-other", index=1, count=2)
+        assert _facts_jobs_in_flight("sp-mine") == []

@@ -490,6 +490,69 @@ are still pending and whether a pass is currently chasing them ("N pending
 · continuing" vs. "N pending · not running") — the second phrase is the
 one that means an operator should intervene.
 
+### Parallel passes (TCRD-296 gap #67)
+
+A facts pass used to take ONE advisory lock per CONNECTION — fine for
+several small connections, but a live incident merged seven parallel
+SharePoint connections into one and watched throughput fall from ~11,800
+documents/hour (seven passes in parallel) to ~1,400/hour (one lock, one
+pass): a 62k-document backlog went from a manageable few hours to a ~45-hour
+crawl.
+
+**A trigger now fans out into several PARTITIONS of one connection's own
+pass**, instead of requiring several connections to get parallelism. Every
+trigger surface — the source card's **Extract facts now** / `POST
+…/facts-extract` / `agnes admin sharepoint facts-extract`, the crawl's own
+streamed enqueue (`extraction.facts.stream_every`), and a timed-out
+generation's self-continuation — goes through the same fan-out
+(`connectors.sharepoint.facts_extraction.enqueue_facts_extraction_passes`):
+
+- **Count.** `min(extraction.facts.concurrency_passes` (default 4, `/admin/
+  server-config` → Extraction → Facts, `agnes admin server-config`),
+  `ceil(pending_documents / 2000))` — never more partitions than the
+  backlog actually justifies, and never fewer than the config ceiling
+  allows. A backlog small enough to resolve to 1 enqueues exactly today's
+  single job, same idempotency key, same payload shape — nothing about a
+  connection with a modest backlog changes.
+- **Assignment.** Each partition owns a STABLE, disjoint slice of the
+  connection's documents — `hash(corpus_file_id) % count` — so re-running
+  the same `count` later reproduces the identical split, and every document
+  is planned by exactly one partition, never zero or two.
+- **Jobs and locks.** Each partition is its OWN `sharepoint-facts-extraction`
+  job (payload gains `{"partition": {"index", "count"}}`, idempotency key
+  `sharepoint-facts-extraction:{connection_id}:{index}/{count}`) — its own
+  worker-lane slot, its own non-blocking lock, so distinct partitions of the
+  SAME connection never contend with each other, and two identical
+  fan-outs still dedupe cleanly (a second trigger with the same backlog is
+  a no-op, same as before). A partitioned run also forces the sync
+  transport regardless of `extraction.facts.transport` — the Batches API's
+  resume scan is not yet partition-safe.
+- **Ledger.** The shared per-document state
+  (`sharepoint_connection_state`, `kind='facts'`) is written with a
+  per-document Postgres `jsonb` MERGE
+  (`connectors.sharepoint.state_store.merge_docs`) instead of a
+  whole-payload overwrite, so two partitions persisting DIFFERENT documents
+  at the same time never clobber each other's progress — the bug a naive
+  "just enqueue several jobs" fix would have reproduced.
+- **Once-per-connection bookkeeping.** The end-of-pass orphan sweep
+  (#2220) and the decision whether to plan the NEXT generation
+  (self-continuation, above) both run exactly once PER CONNECTION — on
+  whichever partition happens to finish last, mirroring the automatic
+  parallel crawl's "the last child finalizes the parent" rule — never once
+  per partition.
+- **`facts reset --no-claims` refuses while ANY partition is running**, not
+  just a single whole-connection lock — the same `409
+  facts_extraction_running` an operator already sees today, now covering
+  every partition.
+
+**Where it surfaces.** The source card's facts line, the `/admin/
+extraction` fleet table, and `agnes admin sharepoint runs` all gain an
+additive throughput line once more than one partition is involved — "3/4
+passes running, 1,400 docs/h, ETA ~40m" — computed from documents ingested
+in the trailing 10 minutes (`facts_ingest_runs`) for the connection's own
+collections. A connection whose backlog never needs more than one partition
+shows nothing extra.
+
 ### Provider limits (TCRD-296 synthesis F.25)
 
 A live incident hit two shapes of "the provider will refuse EVERY call, not

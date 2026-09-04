@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -318,3 +319,37 @@ class FactsIngestRunsPgRepository:
                 "from the rate card)"
             ),
         }
+
+    def documents_done_since(self, corpus_ids: Sequence[str], since: datetime) -> int:
+        """``sum(documents_seen)`` across every run report persisted at or
+        after ``since`` whose ``corpus_ids`` OVERLAPS ``corpus_ids`` — the
+        fleet/status throughput signal for a SharePoint connection's own
+        facts pass (TCRD-296 gap #67, ``app/api/admin_extraction.py::
+        _facts_throughput_and_eta``: "documents done in the last N minutes
+        for the connection's collections").
+
+        Connection-scoped by OVERLAP, not equality: a run report's
+        ``corpus_ids`` is whatever collections that ONE batch actually
+        touched (typically all of a connection's own, but not guaranteed
+        — see :meth:`create`'s docstring). ``jsonb_array_elements_text`` +
+        ``= ANY(:corpus_ids)`` is exactly "did this run touch at least one
+        of THIS connection's own collections" without decoding the column
+        in Python — deliberately not the ``?|`` "any key" jsonb operator,
+        whose bare ``?`` collides with this driver's bind-parameter style.
+        Empty ``corpus_ids`` answers ``0`` without a query — nothing to
+        overlap.
+        """
+        if not corpus_ids:
+            return 0
+        with self._engine.connect() as conn:
+            total = conn.execute(
+                sa.text(
+                    "SELECT COALESCE(SUM(documents_seen), 0) FROM facts_ingest_runs "
+                    "WHERE created_at >= :since AND EXISTS ("
+                    "  SELECT 1 FROM jsonb_array_elements_text(corpus_ids) AS cid "
+                    "  WHERE cid = ANY(:corpus_ids)"
+                    ")"
+                ),
+                {"since": since, "corpus_ids": list(corpus_ids)},
+            ).scalar()
+        return int(total or 0)
