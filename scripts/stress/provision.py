@@ -17,24 +17,26 @@ Service accounts rather than real users because:
     Admin (``user_group_members(_pg).add_member``), so a leaked load-test
     PAT is bounded by the grant this script wrote and nothing else.
 
-Minting a PAT is admin AND session-token-only, so ``--admin-token`` must be
-an interactive session JWT (a browser cookie), never another PAT.
+Minting a PAT is admin AND session-token-only, so the admin token must be an
+interactive session JWT (a browser cookie), never another PAT. It is read from
+``$AGNES_ADMIN_TOKEN`` or ``--admin-token-file`` and never accepted as a
+command-line value — argv is world-readable while the process runs.
 
 The state file holds raw PATs. It is written 0600 and its contents are
 never echoed; pass it to the runner by path.
 
 Usage::
 
+    export AGNES_ADMIN_TOKEN="$(cat /path/to/token)"
+
     python scripts/stress/provision.py create \\
-        --base-url https://host --admin-token "$TOK" \\
-        --count 20 --state /path/to/identities.json
+        --base-url https://host --count 20 --state /path/to/identities.json
 
     python scripts/stress/provision.py teardown \\
-        --base-url https://host --admin-token "$TOK" \\
-        --state /path/to/identities.json
+        --base-url https://host --state /path/to/identities.json
 
     python scripts/stress/provision.py verify \\
-        --base-url https://host --admin-token "$TOK" --prefix loadbot
+        --base-url https://host --prefix loadbot
 """
 
 from __future__ import annotations
@@ -89,6 +91,11 @@ class ProvisionState:
     group_id: str
     grant_ids: list[str]
     identities: list[Identity]
+    #: Whether THIS run created the group, as opposed to adopting one that
+    #: already existed. Teardown purges only what it made: a name collision
+    #: with an operator's own group would otherwise delete that group and
+    #: every membership and grant on it.
+    group_created: bool = False
     #: Which door produced these identities. Teardown differs — a service
     #: account is deactivated through the service-account resource, a user
     #: through the users resource — so the state file must remember which
@@ -101,6 +108,7 @@ class ProvisionState:
             "group_name": self.group_name,
             "group_id": self.group_id,
             "grant_ids": self.grant_ids,
+            "group_created": self.group_created,
             "identity_kind": self.identity_kind,
             "identities": [asdict(i) for i in self.identities],
         }
@@ -112,6 +120,10 @@ class ProvisionState:
             group_name=raw["group_name"],
             group_id=raw["group_id"],
             grant_ids=list(raw.get("grant_ids") or []),
+            # Absent in a state file written before this field existed. False
+            # is the safe default: refuse to delete a group we cannot prove
+            # we made.
+            group_created=bool(raw.get("group_created", False)),
             identity_kind=str(raw.get("identity_kind") or "service-account"),
             identities=[Identity(**i) for i in raw["identities"]],
         )
@@ -210,11 +222,17 @@ def _find_group(api: AdminApi, name: str) -> Optional[dict]:
     return None
 
 
-def ensure_group(api: AdminApi, name: str) -> str:
+def ensure_group(api: AdminApi, name: str) -> tuple[str, bool]:
+    """Return ``(group_id, created_by_this_run)``.
+
+    The second element is what teardown consults before deleting anything:
+    reusing a group by name is convenient across a ramp, but it means the
+    id in the state file may belong to somebody else's group.
+    """
     existing = _find_group(api, name)
     if existing:
-        print(f"[group] reusing {name!r} ({existing['id']})", file=sys.stderr)
-        return str(existing["id"])
+        print(f"[group] reusing {name!r} ({existing['id']}) — will NOT be purged", file=sys.stderr)
+        return str(existing["id"]), False
     created = api.expect(
         "POST",
         "/api/admin/groups",
@@ -222,7 +240,7 @@ def ensure_group(api: AdminApi, name: str) -> str:
         ok=(201,),
     )
     print(f"[group] created {name!r} ({created['id']})", file=sys.stderr)
-    return str(created["id"])
+    return str(created["id"]), True
 
 
 def ensure_grants(api: AdminApi, group_id: str, grants: list[str]) -> list[str]:
@@ -261,6 +279,7 @@ def create_identity(
     prefix: str,
     group_id: str,
     token_ttl_days: Optional[int],
+    staged: Optional[list] = None,
 ) -> Identity:
     slug = f"{prefix}-{idx:02d}"
     status, body = api.request(
@@ -293,6 +312,9 @@ def create_identity(
 
     account_id = str(account["id"])
     email = str(account["email"])
+    # See the note in create_user_identity: staged before it can hold a PAT.
+    if staged is not None:
+        staged.append(Identity(idx=idx, slug=slug, account_id=account_id, email=email, token=""))
 
     member_status, member_body = api.request(
         "POST", f"/api/admin/groups/{group_id}/members", json_body={"email": email}
@@ -317,7 +339,10 @@ def create_identity(
     if mint_status != 201:
         raise SystemExit(f"mint token for {slug} -> {mint_status}: {json.dumps(mint_body)[:400]}")
 
-    return Identity(idx=idx, slug=slug, account_id=account_id, email=email, token=str(mint_body["token"]))
+    identity = Identity(idx=idx, slug=slug, account_id=account_id, email=email, token=str(mint_body["token"]))
+    if staged is not None:
+        staged[-1] = identity
+    return identity
 
 
 def create_user_identity(
@@ -329,6 +354,7 @@ def create_user_identity(
     email_domain: str,
     token_ttl_days: Optional[int],
     pacer: LoginPacer,
+    staged: Optional[list] = None,
 ) -> Identity:
     """Fallback for a build with no service-account route: an ordinary user.
 
@@ -364,6 +390,14 @@ def create_user_identity(
     else:
         raise SystemExit(f"POST /api/users -> {status}: {json.dumps(body)[:400]}")
 
+    # Stage the account BEFORE it can hold a credential. Everything after this
+    # point can fail — or succeed server-side with its response lost — and the
+    # account would still exist. An account missing from the state file is one
+    # teardown cannot revoke, which is the only failure here with a lasting
+    # consequence. The token is filled in below once it exists.
+    if staged is not None:
+        staged.append(Identity(idx=idx, slug=slug, account_id=user_id, email=email, token=""))
+
     password = secrets.token_urlsafe(32)
     pw_status, pw_body = api.request("POST", f"/api/users/{user_id}/set-password", json_body={"password": password})
     if pw_status not in (200, 204):
@@ -392,7 +426,10 @@ def create_user_identity(
     if mint_status != 201:
         raise SystemExit(f"mint PAT for {email} -> {mint_status}: {json.dumps(mint_body)[:300]}")
 
-    return Identity(idx=idx, slug=slug, account_id=user_id, email=email, token=str(mint_body["token"]))
+    identity = Identity(idx=idx, slug=slug, account_id=user_id, email=email, token=str(mint_body["token"]))
+    if staged is not None:
+        staged[-1] = identity
+    return identity
 
 
 def cmd_create(args: argparse.Namespace) -> int:
@@ -416,9 +453,13 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     with AdminApi(args.base_url, args.admin_token) as api:
         preflight(api)
-        group_id = ensure_group(api, args.group)
+        group_id, group_created = ensure_group(api, args.group)
         grant_ids = ensure_grants(api, group_id, args.grant)
 
+        # `identities` is the SAME list the state file is written from, and
+        # each create appends its account to it before minting, so the
+        # `finally` below persists a half-provisioned account rather than
+        # losing it.
         identities: list[Identity] = []
         state = ProvisionState(
             base_url=args.base_url.rstrip("/"),
@@ -426,6 +467,7 @@ def cmd_create(args: argparse.Namespace) -> int:
             group_id=group_id,
             grant_ids=grant_ids,
             identities=identities,
+            group_created=group_created,
             identity_kind=args.identity_kind,
         )
         pacer = LoginPacer()
@@ -440,6 +482,7 @@ def cmd_create(args: argparse.Namespace) -> int:
                         email_domain=args.email_domain,
                         token_ttl_days=args.token_ttl_days,
                         pacer=pacer,
+                        staged=identities,
                     )
                 else:
                     ident = create_identity(
@@ -448,8 +491,8 @@ def cmd_create(args: argparse.Namespace) -> int:
                         prefix=args.prefix,
                         group_id=group_id,
                         token_ttl_days=args.token_ttl_days,
+                        staged=identities,
                     )
-                identities.append(ident)
                 print(f"[identity] {idx}/{args.count} ready ({ident.email})", file=sys.stderr)
         finally:
             # Always persist what exists so a crash mid-loop is still
@@ -464,6 +507,10 @@ def cmd_create(args: argparse.Namespace) -> int:
 def _write_state(path: Path, state: ProvisionState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The mode argument only applies when open() CREATES the file. Overwriting
+    # an existing --force target keeps whatever mode it had, so a 0644 file
+    # would receive raw PATs and stay world-readable.
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as fh:
         json.dump(state.to_json(), fh, indent=2)
 
@@ -509,7 +556,13 @@ def cmd_teardown(args: argparse.Namespace) -> int:
                 else:
                     print(f"[teardown] {ident.slug} deleted", file=sys.stderr)
 
-        if args.purge_group:
+        if args.purge_group and not state.group_created:
+            print(
+                f"[teardown] group {state.group_name} was adopted, not created by this run — "
+                "leaving it and its grants alone",
+                file=sys.stderr,
+            )
+        elif args.purge_group:
             for grant_id in state.grant_ids:
                 status, _ = api.request("DELETE", f"/api/admin/grants/{grant_id}")
                 if status not in (204, 404):
@@ -566,10 +619,25 @@ def cmd_verify(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _admin_token(value: Optional[str]) -> str:
-    token = value or os.environ.get("AGNES_ADMIN_TOKEN", "")
+def _admin_token(token_file: Optional[str]) -> str:
+    """Read the admin session JWT from a file or the environment.
+
+    Never from argv. A value on the command line is recorded in shell
+    history and readable in `ps` by every process on the machine for as
+    long as the call runs, and this credential is an interactive session
+    token — the one thing that can mint durable ones.
+    """
+    if token_file:
+        token = Path(token_file).read_text().strip()
+        if not token:
+            raise SystemExit(f"{token_file} is empty")
+        return token
+    token = os.environ.get("AGNES_ADMIN_TOKEN", "").strip()
     if not token:
-        raise SystemExit("no admin token — pass --admin-token or set AGNES_ADMIN_TOKEN")
+        raise SystemExit(
+            "no admin token — set AGNES_ADMIN_TOKEN, or pass --admin-token-file <path>. "
+            "It is deliberately not accepted as a command-line value."
+        )
     return token
 
 
@@ -579,7 +647,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(sp: argparse.ArgumentParser, *, base_required: bool = True) -> None:
         sp.add_argument("--base-url", required=base_required, help="https://host of the instance")
-        sp.add_argument("--admin-token", default=None, help="interactive session JWT (or $AGNES_ADMIN_TOKEN)")
+        # Deliberately NOT a --admin-token value flag: an argument lands in
+        # shell history and in every process listing on the host, and the
+        # repository's security rules forbid secrets on argv. The token
+        # arrives by environment or by file path.
+        sp.add_argument(
+            "--admin-token-file",
+            default=None,
+            help="file holding the interactive session JWT; or set $AGNES_ADMIN_TOKEN",
+        )
         sp.add_argument("--prefix", default=DEFAULT_PREFIX, help="identity slug prefix")
 
     c = sub.add_parser("create", help="create N identities + group + grants")
@@ -627,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    args.admin_token = _admin_token(args.admin_token)
+    args.admin_token = _admin_token(args.admin_token_file)
     if getattr(args, "grant", None) is None and args.cmd == "create":
         args.grant = [DEFAULT_GRANT]
     return int(args.func(args))

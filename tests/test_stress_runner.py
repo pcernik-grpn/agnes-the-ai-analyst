@@ -94,8 +94,12 @@ def _build_stub(behavior: dict) -> FastAPI:
                 await asyncio.sleep(READY_DELAY_S)
                 stamp_id = behavior.get("wrong_chat_id") or chat_id
                 await ws.send_json(_stamp(stamp_id, {"type": "ready"}))
+                if behavior.get("silent_after_ready"):
+                    continue  # ready, then nothing — the shape of a stalled turn
                 if behavior.get("emit_error"):
                     await ws.send_json(_stamp(chat_id, {"type": "error", "kind": "boom", "message": "nope"}))
+                    if behavior.get("no_done_after_error"):
+                        continue  # a refusal that leaves the socket attached
                     await ws.send_json(_stamp(chat_id, {"type": "done"}))
                     continue
                 # A real runner does not start working the instant the
@@ -169,12 +173,12 @@ def _write_journey(tmp_path: Path, *, idle_seconds: float = 0.2) -> Path:
     return path
 
 
-def _write_identities(tmp_path: Path, count: int) -> Path:
+def _write_identities(tmp_path: Path, count: int, base_url: str = "http://stub") -> Path:
     path = tmp_path / "identities.json"
     path.write_text(
         json.dumps(
             {
-                "base_url": "http://stub",
+                "base_url": base_url,
                 "group_name": "loadtest",
                 "group_id": "g1",
                 "grant_ids": [],
@@ -199,7 +203,7 @@ def _args(
 ) -> argparse.Namespace:
     return argparse.Namespace(
         base_url=base_url,
-        identities=str(_write_identities(tmp_path, users)),
+        identities=str(_write_identities(tmp_path, users, base_url)),
         journey=str(journey),
         users=users,
         stagger=0.0,
@@ -207,6 +211,7 @@ def _args(
         run_id="test",
         step_label="stub",
         abort_file=abort_file,
+        allow_host_mismatch=False,
         verbose=False,
         dry_run=False,
     )
@@ -386,6 +391,7 @@ def test_dry_run_validates_without_touching_the_network(tmp_path, capsys):
             "http://unreachable.invalid",
             "--identities",
             str(identities),
+            "--allow-host-mismatch",
             "--journey",
             str(journey),
             "--users",
@@ -407,6 +413,7 @@ def test_dry_run_refuses_more_users_than_identities(tmp_path):
                 "http://unreachable.invalid",
                 "--identities",
                 str(_write_identities(tmp_path, 2)),
+                "--allow-host-mismatch",
                 "--journey",
                 str(_write_journey(tmp_path)),
                 "--users",
@@ -488,3 +495,107 @@ def test_a_failed_turn_makes_the_journey_not_completed(stub_server, tmp_path):
         assert "phase(s) failed" in o["error"]
     # The journey still ran to the end — every phase is on disk.
     assert {r["phase"] for r in _rows(tmp_path)} >= {"turn_resumed", "close"}
+
+
+# ---------------------------------------------------------------------------
+# Review findings (PR #2243) — each of these is a defect that shipped once
+# ---------------------------------------------------------------------------
+
+
+def test_tokens_are_not_sent_to_a_host_they_were_not_minted_for(stub_server, tmp_path):
+    """A stale or mistyped --base-url must not disclose every PAT.
+
+    The state file records the instance the tokens belong to; without this
+    check a wrong host receives all of them and the run merely fails.
+    """
+    base_url, _ = stub_server
+    args = _args(base_url, tmp_path, users=1, journey=_write_journey(tmp_path))
+    _write_identities(tmp_path, 1, base_url="https://somewhere-else.example")
+
+    with pytest.raises(SystemExit, match="Refusing to send them there"):
+        asyncio.run(run_step(args))
+
+
+def test_the_host_check_can_be_overridden_deliberately(stub_server, tmp_path):
+    base_url, _ = stub_server
+    args = _args(base_url, tmp_path, users=1, journey=_write_journey(tmp_path))
+    _write_identities(tmp_path, 1, base_url="https://somewhere-else.example")
+    args.allow_host_mismatch = True
+
+    assert asyncio.run(run_step(args)) == 0
+
+
+def test_a_partially_provisioned_identity_is_refused(stub_server, tmp_path):
+    """An identity with no token means provisioning died mid-flight."""
+    base_url, _ = stub_server
+    args = _args(base_url, tmp_path, users=2, journey=_write_journey(tmp_path))
+    path = tmp_path / "identities.json"
+    raw = json.loads(path.read_text())
+    raw["identities"][1]["token"] = ""
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(SystemExit, match="no token"):
+        asyncio.run(run_step(args))
+
+
+def test_an_existing_output_file_is_refused(stub_server, tmp_path):
+    """Appending would leave the rows and the manifest describing different runs."""
+    base_url, _ = stub_server
+    args = _args(base_url, tmp_path, users=1, journey=_write_journey(tmp_path))
+    Path(args.out).write_text('{"from": "an earlier run"}\n')
+
+    with pytest.raises(SystemExit, match="already exists"):
+        asyncio.run(run_step(args))
+
+
+def test_a_silent_stream_trips_the_first_token_budget_not_the_turn_budget(stub_server, tmp_path):
+    """The nearest live deadline wins.
+
+    A stream that goes quiet before any prose must be reported against the
+    budget it actually blew. Waiting on the whole-turn deadline instead
+    mislabels it and hides which limit was reached.
+    """
+    base_url, behavior = stub_server
+    behavior["silent_after_ready"] = True
+    args = _args(base_url, tmp_path, users=1, journey=_write_journey(tmp_path))
+
+    from scripts.stress import runner as runner_mod
+
+    original = dict(runner_mod.DEFAULT_TIMEOUTS)
+    runner_mod.DEFAULT_TIMEOUTS.update({"first_token": 1.0, "turn_done": 30.0})
+    try:
+        asyncio.run(run_step(args))
+    finally:
+        runner_mod.DEFAULT_TIMEOUTS.update(original)
+
+    cold = next(r for r in _rows(tmp_path) if r["phase"] == "turn_cold")
+    assert cold["error"] == "first_token_timeout"
+    # It tripped on the 1 s budget, not by sitting out the 30 s one.
+    assert cold["done_ms"] < 10_000
+
+
+def test_a_server_error_frame_survives_a_later_timeout(stub_server, tmp_path):
+    """The server's own reason outranks our stopwatch.
+
+    Some refusals broadcast an `error` and deliberately leave the socket
+    attached with no `done` to follow. Letting the turn budget overwrite the
+    classification would replace why the server refused with the fact that we
+    stopped waiting.
+    """
+    base_url, behavior = stub_server
+    behavior["emit_error"] = True
+    behavior["no_done_after_error"] = True
+    args = _args(base_url, tmp_path, users=1, journey=_write_journey(tmp_path))
+
+    from scripts.stress import runner as runner_mod
+
+    original = dict(runner_mod.DEFAULT_TIMEOUTS)
+    runner_mod.DEFAULT_TIMEOUTS.update({"first_token": 1.0, "turn_done": 3.0})
+    try:
+        asyncio.run(run_step(args))
+    finally:
+        runner_mod.DEFAULT_TIMEOUTS.update(original)
+
+    cold = next(r for r in _rows(tmp_path) if r["phase"] == "turn_cold")
+    assert cold["error"] == "frame_error"
+    assert "boom" in cold["detail"]

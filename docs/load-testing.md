@@ -40,13 +40,17 @@ hold an interactive session, they can never join Admin, and deactivating one rev
 every PAT it holds in a single call.
 
 ```bash
+export AGNES_ADMIN_TOKEN="$(cat /path/to/token)"
+
 python scripts/stress/provision.py create \
-    --base-url https://<host> --admin-token "$TOK" \
-    --count 20 --state /path/identities.json
+    --base-url https://<host> --count 20 --state /path/identities.json
 ```
 
-`--admin-token` must be an **interactive session JWT** (the browser's `access_token`
-cookie), not a PAT: minting a durable credential is session-token-only by design.
+The admin token must be an **interactive session JWT** (the browser's `access_token`
+cookie), not a PAT: minting a durable credential is session-token-only by design. It is
+read from `$AGNES_ADMIN_TOKEN` or `--admin-token-file` and is **deliberately not
+accepted as a command-line value** — argv is readable by every process on the host for
+as long as the call runs, and this is the one credential that can mint others.
 
 On a build without the service-account route, `--identity-kind user` creates ordinary
 password users instead. Read the trade-off before using it: these accounts *can* sign in.
@@ -68,12 +72,16 @@ explicit, revocable membership set, **not** a boundary. Which means:
 
 ```bash
 python scripts/stress/provision.py teardown \
-    --base-url https://<host> --admin-token "$TOK" \
-    --state /path/identities.json --purge-identities --purge-group
+    --base-url https://<host> --state /path/identities.json \
+    --purge-identities --purge-group
 
 python scripts/stress/provision.py verify \
-    --base-url https://<host> --admin-token "$TOK" --identity-kind user
+    --base-url https://<host> --identity-kind user
 ```
+
+`--purge-group` deletes the group **only if this run created it**. A group adopted by
+name is left alone, grants and all: reusing one across a ramp is convenient, but the id
+in the state file may belong to somebody else.
 
 `verify` re-reads the server's own listing rather than the state file, so it also catches
 an identity an interrupted earlier run left behind.
@@ -128,6 +136,12 @@ window — use that window to scope dashboard queries to the wave.
 
 ### Reading the results
 
+- **The output file must not already exist.** The manifest summarises only the rows the
+  current invocation produced, so appending to a previous run would leave the data and
+  its summary describing different things, with nothing in either saying so.
+- **The tokens are bound to the host they were minted for.** A state file naming a
+  different instance is refused rather than presented to it (`--allow-host-mismatch`
+  overrides, deliberately awkwardly).
 - **A journey that reached its last step is not a success.** A failed turn is recorded
   and the journey walks on, so `outcomes[].completed` is false whenever any phase
   errored. Check `summary.errors`, never the wall clock alone.
@@ -166,8 +180,12 @@ that takes a remote command last), so the deployment's coordinates stay in your 
 out of this repo. `--service` is repeatable — **watch every service that can hold the
 evidence.** An agent-engine failure is stated in the engine's log, not the app's.
 
-The streams reconnect on their own. A tunnel that drops mid-wave takes the rest of that
-wave's record with it otherwise, and it will drop.
+The streams reconnect on their own, resuming the log from the last timestamp received
+rather than from the live tail — the gap during a disconnect is exactly where a
+saturation event hides. A tunnel that drops mid-wave otherwise takes the rest of that
+wave's record with it, and it will drop. If a stream cannot be reopened at all, the
+watcher says so loudly and exits non-zero: a run whose capture died must not be
+mistaken for a clean one.
 
 ### The abort
 

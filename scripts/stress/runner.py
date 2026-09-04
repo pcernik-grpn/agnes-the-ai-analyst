@@ -58,8 +58,8 @@ except ImportError:  # pragma: no cover — websockets rides in via uvicorn[stan
 # Timeouts
 # ---------------------------------------------------------------------------
 
-# Sized off Adam's Hobby-tier baseline (first token p50 ~16.5 s, whole turn
-# 19-22 s) with room for the degradation the run exists to find: a timeout
+# Sized off an observed single-user baseline (first token p50 ~16 s, whole
+# turn ~20 s) with room for the degradation the run exists to find: a timeout
 # that fires before the server gives up turns a slow answer into a missing
 # data point, which is the one outcome that teaches nothing.
 DEFAULT_TIMEOUTS = {
@@ -184,8 +184,19 @@ class Recorder:
     _fh: Any = None
 
     def open(self) -> None:
+        """Create the output file, refusing to append to an existing one.
+
+        The manifest summarises only the rows THIS invocation produced, so
+        appending to a previous run's file leaves the data and its summary
+        describing different things — with nothing in either saying so.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = self.path.open("a")
+        if self.path.exists():
+            raise SystemExit(
+                f"{self.path} already exists. Its manifest would describe only the new rows "
+                "while the file held both runs — pick a new --out."
+            )
+        self._fh = self.path.open("x")
 
     def close(self) -> None:
         if self._fh:
@@ -444,15 +455,33 @@ async def _do_turn(ctx: UserContext, step: Step) -> None:
     chars = 0
     seqs: list[int] = []
     error: Optional[str] = None
+    error_is_final = False
     detail: Optional[str] = None
     deadline_first = ctx.timeouts["first_token"]
     deadline_done = ctx.timeouts["turn_done"]
+    deadline_done_default = deadline_done
+    waiting_on: tuple[str, float] = ("turn_timeout", deadline_done_default)
 
     try:
         while True:
-            remaining = deadline_done - (time.monotonic() - t0)
+            elapsed_s = time.monotonic() - t0
+            # Wait on the NEAREST live deadline, not always the whole-turn one.
+            # A stream that goes silent before any prose must trip the
+            # first-token budget at 240 s; blocking on the 420 s budget
+            # instead mislabels it a turn_timeout and hides which budget the
+            # server actually blew.
+            deadlines = [(deadline_done - elapsed_s, "turn_timeout", deadline_done)]
+            if first_token_ms is None:
+                deadlines.append((deadline_first - elapsed_s, "first_token_timeout", deadline_first))
+            remaining, kind, budget = min(deadlines)
+            # Remembered for the except handler below: `wait_for` is what
+            # actually raises, and it does not know which budget it was
+            # counting down. Classifying there from a fixed name is how the
+            # first-token budget got reported as a turn timeout.
+            waiting_on = (kind, budget)
             if remaining <= 0:
-                error, detail = "turn_timeout", f"no done frame within {deadline_done}s"
+                if not error_is_final:
+                    error, detail = _timeout_reason(kind, budget)
                 break
             raw = await asyncio.wait_for(ctx.ws.recv(), timeout=remaining)
             if isinstance(raw, bytes):
@@ -488,20 +517,26 @@ async def _do_turn(ctx: UserContext, step: Step) -> None:
                     first_token_ms = elapsed
                 chars = max(chars, len(frame.get("content") or ""))
             elif ftype == "error":
+                # The server has stated why the turn failed. Keep waiting for
+                # `done` so the transcript is complete, but this classification
+                # is final: some refusals (sender limits) broadcast an error and
+                # deliberately leave the socket attached with no `done` to
+                # follow, and letting the later timeout overwrite this would
+                # replace the server's own reason with our stopwatch's.
                 error = "frame_error"
+                error_is_final = True
                 detail = json.dumps({k: frame.get(k) for k in ("kind", "message")})[:300]
             elif ftype == "done":
                 break
 
-            if first_token_ms is None and elapsed / 1000 > deadline_first:
-                error, detail = "first_token_timeout", f"no token within {deadline_first}s"
-                break
     except CrossTalk:
         raise
     except asyncio.TimeoutError:
-        error, detail = "turn_timeout", f"recv timed out after {deadline_done}s"
+        if not error_is_final:
+            error, detail = _timeout_reason(*waiting_on)
     except Exception as exc:
-        error, detail = "stream_broken", repr(exc)[:300]
+        if not error_is_final:
+            error, detail = "stream_broken", repr(exc)[:300]
 
     done_ms = (time.monotonic() - t0) * 1000
     if error is None and frames and first_token_ms is None:
@@ -524,6 +559,12 @@ async def _do_turn(ctx: UserContext, step: Step) -> None:
         f"{step.phase} activity={row['first_activity_ms']} ttft={row['first_token_ms']} "
         f"done={row['done_ms']} tools={tool_calls} {row.get('error') or 'ok'}"
     )
+
+
+def _timeout_reason(kind: str, budget: float) -> tuple[str, str]:
+    """Name the budget that ran out, so the row says which limit was reached."""
+    what = "token" if kind.startswith("first") else "done frame"
+    return kind, f"no {what} within {budget}s"
 
 
 def _seq_gap(seqs: list[int]) -> Optional[int]:
@@ -616,11 +657,36 @@ async def run_user(ctx: UserContext, journey: Journey, start_delay: float) -> di
 # ---------------------------------------------------------------------------
 
 
-def _load_identities(path: Path, count: int) -> list[dict]:
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/").lower()
+
+
+def _load_identities(path: Path, count: int, base_url: str, *, allow_host_mismatch: bool = False) -> list[dict]:
+    """Load N identities, refusing to send their PATs to the wrong host.
+
+    The state file records the instance the tokens were minted against.
+    Nothing else stops a mistyped or stale ``--base-url`` from presenting
+    every one of them to a different server, which is a credential
+    disclosure and not a failed run.
+    """
     raw = json.loads(path.read_text())
+    minted_for = str(raw.get("base_url") or "")
+    if minted_for and _origin(minted_for) != _origin(base_url) and not allow_host_mismatch:
+        raise SystemExit(
+            f"{path} holds tokens minted for {_origin(minted_for)}, but --base-url is "
+            f"{_origin(base_url)}. Refusing to send them there. Pass --allow-host-mismatch "
+            "only if you are certain the same credentials are valid on both."
+        )
     identities = raw["identities"]
     if len(identities) < count:
         raise SystemExit(f"{path} holds {len(identities)} identities, --users asks for {count}")
+    missing = [i["slug"] for i in identities[:count] if not i.get("token")]
+    if missing:
+        raise SystemExit(
+            f"{path} has identities with no token ({', '.join(missing)}) — a partial "
+            "provisioning run. Tear it down and re-provision."
+        )
     return identities[:count]
 
 
@@ -662,7 +728,9 @@ async def run_step(args: argparse.Namespace) -> int:
         raise SystemExit("websockets is not installed — pip install websockets")
 
     journey = Journey.load(Path(args.journey))
-    identities = _load_identities(Path(args.identities), args.users)
+    identities = _load_identities(
+        Path(args.identities), args.users, args.base_url, allow_host_mismatch=args.allow_host_mismatch
+    )
     if args.abort_file and Path(args.abort_file).exists():
         raise SystemExit(f"{args.abort_file} exists — a previous step aborted. Read it, then delete it to run again.")
     run_id = args.run_id or uuid.uuid4().hex[:8]
@@ -747,6 +815,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="stop each journey at its next step once this file exists (written by watch.py)",
     )
+    p.add_argument(
+        "--allow-host-mismatch",
+        action="store_true",
+        help="send the state file's PATs to a --base-url they were not minted for",
+    )
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="validate journey + identities, then exit")
     return p
@@ -756,7 +829,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.dry_run:
         journey = Journey.load(Path(args.journey))
-        identities = _load_identities(Path(args.identities), args.users)
+        identities = _load_identities(
+            Path(args.identities), args.users, args.base_url, allow_host_mismatch=args.allow_host_mismatch
+        )
         print(f"journey {journey.name}: {len(journey.steps)} steps", file=sys.stderr)
         for s in journey.steps:
             extra = s.path if s.kind == "http" else (f"{s.seconds}s" if s.kind == "sleep" else "")

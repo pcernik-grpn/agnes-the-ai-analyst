@@ -75,6 +75,12 @@ DEFAULT_PATTERNS = [
 
 SAMPLE_INTERVAL_S = 1.0
 
+# Consecutive failures to REOPEN a stream before we declare that evidence
+# stream lost. A container being recreated takes a few seconds; a stream that
+# cannot be reopened after this many tries is not coming back on its own, and
+# a run continuing blind is worse than one that says so.
+_SETUP_FAILURE_LIMIT = 5
+
 
 def _remote_locate(service: str) -> str:
     """Shell that prints the cgroup cpu.stat path for a compose service."""
@@ -137,6 +143,7 @@ def _stream_with_retry(
     stop: threading.Event,
     label: str,
     on_reconnect=None,
+    on_dead=lambda reason: None,
 ) -> None:
     """Consume a remote stream, reopening it if the transport dies.
 
@@ -154,8 +161,32 @@ def _stream_with_retry(
     state that does not survive a new container.
     """
     attempt = 0
+    consecutive_setup_failures = 0
     while not stop.is_set():
-        proc = ssh.popen(remote_factory())
+        # Opening the stream is inside the loop's error handling, not before
+        # it: resolving a container that is mid-recreate raises, and an
+        # unhandled raise here only kills this daemon thread — the watcher
+        # would keep running and exit successfully with the evidence stream
+        # silently gone.
+        try:
+            proc = ssh.popen(remote_factory())
+            consecutive_setup_failures = 0
+        except BaseException as exc:  # SystemExit included: it must not kill the thread
+            consecutive_setup_failures += 1
+            print(
+                f"[watch:{label}] could not open the stream "
+                f"({consecutive_setup_failures}/{_SETUP_FAILURE_LIMIT}): {exc!r:.200}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if consecutive_setup_failures >= _SETUP_FAILURE_LIMIT:
+                on_dead(
+                    f"{label}: could not reopen the stream after "
+                    f"{_SETUP_FAILURE_LIMIT} attempts — this evidence stream is gone"
+                )
+                return
+            time.sleep(min(2.0 * consecutive_setup_failures, 15.0))
+            continue
         if attempt:
             print(f"[watch:{label}] stream reconnected (attempt {attempt})", file=sys.stderr, flush=True)
         try:
@@ -185,6 +216,14 @@ class Aborter:
     def __init__(self, path: Optional[Path]) -> None:
         self.path = path
         self.tripped = False
+        #: Streams that gave up reopening. Not an abort — losing the capture
+        #: is a reason to distrust the record, not to stop the load — but the
+        #: watcher must exit non-zero so it cannot be mistaken for a clean run.
+        self.dead_streams: list[str] = []
+
+    def stream_dead(self, reason: str) -> None:
+        self.dead_streams.append(reason)
+        print(f"\n*** CAPTURE LOST *** {reason}\n", file=sys.stderr, flush=True)
 
     def trip(self, reason: str) -> None:
         if self.tripped:
@@ -215,16 +254,32 @@ def _tail_log(
     """
     rx = re.compile("|".join(patterns), re.IGNORECASE)
     fh = out_path.open("a")
-    state = {"matches": 0}
+    state: dict = {"matches": 0, "since": None, "seen": set()}
 
     def remote() -> str:
         cid = _resolve_container(ssh, service)
-        # --tail 0 on every attempt: a reconnect must not re-ingest the
-        # backlog it already wrote, which would double-count matches and
-        # re-trip an abort on a line already acted on.
-        return f"sudo docker logs -f --tail 0 {shlex.quote(cid)} 2>&1"
+        # Resume from the last line we actually received, not from the live
+        # tail. `--tail 0` would silently drop everything produced during the
+        # disconnect — which is the window the reconnect exists to preserve,
+        # and exactly where a saturation event hides. `--timestamps` is what
+        # makes the resume point knowable; the overlap it re-delivers is
+        # de-duplicated below.
+        since = f" --since {shlex.quote(state['since'])}" if state["since"] else " --tail 0"
+        return f"sudo docker logs -f --timestamps{since} {shlex.quote(cid)} 2>&1"
 
     def on_line(line: str) -> None:
+        # `--since` is inclusive to the second, so a reconnect re-delivers the
+        # tail of that second. Drop only lines already written, keyed on the
+        # whole line: identical text in the same second is indistinguishable
+        # and duplicating it would double-count a match and re-trip an abort
+        # already acted on.
+        stamp = line.split(" ", 1)[0] if " " in line else ""
+        if stamp and stamp == state["since"]:
+            if line in state["seen"]:
+                return
+            state["seen"].add(line)
+        elif stamp:
+            state["since"], state["seen"] = stamp, {line}
         fh.write(line)
         fh.flush()
         if rx.search(line):
@@ -234,7 +289,7 @@ def _tail_log(
                 aborter.trip(f"QueuePool exhaustion in the {label} log — H1 confirmed")
 
     try:
-        _stream_with_retry(ssh, remote, on_line, stop, label)
+        _stream_with_retry(ssh, remote, on_line, stop, label, on_dead=aborter.stream_dead)
     finally:
         fh.close()
     print(f"[log:{label}] stream ended after {state['matches']} matched lines", file=sys.stderr)
@@ -267,8 +322,14 @@ def _sample_throttle(
 
     def remote() -> str:
         stat_path = _resolve_stat_path(ssh, service)
+        # `cat || break`, and the read is its own statement rather than a
+        # substitution inside `echo`: in a pipeline the exit status is `tr`'s,
+        # so a container recreated underneath us would leave `cat` failing
+        # while the loop happily emitted unparsable lines forever — the
+        # reconnect (which re-resolves the new cgroup path) would never fire.
         return (
-            f"while :; do echo \"T $(date +%s.%N) $(cat {shlex.quote(stat_path)} | tr '\\n' ' ')\"; "
+            f"while :; do S=$(cat {shlex.quote(stat_path)}) || break; "
+            f"echo \"T $(date +%s.%N) $(echo \"$S\" | tr '\\n' ' ')\"; "
             f"sleep {SAMPLE_INTERVAL_S}; done"
         )
 
@@ -334,7 +395,7 @@ def _sample_throttle(
         state["prev"] = cur
 
     try:
-        _stream_with_retry(ssh, remote, on_line, stop, label, on_reconnect=on_reconnect)
+        _stream_with_retry(ssh, remote, on_line, stop, label, on_reconnect=on_reconnect, on_dead=aborter.stream_dead)
     finally:
         fh.close()
 
@@ -455,8 +516,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         pass
     stop.set()
-    print("[watch] stopped", file=sys.stderr)
-    return 1 if aborter.tripped else 0
+    if aborter.dead_streams:
+        print(
+            f"[watch] stopped — {len(aborter.dead_streams)} capture stream(s) were lost; "
+            "the server-side record for this run is incomplete",
+            file=sys.stderr,
+        )
+    else:
+        print("[watch] stopped", file=sys.stderr)
+    return 1 if (aborter.tripped or aborter.dead_streams) else 0
 
 
 if __name__ == "__main__":
