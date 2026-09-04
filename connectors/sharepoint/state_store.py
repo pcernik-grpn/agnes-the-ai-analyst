@@ -43,18 +43,20 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "FactsPassLocked",  # noqa: F822 — lazily resolved via __getattr__ below
     "StateStoreError",
+    "any_facts_pass_running",
     "delete",
     "facts_pass_lock",
     "file_state_path",
     "get",
     "list_kinds",
+    "merge_docs",
     "put",
 ]
 
@@ -228,26 +230,41 @@ def list_kinds(connection_id: str, prefix: str) -> List[str]:
 # Facts-pass lock — DuckDB fallback
 # --------------------------------------------------------------------------
 
-#: One ``threading.Lock`` per connection id, created lazily. The DuckDB
-#: app-state backend is frozen single-process (``docs/migrations.md``), so a
-#: process-local lock gives the same "only one facts pass per connection at
-#: a time" guarantee the Postgres advisory lock gives across processes.
+#: One ``threading.Lock`` per (connection id, partition key), created
+#: lazily. The DuckDB app-state backend is frozen single-process (``docs/
+#: migrations.md``), so a process-local lock gives the same "only one
+#: facts pass per PARTITION at a time" guarantee the Postgres advisory
+#: lock gives across processes — distinct partitions of the same
+#: connection get distinct dict entries (and so never contend with each
+#: other), exactly like the Postgres side's distinct advisory-lock keys.
 _facts_locks_guard = threading.Lock()
 _facts_locks: Dict[str, threading.Lock] = {}
 
 
-def _file_backend_lock(connection_id: str) -> threading.Lock:
+def _facts_lock_key(connection_id: str, partition: Optional[Tuple[int, int]]) -> str:
+    """The lock-table key for ``(connection_id, partition)`` — exactly
+    ``connection_id`` (unchanged) when ``partition`` is ``None`` or
+    ``count <= 1``, so every existing (un-partitioned) caller keeps
+    locking the SAME key it always has."""
+    if partition is None or partition[1] <= 1:
+        return connection_id
+    index, count = partition
+    return f"{connection_id}:{index}/{count}"
+
+
+def _file_backend_lock(connection_id: str, partition: Optional[Tuple[int, int]] = None) -> threading.Lock:
+    key = _facts_lock_key(connection_id, partition)
     with _facts_locks_guard:
-        lock = _facts_locks.get(connection_id)
+        lock = _facts_locks.get(key)
         if lock is None:
             lock = threading.Lock()
-            _facts_locks[connection_id] = lock
+            _facts_locks[key] = lock
         return lock
 
 
 @contextlib.contextmanager
-def facts_pass_lock(connection_id: str) -> Iterator[None]:
-    """Serialize facts-extraction passes for ONE connection — the crawl's
+def facts_pass_lock(connection_id: str, *, partition: Optional[Tuple[int, int]] = None) -> Iterator[None]:
+    """Serialize facts-extraction passes for one connection — the crawl's
     chained tail (``facts_extraction.maybe_run_after_crawl``) and the
     standalone operator trigger (``facts_extraction
     .run_standalone_facts_extraction``) can both reach the same connection
@@ -258,6 +275,13 @@ def facts_pass_lock(connection_id: str) -> Iterator[None]:
     "refuse loudly" (the standalone trigger — it only ever runs because an
     operator explicitly asked).
 
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) — ``None`` or
+    ``count <= 1`` (every caller before this feature existed) locks the
+    WHOLE connection, byte-identical to today. ``count > 1`` locks only
+    THIS partition's own slot, so several partitions of the SAME
+    connection can hold this context manager at once without contending —
+    see :func:`any_facts_pass_running` for "is ANY of them held right now".
+
     Postgres: :meth:`~src.repositories.sharepoint_state_pg
     .SharepointStatePgRepository.facts_pass_lock` — a transaction-scoped
     advisory lock, released automatically when its owning transaction ends,
@@ -265,21 +289,85 @@ def facts_pass_lock(connection_id: str) -> Iterator[None]:
     locked.
 
     DuckDB (frozen backend, single-process by construction): a plain
-    per-connection ``threading.Lock``, non-blocking — sufficient on a
-    backend that never spans more than one process.
+    per-(connection, partition) ``threading.Lock``, non-blocking —
+    sufficient on a backend that never spans more than one process.
     """
     from src.repositories import use_pg
     from src.repositories.sharepoint_state_pg import FactsPassLocked
 
     if use_pg():
-        with _pg_repo().facts_pass_lock(connection_id):
+        with _pg_repo().facts_pass_lock(connection_id, partition=partition):
             yield
         return
 
-    lock = _file_backend_lock(connection_id)
+    lock = _file_backend_lock(connection_id, partition)
     if not lock.acquire(blocking=False):
         raise FactsPassLocked(f"a facts-extraction pass is already running for connection {connection_id!r}")
     try:
         yield
     finally:
         lock.release()
+
+
+def any_facts_pass_running(connection_id: str) -> bool:
+    """Whether ANY facts-extraction pass for this connection currently
+    holds :func:`facts_pass_lock` — the un-partitioned whole-connection
+    lock, OR any single partition of a fanned-out one (TCRD-296 gap #67).
+    Used by ``facts_extraction.reset_no_claims_ledger_entries`` to refuse
+    while a pass could be concurrently upserting the same ledger it is
+    about to mutate.
+    """
+    from src.repositories import use_pg
+
+    if not use_pg():
+        with _facts_locks_guard:
+            for key, lock in _facts_locks.items():
+                if (key == connection_id or key.startswith(f"{connection_id}:")) and lock.locked():
+                    return True
+        return False
+    return _pg_repo().any_facts_pass_running(connection_id)
+
+
+def merge_docs(kind: str, connection_id: str, *, set_entries: Dict[str, Any], removed: Iterable[str] = ()) -> None:
+    """Per-document MERGE write into this connection's ``kind`` ledger's
+    ``docs`` sub-object — the partitioned-facts-pass persistence primitive
+    (TCRD-296 gap #67). Unlike :func:`put`, which REPLACES the whole
+    payload, this touches only the given document keys, so two partitions
+    of the SAME connection's facts pass can each persist their own
+    progress without one clobbering the other's (see
+    ``connectors.sharepoint.facts_extraction._PartitionDocsLedger`` /
+    ``_persist_facts_docs``, the callers).
+
+    A no-op when both ``set_entries`` and ``removed`` are empty — no
+    write, no row created for a connection that has never been touched.
+
+    Postgres: an atomic ``jsonb`` merge in ONE statement
+    (:meth:`~src.repositories.sharepoint_state_pg.SharepointStatePgRepository
+    .merge_docs`) — safe under concurrent callers because each is a single
+    row-locked ``UPDATE``, never a read-modify-write round trip through
+    Python.
+
+    DuckDB (frozen backend, single-process by construction): a plain
+    read-modify-write of the JSON file — safe because the ONLY way two
+    writers could race here is two partitions of the same connection, and
+    partitioning only ever produces true concurrency on Postgres (a
+    DuckDB-backed instance's job queue is single-process, so at most one
+    partition is ever actually running at a time).
+    """
+    set_entries = dict(set_entries or {})
+    removed_list = list(removed)
+    if not set_entries and not removed_list:
+        return
+
+    from src.repositories import use_pg
+
+    if not use_pg():
+        current = _read_file(kind, connection_id) or {}
+        docs = current.setdefault("docs", {})
+        docs.update(set_entries)
+        for key in removed_list:
+            docs.pop(key, None)
+        current.setdefault("version", 1)
+        _write_file(kind, connection_id, current)
+        return
+    _pg_repo().merge_docs(connection_id, kind, set_entries=set_entries, removed=removed_list)

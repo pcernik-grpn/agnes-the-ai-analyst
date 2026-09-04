@@ -305,3 +305,49 @@ def test_llm_usage_rollup_mixed_priced_and_unpriced_runs_reports_partial_coverag
     assert rollup["priced_runs"] == 1
     assert rollup["estimated_cost_usd"] is not None
     assert sorted(rollup["models"]) == ["claude-sonnet-4", "some-unknown-model-9000"]
+
+
+# ---------------------------------------------------------------------------
+# documents_done_since — the fleet throughput signal (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def _backdate(pg_engine, run_id: str, created_at) -> None:
+    import sqlalchemy as sa
+
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts_ingest_runs SET created_at = :created_at WHERE id = :id"),
+            {"created_at": created_at, "id": run_id},
+        )
+
+
+def test_documents_done_since_sums_only_overlapping_recent_runs(pg_engine, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    now = datetime.now(timezone.utc)
+
+    recent_same_corpus = _create(repo, corpus_ids=["col_a"], documents_seen=5)
+    recent_other_corpus = _create(repo, corpus_ids=["col_z"], documents_seen=100)
+    stale_same_corpus = _create(repo, corpus_ids=["col_a"], documents_seen=50)
+    _backdate(pg_engine, recent_same_corpus, now - timedelta(minutes=1))
+    _backdate(pg_engine, recent_other_corpus, now - timedelta(minutes=1))
+    _backdate(pg_engine, stale_same_corpus, now - timedelta(hours=2))
+
+    total = repo.documents_done_since(["col_a", "col_b"], now - timedelta(minutes=10))
+    assert total == 5  # only the recent, overlapping run counts
+
+
+def test_documents_done_since_empty_corpus_ids_is_zero_without_a_query(pg_engine, monkeypatch):
+    from datetime import datetime, timezone
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.documents_done_since([], datetime.now(timezone.utc)) == 0
+
+
+def test_documents_done_since_no_matching_runs_is_zero(pg_engine, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.documents_done_since(["col_never_seen"], datetime.now(timezone.utc) - timedelta(minutes=10)) == 0

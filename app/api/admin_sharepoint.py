@@ -4632,13 +4632,15 @@ async def trigger_facts_extraction(
     connection's collections ALREADY hold, without running a crawl first
     (the operator question "how do we get the fact graph populated with
     what we already have?", which previously had no answer but "re-run the
-    whole crawl"). Enqueues ``connectors.sharepoint.facts_extraction
-    .run_standalone_facts_extraction`` (via
-    ``app/worker/kinds.py::_run_sharepoint_facts_extraction``) with
-    ``{"connection_id": connection_id}`` plus, only when set, ``doc_ids``
-    and ``timeout_s`` from an optional :class:`FactsExtractionRunOptions`
-    body — the SAME "absent means configured" mechanics as
-    :func:`trigger_extraction`'s ``ExtractionRunOptions`` above.
+    whole crawl"). Enqueues via
+    ``connectors.sharepoint.facts_extraction.enqueue_facts_extraction_passes``
+    (which delegates to ``run_standalone_facts_extraction`` — via
+    ``app/worker/kinds.py::_run_sharepoint_facts_extraction`` — one job per
+    partition) with ``{"connection_id": connection_id}`` plus, only when
+    set, ``doc_ids`` and ``timeout_s`` from an optional
+    :class:`FactsExtractionRunOptions` body — the SAME "absent means
+    configured" mechanics as :func:`trigger_extraction`'s
+    ``ExtractionRunOptions`` above.
 
     404 on an unknown/non-sharepoint connection BEFORE the facts readiness
     gate below (same ordering as :func:`trigger_extraction`). Then refuses
@@ -4647,12 +4649,20 @@ async def trigger_facts_extraction(
     (``extraction.facts.enabled``, ``facts.enabled``) is off; see
     :func:`_facts_extraction_readiness`.
 
-    Deduped on the STABLE per-connection idempotency key
-    (:func:`_facts_extraction_idempotency_key`), distinct from every other
-    job kind's own key for the same connection — a facts-extraction trigger
-    and a crawl trigger (or an ACL sync, or a subtree sweep) can always run
-    side by side. ``enqueue()``'s own ``"deduped"`` return value decides
-    202 vs. ``409 facts_extraction_already_running``.
+    Deduped on the STABLE per-connection (or per-partition, TCRD-296 gap
+    #67) idempotency key (:func:`_facts_extraction_idempotency_key`),
+    distinct from every other job kind's own key for the same connection —
+    a facts-extraction trigger and a crawl trigger (or an ACL sync, or a
+    subtree sweep) can always run side by side. A backlog small enough to
+    need only ONE partition (the common case) enqueues exactly one job and
+    responds with today's shape (``job_id``, ``status``) unchanged; a
+    larger backlog fans out into several, additively reported as
+    ``jobs``/``partitions_total`` alongside the SAME ``job_id``/``status``
+    keys (the FIRST partition's), so an existing caller reading only those
+    two keys keeps working. ``409 facts_extraction_already_running`` fires
+    only when EVERY partition this call would have enqueued already exists
+    (queued/running) under its own key — an identical second trigger is a
+    pure no-op, never a partial 202.
     """
     _sharepoint_connection_or_404(connection_id)
 
@@ -4660,30 +4670,38 @@ async def trigger_facts_extraction(
     if not usable:
         raise HTTPException(status_code=409, detail=error)
 
-    from app.worker.registry import job_max_attempts
-    from src.repositories import jobs_repo
+    from connectors.sharepoint.facts_extraction import enqueue_facts_extraction_passes
 
-    payload: Dict[str, Any] = {"connection_id": connection_id}
+    extra_payload: Dict[str, Any] = {}
     if options is not None:
         if options.doc_ids is not None:
-            payload["doc_ids"] = options.doc_ids
+            extra_payload["doc_ids"] = options.doc_ids
         if options.timeout_s is not None:
-            payload["timeout_s"] = options.timeout_s
+            extra_payload["timeout_s"] = options.timeout_s
 
-    job = jobs_repo().enqueue(
-        "sharepoint-facts-extraction",
-        payload,
-        idempotency_key=_facts_extraction_idempotency_key(connection_id),
-        max_attempts=job_max_attempts("sharepoint-facts-extraction"),
-    )
-    if job["deduped"]:
+    jobs = enqueue_facts_extraction_passes(connection_id, extra_payload=extra_payload or None)
+    if all(job["deduped"] for job in jobs):
         raise HTTPException(
             status_code=409,
-            detail={"error": "facts_extraction_already_running", "job_id": job["id"]},
+            detail={
+                "error": "facts_extraction_already_running",
+                "job_id": jobs[0]["id"],
+                "job_ids": [job["id"] for job in jobs],
+            },
         )
 
-    logger.info("sharepoint connection %s: facts-extraction job %s enqueued (manual trigger)", connection_id, job["id"])
-    return {"job_id": job["id"], "status": job["status"]}
+    logger.info(
+        "sharepoint connection %s: facts-extraction job(s) %s enqueued (manual trigger, %d partition(s))",
+        connection_id,
+        ", ".join(job["id"] for job in jobs),
+        len(jobs),
+    )
+    return {
+        "job_id": jobs[0]["id"],
+        "status": jobs[0]["status"],
+        "jobs": [{"job_id": job["id"], "status": job["status"]} for job in jobs],
+        "partitions_total": len(jobs),
+    }
 
 
 class FactsResetNoClaimsRequest(BaseModel):

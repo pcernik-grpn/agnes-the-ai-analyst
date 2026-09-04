@@ -914,6 +914,7 @@ def test_run_knobs_are_known_fields_with_the_stages_own_defaults(seeded_app, mon
     facts = fields["facts"]["fields"]
     assert facts["stream_every"] == {**facts["stream_every"], "kind": "int", "default": 0}
     assert facts["run_timeout_s"]["default"] == DEFAULT_STANDALONE_TIMEOUT_S
+    assert facts["concurrency_passes"] == {**facts["concurrency_passes"], "kind": "int", "default": 4}
     assert facts["transport"]["default"] == "sync"
     assert facts["retry_mode"]["default"] == "on_gate_fail"
     assert facts["provider"] == {**facts["provider"], "kind": "string", "default": "inherit"}
@@ -947,6 +948,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
                         "transport": "batch",
                         "retry_mode": "off",
                         "run_timeout_s": 7200,
+                        "concurrency_passes": 2,
                         "provider": "vertex",
                         # A documented bucket for the default (Haiku) model
                         # — see `VERTEX_REGION_MODEL_MATRIX` (TCRD-296
@@ -968,6 +970,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
     assert got["facts"]["transport"] == "batch"
     assert got["facts"]["retry_mode"] == "off"
     assert got["facts"]["run_timeout_s"] == 7200
+    assert got["facts"]["concurrency_passes"] == 2
     assert got["facts"]["provider"] == "vertex"
     assert got["facts"]["vertex_region"] == "europe-west1"
 
@@ -980,6 +983,8 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
         {"facts": {"concurrency": 65}},
         {"facts": {"stream_every": -1}},
         {"facts": {"run_timeout_s": 5}},
+        {"facts": {"concurrency_passes": 0}},
+        {"facts": {"concurrency_passes": 65}},
         {"facts": {"transport": "carrier-pigeon"}},
         {"facts": {"retry_mode": "sometimes"}},
         {"facts": {"stream_every": "300"}},

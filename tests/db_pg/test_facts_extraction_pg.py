@@ -2143,3 +2143,233 @@ def test_maybe_continue_pass_resets_the_chain_once_a_pass_drains_the_backlog(pg_
     )
     assert result is None
     assert load_state(CONNECTION_ID)["facts_continuation_chain"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Partitioned passes (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_docs_is_a_per_document_upsert_not_a_whole_payload_overwrite(pg_env):
+    """The crux: two writers persisting DIFFERENT document keys through
+    ``state_store.merge_docs`` must both survive — the bug a whole-payload
+    ``save_state`` overwrite would reproduce (the second writer's stale
+    in-memory snapshot of the FIRST writer's key would clobber it)."""
+    from connectors.sharepoint.facts_extraction import load_state
+    from connectors.sharepoint.state_store import merge_docs
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+
+    merge_docs("facts", CONNECTION_ID, set_entries={"cf_1": {"status": "done", "extracted_sha": "a"}}, removed=[])
+    merge_docs("facts", CONNECTION_ID, set_entries={"cf_2": {"status": "done", "extracted_sha": "b"}}, removed=[])
+
+    docs = load_state(CONNECTION_ID)["docs"]
+    assert docs["cf_1"] == {"status": "done", "extracted_sha": "a"}
+    assert docs["cf_2"] == {"status": "done", "extracted_sha": "b"}
+
+
+def test_merge_docs_removal_touches_only_the_named_keys(pg_env):
+    from connectors.sharepoint.facts_extraction import load_state
+    from connectors.sharepoint.state_store import merge_docs
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+
+    merge_docs(
+        "facts",
+        CONNECTION_ID,
+        set_entries={"cf_1": {"status": "done"}, "cf_2": {"status": "done"}},
+        removed=[],
+    )
+    merge_docs("facts", CONNECTION_ID, set_entries={}, removed=["cf_1"])
+
+    docs = load_state(CONNECTION_ID)["docs"]
+    assert "cf_1" not in docs
+    assert docs["cf_2"] == {"status": "done"}
+
+
+def test_two_sequential_partitions_both_persist_without_clobbering_each_other(pg_env):
+    """End to end: two partitions of the SAME connection's facts pass, run
+    one after the other (each partition's in-memory state was loaded
+    BEFORE the other's own writes — the exact staleness a whole-payload
+    ``save_state`` would clobber on), both leave their own documents
+    ``done`` in the shared ledger."""
+    from connectors.sharepoint.facts_extraction import _partition_of, load_state
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    for i in range(6):
+        _seed_document(file_id=f"cf_{i}", doc_id=f"doc{i}", text=f"The rollout number {i} began in March.")
+
+    count = 2
+    owned = {index: [f"cf_{i}" for i in range(6) if _partition_of(f"cf_{i}", count) == index] for index in range(count)}
+    assert owned[0] and owned[1]  # both partitions actually own something
+
+    _run(_ScriptedExtractor([]), concurrency=1, partition=(0, count))
+    _run(_ScriptedExtractor([]), concurrency=1, partition=(1, count))
+
+    docs = load_state(CONNECTION_ID)["docs"]
+    for file_id in owned[0] + owned[1]:
+        assert docs[file_id]["status"] == "done", (file_id, docs.get(file_id))
+
+
+def test_a_partitioned_pass_only_ever_touches_its_own_documents(pg_env):
+    from connectors.sharepoint.facts_extraction import _partition_of, load_state
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    for i in range(6):
+        _seed_document(file_id=f"cf_{i}", doc_id=f"doc{i}", text=f"The rollout number {i} began in March.")
+
+    count = 2
+    owned0 = [f"cf_{i}" for i in range(6) if _partition_of(f"cf_{i}", count) == 0]
+    owned1 = [f"cf_{i}" for i in range(6) if _partition_of(f"cf_{i}", count) == 1]
+    assert owned0 and owned1
+
+    _run(_ScriptedExtractor([]), concurrency=1, partition=(0, count))
+
+    docs = load_state(CONNECTION_ID)["docs"]
+    for file_id in owned0:
+        assert file_id in docs
+    for file_id in owned1:
+        assert file_id not in docs  # untouched by partition 0
+
+
+def test_enqueue_facts_extraction_passes_fans_out_by_pending_backlog(pg_env, monkeypatch):
+    from connectors.sharepoint.facts_extraction import enqueue_facts_extraction_passes
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    monkeypatch.setattr(
+        "app.instance_config.get_value",
+        lambda *path, default=None: 4 if path[-1] == "concurrency_passes" else default,
+    )
+
+    jobs = enqueue_facts_extraction_passes(CONNECTION_ID, pending=8001)  # ceil(8001/2000) = 5, capped at 4
+    assert len(jobs) == 4
+    keys = {job["idempotency_key"] for job in jobs}
+    assert len(keys) == 4  # every partition gets its own key
+    live = jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10)
+    assert len(live) == 4
+    partitions = sorted(job["payload_json"]["partition"]["index"] for job in live)
+    assert partitions == [0, 1, 2, 3]
+    for job in live:
+        assert job["payload_json"]["partition"]["count"] == 4
+
+
+def test_enqueue_facts_extraction_passes_second_call_is_a_no_op(pg_env, monkeypatch):
+    from connectors.sharepoint.facts_extraction import enqueue_facts_extraction_passes
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    first = enqueue_facts_extraction_passes(CONNECTION_ID, pending=5000)
+    second = enqueue_facts_extraction_passes(CONNECTION_ID, pending=5000)
+    assert [j["id"] for j in first] == [j["id"] for j in second]
+    assert all(j.get("deduped") for j in second)
+    live = jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=50)
+    assert len(live) == len(first)  # nothing piled up
+
+
+def test_enqueue_facts_extraction_passes_with_no_backlog_is_a_single_legacy_shaped_job(pg_env):
+    """count==1 (no real backlog) keeps today's payload/key shape byte for
+    byte — no ``partition`` key at all — so every pre-existing caller/test
+    of the singular trigger stays unaffected."""
+    from connectors.sharepoint.facts_extraction import enqueue_facts_extraction_passes, facts_extraction_idempotency_key
+
+    _seed_four_documents()
+    jobs = enqueue_facts_extraction_passes(CONNECTION_ID, pending=0)
+    assert len(jobs) == 1
+    assert jobs[0]["idempotency_key"] == facts_extraction_idempotency_key(CONNECTION_ID)
+    assert "partition" not in jobs[0]["payload_json"]
+
+
+def test_any_facts_pass_running_sees_a_held_partition_lock(pg_env):
+    from connectors.sharepoint.state_store import any_facts_pass_running, facts_pass_lock
+
+    _seed_collection()
+    _seed_connection()
+
+    assert any_facts_pass_running(CONNECTION_ID) is False
+    with facts_pass_lock(CONNECTION_ID, partition=(1, 4)):
+        assert any_facts_pass_running(CONNECTION_ID) is True
+    assert any_facts_pass_running(CONNECTION_ID) is False
+
+
+def test_two_different_partition_indices_can_run_at_once(pg_env):
+    from connectors.sharepoint.state_store import facts_pass_lock
+
+    _seed_collection()
+    _seed_connection()
+
+    with facts_pass_lock(CONNECTION_ID, partition=(0, 4)):
+        with facts_pass_lock(CONNECTION_ID, partition=(1, 4)):
+            pass  # no FactsPassLocked — distinct partitions never contend
+
+
+def test_the_same_partition_index_cannot_run_twice_at_once(pg_env):
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    _seed_collection()
+    _seed_connection()
+
+    with facts_pass_lock(CONNECTION_ID, partition=(2, 4)):
+        with pytest.raises(FactsPassLocked):
+            with facts_pass_lock(CONNECTION_ID, partition=(2, 4)):
+                pass
+
+
+def test_reset_no_claims_refuses_while_a_partition_is_running(pg_env):
+    from connectors.sharepoint.facts_extraction import reset_no_claims_ledger_entries
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    _seed_collection()
+    _seed_connection()
+
+    with facts_pass_lock(CONNECTION_ID, partition=(3, 4)):
+        with pytest.raises(FactsPassLocked):
+            reset_no_claims_ledger_entries(CONNECTION_ID)
+
+
+def test_a_multi_partition_pass_sweeps_orphans_only_once_the_last_partition_finishes(pg_env, monkeypatch):
+    """#2220's end-of-pass sweep must fire once per CONNECTION, after the
+    LAST partition of a generation finishes — never once per partition."""
+    from src.repositories import jobs_repo
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    for i in range(4):
+        _seed_document(file_id=f"cf_{i}", doc_id=f"doc{i}", text=f"The rollout number {i} began in March.")
+
+    sweep_calls: list[str] = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction._run_end_of_pass_orphan_sweep",
+        lambda report: sweep_calls.append("swept"),
+    )
+
+    count = 2
+    # Partition 1 is still "queued" while partition 0 runs — so partition
+    # 0 finishing must NOT sweep yet.
+    jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        {"connection_id": CONNECTION_ID, "partition": {"index": 1, "count": count}},
+        idempotency_key="sharepoint-facts-extraction:%s:1/%d" % (CONNECTION_ID, count),
+    )
+    _run(_ScriptedExtractor([]), concurrency=1, partition=(0, count))
+    assert sweep_calls == []
+
+    # Now no sibling is queued/running any more — the LAST partition sweeps.
+    jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10)
+    from src.db_pg import get_engine
+    import sqlalchemy as sa2
+
+    with get_engine().begin() as conn:
+        conn.execute(sa2.text("UPDATE jobs SET status = 'done' WHERE kind = 'sharepoint-facts-extraction'"))
+
+    _run(_ScriptedExtractor([]), concurrency=1, partition=(1, count))
+    assert sweep_calls == ["swept"]

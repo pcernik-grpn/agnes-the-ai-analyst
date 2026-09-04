@@ -87,6 +87,15 @@ function fmtErrorCell(run) {
   return disabledReason ? `OCR: paused — provider refused (${disabledReason})` : "";
 }
 
+// TCRD-296 gap #67 — a partitioned facts pass's ETA, "~Xm" / "~Xh Ym".
+function fmtEta(seconds) {
+  if (seconds == null) return null;
+  if (seconds < 60) return "<1m";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours > 0 ? `~${hours}h ${minutes}m` : `~${minutes}m`;
+}
+
 // Sums input/output tokens across every priced stage (`ner`/`ocr`/`facts`)
 // a run's `usage` carries — see `_run_total_cost_usd`'s docstring on the
 // API side for why `usage` is keyed by stage and only populated once the
@@ -101,13 +110,31 @@ function tokenTotals(usage) {
   return any ? `${inTok.toLocaleString()} / ${outTok.toLocaleString()}` : "—";
 }
 
+// TCRD-296 gap #67 — "3/4 passes running, 1,400 docs/h, ETA ~40m", appended
+// to `factsCell`'s own line below. Empty string when there is nothing to
+// add: a single-partition (or never-run) connection reads exactly as it did
+// before this feature existed.
+function factsThroughputNote(facts) {
+  const parts = [];
+  if (facts.facts_passes_total != null && facts.facts_passes_total > 1) {
+    parts.push(`${facts.facts_passes_running ?? 0}/${facts.facts_passes_total} passes running`);
+  }
+  if (facts.facts_docs_per_hour != null) {
+    parts.push(`${facts.facts_docs_per_hour.toLocaleString()} docs/h`);
+  }
+  const eta = fmtEta(facts.facts_eta_seconds);
+  if (eta != null) parts.push(`ETA ${eta}`);
+  return parts.length ? ` <span class="ext-sub">(${parts.join(", ")})</span>` : "";
+}
+
 function factsCell(facts) {
   if (!facts) return "—";
   const done = facts.docs_done;
+  const throughput = factsThroughputNote(facts);
   if (facts.phase_active) {
     const total = facts.docs_total != null ? facts.docs_total : "?";
     const pending = facts.docs_total != null && done != null ? Math.max(facts.docs_total - done, 0) : "?";
-    return `${done ?? 0} / ${total} <span class="ext-sub">(${pending} pending)</span>`;
+    return `${done ?? 0} / ${total} <span class="ext-sub">(${pending} pending)</span>${throughput}`;
   }
   if (done != null) {
     // A pass that finished walked its whole corpus this run — nothing left
@@ -123,9 +150,9 @@ function factsCell(facts) {
       swept != null && swept > 0
         ? ` <span class="ext-sub">(${swept} orphan${swept === 1 ? "" : "s"} swept)</span>`
         : "";
-    return `${done} <span class="ext-sub">(0 pending)</span>${sweptNote}`;
+    return `${done} <span class="ext-sub">(0 pending)</span>${sweptNote}${throughput}`;
   }
-  return "—";
+  return throughput ? `— ${throughput}` : "—";
 }
 
 function phaseCell(run) {

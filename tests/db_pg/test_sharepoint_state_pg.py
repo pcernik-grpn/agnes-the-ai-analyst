@@ -225,3 +225,98 @@ def test_the_lock_is_visible_from_a_second_engine_connection(pg_engine, monkeypa
             pass
         else:
             raise AssertionError("expected the second repo instance to see the first's held lock")
+
+
+# ---------------------------------------------------------------------------
+# facts_pass_lock partitions + any_facts_pass_running (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def test_distinct_partitions_of_the_same_connection_never_contend(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    with repo.facts_pass_lock("conn-a", partition=(0, 4)):
+        with repo.facts_pass_lock("conn-a", partition=(1, 4)):
+            pass  # must not raise
+
+
+def test_the_same_partition_index_is_refused_twice(pg_engine, monkeypatch):
+    from src.repositories.sharepoint_state_pg import FactsPassLocked
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    with repo.facts_pass_lock("conn-a", partition=(2, 4)):
+        try:
+            with repo.facts_pass_lock("conn-a", partition=(2, 4)):
+                pass
+        except FactsPassLocked:
+            pass
+        else:
+            raise AssertionError("expected FactsPassLocked on the same partition twice")
+
+
+def test_a_partition_lock_does_not_block_a_different_connections_same_index(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    with repo.facts_pass_lock("conn-a", partition=(0, 4)):
+        with repo.facts_pass_lock("conn-b", partition=(0, 4)):
+            pass  # must not raise — the classid is derived per-connection
+
+
+def test_any_facts_pass_running_sees_the_legacy_whole_connection_lock(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.any_facts_pass_running("conn-a") is False
+    with repo.facts_pass_lock("conn-a"):
+        assert repo.any_facts_pass_running("conn-a") is True
+    assert repo.any_facts_pass_running("conn-a") is False
+
+
+def test_any_facts_pass_running_sees_any_held_partition(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    with repo.facts_pass_lock("conn-a", partition=(3, 8)):
+        assert repo.any_facts_pass_running("conn-a") is True
+        assert repo.any_facts_pass_running("conn-b") is False
+    assert repo.any_facts_pass_running("conn-a") is False
+
+
+# ---------------------------------------------------------------------------
+# merge_docs — per-document ledger merge (TCRD-296 gap #67)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_docs_creates_the_row_on_first_write(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.merge_docs("conn-a", "facts", set_entries={"cf_1": {"status": "done"}}, removed=[])
+    assert repo.get("conn-a", "facts") == {"version": 1, "docs": {"cf_1": {"status": "done"}}}
+
+
+def test_merge_docs_does_not_touch_other_top_level_fields(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.put("conn-a", "facts", {"version": 1, "docs": {}, "facts_continuation_chain": 3})
+    repo.merge_docs("conn-a", "facts", set_entries={"cf_1": {"status": "done"}}, removed=[])
+    stored = repo.get("conn-a", "facts")
+    assert stored["facts_continuation_chain"] == 3
+    assert stored["docs"] == {"cf_1": {"status": "done"}}
+
+
+def test_merge_docs_two_calls_for_different_keys_both_survive(pg_engine, monkeypatch):
+    """The crux: a naive whole-payload overwrite would lose whichever call
+    ran first once the second call's stale in-memory snapshot re-saved the
+    whole payload without it — `merge_docs` never re-reads-then-overwrites
+    the OTHER key at all."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.merge_docs("conn-a", "facts", set_entries={"cf_1": {"status": "done"}}, removed=[])
+    repo.merge_docs("conn-a", "facts", set_entries={"cf_2": {"status": "done"}}, removed=[])
+    docs = repo.get("conn-a", "facts")["docs"]
+    assert docs == {"cf_1": {"status": "done"}, "cf_2": {"status": "done"}}
+
+
+def test_merge_docs_removed_key_leaves_siblings_untouched(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.merge_docs("conn-a", "facts", set_entries={"cf_1": {"status": "done"}, "cf_2": {"status": "done"}}, removed=[])
+    repo.merge_docs("conn-a", "facts", set_entries={}, removed=["cf_1"])
+    docs = repo.get("conn-a", "facts")["docs"]
+    assert docs == {"cf_2": {"status": "done"}}
+
+
+def test_merge_docs_is_a_no_op_with_nothing_to_write(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.merge_docs("conn-never-touched", "facts", set_entries={}, removed=[])
+    assert repo.get("conn-never-touched", "facts") is None

@@ -21,7 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -32,8 +32,23 @@ from sqlalchemy.engine import Engine
 #: overload the whole-app leases in ``src/db_pg.py`` use
 #: (``_SEED_LEASE_ID`` / ``_REBUILD_LEASE_ID`` / the migration lock): a
 #: two-int key occupies a distinct corner of the same 64-bit advisory-lock
-#: keyspace, so this can never collide with one of those fixed keys.
+#: keyspace, so this can never collide with one of those fixed keys. Used
+#: for the WHOLE-CONNECTION lock (``partition`` ``None``/``count <= 1``) —
+#: unchanged from before TCRD-296 gap #67.
 _FACTS_LOCK_CLASS_ID = 0x53504C4B
+
+#: Namespace PREFIX for a PARTITIONED pass's own advisory lock (TCRD-296
+#: gap #67). Each partition of one connection's fan-out locks
+#: ``pg_try_advisory_xact_lock(hashtext(f"{_FACTS_PARTITION_LOCK_NS}:{cid}"),
+#: index)`` — a CONNECTION-SPECIFIC classid (unlike the fixed
+#: ``_FACTS_LOCK_CLASS_ID`` above) so distinct partitions of the SAME
+#: connection get distinct ``objid``s and never contend, while
+#: :meth:`any_facts_pass_running` can still answer "any partition of THIS
+#: connection" with one ``pg_locks`` lookup filtered on that one classid —
+#: filtering by ``objid`` alone would not work, since ``objid`` here is
+#: just the small partition index and collides across unrelated
+#: connections.
+_FACTS_PARTITION_LOCK_NS = "sharepoint_facts_partition"
 
 
 class FactsPassLocked(RuntimeError):
@@ -207,13 +222,24 @@ class SharepointStatePgRepository:
         return _decode(existing["payload"]) if existing is not None else dict(payload)
 
     @contextlib.contextmanager
-    def facts_pass_lock(self, connection_id: str) -> Iterator[None]:
-        """Non-blocking, per-connection lock serializing facts-extraction
-        passes — the crawl's chained tail and the standalone operator
-        trigger can both reach the same connection at once, and only one
-        may actually run (``connectors.sharepoint.facts_extraction``'s
-        module docstring). Raises :class:`FactsPassLocked` immediately
-        rather than waiting.
+    def facts_pass_lock(self, connection_id: str, *, partition: Optional[Tuple[int, int]] = None) -> Iterator[None]:
+        """Non-blocking lock serializing facts-extraction passes — the
+        crawl's chained tail and the standalone operator trigger can both
+        reach the same connection at once, and only one may actually run
+        (``connectors.sharepoint.facts_extraction``'s module docstring).
+        Raises :class:`FactsPassLocked` immediately rather than waiting.
+
+        ``partition`` (``(index, count)``, TCRD-296 gap #67) — ``None`` or
+        ``count <= 1`` (every caller before this feature existed) locks
+        the WHOLE connection under :data:`_FACTS_LOCK_CLASS_ID`, byte-
+        identical to today. ``count > 1`` locks only THIS partition's own
+        slot, under a CONNECTION-SPECIFIC classid
+        (:data:`_FACTS_PARTITION_LOCK_NS`) with ``objid = index`` — so
+        distinct partitions of the SAME connection never contend, and
+        :meth:`any_facts_pass_running` can still find every currently-held
+        partition lock for one connection with a single ``pg_locks``
+        lookup (see that constant's own docstring for why a connection-
+        specific classid, not the fixed one, is what makes that possible).
 
         A transaction-scoped Postgres advisory lock, held for the lifetime
         of the ``with`` block on its OWN connection (never the caller's):
@@ -222,20 +248,29 @@ class SharepointStatePgRepository:
         worker can never leave a connection's facts pass stuck locked.
         Held for as long as the caller's ``with`` block runs, which for a
         standalone pass can be up to its own timeout (default one hour) —
-        acceptable here because at most one pass runs per connection at a
-        time by construction, so this is one held connection per
-        currently-running pass, not per request.
+        acceptable here because at most one pass runs per (connection,
+        partition) at a time by construction, so this is one held
+        connection per currently-running pass, not per request.
         """
         conn = self._engine.connect()
         trans = conn.begin()
         acquired = False
         try:
-            acquired = bool(
-                conn.execute(
-                    sa.text("SELECT pg_try_advisory_xact_lock(:class_id, hashtext(:cid))"),
-                    {"class_id": _FACTS_LOCK_CLASS_ID, "cid": connection_id},
-                ).scalar()
-            )
+            if partition is None or partition[1] <= 1:
+                acquired = bool(
+                    conn.execute(
+                        sa.text("SELECT pg_try_advisory_xact_lock(:class_id, hashtext(:cid))"),
+                        {"class_id": _FACTS_LOCK_CLASS_ID, "cid": connection_id},
+                    ).scalar()
+                )
+            else:
+                index, _count = partition
+                acquired = bool(
+                    conn.execute(
+                        sa.text("SELECT pg_try_advisory_xact_lock(hashtext(:ns), :idx)"),
+                        {"ns": f"{_FACTS_PARTITION_LOCK_NS}:{connection_id}", "idx": index},
+                    ).scalar()
+                )
             if not acquired:
                 raise FactsPassLocked(f"a facts-extraction pass is already running for connection {connection_id!r}")
             yield
@@ -245,3 +280,100 @@ class SharepointStatePgRepository:
             else:
                 trans.rollback()
             conn.close()
+
+    def any_facts_pass_running(self, connection_id: str) -> bool:
+        """Whether ANY facts-extraction pass for this connection currently
+        holds :meth:`facts_pass_lock` — the un-partitioned whole-connection
+        lock (:data:`_FACTS_LOCK_CLASS_ID`, ``objid = hashtext(connection_id)``),
+        OR any single partition of a fanned-out one
+        (:data:`_FACTS_PARTITION_LOCK_NS`, any ``objid``) — see
+        :func:`connectors.sharepoint.state_store.any_facts_pass_running`,
+        the facade every caller actually uses.
+
+        A plain ``pg_locks`` read, not itself a lock: this answers "right
+        now", accepting the narrow race a check-then-act pattern always
+        has (a partition could start immediately after this returns
+        ``False``) — the SAME best-effort, immediate-refuse posture every
+        other use of this lock already takes.
+        """
+        with self._engine.connect() as conn:
+            legacy = bool(
+                conn.execute(
+                    sa.text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                        "WHERE locktype = 'advisory' AND classid = :cls AND objid = hashtext(:cid))"
+                    ),
+                    {"cls": _FACTS_LOCK_CLASS_ID, "cid": connection_id},
+                ).scalar()
+            )
+            if legacy:
+                return True
+            partitioned = bool(
+                conn.execute(
+                    sa.text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = hashtext(:ns))"
+                    ),
+                    {"ns": f"{_FACTS_PARTITION_LOCK_NS}:{connection_id}"},
+                ).scalar()
+            )
+            return partitioned
+
+    def merge_docs(self, connection_id: str, kind: str, *, set_entries: Dict[str, Any], removed: List[str]) -> None:
+        """Atomic per-document ``jsonb`` merge into ``payload -> 'docs'`` —
+        see ``connectors.sharepoint.state_store.merge_docs``'s docstring
+        for why this exists instead of :meth:`put`'s whole-payload
+        overwrite (TCRD-296 gap #67).
+
+        A row for ``(connection_id, kind)`` is upserted first (an empty
+        ``{"version": 1, "docs": {}}`` payload, ``DO NOTHING`` if one
+        already exists) so the merge below is always a single, simple
+        ``UPDATE`` against an existing row rather than a conditional
+        insert-or-update of the merge itself. The ``docs`` value is then
+        rebuilt in ONE expression — ``||`` folds in ``set_entries`` (a
+        shallow merge: a changed key's value is REPLACED, never deep-
+        merged), then one ``-`` per ``removed`` key (jsonb has no
+        multi-key subtraction for a single call) — inside a single
+        ``jsonb_set`` so every OTHER top-level field on the payload
+        (``version``, ``facts_continuation_chain``, ...) is left
+        untouched. The whole thing is one row-locked ``UPDATE`` statement,
+        which is what makes two partitions calling this concurrently for
+        DIFFERENT keys safe: Postgres serializes the two statements
+        against the same row, and neither ever re-reads-then-writes the
+        other's already-committed keys.
+
+        A no-op — no row created, no statement issued — when both
+        ``set_entries`` and ``removed`` are empty: a connection this was
+        never called for stays absent, never gets an empty placeholder row.
+        """
+        if not set_entries and not removed:
+            return
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO sharepoint_connection_state (connection_id, kind, payload, updated_at) "
+                    "VALUES (:cid, :kind, :empty, :now) "
+                    "ON CONFLICT (connection_id, kind) DO NOTHING"
+                ),
+                {
+                    "cid": connection_id,
+                    "kind": kind,
+                    "empty": json.dumps({"version": 1, "docs": {}}),
+                    "now": _now(),
+                },
+            )
+            docs_expr = "COALESCE(payload -> 'docs', '{}'::jsonb)"
+            params: Dict[str, Any] = {"cid": connection_id, "kind": kind, "now": _now()}
+            if set_entries:
+                docs_expr = f"({docs_expr} || CAST(:set_json AS jsonb))"
+                params["set_json"] = json.dumps(set_entries)
+            for i, key in enumerate(removed):
+                docs_expr = f"({docs_expr} - :removed_{i})"
+                params[f"removed_{i}"] = key
+            conn.execute(
+                sa.text(
+                    "UPDATE sharepoint_connection_state "
+                    f"SET payload = jsonb_set(payload, '{{docs}}', {docs_expr}), updated_at = :now "
+                    "WHERE connection_id = :cid AND kind = :kind"
+                ),
+                params,
+            )

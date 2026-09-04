@@ -1252,6 +1252,37 @@ def _fmt_facts_backlog_suffix(facts: Dict[str, Any]) -> str:
     return f" · {n} backlog, {state}"
 
 
+def _fmt_eta(seconds: Optional[float]) -> Optional[str]:
+    """ "~Xm" / "~Xh Ym" (TCRD-296 gap #67) — the same rendering the fleet
+    web page's ``fmtEta`` uses, so the terminal and the browser never
+    disagree about a partitioned pass's ETA wording."""
+    if seconds is None:
+        return None
+    seconds = float(seconds)
+    if seconds < 60:
+        return "<1m"
+    hours, minutes = divmod(int(seconds // 60), 60)
+    return f"~{hours}h {minutes}m" if hours else f"~{minutes}m"
+
+
+def _fmt_facts_throughput_suffix(facts: Dict[str, Any]) -> str:
+    """ " · 3/4 passes running, 1,400 docs/h, ETA ~40m" (TCRD-296 gap #67)
+    — empty when the pass is not (or has never been) partitioned and there
+    is no throughput signal yet, so a single-partition connection's line
+    reads exactly as it did before this feature existed."""
+    parts = []
+    total = facts.get("facts_passes_total")
+    if total is not None and total > 1:
+        parts.append(f"{facts.get('facts_passes_running') or 0}/{total} passes running")
+    docs_per_hour = facts.get("facts_docs_per_hour")
+    if docs_per_hour is not None:
+        parts.append(f"{docs_per_hour:,.1f} docs/h")
+    eta = _fmt_eta(facts.get("facts_eta_seconds"))
+    if eta is not None:
+        parts.append(f"ETA {eta}")
+    return f" · {', '.join(parts)}" if parts else ""
+
+
 def _fmt_facts(facts: Optional[Dict[str, Any]]) -> str:
     if not facts:
         return "—"
@@ -1264,7 +1295,7 @@ def _fmt_facts(facts: Optional[Dict[str, Any]]) -> str:
         base = f"{done} (0 pending)"
     else:
         base = "—"
-    return base + _fmt_facts_backlog_suffix(facts)
+    return base + _fmt_facts_backlog_suffix(facts) + _fmt_facts_throughput_suffix(facts)
 
 
 def _fmt_phase(run: Optional[Dict[str, Any]]) -> str:

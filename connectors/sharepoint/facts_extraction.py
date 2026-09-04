@@ -118,8 +118,10 @@ per-call price.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import re
 import secrets
 import threading
@@ -1421,7 +1423,6 @@ def _facts_cache_key(*, sha256: str, model: str, fingerprint: str, suffix: str =
     conflating the two keys would serve a first-pass reply to a retry
     lookup or vice versa.
     """
-    import hashlib
 
     raw = "|".join((sha256 or "", model or "", fingerprint or "", suffix or "")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -1473,6 +1474,170 @@ def _cache_store(
         logger.warning(
             "facts extraction: cache store failed (%s) — continuing without caching this reply", type(exc).__name__
         )
+
+
+# --------------------------------------------------------------------------
+# Partitioned passes (TCRD-296 gap #67) — stable document->partition
+# assignment, shared by the planner (`_plan_documents`) and the fan-out
+# trigger (`enqueue_facts_extraction_passes`) below.
+# --------------------------------------------------------------------------
+
+
+def _partition_of(corpus_file_id: str, count: int) -> int:
+    """Which partition (``0..count-1``) owns this document — a STABLE
+    function of ``corpus_file_id`` alone, so the same document always
+    lands in the same partition regardless of which process/host computes
+    it, and re-running the SAME ``count`` later reproduces the identical
+    split (idempotent re-runs, exactly like :func:`is_up_to_date` already
+    relies on for the per-document ledger). Python's built-in ``hash()``
+    is deliberately NOT used here — string hashing is randomized per
+    process (``PYTHONHASHSEED``), which would scatter one connection's
+    documents across a DIFFERENT split every time a worker restarts.
+    ``sha1`` is fast enough for this (a handful of bytes, once per
+    document per pass) and its first 8 bytes give more than enough
+    entropy to distribute evenly across any realistic partition count.
+    """
+    if count <= 1:
+        return 0
+    digest = hashlib.sha1(corpus_file_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
+class _PartitionDocsLedger(dict):
+    """A ``docs_state`` dict SCOPED to one partition's own documents,
+    tracking which keys were set/removed since the last
+    :meth:`drain_dirty` call.
+
+    Every existing ``docs_state[file_id] = {...}`` / ``docs_state.pop(file_id,
+    None)`` call site in this module (:func:`_plan_documents`,
+    :func:`_fold_accepted_result`, :class:`_BatchShipper`, ...) already
+    treats ``docs_state`` as a plain dict and needs no change to work
+    against this — the ONLY thing that changes for a partitioned run is
+    HOW the caller persists it afterwards (see :func:`_persist_facts_docs`):
+    a per-document MERGE into the connection-wide ledger instead of a
+    whole-payload overwrite, which is what keeps a sibling partition's own
+    concurrent progress from being clobbered by a stale in-memory
+    snapshot (TCRD-296 gap #67's finding — a single connection-wide
+    ``save_state`` call turned a 7-connection-parallel pass into one
+    connection with ONE slow pass once those connections were merged).
+    """
+
+    def __init__(self, initial: Dict[str, Any]) -> None:
+        super().__init__(initial)
+        self._dirty_set: set = set()
+        self._dirty_removed: set = set()
+
+    def __setitem__(self, key: str, value: Any) -> None:  # noqa: D105
+        super().__setitem__(key, value)
+        self._dirty_set.add(key)
+        self._dirty_removed.discard(key)
+
+    def pop(self, key: str, *default: Any) -> Any:  # noqa: D102
+        had_key = key in self
+        result = super().pop(key, *default)
+        if had_key:
+            self._dirty_removed.add(key)
+            self._dirty_set.discard(key)
+        return result
+
+    def drain_dirty(self) -> Tuple[Dict[str, Any], List[str]]:
+        """Every key set/removed since the last drain — ``(set_entries,
+        removed)`` — and clears the tracking. Called right before each
+        merge-write (:func:`_persist_facts_docs`)."""
+        set_entries = {key: self[key] for key in self._dirty_set if key in self}
+        removed = sorted(self._dirty_removed)
+        self._dirty_set.clear()
+        self._dirty_removed.clear()
+        return set_entries, removed
+
+
+def _load_facts_state_for_partition(
+    connection_id: str, partition: Optional[Tuple[int, int]]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """``(state, docs_state)`` for one pass — the un-partitioned shape
+    (``partition`` ``None`` or ``count <= 1``, every caller before this
+    feature existed) unchanged: ``state["docs"]`` itself, mutated and
+    persisted whole exactly as today.
+
+    For a partitioned run, ``state`` is still the FULL connection-wide
+    blob (top-level fields like ``facts_continuation_chain`` are read off
+    it, though a partitioned pass never writes them directly — see
+    :func:`maybe_continue_pass`), but ``docs_state`` is a
+    :class:`_PartitionDocsLedger` scoped to only the documents THIS
+    partition owns (:func:`_partition_of`). :func:`_plan_documents`'s own
+    partition filter already keeps a partitioned walk from ever offering
+    another partition's file, so this scoping is belt-and-braces there —
+    but it is also what keeps the batch transport's resume scan (``for
+    fid, e in docs_state.items() if e["batch_id"] == ...``) from ever
+    picking up a SIBLING partition's still in-flight batch id, which is
+    why :func:`run_facts_extraction` forces the sync transport for a
+    partitioned run instead (see its own docstring).
+    """
+    state = load_state(connection_id)
+    if partition is None or partition[1] <= 1:
+        return state, state["docs"]
+    index, count = partition
+    scoped = {fid: entry for fid, entry in state["docs"].items() if _partition_of(fid, count) == index}
+    return state, _PartitionDocsLedger(scoped)
+
+
+def _persist_facts_docs(
+    connection_id: str, state: Dict[str, Any], docs_state: Dict[str, Any], *, partition: Optional[Tuple[int, int]]
+) -> None:
+    """Persist this pass's progress — a plain :func:`save_state` (whole
+    payload) for an un-partitioned run, or a per-document
+    :func:`~connectors.sharepoint.state_store.merge_docs` write of only
+    what changed since the last call, for a partitioned one (see
+    :func:`_load_facts_state_for_partition`'s docstring for why a whole
+    overwrite is unsafe there)."""
+    if partition is None or partition[1] <= 1:
+        save_state(connection_id, state)
+        return
+    if not isinstance(docs_state, _PartitionDocsLedger):
+        return
+    set_entries, removed = docs_state.drain_dirty()
+    if not set_entries and not removed:
+        return
+    from connectors.sharepoint.state_store import merge_docs
+
+    merge_docs("facts", connection_id, set_entries=set_entries, removed=removed)
+
+
+def _is_last_facts_partition(connection_id: str, partition: Optional[Tuple[int, int]]) -> bool:
+    """Whether THIS partition is the last of its generation to finish —
+    true unconditionally for an un-partitioned run (``partition`` ``None``
+    or ``count <= 1``). For a partitioned one, true exactly when no OTHER
+    ``sharepoint-facts-extraction`` job for this connection, sharing the
+    same ``count``, is still ``queued``/``running`` — mirrors the crawl
+    shard design's "the LAST child to finish finalizes the parent"
+    (2026-09-03 auto-parallel-crawl design §4.3), reused here for the same
+    reason: only the last completer of a generation should run work that
+    must happen exactly once per connection (the end-of-pass orphan sweep,
+    #2220; the decision whether to plan the NEXT generation,
+    :func:`maybe_continue_pass`).
+
+    THIS job's own row (still ``running`` while this function executes,
+    for the in-process caller) is excluded by matching ``index`` — every
+    OTHER row is a genuine sibling.
+    """
+    if partition is None or partition[1] <= 1:
+        return True
+    index, count = partition
+    from src.repositories import jobs_repo
+
+    repo = jobs_repo()
+    for status in ("queued", "running"):
+        for job in repo.list(kind="sharepoint-facts-extraction", status=status, limit=200):
+            payload = job.get("payload_json") or {}
+            if str(payload.get("connection_id")) != str(connection_id):
+                continue
+            other = payload.get("partition") or {}
+            if int(other.get("count") or 1) != count:
+                continue
+            if int(other.get("index") or 0) == index:
+                continue  # this job's own row
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1578,89 +1743,96 @@ def reset_no_claims_ledger_entries(connection_id: str, *, dry_run: bool = False)
     ``dry_run`` (default ``False``) computes and reports every outcome
     WITHOUT writing anything back — the state is loaded but never saved.
 
-    Takes the SAME per-connection ``connectors.sharepoint.state_store
-    .facts_pass_lock`` a real pass holds for its own duration (never
-    waits): a running pass upserts the WHOLE ``docs`` payload on its own
-    schedule, so mutating the ledger underneath it would race that write.
-    Raises :class:`~connectors.sharepoint.state_store.FactsPassLocked`
-    (propagated, not caught — the caller/endpoint translates it to a
-    ``409``), the same posture :func:`run_standalone_facts_extraction`
-    already has for the same lock.
+    Refuses (:class:`~connectors.sharepoint.state_store.FactsPassLocked`,
+    propagated — the caller/endpoint translates it to a ``409``) while ANY
+    facts-extraction pass for this connection — the un-partitioned chained/
+    standalone lock, or ANY partition of a fanned-out pass (TCRD-296 gap
+    #67) — currently holds
+    ``connectors.sharepoint.state_store.any_facts_pass_running``'s answer
+    as ``True``: an in-flight pass upserts the ledger on its own schedule
+    (whole-payload for an un-partitioned run, a per-document merge for a
+    partitioned one), so mutating it here at the same time would race that
+    write. Checked once, up front, rather than held as a lock for this
+    call's own duration — a real pass can run for up to an hour, and this
+    is a rare, deliberate operator action, not a hot path a lock needs to
+    protect from itself.
     """
-    from connectors.sharepoint.state_store import facts_pass_lock
+    from connectors.sharepoint.state_store import FactsPassLocked, any_facts_pass_running
     from src.repositories import corpus_file_sources_repo, facts_repo
 
-    with facts_pass_lock(connection_id):
-        state = load_state(connection_id)
-        docs_state: Dict[str, Any] = state.get("docs") or {}
+    if any_facts_pass_running(connection_id):
+        raise FactsPassLocked(f"a facts-extraction pass is already running for connection {connection_id!r}")
 
-        candidates = [
-            file_id
-            for file_id, entry in docs_state.items()
-            if isinstance(entry, dict)
-            and entry.get("status") == "done"
-            and int(entry.get("nodes") or 0) > 0
-            and "claims_on_file_id" not in entry
-        ]
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state.get("docs") or {}
 
-        sources_repo = corpus_file_sources_repo()
-        facts = facts_repo()
+    candidates = [
+        file_id
+        for file_id, entry in docs_state.items()
+        if isinstance(entry, dict)
+        and entry.get("status") == "done"
+        and int(entry.get("nodes") or 0) > 0
+        and "claims_on_file_id" not in entry
+    ]
 
-        mapping: Dict[str, Dict[str, Any]] = {}
-        siblings_by_file: Dict[str, List[str]] = {}
-        all_file_ids: set = set(candidates)
-        for file_id in candidates:
-            row = sources_repo.get(file_id)
-            if not row or not row.get("source_doc_id"):
-                continue
-            mapping[file_id] = row
-            siblings = sources_repo.files_for_doc(row["corpus_id"], row["source_doc_id"])
-            siblings_by_file[file_id] = siblings
-            all_file_ids.update(siblings)
+    sources_repo = corpus_file_sources_repo()
+    facts = facts_repo()
 
-        counts = facts.claims_count_by_file(sorted(all_file_ids))
+    mapping: Dict[str, Dict[str, Any]] = {}
+    siblings_by_file: Dict[str, List[str]] = {}
+    all_file_ids: set = set(candidates)
+    for file_id in candidates:
+        row = sources_repo.get(file_id)
+        if not row or not row.get("source_doc_id"):
+            continue
+        mapping[file_id] = row
+        siblings = sources_repo.files_for_doc(row["corpus_id"], row["source_doc_id"])
+        siblings_by_file[file_id] = siblings
+        all_file_ids.update(siblings)
 
-        reset_ids: List[str] = []
-        duplicate_ids: Dict[str, str] = {}
-        already_had_claims = 0
-        unmapped: List[str] = []
+    counts = facts.claims_count_by_file(sorted(all_file_ids))
 
-        for file_id in candidates:
-            if counts.get(file_id, 0) > 0:
-                already_had_claims += 1
-                continue
-            row = mapping.get(file_id)
-            if row is None:
-                # No `corpus_file_sources` mapping (or no `source_doc_id`)
-                # at all — nothing to check a sibling against, and no
-                # doc_id to re-derive by. Left alone; the run report names
-                # it so an operator can look closer rather than have it
-                # silently vanish from either bucket.
-                unmapped.append(file_id)
-                continue
-            siblings = [s for s in siblings_by_file.get(file_id, []) if s != file_id]
-            winner = next((s for s in siblings if counts.get(s, 0) > 0), None)
-            if winner is not None:
-                duplicate_ids[file_id] = winner
-                if not dry_run:
-                    docs_state[file_id]["claims_on_file_id"] = winner
-                continue
-            reset_ids.append(file_id)
+    reset_ids: List[str] = []
+    duplicate_ids: Dict[str, str] = {}
+    already_had_claims = 0
+    unmapped: List[str] = []
+
+    for file_id in candidates:
+        if counts.get(file_id, 0) > 0:
+            already_had_claims += 1
+            continue
+        row = mapping.get(file_id)
+        if row is None:
+            # No `corpus_file_sources` mapping (or no `source_doc_id`)
+            # at all — nothing to check a sibling against, and no
+            # doc_id to re-derive by. Left alone; the run report names
+            # it so an operator can look closer rather than have it
+            # silently vanish from either bucket.
+            unmapped.append(file_id)
+            continue
+        siblings = [s for s in siblings_by_file.get(file_id, []) if s != file_id]
+        winner = next((s for s in siblings if counts.get(s, 0) > 0), None)
+        if winner is not None:
+            duplicate_ids[file_id] = winner
             if not dry_run:
-                docs_state.pop(file_id, None)
+                docs_state[file_id]["claims_on_file_id"] = winner
+            continue
+        reset_ids.append(file_id)
+        if not dry_run:
+            docs_state.pop(file_id, None)
 
-        if not dry_run and (reset_ids or duplicate_ids):
-            state["docs"] = docs_state
-            save_state(connection_id, state)
+    if not dry_run and (reset_ids or duplicate_ids):
+        state["docs"] = docs_state
+        save_state(connection_id, state)
 
-        return {
-            "dry_run": dry_run,
-            "candidates": len(candidates),
-            "reset": sorted(reset_ids),
-            "duplicates_recorded": dict(sorted(duplicate_ids.items())),
-            "already_had_claims": already_had_claims,
-            "unmapped": sorted(unmapped),
-        }
+    return {
+        "dry_run": dry_run,
+        "candidates": len(candidates),
+        "reset": sorted(reset_ids),
+        "duplicates_recorded": dict(sorted(duplicate_ids.items())),
+        "already_had_claims": already_had_claims,
+        "unmapped": sorted(unmapped),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -3193,6 +3365,7 @@ def _plan_documents(
     max_doc_chars: int,
     system_prompt_tokens: int = 0,
     max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
+    partition: Optional[Tuple[int, int]] = None,
 ) -> Any:
     """Yield the documents that actually need a model call — the SAME walk
     for BOTH transports (:func:`run_facts_extraction`'s sync loop and
@@ -3212,10 +3385,19 @@ def _plan_documents(
     meaningless head (``too_large_tabular``), and everything else still
     over budget is truncated a second time, tighter than the flat
     character cap alone.
+
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) narrows the walk
+    to documents THIS partition owns (:func:`_partition_of`) — ``None``
+    (every caller before this feature existed) or ``count <= 1`` sees
+    every document, unchanged. Applied FIRST, before even the source-doc
+    mapping lookup: a document belonging to another partition costs this
+    pass nothing to skip.
     """
     for collection_id in collection_ids_for(connection):
         for file_row in files_repo.list_for_corpus(collection_id):
             file_id = str(file_row["id"])
+            if partition is not None and partition[1] > 1 and _partition_of(file_id, partition[1]) != partition[0]:
+                continue
             mapping = sources_repo.get(file_id) or {}
             doc_id = mapping.get("source_doc_id")
             if not doc_id:
@@ -3997,6 +4179,7 @@ def run_facts_extraction(
     provider: Optional[str] = None,
     vertex_region: Optional[str] = None,
     max_prompt_tokens: Optional[int] = None,
+    partition: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -4077,6 +4260,24 @@ def run_facts_extraction(
     :data:`MAX_PROMPT_TOKENS_CEILING`) — see :func:`_plan_documents` and
     :func:`_bound_failures_for_retry`.
 
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) narrows this pass
+    to the slice of the corpus :func:`_partition_of` assigns it, and
+    switches the ledger's persistence from a whole-payload
+    :func:`save_state` to a per-document merge (see
+    :func:`_load_facts_state_for_partition` / :func:`_persist_facts_docs`)
+    — so several partitions of the SAME connection can run at once without
+    clobbering each other's progress. ``None`` (every caller before this
+    feature existed) or ``count <= 1`` is byte-identical to today's single,
+    un-partitioned pass. A partitioned run also FORCES the sync transport
+    regardless of ``extraction.facts.transport`` — the Batches API resume
+    scan is not yet partition-safe (it would need to tell a sibling
+    partition's still in-flight batch id apart from its own), same posture
+    as the existing vertex/batch fallback above. The end-of-pass orphan
+    sweep (#2220) and the auto-continuation decision
+    (:func:`maybe_continue_pass`) both run only once PER CONNECTION, on
+    whichever partition happens to finish last (:func:`_is_last_facts_partition`)
+    — never once per partition.
+
     Returns the pass report (see :meth:`_Report.render`).
     """
     from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
@@ -4134,6 +4335,21 @@ def run_facts_extraction(
     mode = _resolve_run_transport(
         connection_id=connection_id, transport=transport, connection=connection, effective_provider=effective_provider
     )
+    if mode == "batch" and partition is not None and partition[1] > 1:
+        # A partitioned run's resume scan (`_run_batch_pass`'s "batches a
+        # PRIOR pass left in flight") walks the WHOLE connection-wide
+        # ledger by `batch_id`, with no notion of partition ownership yet
+        # — not partition-safe. Force sync instead, same posture as the
+        # vertex/batch fallback below (one warning naming why, never an
+        # error or a silent switch).
+        logger.warning(
+            "facts extraction: connection %s — partition %d/%d forces the sync transport "
+            "(extraction.facts.transport: batch is not yet partition-safe)",
+            connection_id,
+            partition[0],
+            partition[1],
+        )
+        mode = "sync"
     if mode == "batch":
         # Same precedence as the sync loop below: an explicit `retry_mode`
         # (the test seam) wins, else the connection's override, else the
@@ -4180,8 +4396,7 @@ def run_facts_extraction(
     llm_cache = _resolve_llm_cache()
 
     report = _Report()
-    state = load_state(connection_id)
-    docs_state: Dict[str, Any] = state["docs"]
+    state, docs_state = _load_facts_state_for_partition(connection_id, partition)
     anonymize_marked = anonymize_marked_collection_ids(connection)
     shipper = _BatchShipper(
         report=report, anonymize_marked=anonymize_marked, user=_ingest_identity(), docs_state=docs_state
@@ -4225,13 +4440,13 @@ def run_facts_extraction(
             # next pass retries them (TCRD-296 gap #62); persist that
             # correction now rather than letting it live only in memory —
             # a pass whose EVERY batch gets refused would otherwise never
-            # call `save_state` at all this run. A refusal is never
-            # allowed to abort the whole pass — one collection's
-            # misconfiguration must not cost the others.
-            save_state(connection_id, state)
+            # persist anything this run. A refusal is never allowed to
+            # abort the whole pass — one collection's misconfiguration
+            # must not cost the others.
+            _persist_facts_docs(connection_id, state, docs_state, partition=partition)
         else:
             shipped_usage.update({k: int(v) for k, v in snapshot.items() if isinstance(v, (int, float))})
-            save_state(connection_id, state)
+            _persist_facts_docs(connection_id, state, docs_state, partition=partition)
 
     def _accept(result: _DocResult) -> None:
         """Fold one finished document into the report, the batch and the
@@ -4353,6 +4568,7 @@ def run_facts_extraction(
             max_doc_chars=resolved_max_doc_chars,
             system_prompt_tokens=system_prompt_tokens,
             max_prompt_tokens=resolved_max_prompt_tokens,
+            partition=partition,
         ):
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
@@ -4392,7 +4608,11 @@ def run_facts_extraction(
         # it shipped has flushed with `run_orphan_sweep=False`. Runs on
         # every exit path (including a hard stop), same "always finish
         # this pass's own bookkeeping" reasoning as the `_flush()` above.
-        _run_end_of_pass_orphan_sweep(report)
+        # Gap #67: for a PARTITIONED run this must fire once per
+        # CONNECTION, not once per partition — only the partition that
+        # finishes LAST (no sibling still queued/running) actually sweeps.
+        if _is_last_facts_partition(connection_id, partition):
+            _run_end_of_pass_orphan_sweep(report)
 
     resolved_provider_for_report = getattr(extractor, "provider", effective_provider)
     if hard_stop is not None:
@@ -5060,6 +5280,7 @@ def run_standalone_facts_extraction(
     *,
     doc_ids: Optional[Sequence[str]] = None,
     timeout_s: Optional[float] = None,
+    partition: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass OUTSIDE a crawl, over whatever this
     connection's collections already hold — the operator's OWN trigger
@@ -5101,6 +5322,13 @@ def run_standalone_facts_extraction(
     seam (duck-typed on ``.expired()``, see ``_deadline_expired`` above) —
     rather than inventing a second implementation of the same wall-clock
     bound.
+
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) is threaded
+    straight through to :func:`run_facts_extraction` and used to scope the
+    lock (:func:`~connectors.sharepoint.state_store.facts_pass_lock`) to
+    THIS partition alone — ``None`` (the un-partitioned trigger, still the
+    default for a job payload with no ``partition`` key) is byte-identical
+    to today's single whole-connection lock and pass.
     """
     if not facts_extraction_enabled():
         raise FactsExtractionDisabled(
@@ -5118,8 +5346,8 @@ def run_standalone_facts_extraction(
 
     resolved_timeout = _standalone_timeout_seconds() if timeout_s is None else timeout_s
     deadline = _Deadline(resolved_timeout)
-    with facts_pass_lock(connection_id):
-        return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline)
+    with facts_pass_lock(connection_id, partition=partition):
+        return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline, partition=partition)
 
 
 # --------------------------------------------------------------------------
@@ -5154,19 +5382,152 @@ MAX_CONSECUTIVE_FACTS_CONTINUATIONS = 48
 FACTS_CONTINUATION_DELAY_S = 30
 
 
-def facts_extraction_idempotency_key(connection_id: str) -> str:
-    """The STABLE per-connection idempotency key for the
+def facts_extraction_idempotency_key(
+    connection_id: str, *, index: Optional[int] = None, count: Optional[int] = None
+) -> str:
+    """The STABLE per-connection (or per-partition) idempotency key for the
     ``sharepoint-facts-extraction`` job — the single source of truth
     shared by the manual trigger (``app/api/admin_sharepoint.py::
     _facts_extraction_idempotency_key``, which delegates here), the
     fleet/status readers that look a job up by it
-    (``app/api/admin_extraction.py::_facts_job_in_flight``), and this
-    module's own auto-continuation (:func:`maybe_continue_pass`) — so a
-    manual "run now", an auto-continuation of a timed-out pass, and any
-    other trigger for the SAME connection can never both be queued at
-    once, regardless of which of them minted the job.
+    (``app/api/admin_extraction.py::_facts_job_in_flight``/
+    ``_facts_jobs_in_flight``), and this module's own auto-continuation
+    (:func:`maybe_continue_pass`) — so a manual "run now", an
+    auto-continuation of a timed-out pass, and any other trigger for the
+    SAME connection (or the SAME partition of it) can never both be
+    queued at once, regardless of which of them minted the job.
+
+    ``index``/``count`` (TCRD-296 gap #67) are BOTH optional and default
+    to ``None`` — omitted, or ``count <= 1``, returns exactly today's
+    legacy key (``sharepoint-facts-extraction:{connection_id}``), so every
+    existing caller (none of which pass these) and every legacy job
+    payload from before this feature keep working unchanged. Only
+    ``count > 1`` mints the partitioned form
+    (``sharepoint-facts-extraction:{connection_id}:{index}/{count}``) —
+    the presence of a ``:{index}/{count}`` suffix IS the signal "this is a
+    fanned-out pass", so a fan-out that resolves to a single partition
+    (a small backlog) never even looks partitioned.
     """
-    return f"sharepoint-facts-extraction:{connection_id}"
+    if count is None or count <= 1:
+        return f"sharepoint-facts-extraction:{connection_id}"
+    return f"sharepoint-facts-extraction:{connection_id}:{index or 0}/{count}"
+
+
+#: ``extraction.facts.concurrency_passes`` — the ceiling on how many
+#: ``sharepoint-facts-extraction`` PARTITIONS a fan-out
+#: (:func:`enqueue_facts_extraction_passes`) ever enqueues for one
+#: connection at once (TCRD-296 gap #67). Default 4: the live finding this
+#: closes measured seven connections in parallel giving ~11,800
+#: documents/hour against the SAME provider account that one merged
+#: connection (one lock, one job) gave only ~1,400 documents/hour —
+#: throughput scales with concurrent PASSES, not with corpus size, because
+#: the bottleneck is per-document ingest latency under load, not the model
+#: call itself (mostly cache hits). 4 is deliberately below that 7-wide
+#: figure: each partition is its own ``sharepoint-facts-extraction`` job
+#: competing for the SAME ``extraction.concurrency`` lane budget every
+#: other extraction job kind shares (`app/worker/runtime.py`), so a
+#: connection's own fan-out must leave lane headroom for its OWN crawl and
+#: for every other connection's jobs — 4 is safe against the lane budget's
+#: own default sizing without an operator having to tune it for the
+#: common case; a fleet with more lane headroom can raise it.
+DEFAULT_FACTS_CONCURRENCY_PASSES = 4
+
+#: How many pending documents justify ONE partition — a fan-out never
+#: creates more partitions than ``ceil(pending / this)`` even when
+#: ``concurrency_passes`` allows more, so a small backlog (a handful of
+#: documents left over after a normal pass) never gets split into passes
+#: that would spend more on job/lock overhead than the work itself.
+_FACTS_PARTITION_TARGET_DOCS = 2000
+
+
+def _facts_concurrency_passes() -> int:
+    """``extraction.facts.concurrency_passes``, clamped to ``[1, 64]`` —
+    the same ceiling :data:`MAX_CONCURRENCY` already uses for the
+    per-document worker pool, reused here since both bound "how many
+    things run against the same provider account at once"."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "concurrency_passes", default=DEFAULT_FACTS_CONCURRENCY_PASSES)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_FACTS_CONCURRENCY_PASSES
+    return max(1, min(value, MAX_CONCURRENCY))
+
+
+def plan_facts_partition_count(pending: int) -> int:
+    """How many partitions a fan-out should enqueue for a backlog of
+    ``pending`` documents: ``min(concurrency_passes, ceil(pending /
+    _FACTS_PARTITION_TARGET_DOCS))``, never less than 1. A non-positive
+    ``pending`` (nothing to do, or an unknown/misconfigured connection)
+    always resolves to 1 — the legacy, un-partitioned shape — rather than
+    fanning out zero real work into several no-op jobs."""
+    if pending <= 0:
+        return 1
+    configured = _facts_concurrency_passes()
+    return max(1, min(configured, math.ceil(pending / _FACTS_PARTITION_TARGET_DOCS)))
+
+
+def enqueue_facts_extraction_passes(
+    connection_id: str,
+    *,
+    extra_payload: Optional[Dict[str, Any]] = None,
+    pending: Optional[int] = None,
+    run_after: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Enqueue this connection's ``sharepoint-facts-extraction`` pass,
+    fanned out into however many partitions the current backlog and
+    ``extraction.facts.concurrency_passes`` justify
+    (:func:`plan_facts_partition_count`) — the SHARED fan-out every trigger
+    surface for this job kind goes through: the manual operator trigger
+    (``POST …/facts-extract``), the crawl's own streamed enqueue
+    (``connectors.sharepoint.crawler._enqueue_streamed_facts_pass``), and
+    the self-continuation of a timed-out generation
+    (:func:`maybe_continue_pass`).
+
+    ``pending`` lets a caller that already computed
+    :func:`count_pending_documents` (``maybe_continue_pass`` does) avoid
+    paying for that scan twice; omitted, it is computed here.
+
+    A resolved ``count`` of 1 (no real backlog, or the knob/backlog says a
+    single pass is enough) enqueues EXACTLY today's single, un-partitioned
+    job — same idempotency key, same payload shape (no ``partition`` key
+    at all) — so every existing caller and test of the singular trigger is
+    unaffected. Only ``count > 1`` adds ``payload["partition"] =
+    {"index", "count"}`` and mints the partitioned idempotency key
+    (:func:`facts_extraction_idempotency_key`).
+
+    Returns every enqueued (or deduped-onto-existing) job dict, in
+    partition-index order — ``len(result) == count``. A caller that only
+    cares about "did this actually start something new" checks whether
+    EVERY entry is ``deduped`` (a second, identical trigger — see
+    ``app/api/admin_sharepoint.py::trigger_facts_extraction``).
+    """
+    from src.repositories import jobs_repo
+
+    resolved_pending = count_pending_documents(connection_id) if pending is None else pending
+    count = plan_facts_partition_count(resolved_pending)
+
+    from app.worker.registry import job_max_attempts
+
+    max_attempts = job_max_attempts("sharepoint-facts-extraction")
+    repo = jobs_repo()
+    jobs: List[Dict[str, Any]] = []
+    for index in range(count):
+        payload: Dict[str, Any] = {"connection_id": connection_id}
+        if extra_payload:
+            payload.update(extra_payload)
+        if count > 1:
+            payload["partition"] = {"index": index, "count": count}
+        job = repo.enqueue(
+            "sharepoint-facts-extraction",
+            payload,
+            run_after=run_after,
+            idempotency_key=facts_extraction_idempotency_key(connection_id, index=index, count=count),
+            max_attempts=max_attempts,
+        )
+        jobs.append(job)
+    return jobs
 
 
 def count_pending_documents(connection_id: str) -> int:
@@ -5292,46 +5653,72 @@ def maybe_continue_pass(
 
     Continues when ALL of:
 
-    - ``report["interrupted"]`` is true and ``report["interrupted_reason"]
-      == "timeout"`` — the ONLY reason this module auto-continues on (see
-      :meth:`_Report.render`). A stop/cancel leaves a different reason (or
-      the pass simply never finishes to report one), and a closed-set
-      provider refusal — TCRD-296 synthesis F.25 — completes the job with
-      ``interrupted_reason: "provider_limit"`` instead of ``"timeout"``, so
-      this check alone already keeps the auto-continuation chain from
-      re-enqueueing into a fleet-level condition
-      (:func:`streamed_pass_suppressed_by_provider_limit` is what gates the
-      OTHER re-enqueue point, the crawl's own streamed trigger). A genuinely
-      unrecoverable failure (credentials, permissions...) still raises
-      :class:`FactsExtractionUnavailable`, which fails the job rather than
-      completing it, so this function is simply never called for that
-      case. A future per-run DOCUMENT budget (none exists today) would
-      need its own distinct reason value to auto-continue the same way.
+    - **The generation is over.** ``payload["partition"]`` (TCRD-296 gap
+      #67 — absent/``count <= 1`` for the un-partitioned case) names which
+      partition THIS job was; when ``count > 1`` this function does
+      NOTHING (no chain touch, no continuation) unless
+      :func:`_is_last_facts_partition` says every sibling partition of the
+      SAME generation has already terminated — mirrors the crawl shard
+      design's "the last child finalizes the parent". Only the last
+      completer decides whether to plan the NEXT generation, and it does
+      so once, for the WHOLE connection, never once per partition.
+    - **The stop reason allows it.** For an un-partitioned run
+      (``count <= 1``): ``report["interrupted"]`` is true and
+      ``report["interrupted_reason"] == "timeout"`` — the ONLY reason this
+      module auto-continues on (see :meth:`_Report.render`). For a
+      partitioned run's last-completer evaluation: no active
+      ``provider_limit`` condition (:func:`streamed_pass_suppressed_by_
+      provider_limit`) — the per-partition ``report`` this hook receives
+      is only ONE partition's own outcome, but the aggregate "should the
+      next generation run" decision only needs to know whether ANY
+      partition this generation hit a provider refusal (that condition is
+      GLOBAL, set by whichever partition hit it) and whether work remains
+      (the pending count below, which reflects the WHOLE connection
+      regardless of which partition left it). A stop/cancel or a
+      genuinely unrecoverable failure (credentials, permissions...) still
+      raises :class:`FactsExtractionUnavailable`, which fails the job
+      rather than completing it, so this function is simply never called
+      for that case.
     - :func:`count_pending_documents` reports more than 0 remaining — a
-      pass that timed out exactly as the corpus was exhausted has no more
-      work, and chaining onto it would only spend a worker slot
-      confirming that.
+      pass (or generation) that ended exactly as the corpus was exhausted
+      has no more work, and chaining onto it would only spend a worker
+      slot confirming that.
     - the connection's consecutive-continuation counter, persisted
       alongside the facts state (reset to 0 the moment a pass finishes
       with nothing pending), is under
       :data:`MAX_CONSECUTIVE_FACTS_CONTINUATIONS`.
 
-    On success, ``run_after`` is set :data:`FACTS_CONTINUATION_DELAY_S`
-    seconds out, the new job's payload carries the SAME ``doc_ids``/
-    ``timeout_s`` this pass ran with plus ``continued_from`` (this pass's
-    own job id), and — once the new job exists —
-    ``original_job_id``'s own stored report gains
-    ``continued_by_job_id`` (:meth:`JobsRepository.record_continuation`).
+    On success, the next generation is enqueued through
+    :func:`enqueue_facts_extraction_passes` (fresh partition count, since
+    the backlog may have shrunk or grown since the last plan) with
+    ``run_after`` set :data:`FACTS_CONTINUATION_DELAY_S` seconds out; the
+    new payload carries the SAME ``doc_ids``/``timeout_s`` this generation
+    ran with plus ``continued_from`` (this job's own id). Once the new
+    job(s) exist, ``original_job_id``'s own stored report gains
+    ``continued_by_job_id`` (:meth:`JobsRepository.record_continuation`)
+    pointing at the FIRST (index 0) of them — the representative link; the
+    log line below names every id in the new generation.
 
-    Returns the new job's id, or ``None`` when no continuation was
-    enqueued (any of the above, or the dedup path unexpectedly winning —
-    see the docstring's opening paragraph for why that should not
-    normally happen). Best-effort: any exception here is caught and
-    logged, never re-raised — a bug in the re-enqueue path must never
-    turn an already-successful pass into a failed job.
+    Returns the first new job's id, or ``None`` when no continuation was
+    enqueued (any of the above, a sibling partition still in flight, or
+    the dedup path unexpectedly winning — see the docstring's opening
+    paragraph for why that should not normally happen). Best-effort: any
+    exception here is caught and logged, never re-raised — a bug in the
+    re-enqueue path must never turn an already-successful pass into a
+    failed job.
     """
     try:
-        if not report.get("interrupted") or report.get("interrupted_reason") != "timeout":
+        partition_field = payload.get("partition") or {}
+        count = max(1, int(partition_field.get("count") or 1))
+        index = int(partition_field.get("index") or 0)
+
+        if count > 1:
+            if not _is_last_facts_partition(connection_id, (index, count)):
+                return None  # a sibling of this generation is still in flight
+            if streamed_pass_suppressed_by_provider_limit() is not None:
+                _reset_facts_continuation_chain(connection_id)
+                return None
+        elif not report.get("interrupted") or report.get("interrupted_reason") != "timeout":
             _reset_facts_continuation_chain(connection_id)
             return None
 
@@ -5351,9 +5738,7 @@ def maybe_continue_pass(
             )
             return None
 
-        from src.repositories import jobs_repo
-
-        next_payload: Dict[str, Any] = {"connection_id": connection_id}
+        next_payload: Dict[str, Any] = {}
         if payload.get("doc_ids"):
             next_payload["doc_ids"] = payload["doc_ids"]
         if payload.get("timeout_s") is not None:
@@ -5361,41 +5746,41 @@ def maybe_continue_pass(
         if original_job_id:
             next_payload["continued_from"] = original_job_id
 
-        from app.worker.registry import job_max_attempts
-
-        job = jobs_repo().enqueue(
-            "sharepoint-facts-extraction",
-            next_payload,
+        jobs = enqueue_facts_extraction_passes(
+            connection_id,
+            extra_payload=next_payload,
+            pending=pending,
             run_after=datetime.now(timezone.utc) + timedelta(seconds=FACTS_CONTINUATION_DELAY_S),
-            idempotency_key=facts_extraction_idempotency_key(connection_id),
-            max_attempts=job_max_attempts("sharepoint-facts-extraction"),
         )
-        if job.get("deduped"):
+        if all(job.get("deduped") for job in jobs):
             # Another trigger (a race, or an operator's manual click) beat
-            # this one to the key — the pending backlog is already covered
-            # by whatever job holds it now; nothing more for THIS pass to
-            # do. Not expected in the ordinary chain (see docstring).
+            # this one to every key — the pending backlog is already
+            # covered by whatever job(s) hold them now; nothing more for
+            # THIS pass to do. Not expected in the ordinary chain (see
+            # docstring).
             logger.info(
-                "facts extraction: connection %s — %d documents still pending, but another pass (job %s) "
+                "facts extraction: connection %s — %d documents still pending, but another pass (job(s) %s) "
                 "already holds the key; not chaining a duplicate",
                 connection_id,
                 pending,
-                job["id"],
+                ", ".join(job["id"] for job in jobs),
             )
             return None
 
         if original_job_id:
-            jobs_repo().record_continuation(original_job_id, job["id"])
+            from src.repositories import jobs_repo
+
+            jobs_repo().record_continuation(original_job_id, jobs[0]["id"])
 
         logger.info(
-            "facts extraction: connection %s — %d documents pending, continuing (job %s, chain %d/%d)",
+            "facts extraction: connection %s — %d documents pending, continuing (job(s) %s, chain %d/%d)",
             connection_id,
             pending,
-            job["id"],
+            ", ".join(job["id"] for job in jobs),
             chain,
             MAX_CONSECUTIVE_FACTS_CONTINUATIONS,
         )
-        return job["id"]
+        return jobs[0]["id"]
     except Exception:
         logger.exception(
             "facts extraction: connection %s — auto-continuation failed (non-fatal; an operator can "

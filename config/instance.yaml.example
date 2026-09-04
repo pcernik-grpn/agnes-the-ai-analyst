@@ -1649,6 +1649,29 @@ extraction:
     # to at least 2 for a streamed pass to actually OVERLAP the crawl still
     # running; at the default of 1 it simply queues behind it.
     stream_every: 0
+    # How many PARTITIONS one facts-extraction trigger (the manual
+    # `POST …/facts-extract`, the streamed enqueue above, and a timed-out
+    # generation's own self-continuation) fans out into at most — each
+    # partition is its own `sharepoint-facts-extraction` job, processing a
+    # disjoint slice of the connection's pending documents
+    # (`hash(corpus_file_id) % count`) in parallel, on its own lock and its
+    # own worker-lane slot. The ACTUAL count is also capped by the backlog
+    # itself (never more than `ceil(pending / 2000)` partitions, so a small
+    # backlog never gets split into more jobs than it has work) — this is
+    # only the CEILING. Default 4: a live finding measured seven
+    # connections running facts extraction in parallel giving ~11,800
+    # documents/hour against the SAME provider account, versus ~1,400
+    # documents/hour once those connections were merged into one (one
+    # lock, one job) — throughput scales with concurrent PASSES, not
+    # corpus size, because the bottleneck is per-document ingest latency
+    # under load, not the model call itself (mostly cache hits). 4 stays
+    # safely under that 7-wide figure while leaving lane headroom
+    # (`extraction.concurrency` above) for this connection's own crawl and
+    # every other connection's jobs, so the common case needs no tuning;
+    # a fleet with more lane headroom (and a single very large connection)
+    # can raise it. 1 disables fan-out entirely — every trigger behaves
+    # exactly as it did before this knob existed.
+    concurrency_passes: 4
     # Cost-levers lever A (docs/superpowers/specs/2026-09-02-fact-
     # extraction-cost-levers.md §2): when the corrective retry fires,
     # after the zero-token deterministic quote repair has had its chance

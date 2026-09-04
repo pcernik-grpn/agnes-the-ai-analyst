@@ -2166,6 +2166,38 @@ class TestFactsExtractionTrigger:
         assert facts.status_code == 202, facts.text
         assert facts.json()["job_id"] != crawl_job["id"]
 
+    def test_a_large_backlog_fans_out_into_several_partition_jobs(self, seeded_app, monkeypatch):
+        """TCRD-296 gap #67: a backlog large enough to justify more than
+        one partition enqueues several jobs, additively reported
+        (``jobs``/``partitions_total``) alongside the SAME ``job_id``/
+        ``status`` keys (the first partition's) an existing caller reads."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_FACTS_CONFIG))
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.count_pending_documents", lambda connection_id: 9000
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-fanout")
+
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["partitions_total"] == 4  # default extraction.facts.concurrency_passes
+        assert len(body["jobs"]) == 4
+        assert body["job_id"] == body["jobs"][0]["job_id"]
+
+        from src.repositories import jobs_repo
+
+        live = jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10)
+        assert len(live) == 4
+        assert sorted(j["payload_json"]["partition"]["index"] for j in live) == [0, 1, 2, 3]
+
+        # An identical second trigger is a pure no-op — 409, never a
+        # partial 202.
+        second = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "facts_extraction_already_running"
+        assert len(second.json()["detail"]["job_ids"]) == 4
+
 
 class TestCertificateMetadata:
     """`GET /connections/{id}/certificate` — read-only certificate metadata
