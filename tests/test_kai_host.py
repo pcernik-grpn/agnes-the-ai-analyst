@@ -2161,3 +2161,15 @@ def test_otlp_ticket_is_issued_exactly_when_the_instance_exports_otlp(seeded_app
 
     row = ticket_repo().resolve(payload["otlp"])
     assert row is not None and row["scope"] == "kai_otlp"
+
+
+def test_otlp_ticket_follows_the_broker_route_not_the_process_exporter(seeded_app, kai_env, monkeypatch):
+    """A per-signal ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` alone runs the app's
+    own exporter, but the broker route needs the BASE endpoint to append
+    ``/v1/<signal>`` to — so it must not mint a ticket for a route that would
+    answer 503 on every batch (RBAC review finding on the route's PR)."""
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/v1/traces")
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    payload = seeded_app["client"].post("/api/kai/tickets", headers={"Authorization": f"Bearer {credential}"}).json()
+    assert "otlp" not in payload

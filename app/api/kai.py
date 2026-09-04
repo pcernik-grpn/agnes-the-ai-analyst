@@ -199,19 +199,22 @@ def _broker_mcp_enabled() -> bool:
 def _broker_otlp_enabled() -> bool:
     """Whether this instance issues the ``kai_otlp`` ticket scope.
 
-    Not a switch of its own: the scope exists exactly when the instance's own
-    OTLP export is configured (``OTEL_EXPORTER_OTLP_ENDPOINT``), because
-    ``POST /api/broker/otlp/v1/{signal}`` forwards to that very collector with
-    that very credential — a ticket for a route that would answer 503 is
-    worse than no ticket. The engine side is the mirror image: the sandbox
-    only initializes OTel when its host declares an ``otlp`` upstream
-    (``HOST_BROKER_OTLP_URL``), and an ACTIVE scope with no ticket fails every
-    turn before the prompt is sent, which is why the URL must never reach an
-    engine ahead of the app version carrying the route.
+    Not a switch of its own: the scope exists exactly when
+    ``src.observability.otel.collector`` names somewhere to forward to — the
+    SAME function ``POST /api/broker/otlp/v1/{signal}`` resolves its target
+    from — so a ticket can never exist for a route that would answer 503.
+    (Deliberately not ``endpoint_configured()``: a per-signal
+    ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` alone runs this process's own
+    exporter but is no base for a relay's ``/v1/metrics`` or ``/v1/logs``.)
+    The engine side is the mirror image: the sandbox only initializes OTel
+    when its host declares an ``otlp`` upstream (``HOST_BROKER_OTLP_URL``), and
+    an ACTIVE scope with no ticket fails every turn before the prompt is sent,
+    which is why the URL must never reach an engine ahead of the app version
+    carrying the route.
     """
-    from src.observability.otel import endpoint_configured
+    from src.observability.otel import collector
 
-    return endpoint_configured()
+    return collector() is not None
 
 
 def _b64url(raw: bytes) -> str:

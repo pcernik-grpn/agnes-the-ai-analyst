@@ -168,6 +168,22 @@ def test_unreachable_collector_is_a_typed_502(otlp_broker):
     assert r.json()["detail"]["code"] == "otlp_collector_unreachable"
 
 
+def test_declared_oversized_batch_is_refused_before_it_is_read(otlp_broker):
+    tok = ticket_repo().mint("chat_otlp_declared", "kai_otlp", ttl_seconds=60)
+
+    async def _run():
+        transport = httpx.ASGITransport(app=otlp_broker)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/otlp/v1/traces",
+                headers={"Authorization": f"Bearer {tok}", "content-length": str(64 * 1024 * 1024)},
+                content=b"",
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 413
+
+
 def test_headers_parser_handles_the_baggage_form():
     from app.api.broker import _parse_otlp_headers
 

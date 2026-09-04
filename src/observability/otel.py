@@ -44,6 +44,7 @@ import threading
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, Mapping, Optional
+from urllib.parse import unquote
 
 try:
     from opentelemetry import trace
@@ -118,7 +119,44 @@ def _build_resource(role: Optional[str]) -> Any:
 
 
 def endpoint_configured() -> bool:
+    """Whether this process's OWN exporter has somewhere to send: the base
+    endpoint or the per-signal traces override, either of which the SDK's
+    OTLP exporter honours."""
     return bool(os.environ.get(ENDPOINT_VAR, "").strip() or os.environ.get(TRACES_ENDPOINT_VAR, "").strip())
+
+
+def parse_otlp_headers(raw: str) -> dict[str, str]:
+    """``OTEL_EXPORTER_OTLP_HEADERS`` — ``k1=v1,k2=v2`` with W3C-baggage
+    (percent-)encoded values — as a header dict. Blank keys are dropped so a
+    stray trailing comma cannot blank a real header."""
+    out: dict[str, str] = {}
+    for pair in (raw or "").split(","):
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            continue
+        out[key] = unquote(value.strip())
+    return out
+
+
+def collector() -> Optional[tuple[str, dict[str, str]]]:
+    """The collector a broker route can forward a sandbox's batches to: the
+    BASE endpoint (``/v1/<signal>`` appended per call) plus the operator's
+    headers — or ``None``.
+
+    Deliberately narrower than :func:`endpoint_configured`: a per-signal
+    ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` alone lets this process's own
+    exporter run, but gives a relay nothing to append ``/v1/metrics`` or
+    ``/v1/logs`` to, so it is not a collector in this sense. The ticket that
+    admits a sandbox to the broker route is minted from THIS function, so a
+    ticket can never exist for a route that would answer 503. Read per call,
+    like the exporter itself, so a rolled-forward ``.env`` is honoured on the
+    next batch.
+    """
+    endpoint = os.environ.get(ENDPOINT_VAR, "").strip().rstrip("/")
+    if not endpoint:
+        return None
+    return endpoint, parse_otlp_headers(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
 
 
 def configure_otel(*, role: Optional[str] = None, exporter: Any = None) -> bool:  # noqa: C901
@@ -578,12 +616,14 @@ __all__ = [
     "ENDPOINT_VAR",
     "MAX_CONTENT_CHARS",
     "capture_content_enabled",
+    "collector",
     "configure_otel",
     "end_completion_span",
     "end_generation_span",
     "endpoint_configured",
     "input_messages_from_request",
     "is_enabled",
+    "parse_otlp_headers",
     "set_usage_attributes",
     "shutdown_otel",
     "start_completion_span",

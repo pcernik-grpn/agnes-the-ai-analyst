@@ -936,30 +936,12 @@ _OTLP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 _OTLP_FORWARDED_REQUEST_HEADERS = frozenset({"content-type", "content-encoding"})
 
 
-def _parse_otlp_headers(raw: str) -> Dict[str, str]:
-    """``OTEL_EXPORTER_OTLP_HEADERS`` — ``k1=v1,k2=v2`` with W3C-baggage
-    (percent-)encoded values — as a header dict. Blank keys are dropped so a
-    stray trailing comma cannot blank a real header."""
-    out: Dict[str, str] = {}
-    for pair in (raw or "").split(","):
-        key, sep, value = pair.partition("=")
-        key = key.strip()
-        if not sep or not key:
-            continue
-        out[key] = unquote(value.strip())
-    return out
-
-
-def _otlp_collector() -> Optional["tuple[str, Dict[str, str]]"]:
-    """The collector this instance's own OTLP export points at — the base
-    endpoint (the SDK-style base, ``/v1/<signal>`` appended per call) and the
-    operator's headers — or ``None`` when the instance exports nothing. Read
-    per request, like the app's own exporter, so a rolled-forward ``.env``
-    is honoured on the next batch."""
-    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip().rstrip("/")
-    if not endpoint:
-        return None
-    return endpoint, _parse_otlp_headers(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
+# The collector (base endpoint + operator headers) comes from ONE place —
+# ``src.observability.otel.collector`` — which is also what
+# ``/api/kai/tickets`` mints the ``kai_otlp`` ticket from, so the ticket and
+# the route can never disagree about whether there is somewhere to forward to.
+_otlp_collector = _otel.collector
+_parse_otlp_headers = _otel.parse_otlp_headers
 
 
 @router.post("/otlp/v1/{signal}", name="otlp_proxy")
@@ -988,6 +970,11 @@ async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depend
     if collector is None:
         raise HTTPException(status_code=503, detail={"code": "otlp_export_not_configured"})
     base, operator_headers = collector
+    # Refuse a declared-oversized batch before buffering it; the post-read
+    # check below still catches an undeclared or lying length.
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _OTLP_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
     body = await request.body()
     if len(body) > _OTLP_MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
