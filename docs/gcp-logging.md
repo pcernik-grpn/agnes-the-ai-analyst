@@ -45,11 +45,30 @@ is down, still booting, or never installed costs log lines and nothing else.
 
 ## Enabling and disabling
 
-`enable_gcp_logging` on the module (default **true**) gates three things
+`enable_gcp_logging` on the module (default **true**) gates four things
 together: installing and configuring the Ops Agent, leaving the overlay file
-on disk, and the project-level `roles/logging.logWriter` grant to the VM
-service account. Set it to `false` and the VM stays on Docker's default
-`json-file` driver.
+on disk, and two project-level IAM grants to the VM service account —
+`roles/logging.logWriter` and `roles/monitoring.metricWriter`. Set it to
+`false` and the VM stays on Docker's default `json-file` driver.
+
+The metric grant is not there for metrics this module wants. The Ops Agent
+bundles an OpenTelemetry sub-agent that cannot be switched off, only emptied,
+and it exports the agent's own `agent.googleapis.com/agent/*` self-metrics
+whatever its config says. Those are free, but without the role every export
+cycle fails and the serial console fills with `monitoring.timeSeries.create`
+`PermissionDenied` once a minute. The metrics Cloud Monitoring *does* bill
+for — the `hostmetrics` receiver's CPU, disk, memory, network and process
+series — are switched off in the agent config, because `enable_datadog` is
+the path that collects those.
+
+**Upgrading an existing VM: recreate it, or pay for host metrics until you
+do.** The IAM grant lands on `terraform apply`; the agent config lives in
+`metadata_startup_script`, which is in `ignore_changes`, so it reaches the VM
+only on instance replacement. Between the two, an already-provisioned VM
+still runs the built-in `hostmetrics` receiver and — now that the role
+permits it — exports it successfully, billed by ingested bytes. Closing that
+window is the same `terraform apply -replace=...` that propagates every other
+startup-script change from this module.
 
 Engagement is **placement + probe**. The overlay is appended to
 `COMPOSE_FILE` only when the file exists *and*
