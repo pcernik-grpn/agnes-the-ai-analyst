@@ -108,7 +108,13 @@ def _user_facing_page_routes() -> set[str]:
       (``/login/*``, ``/``, ``/first-time-setup``) — those are reached before
       any chrome exists;
     * ``require_admin`` is dropped (``test_web_admin_nav.py`` owns those) and
-      so is any path parameter — a detail page is reached from its list.
+      so is any path parameter — a detail page is reached from its list;
+    * a DEBUG-gated ``/_debug/`` page is dropped, because it 404s unless the
+      operator set ``DEBUG=1``. Both premises of this sweep fail for one:
+      nobody can reach it in a deployment, and the chat agent must not tell a
+      user to go there. The skip PROVES the gate rather than trusting the
+      prefix — a ``/_debug/`` page that forgot ``_is_debug()`` really would
+      be user-facing, and still trips the guard.
     """
     lines = ROUTER.read_text(encoding="utf-8").split("\n")
     decorator_idx = [i for i, ln in enumerate(lines) if ln.startswith("@router.")]
@@ -125,7 +131,10 @@ def _user_facing_page_routes() -> set[str]:
             continue  # pre-auth page: no chrome to be reachable from
         if "templates.TemplateResponse(" not in body:
             continue  # a bare redirect is not a page
-        out.add(m.group(1).rstrip("/") or "/")
+        path = m.group(1).rstrip("/") or "/"
+        if path.startswith("/_debug/") and "_is_debug()" in body:
+            continue  # dev-only, 404 without DEBUG=1 — see the docstring
+        out.add(path)
     return out
 
 

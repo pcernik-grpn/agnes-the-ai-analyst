@@ -92,7 +92,7 @@ def policy_disclosure_for_knowledge(item_ids: List[str], owner: Dict[str, Any]) 
 
 
 def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
-    """Data packages, memory domains and artefact collections ``user`` reaches.
+    """Data packages, memory domains and artifact collections ``user`` reaches.
 
     Each row is ``{id, kind, name, description, meta}`` where ``kind`` is one
     of ``data`` / ``memory`` / ``file``. Every section is independently
@@ -160,7 +160,7 @@ def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning("agent ingredients: could not resolve memory stack: %s", e)
 
-    # Artefacts (file collections) the caller can reach — owned ∪ shared with a
+    # Artifacts (file collections) the caller can reach — owned ∪ shared with a
     # group they belong to (admin → all). These are a third knowledge kind the
     # agent can be grounded in, alongside governed data + memory. Same access
     # resolution the /artefacts page uses, so the builder never offers a file
@@ -202,6 +202,6 @@ def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
                 }
             )
     except Exception as e:
-        logger.warning("agent ingredients: could not resolve artefacts: %s", e)
+        logger.warning("agent ingredients: could not resolve artifacts: %s", e)
 
     return sources

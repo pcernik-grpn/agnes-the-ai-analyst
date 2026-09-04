@@ -4671,3 +4671,33 @@ def test_capacity_reclaim_never_evicts_a_session_being_served(manager: ChatManag
         assert manager._repo.get_session(parked.id).sandbox_id is None
 
     asyncio.run(_run())
+
+
+def test_a_resolved_approval_is_recorded_on_the_tool_call_it_gated():
+    """Approval cards are not persisted, so the transcript had no trace that a
+    human approved or denied a call — only the audit log did (issue #2161).
+    The engine provider's request_id IS the tool call id, so the decision is
+    stamped onto the buffered tool_call frame; `build_message_parts` carries
+    it onto the persisted part."""
+    from app.chat.manager import _record_approval_on_tool_call
+
+    buffer = [
+        {"type": "token", "text": "Looking…"},
+        {"type": "tool_call", "tool_use_id": "call-1", "tool": "crm_search", "args": {"q": "a"}},
+        {"type": "tool_call", "tool_use_id": "call-2", "tool": "crm_update", "args": {"id": 1}},
+    ]
+    _record_approval_on_tool_call(buffer, {"type": "approval_resolved", "request_id": "call-2", "decision": "allow"})
+    assert buffer[2]["approval"] == "allow"
+    assert "approval" not in buffer[1]
+
+    # The native runner's `appr-…` ids match no call: nothing is claimed.
+    _record_approval_on_tool_call(buffer, {"type": "approval_resolved", "request_id": "appr-7", "decision": "deny"})
+    assert all("approval" not in f or f["tool_use_id"] == "call-2" for f in buffer if f["type"] == "tool_call")
+
+    # A turn that ended before anyone answered says nothing on the row.
+    _record_approval_on_tool_call(buffer, {"type": "approval_resolved", "request_id": "call-1", "decision": "cancelled"})
+    assert "approval" not in buffer[1]
+
+    # Denials and timeouts are recorded too — the row says what happened.
+    _record_approval_on_tool_call(buffer, {"type": "approval_resolved", "request_id": "call-1", "decision": "timeout"})
+    assert buffer[1]["approval"] == "timeout"

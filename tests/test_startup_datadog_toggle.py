@@ -230,6 +230,29 @@ def test_the_agent_version_is_pinned_and_held(on: str):
     assert f'!= "1:{AGENT_VERSION}-1"' in on
 
 
+def test_the_artifacts_install_after_the_deb_postinst_that_chowns_the_config_dir(on: str):
+    """The order of the apt step and the artifact loop is load-bearing.
+
+    The agent deb's postinst (the embedded fleet installer,
+    `installFilesystem` -> `agentConfigPermissions`, verified on 7.82.3)
+    enforces dd-agent:dd-agent RECURSIVELY on /etc/datadog-agent — on first
+    install and again on every version change. datadog.yaml stays
+    root:dd-agent only because the artifact loop runs AFTER that postinst and
+    re-installs the file with explicit ownership. Swapping the two — say, to
+    have the config in place so the postinst starts the agent already
+    configured — would silently hand the agent user ownership of its own
+    config file, undoing the root-owned-config property the rendered
+    datadog.yaml documents.
+    """
+    apt_at = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    first_artifact_at = on.index('_dd_install_artifact "')
+    assert apt_at < first_artifact_at, (
+        "the artifact loop must stay after the apt step — the deb postinst "
+        "recursively chowns /etc/datadog-agent to dd-agent, so artifacts "
+        "installed before it would lose their root ownership"
+    )
+
+
 def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     assert "usermod -aG docker dd-agent" in on
     assert "systemctl enable datadog-agent" in on
@@ -237,6 +260,42 @@ def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     assert "id dd-agent >/dev/null 2>&1" in on, (
         "every ownership flag below needs the group to exist; a failed apt step must not turn into a failed boot"
     )
+
+
+def test_the_fleet_installer_unit_is_masked_before_the_agent_can_start(on: str):
+    """The mask has to beat the apt step, not merely the `systemctl enable`.
+
+    datadog-agent-installer.service is a soft dependency of
+    datadog-agent.service and exits 255 without remote configuration, which
+    this module deliberately disables (DataDog/datadog-agent#43052). The deb's
+    postinst STARTS the agent — see the artifact-ordering test above, whose
+    whole subject is what that postinst does — so the first pull-in happens
+    during `apt-get install`, long before anything here enables the service.
+    A mask applied after that point arrives one failure too late, and masking
+    does not clear a failed state that is already recorded.
+    """
+    mask_cmd = "ln -sf /dev/null /etc/systemd/system/datadog-agent-installer.service"
+    assert mask_cmd in on
+
+    mask = on.index(mask_cmd)
+    apt = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    assert mask < apt, (
+        "mask before the package install: its postinst starts the agent, which "
+        "is what pulls the installer unit in"
+    )
+
+    # `systemctl mask` is not used on purpose: it can refuse a unit whose file
+    # does not exist yet, which is precisely the state before apt runs.
+    assert "systemctl mask datadog-agent-installer.service" not in on
+
+    # A failure a previous boot recorded outlives the mask, so it is cleared too.
+    reset = on.index("systemctl reset-failed datadog-agent-installer.service")
+    assert reset > apt, "reset-failed only helps after the install that could have failed it"
+
+    # Guarded, like every other step in this block — and asserted on the mask's
+    # OWN line, so an unguarded mask cannot be excused by a neighbour's `|| true`.
+    mask_line = on[mask : on.index("\n", on.index("|| echo", mask))]
+    assert '|| echo "WARNING: could not mask' in mask_line, "the mask step is unguarded"
 
 
 def test_every_artifact_is_installed_and_an_empty_payload_removes_its_target(on: str):
@@ -356,6 +415,116 @@ def test_the_rendered_script_is_valid_bash(tmp_path: Path, enabled: bool):
     script.write_text(_render(enabled))
     proc = subprocess.run([bash, "-n", str(script)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+# --------------------------------------------------------------------------
+# The applier's uid, reserved before anything can steal it (#2137 follow-up)
+# --------------------------------------------------------------------------
+
+
+def test_the_applier_uid_is_reserved_before_docker_and_datadog(on: str, off: str):
+    """The Datadog agent's apt postinst creates its own `dd-agent` system
+    user with no uid pin, and on a fresh image `useradd --system` allocates
+    the next free system uid — which used to be $AGNES_APPLIER_UID, because
+    agnes-applier's own pinned `useradd` ran later in the script. Whichever
+    of the two ran first won the number. Observed live 2026-09-03: dd-agent
+    won, the applier fell back to an allocated uid, and the app crash-looped
+    on an instance.yaml it could no longer read.
+
+    The reservation must now be the very first thing this script does — in
+    both renders, since section 0 has nothing to do with enable_datadog —
+    and specifically before the Datadog agent block in the enabled render.
+    """
+    for label, body in (("on", on), ("off", off)):
+        reserve_at = body.index("# --- 0. Reserve the state-applier's pinned uid")
+        first_useradd = body.index("if ! id -u agnes-applier")
+        docker_at = body.index("# --- 1. Docker (install if missing)")
+        assert reserve_at < first_useradd < docker_at, (
+            f"[{label}] the applier uid reservation must run, and create the user, before section 1's Docker install"
+        )
+
+    agent_at = on.index("--- DATADOG AGENT")
+    on_first_useradd = on.index("if ! id -u agnes-applier")
+    assert on_first_useradd < agent_at, (
+        "the applier's uid reservation must run before the Datadog agent "
+        "block, or the agent's own dd-agent user can steal the pinned uid first"
+    )
+
+
+def test_nothing_executable_precedes_the_uid_reservation(on: str, off: str):
+    """The reservation's guarantee is "before ANY package activity", and the
+    relative anchors above cannot carry it alone: a future `apt-get install`
+    (or a `curl | sh`, or another useradd) inserted ABOVE section 0 would
+    leave every before-Docker / before-Datadog comparison true while
+    re-opening the exact race the reservation exists to close — any
+    package's postinst can allocate a system uid, and the top free one is
+    the uid the applier pins. So pin the invariant itself: between the top
+    of the script and the reservation's `if`, the only executable lines are
+    the fixed prelude — the shell options, the log redirect and its chmod,
+    plain variable assignments (no command substitution), and the banner.
+    """
+    prelude_allowed = (
+        re.compile(r"^#"),  # comments, including the shebang
+        re.compile(r"^\s*$"),  # blank lines
+        re.compile(r"^set -euo pipefail$"),
+        re.compile(r"^exec > /var/log/agnes-startup\.log 2>&1$"),
+        re.compile(r"^chmod 640 /var/log/agnes-startup\.log"),
+        # Plain assignments only — `$(` or a backtick would smuggle a
+        # command into what this whitelist treats as inert.
+        re.compile(r"^[A-Z_][A-Z_0-9]*=(?!.*\$\()(?!.*`).*$"),
+        re.compile(r'^echo "=== \[Agnes '),
+    )
+    for label, body in (("on", on), ("off", off)):
+        reservation_at = body.index("if ! id -u agnes-applier")
+        offenders = [
+            line for line in body[:reservation_at].splitlines() if not any(rx.match(line) for rx in prelude_allowed)
+        ]
+        assert not offenders, (
+            f"[{label}] executable statement(s) before the uid reservation — anything "
+            f"running earlier can allocate the pinned uid first: {offenders!r}"
+        )
+
+
+def test_datadog_pre_creates_dd_agent_at_its_own_pinned_uid(on: str, off: str):
+    """The second, order-independent guard: dd-agent gets a FIXED uid
+    distinct from $AGNES_APPLIER_UID, so even a future reorder that put the
+    Datadog block ahead of section 0 again could not hand it uid 999."""
+    assert "DATADOG_DD_AGENT_UID=998" in on
+    assert "useradd --system --no-create-home --home-dir /opt/datadog-agent" in on
+    assert '--uid "$DATADOG_DD_AGENT_UID" --user-group dd-agent' in on
+
+    # The pre-creation must run before the apt install that would otherwise
+    # let the package's own postinst create dd-agent unpinned.
+    precreate_at = on.index('--uid "$DATADOG_DD_AGENT_UID"')
+    apt_install_at = on.index("DEBIAN_FRONTEND=noninteractive apt-get install")
+    assert precreate_at < apt_install_at
+
+    # A disabled render carries none of the CODE — same posture as every
+    # other Datadog-only artifact
+    # (test_the_off_path_is_the_only_datadog_text_in_a_disabled_render).
+    # Section 0's own comment forward-references the variable name
+    # regardless of enable_datadog (it documents the second guard for a
+    # reader looking at section 0 alone), so only comment lines may still
+    # mention it in the disabled render.
+    off_code_lines = [ln for ln in off.splitlines() if not ln.lstrip().startswith("#")]
+    assert not any("DATADOG_DD_AGENT_UID" in ln for ln in off_code_lines)
+    assert not any("dd-agent" in ln for ln in off_code_lines)
+
+
+def test_the_uid_mismatch_guard_fails_loudly_and_falls_back_to_group_read(on: str, off: str):
+    """A residual uid collision (something other than Datadog already holds
+    $AGNES_APPLIER_UID) must be loud, and must not leave instance.yaml at
+    whatever mode it already had — carrying over a stale 0600 from a
+    previous good boot onto a now-mismatched owner is the exact failure the
+    reservation fix (above) exists to prevent one layer up; this is the
+    fallback for every other way the uid could still be taken. Present in
+    both renders — this guard has nothing to do with enable_datadog."""
+    for label, body in (("on", on), ("off", off)):
+        assert 'echo "ERROR: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID' in body, label
+        assert 'getent passwd "$AGNES_APPLIER_UID"' in body, label
+        assert 'chown ":$AGNES_APPLIER_UID" "$INSTANCE_YAML"' in body, label
+        assert 'chmod 640 "$INSTANCE_YAML"' in body, label
+        assert 'chmod 644 "$INSTANCE_YAML"' in body, label
 
 
 def test_the_rendered_script_stays_well_inside_the_gce_metadata_limit():

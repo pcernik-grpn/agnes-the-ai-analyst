@@ -354,13 +354,80 @@ caveat on cAdvisor's fidelity. A production deployment that doesn't use
 this profile should scrape the same `/metrics` path on whatever ports each
 role's `/healthz`/`/readyz` already answer on, at a similar interval.
 
+## OpenTelemetry export — opt-in, one span per LLM completion
+
+Agnes can ship traces to any OTLP/HTTP collector. It is off until the
+standard variables are set on the process (every process: the app, the
+scheduler, a collector — they share one logging entrypoint and that is where
+the exporter is installed):
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<collector>/<base-path>   # the SDK appends /v1/traces
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<token>    # whatever the collector wants
+AGNES_OTEL_CAPTURE_CONTENT=1                                 # optional — see below
+```
+
+An unset endpoint leaves the OpenTelemetry API's no-op tracer in place: no
+exporter, no background thread, a dictionary lookup per call. The log line
+`otel: OTLP trace export enabled` at startup says it is on; a collector
+that refuses the batches shows up as the SDK's own
+`Failed to export span batch` warnings.
+
+### What is exported
+
+- **One span per LLM completion that transits the chat broker**
+  (`app/api/broker.py`) — every chat surface and every engine, because all of
+  a session's LLM traffic goes through that one route. Named `chat <model>`,
+  kind `CLIENT`, with the duration of the upstream call.
+- **One span per server-side generation** wrapped in `trace_generation`
+  (`src/observability/llm_tracing.py`: summaries, extraction, the semantic
+  layer) — the same tracer, the same table.
+
+| attribute | on | carries |
+|---|---|---|
+| `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model` | both | provider (`anthropic`, `gcp.vertex_ai`) and models |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | both | uncached input and output |
+| `gen_ai.usage.cache_read_input_tokens`, `gen_ai.usage.cache_creation_input_tokens` | broker | prompt-cache reads and writes, **separately** — folding them into `input_tokens` undercounts an agentic run by orders of magnitude (see *Chat cost*) |
+| `gen_ai.response.finish_reasons` | broker | the stop reason |
+| `agnes.session_id`, `agnes.user_email`, `agnes.user_id`, `agnes.agent_id`, `agnes.ticket_scope` | broker | which session, who ran it, under which agent; `llm` is the embedded turn engine, `main` the native sandbox |
+| `agnes.upstream`, `agnes.stream`, `http.response.status_code`, `error.type` | broker | where the call went and how it ended |
+| `agnes.prompt_chars`, `agnes.completion_chars` | generation | sizes, never text |
+
+The resource on every span is `service.name=agnes`, `service.version`,
+`deployment.environment` and `service.instance.id` (`hostname:pid`) —
+`deployment.environment` is the same `AGNES_DEPLOYMENT_ENV` /
+`RELEASE_CHANNEL` label the logs carry, so one instance is one value in
+both signals. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override
+any of them.
+
+### Content
+
+Prompt and completion text is **not** exported by default, for the same
+reason the logs never carry it: in this product it routinely holds customer
+data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds `gen_ai.input.messages` (system
+prompt and conversation, tool calls and tool results included, binary
+blocks reduced to their type) and `gen_ai.output.messages` (the answer,
+re-assembled from the stream) in the OpenTelemetry GenAI message shape.
+Each attribute is capped (`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged
+as `agnes.content_truncated`. Turn it on only where the collector is
+allowed to hold that data.
+
+### What is not exported
+
+HTTP request spans, database calls and the sandbox's own per-tool spans. The
+broker sees a completion, not the agent loop around it; an engine that
+traces its own turns needs its host to broker an `otlp` egress scope for
+that, which this route does not yet do.
+
 ## No telemetry vendor
 
 Agnes sends nothing to a third-party analytics or error-tracking service, and
-has no key for one. An optional integration with a hosted product-analytics
-vendor existed until 0.96 and was removed (see `CHANGELOG.md`): it was off on
-every deployment, it never saw the failures that mattered — a handled error
-is not a 500, so it was never captured — and it asked operators to ship
-prompts and session replays off-host to get numbers the log pipeline already
-carries. What it did well, LLM call metadata and an environment label, is
-above, in logs.
+has no key for one. The OTLP export above goes only where the operator
+points it, with the operator's credential, and is off until they do. An
+optional integration with a hosted product-analytics vendor existed until
+0.96 and was removed (see `CHANGELOG.md`): it was off on every deployment,
+it never saw the failures that mattered — a handled error is not a 500, so
+it was never captured — and it asked operators to ship prompts and session
+replays off-host to get numbers the log pipeline already carries. What it
+did well, LLM call metadata and an environment label, is above, in logs
+and, opt-in, in traces.

@@ -1273,13 +1273,27 @@ async def export_semantic_model(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Export the stored document byte-for-byte — never re-serialized, so
-    comments and key order survive."""
+    comments and key order survive.
+
+    Provenance rides response HEADERS, never the body (issue #2153): ``ETag``
+    is the row's own ``content_hash`` (sha256 of the document), quoted per
+    RFC 7232, and ``X-Semantic-Model-Updated-At`` is ``updated_at`` in
+    ISO-8601 — the only two fields the row actually carries that identify
+    *which* revision this is. A caller that must pin provenance (a skill,
+    an agent) reads these instead of re-hashing the body itself; the MCP
+    tool `semantic_model_get` folds both into its response. No
+    If-None-Match / conditional GET — the ETag is informational only, not
+    a caching contract."""
     row = semantic_model_repo().get_by_slug(slug)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{slug}' not found")
     if not _can_read_model(user, row, conn):
         raise HTTPException(status_code=403, detail=_export_denied_message(slug))
-    return Response(content=row["document"], media_type="text/yaml")
+    headers = {"ETag": f'"{row["content_hash"]}"'}
+    updated_at = row.get("updated_at")
+    if updated_at:
+        headers["X-Semantic-Model-Updated-At"] = updated_at.isoformat()
+    return Response(content=row["document"], media_type="text/yaml", headers=headers)
 
 
 # ---------------------------------------------------------------------------

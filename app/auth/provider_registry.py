@@ -172,7 +172,7 @@ def _rescue_if_unusable(cache_key: tuple, allowlist: list[str] | None) -> list[s
         any_raised = any_raised or raised
     if any_raised:
         # At least one probe could not answer. "Everything looks unavailable"
-        # is then an artefact of the fault, not a statement about the
+        # is then an artifact of the fault, not a statement about the
         # configuration — and rescuing would narrow the offering (404 on the
         # operator's intended door) for its duration. Leave the allowlist
         # alone; each provider is still gated by its own is_available() at the

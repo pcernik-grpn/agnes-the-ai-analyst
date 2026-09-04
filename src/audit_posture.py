@@ -613,6 +613,13 @@ POSTURE: dict[str, str] = {
     "POST /api/upload/sessions": "session.upload",
     # -- app.api.uploads -------------------------------------------------------
     "POST /api/admin/uploads/cover-image": "cover_image.upload",
+    # -- app.api.admin_service_accounts (issue #1534) ---------------------------
+    "POST /api/admin/service-accounts": "user.service_account_create",
+    "POST /api/admin/service-accounts/{service_account_id}/tokens": "token.create",
+    # One PATCH, two lifecycle actions (activate/deactivate by `active` in the
+    # body) — named for the primary branch, same multi-action convention as
+    # data_app.container_up above.
+    "PATCH /api/admin/service-accounts/{service_account_id}": "user.service_account_deactivate",
     # -- app.api.users ---------------------------------------------------------
     "DELETE /api/users/{user_id}": "user.delete",
     "PATCH /api/users/{user_id}": "user.update",
@@ -1129,6 +1136,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /auth/admin/tokens": "token.list",
     "GET /auth/tokens": "token.list",
     "GET /auth/tokens/{token_id}": "token.list",
+    # -- app.api.admin_service_accounts (issue #1534) — surfaces a per-account
+    # PAT summary (count/last_used_at/soonest expiry), the same sensitivity
+    # class as the admin all-tokens listing above.
+    "GET /api/admin/service-accounts": "token.list",
     # -- app.api.users --
     "GET /api/users": "exempt:ui_support",
     "GET /api/users/{user_id}": "exempt:ui_support",
@@ -1176,6 +1187,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /metrics": "exempt:health",
     # -- app.web.router --
     "GET /": "exempt:ui_support",
+    "GET /_debug/error-surfaces": "exempt:noise",
     "GET /_debug/throw/exc": "exempt:noise",
     "GET /_debug/throw/http/{code:int}": "exempt:noise",
     "GET /activity-center": "exempt:ui_support",
@@ -1254,6 +1266,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /library": "exempt:ui_support",
     "GET /library/{slug}": "exempt:ui_support",
     "GET /library/{slug}/f/{file_id}": "exempt:ui_support",
+    # An HTML FRAGMENT of the collection page's own file rows, fetched by the
+    # Library's live search (#2141). Same posture as the two pages above and
+    # for the same reason — it renders rows the caller can already read on
+    # `GET /library/{slug}`, and it is gated on that same collection access.
+    "GET /library/{slug}/matching-files": "exempt:ui_support",
     "GET /login": "exempt:ui_support",
     "GET /login/email": "exempt:ui_support",
     "GET /login/password": "exempt:ui_support",

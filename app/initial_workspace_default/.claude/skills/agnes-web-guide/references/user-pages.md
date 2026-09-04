@@ -11,7 +11,7 @@ user sees there, and when to send them.
   rename, pin, bulk cleanup. "Where did our conversation from last week go?"
   → here.
 - `/library` — the one browse surface for everything the user can have or
-  already has: uploaded files & artefacts, data packages, corporate-memory
+  already has: uploaded files & artifacts, data packages, corporate-memory
   domains, marketplace plugins, recipes, skills, agents, and items shared
   with them. An *In stack only* toggle narrows the list to what they
   subscribed to, the *Not in stack yet* filter (in the Filter menu) shows

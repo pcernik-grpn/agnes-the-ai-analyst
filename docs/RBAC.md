@@ -152,7 +152,7 @@ admin creates via the Library/API is then granted to `Everyone` at creation.
 The grant is an ordinary `resource_grants` row — visible in `/admin/access`
 and revocable per collection in the Share dialog. Scope is deliberately
 narrow: non-admin uploads stay private, and chat file drops (which create
-private one-file artefacts through a separate path) are never auto-shared.
+private one-file artifacts through a separate path) are never auto-shared.
 
 ---
 
@@ -400,6 +400,69 @@ prompting from the unattended SessionStart hook. Renewal is just
 
 No server change was needed for this: no new grant type, no PAT default
 TTL change. See [`docs/HEADLESS_USAGE.md`](./HEADLESS_USAGE.md#renewal-interactive-analysts).
+
+---
+
+## Service accounts
+
+A service account (issue #1534) is a `users` row flagged `kind='service'`
+(PG-only — `users.kind`, A3 ratchet) rather than a bespoke table: a headless
+caller (CI, an integration, a bot) that holds its OWN group grants and mints
+its OWN independently-revocable PATs. It is deliberately NOT a template for
+"give a machine admin" — the internal `scheduler@system.local` identity
+(`app/auth/scheduler_token.py`) predates this feature and stays a
+special-cased, Admin-group, shared-secret-authenticated exception; a service
+account is the opposite shape: scoped, admin-provisioned, and structurally
+incapable of reaching Admin.
+
+Admin-only, under `POST/GET /api/admin/service-accounts*`
+(`agnes admin service-account create|list|token|deactivate|activate|
+revoke-token`, or the "Service accounts" section on `/admin/users`):
+
+- **Create** — a display name + slug; the row gets a synthetic
+  `<slug>@service.local` address, `active=true`, and is never added to the
+  Admin group.
+- **Mint a token** — session-token-only (mirrors `POST /auth/tokens`): a
+  PAT-authenticated admin gets a typed 403, preserving the rule that durable
+  credentials are only ever minted from an interactive session. The minted
+  PAT authenticates on REST/CLI/MCP exactly like a human's, scoped by
+  whatever groups the service account itself belongs to.
+- **Deactivate / activate** — the identical `users.active` flip a human
+  account gets; `resolve_token_to_user`'s existing `active` check then kills
+  every one of its PATs with zero new code. Deactivating an unrelated human
+  has no effect on a service account's own tokens, and vice versa.
+- **Revoke a token** — the existing `DELETE /auth/admin/tokens/{token_id}`
+  (admin-on-behalf already works there).
+
+Three guards make the identity structurally safe, each enforced at a single
+shared choke point rather than copied per call site:
+
+1. **No interactive session.** `app.auth.jwt.create_access_token` — the one
+   function every login provider (Google, Microsoft, password, email
+   magic-link, Keboola, SSO, the legacy `/auth/token` endpoint, MCP-OAuth's
+   exchange/refresh) calls to mint the credential a completed login hands
+   back — refuses a `typ="session"` mint for a `kind='service'` row
+   (`ServiceAccountInteractiveLoginError` -> 403). Password reset and
+   setup-request initiation treat it exactly like "no such account" (same
+   anti-enumeration response, no token minted).
+2. **No Admin group.** `UserGroupMembers(Pg)Repository.add_member` refuses
+   (`ServiceAccountAdminGroupForbidden` -> 409
+   `service_account_admin_forbidden`) when the target group is the system
+   Admin group and the user is `kind='service'` — one check inside
+   `add_member` itself covers every one of its ~8 call sites (admin UI/CLI/
+   REST, directory-sync provisioning, the scheduler/bootstrap seeds). It
+   stays freely addable to any ordinary group — scoped grants are the point.
+3. **Visible where grants are managed, absent from human-only pickers.**
+   `GET /api/users` (`search_recent`) is BOTH the `/admin/users` listing AND
+   the only "add someone to a group" picker in the product
+   (`group_drawer.js`, `admin_access.html`'s member-add search) — it
+   deliberately INCLUDES service accounts on both, since granting one a
+   scoped membership is the entire point of the feature.
+
+DuckDB has no `kind` column at all (frozen post-A3 schema): every admin
+service-account endpoint answers a typed `501 requires_postgres_backend`
+there, and guards 1–2 are provable no-ops (a service account cannot exist to
+be refused).
 
 ---
 

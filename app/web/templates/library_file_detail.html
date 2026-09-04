@@ -1,7 +1,7 @@
 {% extends "base_ds.html" %}
 {# One file inside a collection — its own detail page.
 
-   A single-file artefact IS its collection and keeps using library_detail.html;
+   A single-file artifact IS its collection and keeps using library_detail.html;
    this page serves the files *inside* a folder, which had no page of their own
    before collections became folders in the Library.
 
@@ -73,8 +73,15 @@
 {# Secondary actions leave the header for the overflow menu, so Preview is
    the only prominent control on the page. Sharing is not among them — the
    rail's badge is the control, and a second entry point behind a chevron is
-   the redundancy this page had. #}
-{% set _menu_items = [{'label': 'Open collection', 'href': '/library/' ~ collection.slug, 'icon': 'file'}] %}
+   the redundancy this page had.
+
+   Neither is "Open collection", for the same reason and by the same argument:
+   the crumb trail above the hero now links the collection in the first place
+   a reader looks for it, so a copy behind a chevron was a third path to a
+   page already reachable in one click (#2141). That leaves the menu holding
+   at most one item, so it is built only when it HAS one — `detail.menu([])`
+   renders a chevron that opens onto an empty panel. #}
+{% set _menu_items = [] %}
 {# Removing the file was CLI-only (`agnes collections rm-file`), so the page a
    reader lands on to look at a file they just uploaded by mistake could not
    undo it. Owner-or-admin (`can_manage`), and withheld on a source-managed
@@ -86,17 +93,48 @@
    legacy branch below. Same attrs both times, so one handler wires both. #}
 {% set _can_delete = can_manage and not source_managed_by %}
 {% if _can_delete and detail.redesign %}
-  {% set _ = _menu_items.append({'sep': True}) %}
+  {# No leading separator: with "Open collection" gone there is nothing above
+     this to separate it from. #}
   {% set _ = _menu_items.append({'label': 'Delete file', 'icon': 'trash', 'danger': True,
                                  'attrs': 'data-delete-file'}) %}
 {% endif %}
-{% set _menu %}{{ detail.menu(_menu_items) }}{% endset %}
+{% set _menu %}{% if _menu_items %}{{ detail.menu(_menu_items) }}{% endif %}{% endset %}
+
+{# Where "back" goes, and where the trail says you are.
+   Back is the LIBRARY, because that is where a reader who clicked this file
+   came from: the Library lists the collection's files inline, so its back
+   affordance pointing at the collection sent them to a page they had never
+   opened (#2141 item 3). `?section=files` opens the band that holds the row,
+   the same link every other artifact detail page's back uses
+   (router._detail_back). The collection stays in the trail — it IS this
+   file's parent — but as a breadcrumb, not as the back action. #}
+{# WHICH crumb is the back action depends on where the reader came from, and
+   both routes here are real: the Library lists this file inline under its
+   folder, and the collection page lists it too. A single fixed answer is wrong
+   for one of them — pointing back at the collection stranded readers arriving
+   from the Library (#2141 item 3), and pointing back at the Library throws out
+   readers who were part-way through browsing the collection.
+
+   So the Library's own rows carry `?from=library` (see `_library_child_row`)
+   and that is what moves the arrow. Anything else — the collection page's file
+   links, the preview modal's "Open file page", a pasted URL — leaves the arrow
+   on the collection, this file's structural parent. The trail itself is the
+   same either way, so nothing is unreachable in either case.
+
+   `?open=` on the Library crumb reopens the folder, so back lands on the list
+   the reader actually left rather than a collapsed one. #}
+{% set _from_library = request.query_params.get('from') == 'library' %}
+{% set _back = detail_back('files', '/library', 'Library') %}
+{% set _crumbs = [{'href': _back.href ~ ('&' if '?' in _back.href else '?') ~ 'open=' ~ collection.id,
+                   'label': _back.label, 'back': _from_library},
+                  {'href': '/library/' ~ collection.slug, 'label': _collection_name,
+                   'back': not _from_library}] %}
 
 {% call detail.hero(
      kind='file', glyph='doc', name=file.filename, compact=True,
      type_label='File', menu=_menu|trim,
      description='One file in the ' ~ _collection_name ~ ' collection, with its own sharing.',
-     meta=_meta, back_href='/library/' ~ collection.slug, back_label=_collection_name) %}
+     meta=_meta, crumbs=_crumbs) %}
   {# Preview is the primary action: the first thing you want from a file's page
      is to see the file. It opens the same modal a row click opens on the
      collection page (file_preview.js), so the file looks the same either way. #}
@@ -196,9 +234,13 @@
    own value ("Format PDF", "Size 2.1 MB"), so "File information" over the top
    labelled a block that was already fully labelled. #}
 {{ detail.side_open('') }}
+  {# No "Collection" row. The rail's own "In this collection" block below is
+     the one place this page names its parent, and it names it as a related
+     ENTITY (glyph, kind label, link) rather than as a fact about the file —
+     which is what the row was, one block above the same link. With the crumb
+     trail at the top of the page naming it a third time, the rail stated the
+     collection twice in one column. #}
   {{ detail.side_rows([
-       {'key': 'Collection', 'html': True,
-        'val': '<a href="/library/' ~ collection.slug ~ '">' ~ _collection_name ~ '</a>'},
        {'key': 'Format', 'val': _type or 'Unknown'},
        {'key': 'Size', 'val': file_size_display},
        {'key': 'Indexing', 'html': True, 'val': detail.status(_status_label, _status_tone)|trim},

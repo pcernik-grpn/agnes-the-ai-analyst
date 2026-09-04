@@ -14,6 +14,8 @@ not simulated pixels)."""
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import json
 import shutil
 import subprocess
@@ -158,7 +160,7 @@ def _sp_step2_slice() -> str:
     keeps the slice a single honest contiguous range rather than a
     hand-picked patchwork.
     """
-    html = TEMPLATE.read_text(encoding="utf-8")
+    html = _ds_page_source.page_source()
     start = html.index('const SP_CONN_API = "/api/admin/source-connections";')
     end = html.index("</script>", start)
     return html[start:end]

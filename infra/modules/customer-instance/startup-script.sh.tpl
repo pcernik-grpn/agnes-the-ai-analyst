@@ -32,6 +32,54 @@ AGNES_APPLIER_UID=999
 
 echo "=== [Agnes $CUSTOMER_NAME $ROLE] Startup at $(date) ==="
 
+# --- 0. Reserve the state-applier's pinned uid before ANYTHING else can take
+# it -------------------------------------------------------------------
+# `/data/state/instance.yaml` is only readable by the app container (uid
+# $AGNES_APPLIER_UID) while `agnes-applier` resolves to that same number —
+# see the declaration above and the readback further down (#1217). That held
+# for years because nothing else on a fresh VM claimed a uid in the low-900s
+# system range before agnes-applier's own useradd ran, later in this script.
+# The opt-in Datadog agent broke that: its apt postinst creates the
+# `dd-agent` system user with NO uid pin, and `useradd --system` allocates
+# the top free id in the system range — which IS $AGNES_APPLIER_UID on an
+# otherwise-untouched image. Whichever of the two ran first won the number,
+# and agnes-applier used to run second every time. Observed live
+# (2026-09-03, enable_datadog=true on a VM recreate): dd-agent grabbed uid
+# 999, the applier's own pinned useradd failed and fell through to an
+# allocated 997, the recursive /data/state chown further down then re-owned
+# an instance.yaml that was already 0600 from a previous boot onto that
+# uid, and the app container (still uid 999) crash-looped on
+# InstanceConfigUnreadable before Caddy or the scheduler ever started.
+#
+# Reserving the uid HERE — before section 1's Docker install and before the
+# Datadog agent's own apt install, i.e. before anything else that could add
+# a system user — closes the race outright: whichever package runs later
+# simply cannot see $AGNES_APPLIER_UID as free any more. The Datadog block
+# further down additionally pins dd-agent to its own fixed
+# $DATADOG_DD_AGENT_UID as a second, order-independent guard, in case a
+# future reorder ever puts an unpinned-uid installer ahead of this block
+# again.
+#
+# Idempotent and otherwise identical to the belt-and-braces useradd sites
+# further down (kept there too, per #1217 — every useradd site pins the same
+# variable so they cannot drift apart): only the CREATE is skipped when the
+# user already exists here; the actual uid match is verified by the readback
+# right before instance.yaml's chmod, not here.
+if ! id -u agnes-applier >/dev/null 2>&1; then
+    # The group is ensured separately and useradd takes `--gid`, not
+    # `--user-group`: with `--user-group` an orphaned agnes-applier group —
+    # e.g. left behind by the documented userdel+re-run remediation — would
+    # fail BOTH useradd attempts ("group exists") and, under this script's
+    # errexit, abort the whole boot. Only the UID is pinned; the gid does
+    # not matter: instance.yaml is 0600, so the group bits grant nothing
+    # and only the owner's uid decides who can read it.
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
+    || useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid agnes-applier agnes-applier
+fi
+
 # --- 1. Docker (install if missing) ---
 if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -428,6 +476,43 @@ _dd_install_artifact() {
 if [ -z "$DD_API_KEY_VALUE" ]; then
     echo "WARNING: Datadog API key secret '${datadog_api_key_secret}' is unreadable or empty — the agent is not configured this boot" >&2
 else
+    # Pin dd-agent to its own fixed uid BEFORE the apt install below can
+    # create it unpinned. Section 0 (top of this script) already reserves
+    # $AGNES_APPLIER_UID first, which is enough on its own to fix the uid
+    # collision this guards against — this is the second, order-independent
+    # half: even if a future edit moved this block ahead of section 0 again,
+    # dd-agent still could not land on $AGNES_APPLIER_UID, because it is
+    # pinned to a different fixed number instead of "whatever the system
+    # allocates next". apt's postinst honours an existing dd-agent user/group
+    # and skips creating its own. Idempotent; the unpinned fallback only
+    # fires if $DATADOG_DD_AGENT_UID is itself somehow already taken, in
+    # which case allocation behaves exactly as it did before this fix.
+    DATADOG_DD_AGENT_UID=998
+    if ! id -u dd-agent >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /opt/datadog-agent \
+                --shell /usr/sbin/nologin --uid "$DATADOG_DD_AGENT_UID" --user-group dd-agent 2>/dev/null \
+        || useradd --system --no-create-home --home-dir /opt/datadog-agent \
+                --shell /usr/sbin/nologin --user-group dd-agent 2>/dev/null \
+        || echo "WARNING: could not pre-create the dd-agent user — the Datadog package's own postinst will create it instead, unpinned" >&2
+    fi
+
+    # datadog-agent.service Wants datadog-agent-installer.service (Fleet
+    # Automation's remote-upgrade daemon), which cannot run here: it exits 255
+    # with "remote config is required to create the updater", because the
+    # rendered datadog.yaml turns remote configuration off. Datadog confirm
+    # that failure is expected once those features are disabled, and their
+    # graceful-exit bug is open (DataDog/datadog-agent#43052). A soft
+    # dependency, so masking does not stop the agent; unmasked it leaves every
+    # consumer a permanently failed unit, which pins a "failed systemd units"
+    # monitor to alert until nobody reads it.
+    #
+    # Before apt, not after: the deb's postinst starts the agent, which is what
+    # pulls this unit in, so a mask applied afterwards arrives one failure too
+    # late. A symlink to /dev/null is exactly what `systemctl mask` writes, and
+    # unlike the subcommand it does not need the unit file to exist yet.
+    ln -sf /dev/null /etc/systemd/system/datadog-agent-installer.service \
+        || echo "WARNING: could not mask datadog-agent-installer.service — expect a permanently failed unit" >&2
+
     if [ "$(dpkg-query -W -f='$${Version}' datadog-agent 2>/dev/null || true)" != "1:${datadog_agent_version}-1" ]; then
         echo "installing the Datadog Agent ${datadog_agent_version}..."
         (
@@ -455,11 +540,20 @@ else
         # enable_datadog description.
         usermod -aG docker dd-agent \
             || echo "WARNING: could not add dd-agent to the docker group — Docker and container metrics will be missing" >&2
+        # The artifact loop must stay AFTER the apt step above: the deb's
+        # postinst (the embedded fleet installer) recursively chowns
+        # /etc/datadog-agent to dd-agent on install and on every version
+        # change, so an artifact installed before it would lose the root
+        # ownership the datadog.yaml case below sets on purpose.
 %{ for dd_path, dd_content in datadog_files_b64 ~}
         _dd_install_artifact "${dd_path}" "${dd_content}" \
             || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
 %{ endfor ~}
         systemctl daemon-reload >/dev/null 2>&1 || true
+        # Masking (above the apt step) stops the unit failing from here on, but
+        # it does not clear a failure a PREVIOUS boot already recorded — and a
+        # failed unit is remembered until something resets it.
+        systemctl reset-failed datadog-agent-installer.service >/dev/null 2>&1 || true
         systemctl enable datadog-agent >/dev/null 2>&1 || true
         systemctl restart datadog-agent >/dev/null 2>&1 \
             || echo "WARNING: the Datadog Agent did not start — inspect 'systemctl status datadog-agent'" >&2
@@ -540,6 +634,12 @@ fi
 # there on today's image by allocation rather than by intent — so pin it,
 # and let the chmod below check the pin took.
 #
+# Section 0 (top of this script) already creates this user, pinned, before
+# Docker or Datadog can take the uid — so in the normal boot order this `if`
+# is always false. Kept as belt-and-braces anyway, same reasoning as the
+# B3-NEW block further down: a reorder or a partial run should not silently
+# reintroduce an unpinned user via the one copy that lost the pin (#1217).
+#
 # This `if` only guards user CREATION, not the uid check — an
 # agnes-applier that already exists (e.g. a VM provisioned before this pin
 # existed, or one where uid $AGNES_APPLIER_UID was taken by something else at
@@ -550,14 +650,11 @@ fi
 # the pre-existing case, since it re-reads whatever uid the name resolves to
 # right now instead of trusting this block succeeded.
 if ! id -u agnes-applier >/dev/null 2>&1; then
-    # Only the UID is pinned. `--gid` and `--user-group` are mutually
-    # exclusive, so a form passing both always fails — and the gid does not
-    # matter here anyway: instance.yaml is 0600, so the group bits grant
-    # nothing and only the owner's uid decides who can read it.
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
     || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
+            --gid agnes-applier agnes-applier
 fi
 usermod -aG docker agnes-applier
 mkdir -p /data/state /data/postgres
@@ -575,20 +672,38 @@ chown -R agnes-applier:agnes-applier /data/state
 # time, the pin above fell through to an allocated id, the app cannot read a
 # 0600 file it does not own, and — with the fail-closed read this change
 # also introduces — the instance refuses to start. A full outage in place
-# of a silent degradation. Where the pin did not take, the mode stays as it
-# was and the reason is on the console; the hardening applies exactly where
-# its precondition is met.
+# of a silent degradation. Where the pin did not take, the hardening applies
+# exactly where its precondition is met.
 #
 # Covers both non-happy paths from #1217: (a) the uid was taken at THIS
 # boot's provisioning (the `if` above fell through to the unpinned form) and
 # (b) agnes-applier already existed from before the pin with some other uid
 # (an in-place upgrade) — the `if` above skipped creation entirely, so this
 # readback is the only place either shape is caught.
+#
+# "Leave the mode as it was" — this branch's original shape — is exactly the
+# outage the Datadog uid collision (section 0, top of this script) produced:
+# the recursive /data/state chown just above already re-owns instance.yaml
+# to the mismatched agnes-applier regardless of this check, so an existing
+# file that was 0600 from a PREVIOUS good boot stayed 0600 under a uid the
+# app is not. So the mismatch branch now applies the same degraded-but-
+# readable policy scripts/ops/agnes-state-applier.sh's own writer already
+# established for this exact class of problem (#1298,
+# docs/postgres-cutover-runbook.md): 0640 with the app's own gid
+# ($AGNES_APPLIER_UID, numeric — a group entry need not exist by that name
+# for chown to accept it) as a fallback read grant, or 0644 if even that
+# fails, rather than trusting whatever mode happened to be on disk.
 APPLIER_UID=$(id -u agnes-applier 2>/dev/null || echo "")
 if [ "$APPLIER_UID" = "$AGNES_APPLIER_UID" ]; then
     chmod 600 "$INSTANCE_YAML" 2>/dev/null || true
 else
-    echo "WARN: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID — leaving $INSTANCE_YAML at its current mode. 0600 would make it unreadable by the app container (uid $AGNES_APPLIER_UID), which owns neither the file nor this user. Remediation: free uid $AGNES_APPLIER_UID (check what holds it with 'getent passwd $AGNES_APPLIER_UID') and either 'userdel'+re-run this script to recreate agnes-applier pinned, or 'usermod -u $AGNES_APPLIER_UID agnes-applier' followed by 'chown -R agnes-applier:agnes-applier /data/state /opt/agnes/.env' to re-home its existing files onto the new uid. Until then this VM runs in the pre-#1217 degraded mode: instance.yaml stays at its current, looser permissions." >&2
+    echo "ERROR: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID — uid $AGNES_APPLIER_UID is held by $(getent passwd "$AGNES_APPLIER_UID" 2>/dev/null | cut -d: -f1 || echo 'nothing (system uid allocation exhausted?)'). Remediation: free uid $AGNES_APPLIER_UID (see above) and either 'userdel agnes-applier'+re-run this script to recreate it pinned, or 'usermod -u $AGNES_APPLIER_UID agnes-applier' followed by 'chown -R agnes-applier:agnes-applier /data/state /opt/agnes/.env' to re-home its existing files onto the new uid. Until then this VM runs $INSTANCE_YAML at 0640/0644 instead of owner-only — see docs/postgres-cutover-runbook.md." >&2
+    if chown ":$AGNES_APPLIER_UID" "$INSTANCE_YAML" 2>/dev/null; then
+        chmod 640 "$INSTANCE_YAML" 2>/dev/null || true
+    else
+        chmod 644 "$INSTANCE_YAML" 2>/dev/null || true
+        echo "WARNING: could not hand $INSTANCE_YAML to group $AGNES_APPLIER_UID — leaving it at 0644 (world-readable) so the app container can still read its own config" >&2
+    fi
 fi
 # /data/postgres must stay 70:70 (postgres image uid) — applier just
 # runs docker exec against the container, doesn't touch the volume.
@@ -604,9 +719,9 @@ install -m 0644 "$APP_DIR/agnes-state-applier.timer" /etc/systemd/system/agnes-s
 # agnes-applier user + chowns /data/state on first boot. The main
 # applier unit ``Requires=`` it so by the time systemd resolves
 # ``User=agnes-applier`` for the applier, the user definitely exists.
-# The eager useradd block above (lines ~108-117) is now belt-and-
-# braces; customer infras that don't ship matching provisioning logic
-# get the bootstrap for free via this unit.
+# The eager useradd (the uid-reservation block at the top of this
+# script) is now belt-and-braces; customer infras that don't ship
+# matching provisioning logic get the bootstrap for free via this unit.
 install -m 0644 "$APP_DIR/agnes-state-applier-bootstrap.service" /etc/systemd/system/agnes-state-applier-bootstrap.service
 systemctl daemon-reload
 systemctl enable --now agnes-state-applier-bootstrap.service
@@ -1618,16 +1733,18 @@ chmod 600 "$APP_DIR/.env"
 # already source the file. The bootstrap unit's ExecStart re-asserts
 # this every boot in case an operator (or agnes-auto-upgrade) rewrites
 # .env later.
-# In the normal boot order this `if` is always false — section 3 above
-# already created agnes-applier, pinned to $AGNES_APPLIER_UID. Kept pinned
-# here too (same fallback shape) so a reordering of the two blocks can't
-# quietly reintroduce an unpinned user via this path — #1217 was exactly
-# this kind of duplicate that only one of two copies got fixed.
+# In the normal boot order this `if` is always false — the uid-reservation
+# block at the top of this script already created agnes-applier, pinned to
+# $AGNES_APPLIER_UID. Kept pinned here too (same fallback shape) so a
+# reordering of the two blocks can't quietly reintroduce an unpinned user
+# via this path — #1217 was exactly this kind of duplicate that only one of
+# two copies got fixed.
 if ! id -u agnes-applier >/dev/null 2>&1; then
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
     || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
+            --gid agnes-applier agnes-applier
 fi
 chown agnes-applier:agnes-applier /opt/agnes/.env
 chmod 0600 /opt/agnes/.env
