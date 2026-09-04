@@ -394,18 +394,19 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         query_mode — so an unlabelled list renders the same option twice,
         meaning two different things.
 
-        The filter is the Library's now (a Filter button, a faceted menu, a
-        chip row) rather than a flat strip of pills, so the heading is the
-        shared `.fbar-menu__title` and the chip names its category. The rule is
-        unchanged: neither surface may show a bare value.
+        PR #2187 paired an equivalent redesign (a Filter button, a faceted
+        menu, a chip row, `.fbar-menu__title`) with this page, but that half
+        of the PR's "One filter" section is explicitly superseded again by
+        #2196 and was not adopted here — this page keeps its own always-
+        visible toggle strip (`pdw-pickctl__grp`), which already labels each
+        group via `aria-label`. The rule the two designs share is unchanged:
+        neither surface may show a bare, unlabelled value.
         """
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "fbar-menu__title" in src
-        assert "facetGroupHtml('source_type', 'Source')" in src
-        assert "facetGroupHtml('query_mode', 'Query mode')" in src
-        # The chip carries the category too — "Source: keboola, jira".
-        assert "'Source', pickerFacets.source_type.join" in src
-        assert "'Query mode', pickerFacets.query_mode.join" in src
+        assert "pdw-pickctl__grp" in src
+        assert 'aria-label="Filter by \' + esc(label) + \'"' in src
+        assert "toggles('source_type', 'source')" in src
+        assert "toggles('query_mode', 'query mode')" in src
 
     def test_the_in_no_package_toggle_reads_a_server_flag(self) -> None:
         """Membership spans every OTHER package, so the client cannot derive
@@ -434,7 +435,7 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         """On a fresh instance every row is unpackaged, and a control that
         hides nothing is a control that lies."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "un < (st ? st.registry.length : 0)" in src
+        assert "unpackagedN < (st ? st.registry.length : 0)" in src
 
     def test_the_sorts_came_across_including_the_stale_first_one(self) -> None:
         src = COMPONENT.read_text(encoding="utf-8")
