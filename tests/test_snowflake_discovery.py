@@ -1,3 +1,5 @@
+
+from tests import _ds_page_source
 """Snowflake table discovery — the browse half of "add a Snowflake table".
 
 Snowflake was the only source type whose wizard step had no discovery: two
@@ -540,7 +542,7 @@ def test_the_snowflake_picker_prepares_its_status_lines_before_registering():
     """
     from pathlib import Path
 
-    html = Path("app/web/templates/admin_data_sources.html").read_text()
+    html = _ds_page_source.page_source()
     fn = html[html.index("async function _registerSfRows()") :]
     fn = fn[: fn.index("\n}\n")]
     assert "_setBucketOpen(group, true)" in fn, "checked groups must be opened before the status writes"

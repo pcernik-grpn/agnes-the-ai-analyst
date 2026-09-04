@@ -136,7 +136,7 @@ class TestStep2SavedScopesAndGuidanceMarkup:
         assert "ds-wizard-error" not in guidance_tag
 
 
-TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
+TEMPLATE = _ds_page_source.TEMPLATE
 
 
 def _node_run(script: str) -> str:

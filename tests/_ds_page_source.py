@@ -76,3 +76,14 @@ def rendered_with_scripts(html: str) -> str:
     only exist in the response) working as they were.
     """
     return html + "\n" + scripts_only()
+
+
+def styles_only() -> str:
+    """Just the page's stylesheet.
+
+    A test asserting on CSS must not be handed `page_source()`: the same
+    selector appears there as a STRING inside the script (`querySelector(
+    ".ds-sf-conn-error__msg")`), and an `index()` for it lands in JavaScript
+    400 characters from any declaration.
+    """
+    return "\n".join(p.read_text(encoding="utf-8") for p in _STYLES if p.exists())

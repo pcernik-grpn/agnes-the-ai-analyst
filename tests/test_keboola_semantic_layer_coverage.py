@@ -8,6 +8,8 @@ definition, is a real finding.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 from unittest.mock import MagicMock, patch
 
 
@@ -385,7 +387,7 @@ class TestTheWarningStripDoesNotSweepEveryMetastore:
     def test_the_data_sources_page_asks_for_the_cheap_form(self):
         from pathlib import Path
 
-        page = (Path(__file__).resolve().parents[1] / "app/web/templates/admin_data_sources.html").read_text()
+        page = _ds_page_source.page_source()
         assert "semantic-layer/coverage?warnings_only=true" in page
         # …and the Semantic layer page still wants the full report.
         full = (Path(__file__).resolve().parents[1] / "app/web/templates/admin_semantic_layer.html").read_text()

@@ -13,6 +13,8 @@ role-switcher. It changes what RENDERS. It grants nothing.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import re
 from pathlib import Path
 
@@ -227,7 +229,9 @@ class TestTheWizardCanMakeAnAudience:
 
     @pytest.fixture(scope="class")
     def page(self) -> str:
-        return (ROOT / "app" / "web" / "templates" / "admin_data_sources.html").read_text(encoding="utf-8")
+        # The page as the browser assembles it: this surface's script now
+        # lives in js/ds_page.js, so the template alone holds half of it.
+        return _ds_page_source.page_source()
 
     def test_the_step_offers_a_new_group(self, page):
         assert 'id="ds-wizard-newgroup"' in page

@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
+TEMPLATE = _ds_page_source.TEMPLATE
 
 
 def _extract_block(text: str, opener: str) -> str:

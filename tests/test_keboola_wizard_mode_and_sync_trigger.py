@@ -17,12 +17,13 @@ used by `tests/test_admin_data_sources_page.py::TestWizardRegisterPayloadContrac
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 from pathlib import Path
 
 
 def _template_text() -> str:
-    tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    return tpl.read_text(encoding="utf-8")
+    return _ds_page_source.page_source()
 
 
 def _picker_row(tpl: str) -> str:

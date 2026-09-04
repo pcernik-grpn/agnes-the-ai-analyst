@@ -1,3 +1,5 @@
+
+from tests import _ds_page_source
 """POST /api/admin/server-config refuses an unconfirmed connection repoint.
 
 Changing a connection coordinate under ``data_source.<source>`` — Snowflake's
@@ -319,11 +321,24 @@ class TestEveryConnectionSaveSurfaceIsWired:
         "app/web/templates/setup.html",  # first-boot / re-run setup
     ]
 
-    @pytest.mark.parametrize("template", SURFACES)
-    def test_surface_saves_through_the_shared_confirm_helper(self, template):
+    @staticmethod
+    def _surface_text(template: str) -> str:
+        """A surface as the browser assembles it, not just its template.
+
+        `/admin/data-sources` keeps its script in a file it loads
+        (`js/ds_page.js`) so the data-package builder can load the same
+        wizard, so reading the template alone finds half the page — and this
+        guard would report a wired surface as unwired.
+        """
         from pathlib import Path
 
-        body = Path(template).read_text()
+        if template.endswith("admin_data_sources.html"):
+            return _ds_page_source.page_source()
+        return Path(template).read_text()
+
+    @pytest.mark.parametrize("template", SURFACES)
+    def test_surface_saves_through_the_shared_confirm_helper(self, template):
+        body = self._surface_text(template)
         assert "saveConnectionConfig" in body, (
             f"{template} writes a data_source connection but does not go through "
             "saveConnectionConfig, so it cannot answer the repoint 409"
@@ -334,9 +349,7 @@ class TestEveryConnectionSaveSurfaceIsWired:
         """This 409's `detail` is an object (a 422's is an array); interpolating
         either into a template literal prints "[object Object]" at the exact
         moment the operator needs to read why."""
-        from pathlib import Path
-
-        body = Path(template).read_text()
+        body = self._surface_text(template)
         assert "apiDetailText" in body
 
     def test_the_helper_is_loaded_on_every_page(self):

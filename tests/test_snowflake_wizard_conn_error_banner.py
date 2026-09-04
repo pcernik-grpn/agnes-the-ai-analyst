@@ -16,12 +16,13 @@ executing the script.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 from pathlib import Path
 
 
 def _template_text() -> str:
-    tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    return tpl.read_text(encoding="utf-8")
+    return _ds_page_source.page_source()
 
 
 def _function_body(tpl: str, signature: str) -> str:
@@ -120,7 +121,10 @@ def test_conn_error_banner_reuses_the_design_system_danger_tokens():
     """Proper error styling, not the plain highlighted-line-of-text look the
     issue called out — same danger color tokens the rest of the page already
     uses (`.ds-src__health.is-err`, `.ds-conn-test-result.fail`, ...)."""
-    tpl = _template_text()
-    css_start = tpl.index(".ds-sf-conn-error")
-    css_block = tpl[css_start : css_start + 400]
+    # The STYLESHEET, not the whole page: `.ds-sf-conn-error` also appears in
+    # the script as a querySelector string, and slicing from there lands in
+    # JavaScript rather than in a rule.
+    css = _ds_page_source.styles_only()
+    css_start = css.index(".ds-sf-conn-error")
+    css_block = css[css_start : css_start + 400]
     assert "var(--ds-accent-danger" in css_block

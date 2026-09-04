@@ -24,6 +24,8 @@ Covers:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import json
 import shutil
 import subprocess
@@ -219,7 +221,7 @@ def test_admin_data_sources_register_flow_still_targets_the_validated_endpoint()
     are genuinely 2 registration UIs, not 3. This guard only pins that the
     (unchanged) flow still targets the validated endpoint, so a future
     change to admin_data_sources.html can't quietly repoint it."""
-    html = Path("app/web/templates/admin_data_sources.html").read_text(encoding="utf-8")
+    html = _ds_page_source.page_source()
     assert 'API_REGISTER_TABLE = "/api/admin/register-table"' in html
 
 
