@@ -1,0 +1,252 @@
+{% extends "base_ds.html" %}
+
+{#
+  Dev-only gallery of the error surfaces that are NOT the error page — the
+  ones that only appear when something upstream actually fails, which makes
+  them the hardest to review and the easiest to ship broken.
+
+  Every note, toast and dialog message on this page is built by the SHIPPED
+  `window.agnesNotice` (app.js) with copy from the SHIPPED `chat_errors.js`.
+  Nothing here restates a sentence or re-describes a style: change either and
+  this page changes with it. A gallery that transcribes its subject is worse
+  than no gallery, because it goes stale silently and then lies.
+
+  Route: GET /_debug/error-surfaces, DEBUG=1 only (404 otherwise), alongside
+  /_debug/throw/http/{code} which covers the page side.
+#}
+
+{% block title %}Error surfaces — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/chat.css') }}">
+<style>
+  .dbg-intro { max-width: 62ch; color: var(--text-secondary); margin: 0 0 var(--space-6); }
+  .dbg-section { margin: 0 0 var(--space-9); }
+  .dbg-section > h2 {
+    font-size: var(--text-lg);
+    margin: 0 0 var(--space-2);
+  }
+  .dbg-section > p {
+    max-width: 62ch;
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    margin: 0 0 var(--space-4);
+  }
+  /* Each specimen is labelled with the (kind, message) it was rendered from,
+     so a wrong sentence can be traced to the branch that produced it without
+     reading the module. */
+  .dbg-case {
+    border-top: 1px solid var(--border);
+    padding: var(--space-4) 0;
+  }
+  .dbg-case-src {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+    margin: 0 0 var(--space-2);
+    overflow-wrap: anywhere;
+  }
+  .dbg-tone {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    margin-left: var(--space-2);
+  }
+  .dbg-tone.is-warn { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .dbg-tone.is-error { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
+  .dbg-tone.is-ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .dbg-tone.is-info { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  /* The notes are capped to 70% of the message column in the real app; here
+     they sit full-width so several can be compared at once. */
+  .dbg-stream .notice { max-width: 100%; margin: 0; }
+  .dbg-dialog {
+    max-width: 30rem;
+    padding: var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+  }
+  .dbg-dialog h3 { margin: 0 0 var(--space-1); font-size: var(--text-md); }
+  .dbg-dialog p.hint { margin: 0 0 var(--space-4); font-size: var(--text-sm); color: var(--text-secondary); }
+  .dbg-page-links { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-top: var(--space-3); }
+  .dbg-page-links a {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>Error surfaces</h1>
+<p class="dbg-intro">
+  Every message below is built by the shipped <code>window.agnesNotice</code>
+  (app.js) with copy from <code>chat_errors.js</code>, from the
+  <code>(kind, message)</code> shown above it — the same two calls the chat
+  client makes. Change either and this page changes with it.
+</p>
+<p class="dbg-intro">
+  All three surfaces share one component. Tone is three quiet signals — a
+  light ground, a stripe down the left edge, and a 16px glyph — while the
+  sentence itself stays in body ink. Coloured text on a coloured ground was
+  most of what made these read as alarms, and all of what cost them
+  legibility.
+</p>
+
+<section class="dbg-section">
+  <h2>In the transcript</h2>
+  <p>
+    What a reader sees when a turn ends early. The tone chip is
+    <code>chatErrorTone()</code>'s verdict: only a genuine failure gets the
+    red treatment — a rate limit, a restart or a spent budget resolves by
+    waiting or by something the reader can do, so those read amber.
+  </p>
+  <div id="dbg-stream-cases"></div>
+</section>
+
+<section class="dbg-section">
+  <h2>In an upload dialog</h2>
+  <p>
+    <code>requestErrorCopy()</code> against a fake <code>Response</code>. Before
+    this existed each dialog ended in <code>String(j.detail)</code>, so any
+    refusal carrying a structured body — every rate limit and cap — rendered
+    <code>[object Object]</code> here.
+  </p>
+  <div id="dbg-upload-cases"></div>
+</section>
+
+<section class="dbg-section">
+  <h2>As a toast</h2>
+  <p>The row actions (pin, rename, delete) and the attachment queue use this.</p>
+  <div id="dbg-toast-cases"></div>
+</section>
+
+<section class="dbg-section">
+  <h2>The full-page errors</h2>
+  <p>
+    Those live on the error page itself, reachable directly — this list is here
+    so the whole set is one click away.
+  </p>
+  <div class="dbg-page-links">
+    {% for code in [400, 403, 404, 405, 408, 413, 422, 429, 500, 502, 503, 504] %}
+    <a href="/_debug/throw/http/{{ code }}">{{ code }}</a>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script type="module">
+  import { chatErrorCopy, chatErrorTone, requestErrorCopy, requestErrorTone } from "{{ static_url('js/chat_errors.js') }}";
+
+  // (kind, message) pairs as the runner and the manager actually emit them.
+  const STREAM_CASES = [
+    ["runner_exception", "Error code: 429 - {'error': {'message': 'rate_limit_error'}}"],
+    ["runner_exception", "429 RESOURCE_EXHAUSTED: Quota exceeded for base model anthropic-claude-haiku-4-5"],
+    ["concurrency_cap", "user someone@example.com has 3 active sessions; cap = 3"],
+    ["budget_exhausted", "429"],
+    ["rate_limit", "Rate limit hit: 100 messages/hour."],
+    ["daily_budget", "Daily spend cap of $20.00 reached."],
+    ["max_session_tokens", "this conversation has spent its token budget"],
+    ["server_restarting", "gateway is restarting"],
+    ["turn_idle_timeout", "no output for 1800s"],
+    ["subprocess_crashed", "runner exited with signal 9"],
+    ["engine_error", "engine turn failed: boom"],
+    ["not_configured", "no chat provider is configured"],
+  ];
+
+  // status → (code, detail) as each endpoint answers it.
+  const UPLOAD_CASES = [
+    [429, { kind: "rate_limit" }, "Upload failed."],
+    [429, { kind: "concurrency_cap", hint: "cap = 3" }, "Upload failed."],
+    [429, { code: "budget_exhausted" }, "Upload failed."],
+    [403, { code: "access_denied" }, "Upload failed."],
+    [500, null, "Upload failed."],
+    [400, "The file has no header row.", "Upload failed."],
+    [400, { code: "validation_failed" }, "Upload failed."],
+  ];
+
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+
+  function caseBlock(srcText, toneName) {
+    const wrap = el("div", "dbg-case");
+    const src = el("p", "dbg-case-src", srcText);
+    if (toneName) src.appendChild(el("span", `dbg-tone is-${toneName}`, toneName));
+    wrap.appendChild(src);
+    return wrap;
+  }
+
+  // ── transcript notes ────────────────────────────────────────────────
+  const stream = document.getElementById("dbg-stream-cases");
+  for (const [kind, message] of STREAM_CASES) {
+    const tone = chatErrorTone(message, kind);
+    const block = caseBlock(`${kind} — ${message}`, tone);
+    const body = el("div", "dbg-stream");
+    // Exactly what renderSystemNote() builds — the shared .notice from
+    // app.js, same builder, same classes.
+    body.appendChild(window.agnesNotice(chatErrorCopy(message, kind), tone, {
+      placement: "inline",
+      extraClass: "cloud-chat-system-note",
+    }));
+    block.appendChild(body);
+    stream.appendChild(block);
+  }
+
+  // ── upload dialogs ──────────────────────────────────────────────────
+  // A stand-in for the parts of Response that requestErrorCopy reads, so the
+  // real function runs against a real shape without a network call.
+  const fakeRes = (status, detail) => ({
+    status,
+    json: async () => {
+      if (detail === null) throw new Error("no body");
+      return { detail };
+    },
+  });
+
+  const uploads = document.getElementById("dbg-upload-cases");
+  for (const [status, detail, fallback] of UPLOAD_CASES) {
+    const shown = detail === null ? "(no body)" : JSON.stringify(detail);
+    const tone = requestErrorTone(status, detail && typeof detail === "object" ? (detail.kind || detail.code || "") : String(detail || ""));
+    const block = caseBlock(`${status} — detail: ${shown}`, tone);
+    const dialog = el("div", "dbg-dialog");
+    dialog.appendChild(el("h3", null, "Upload a data file"));
+    dialog.appendChild(el("p", "hint", "CSV, Parquet or Excel. Max 20 MB."));
+    // showDialogError() appends the shared .notice into the slot.
+    const slot = el("div", "cloud-chat-upload-error");
+    slot.appendChild(window.agnesNotice(await requestErrorCopy(fakeRes(status, detail), fallback), tone, { placement: "inline" }));
+    dialog.appendChild(slot);
+    block.appendChild(dialog);
+    uploads.appendChild(block);
+  }
+
+  // ── toasts ──────────────────────────────────────────────────────────
+  const toasts = document.getElementById("dbg-toast-cases");
+  for (const [status, detail] of [[429, { kind: "concurrency_cap" }], [429, { kind: "rate_limit" }], [500, null]]) {
+    const shown = detail === null ? "(no body)" : JSON.stringify(detail);
+    const tone = requestErrorTone(status, detail && typeof detail === "object" ? (detail.kind || detail.code || "") : "");
+    const block = caseBlock(`Could not rename · ${status} — detail: ${shown}`, tone);
+    const t = window.agnesNotice(
+      await requestErrorCopy(fakeRes(status, detail), "Could not rename that conversation."),
+      tone,
+      { placement: "floating", extraClass: "toast" },
+    );
+    t.appendChild(el("button", "notice__x toast-x", "✕"));
+    const holder = el("div", null);
+    holder.style.cssText = "display:flex";
+    holder.appendChild(t);
+    block.appendChild(holder);
+    toasts.appendChild(block);
+  }
+</script>
+{% endblock %}

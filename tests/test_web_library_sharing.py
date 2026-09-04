@@ -13,7 +13,7 @@ Three things ship together here and are locked in one place:
     lets the creator of an item share it with groups they belong to. The
     security-relevant invariants are ownership and group containment.
   - ``/library`` — the renamed, widened former ``/artefacts``, listing
-    artefacts + skills with per-row visibility. Agents are deliberately NOT
+    artifacts + skills with per-row visibility. Agents are deliberately NOT
     listed there (they have their own home at ``/agents``), but they remain
     real registry rows whose grants ``/api/v1/agents`` honours.
 
@@ -379,7 +379,7 @@ def test_share_targets_include_everyone(seeded_app):
 
 def test_collection_share_cycles_private_shared_workspace(seeded_app):
     """The three visibility states are reachable and reversible through one
-    idempotent PUT, for the artefact kind."""
+    idempotent PUT, for the artifact kind."""
     from src.grant_scopes import EVERYONE_TARGET_ID
 
     c = seeded_app["client"]
@@ -594,7 +594,7 @@ def test_linked_app_sharing_is_admin_only_and_deliberate(seeded_app, monkeypatch
 
 
 def test_library_lists_artefacts_with_visibility_but_not_agents(seeded_app):
-    """One table for the caller's things — artefacts (and skills) with a type
+    """One table for the caller's things — artifacts (and skills) with a type
     facet and a visibility chip. Agents are excluded: they live on /agents."""
     tok = seeded_app["admin_token"]
     _create_collection(seeded_app, "Quarterly Deck", tok)
@@ -602,8 +602,8 @@ def test_library_lists_artefacts_with_visibility_but_not_agents(seeded_app):
 
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
     assert "Quarterly Deck" in text
-    assert 'data-kind="artefact"' in text
-    # Visibility chip + the share affordance for the grant-backed artefact kind.
+    assert 'data-kind="artifact"' in text
+    # Visibility chip + the share affordance for the grant-backed artifact kind.
     assert "lib-vis--private" in text
     assert 'data-share-type="collection"' in text
     # The agent exists in the registry but is NOT a Library row.
@@ -988,7 +988,7 @@ def _stock_domain(domain_id: str, item_id: str) -> None:
 
 def test_library_lists_granted_resources_of_every_kind(seeded_app):
     """The Library answers "what do I have?" across kinds: the caller's own
-    artefacts PLUS the governed data packages, memory domains and recipes
+    artifacts PLUS the governed data packages, memory domains and recipes
     granted to one of their groups."""
     from src.repositories import data_packages_repo, memory_domains_repo, recipes_repo
 

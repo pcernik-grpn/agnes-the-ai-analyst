@@ -1,4 +1,4 @@
-"""The Library's Artefacts section as something you READ (#2141).
+"""The Library's Artifacts section as something you READ (#2141).
 
 Four faults reported against one surface on a live instance, all the same
 reading: a list is a claim, and it may not change under the reader after they
@@ -86,7 +86,7 @@ def _rows_of(html: str, parent_id: str) -> list[str]:
 def test_sections_outside_the_active_tab_render_hidden(seeded_app):
     """The out-of-tab sections used to render VISIBLE and be hidden by the
     filter engine's first apply(), so opening Library painted Plugins and then
-    swapped it for Artefacts a beat later — and the reader's first click landed
+    swapped it for Artifacts a beat later — and the reader's first click landed
     on whichever row had moved into place."""
     tok = seeded_app["admin_token"]
     _folder(seeded_app, "Paint Folder", tok, 2)
@@ -94,7 +94,7 @@ def test_sections_outside_the_active_tab_render_hidden(seeded_app):
 
     secs = re.findall(r'<section class="fbar-group lib-group[^"]*" data-lib-sec="([^"]+)"([^>]*)>', text)
     assert secs, "no sections rendered"
-    # Artefacts is a Knowledge section and Library opens on Knowledge, so it
+    # Artifacts is a Knowledge section and Library opens on Knowledge, so it
     # paints; the Capabilities sections (skill/plugin/agent) must not.
     by_key = {key: attrs for key, attrs in secs}
     assert "hidden" not in by_key["files"]

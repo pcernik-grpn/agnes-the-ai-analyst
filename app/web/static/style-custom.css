@@ -1191,27 +1191,11 @@ code {
     margin-top: 12px;
 }
 
-/* Error page */
-.error-container {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 60vh;
-}
-
-.error-card {
-    text-align: center;
-}
-
-.error-card h2 {
-    font-size: 3rem;
-    margin-bottom: 16px;
-}
-
-.error-card p {
-    color: var(--text-light);
-    margin-bottom: 24px;
-}
+/* Error page — the live rules are the "Error pages (4xx / 5xx)" block far
+   below. A superseded copy used to sit here, and because `.error-card h2`
+   outranks `.error-title` on specificity its `font-size: 3rem` was what
+   actually rendered: every error page shouted its headline at 48px while the
+   design intended 24px. Do not reintroduce element-scoped rules here. */
 
 /* Footer */
 footer {
@@ -5361,21 +5345,16 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     pointer-events: none;
 }
 
+/* Surface, border, radius, type and the icon layout come from
+   `.notice--floating` (app.js composes both classes). What is left is what
+   makes it a TOAST: it can be clicked away, it is capped so a long receipt
+   wraps instead of spanning the window, and it has a floor so a two-word
+   receipt is not a tiny chip. */
 .toast {
     pointer-events: auto;
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-3);
     min-width: 240px;
     max-width: 380px;
-    padding: var(--space-3) var(--space-4);
-    border-radius: var(--radius-md);
-    background: var(--surface);
-    border: 1px solid var(--border);
-    box-shadow: var(--shadow-elevated);
-    font-size: var(--text-sm);
-    line-height: 1.45;
-    color: var(--text-primary);
+    margin: 0;
     cursor: pointer;
     animation: toast-in 200ms ease;
 }
@@ -5386,26 +5365,11 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
 
 /* Dismiss. Low-contrast until hovered — present, never louder than the
    message it sits beside. */
-.toast-x {
-    flex-shrink: 0;
-    border: none;
-    background: none;
-    padding: 0;
-    margin: 1px 0 0;
-    font: inherit;
-    font-size: 13px;
-    line-height: 1;
-    color: var(--text-muted);
-    cursor: pointer;
-    border-radius: var(--radius-sm);
-}
-.toast-x:hover { color: var(--text-primary); }
-.toast-x:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-
-.toast.is-success { border-left: 3px solid var(--success); }
-.toast.is-warning { border-left: 3px solid var(--warning); }
-.toast.is-error   { border-left: 3px solid var(--error); }
-.toast.is-info    { border-left: 3px solid var(--primary); }
+/* The dismiss control is styled with `.notice__x` above (one rule, both
+   hooks). The four `border-left: 3px solid` tone stripes that used to sit
+   here are gone with them: the stripe was this component's version of
+   repainting per outcome, and the glyph says the same thing without turning
+   a receipt into an alarm. */
 
 @keyframes toast-in {
     from { opacity: 0; transform: translateY(8px); }
@@ -6203,91 +6167,255 @@ details.section-card > summary {
 .group-chip.is-custom      { background: #ede9fe; color: #6d28d9; }
 
 /* =====================================================
-   Error pages (4xx / 5xx)
+   .notice — the one inline-status component
+
+   Three surfaces were saying the same kind of thing in three visual
+   languages: a transcript note (fully tinted pill, centred text, coloured
+   ink), an upload dialog's error slot (tinted box, coloured ink) and a toast
+   (white card with a 3px coloured stripe). Same message, three looks, and all
+   three read as an alarm because the TINT did the talking — a rate limit that
+   clears itself arrived in the same saturated red as a crashed runner.
+
+   One component instead, and the tone is carried by a 16px glyph, not by the
+   surface. Nothing else changes between tones: same ground, same hairline,
+   same ink. Only 5xx-class trouble gets a coloured glyph at all — the same
+   rule the error pages follow.
+
+   Two placements, because a floating element and an in-flow one have
+   genuinely different jobs:
+     .notice--inline    sits IN the content (transcript, dialog). Recessed
+                        onto --ds-surface-dim so it reads as an aside rather
+                        than as another message in the conversation.
+     .notice--floating  sits OVER the content (toast). White and lifted, or
+                        it looks like a hole in the page.
+
+   Radius comes from --radius-* (style-custom.css): --ds-radius-md/-lg are NOT
+   in the token set, and a var() to an undefined property with no fallback
+   voids the whole declaration — the trap already documented on
+   .cloud-chat-system-note and the agent dropdown.
    ===================================================== */
+.notice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    /* Left padding is 2px lighter than the right to compensate for the 3px
+       stripe, so the glyph sits the same distance from the edge as the
+       dismiss control on the other side. */
+    padding: 10px 12px 10px 10px;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--ds-border);
+    border-left: 3px solid var(--ds-border);
+    background: var(--ds-surface-dim);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    /* Body ink, never the tone's own ink. Coloured TEXT on a coloured ground
+       is most of what made these read as alarms, and it is the part that
+       costs legibility — the stripe, the tint and the glyph carry the tone
+       between them without touching the sentence. */
+    color: var(--ds-text-primary);
+    text-align: left;
+}
+.notice--inline { margin: var(--space-2) 0; }
+.notice--floating { box-shadow: var(--ds-shadow-md); }
+/* The glyph. `currentColor` on the svg, so a tone only has to set `color`
+   here — no per-tone fill to keep in step. margin-top optically seats a 16px
+   square against a 1.5-line-height first line. */
+.notice__icon {
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    margin-top: 1px;
+    color: var(--ds-text-muted);
+}
+.notice__icon svg { display: block; width: 100%; height: 100%; }
+.notice__msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+/* Dismiss: present, never louder than the message beside it. `.toast-x` is
+   the same control under its established name (app.js sets it, and
+   tests/test_web_studio.py pins it) — one rule, two hooks, rather than the
+   two identical blocks that used to sit in this file. */
+.notice__x,
+.toast-x {
+    flex-shrink: 0;
+    border: none;
+    background: none;
+    padding: 0;
+    margin: 1px 0 0;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--ds-text-muted);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+}
+.notice__x:hover,
+.toast-x:hover { color: var(--ds-text-primary); }
+.notice__x:focus-visible,
+.toast-x:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: 2px; }
+
+/* Tone: a light ground, a stripe down the left edge, and the glyph. Three
+   quiet signals instead of one loud one — the old version repainted the
+   whole element in a saturated tint AND set the text in the matching ink,
+   which is why a rate limit that clears itself looked like a crash.
+   
+   The surrounding hairline stays `--ds-border` in every tone, and only
+   `border-left-color` is touched. Painting all four edges in a tone token
+   does not survive the themes: `--ds-accent-danger-line` is the SOFT red in
+   the light palette and the FULL one in dark, so a rule that reads well on
+   paper drew a bright outline around the whole element on the dark theme —
+   the exact loudness this component removes. A neutral hairline plus a
+   coloured stripe reads the same in both. */
+.notice.is-warn,
+.notice.is-wait {
+    background: var(--ds-accent-warn-bg);
+    border-left-color: var(--ds-accent-warn-ink);
+}
+.notice.is-warn .notice__icon,
+.notice.is-wait .notice__icon { color: var(--ds-accent-warn-ink); }
+
+.notice.is-error {
+    background: var(--ds-accent-danger-bg);
+    border-left-color: var(--ds-accent-danger-ink);
+}
+.notice.is-error .notice__icon { color: var(--ds-accent-danger-ink); }
+
+.notice.is-ok,
+.notice.is-success {
+    background: var(--ds-accent-success-bg);
+    border-left-color: var(--ds-accent-success-ink);
+}
+.notice.is-ok .notice__icon,
+.notice.is-success .notice__icon { color: var(--ds-accent-success-ink); }
+
+.notice.is-info {
+    background: var(--ds-accent-info-bg);
+    border-left-color: var(--ds-accent-info-ink);
+}
+.notice.is-info .notice__icon { color: var(--ds-accent-info-ink); }
+
+/* =====================================================
+   Error pages (4xx / 5xx)
+
+   An error page is an empty state with a reason, and it is styled like
+   one: a muted mark, a sentence, one line of explanation, the action
+   that resolves it. Deliberately NOT a card — a bordered, shadowed panel
+   floating on the grey app ground announces "here is an object", and
+   there is no object here, only a message. The container paints itself
+   `--surface` so the whole region reads as one white field; the rail
+   carries its own right border, so nothing merges.
+
+   Severity is carried by ONE token (`.error-page--broken`), applied only
+   to 5xx. Every other status renders in muted ink, because "wait a
+   moment", "ask your admin" and "that link is stale" are not emergencies
+   and colouring them like one is what made a 429 read as a crash.
+   ===================================================== */
+/* `[data-theme]` is carried by every page (base_ds always stamps it), and the
+   attribute is here purely for specificity: paper-skin.css sets
+   `[data-theme="paper"] body { background: var(--ds-bg) }` and loads AFTER
+   this file, so a plain `body.error-page` ties on specificity and loses on
+   order — the page rendered on the grey app ground with a white box in the
+   middle, which is the card this redesign removed. */
+[data-theme] body.error-page { background: var(--ds-surface); }
 .error-container {
     display: flex;
     align-items: center;
     justify-content: center;
-    min-height: 60vh;
-    padding: var(--space-5) var(--space-3);
+    /* Fills the viewport minus everything else in the column: `.container`'s
+       own vertical padding plus the footer block (its ~49px and its 48px
+       margin-top). At the previous 60vh the container ended well above the
+       fold and centred the card inside ITS OWN box — about a third of the way
+       down the screen, with a large empty field beneath it. `min-height`, so
+       a long traceback grows the page instead of being clipped. */
+    min-height: calc(100vh - 11rem);
+    padding: var(--space-6) var(--space-3);
 }
 .error-card {
-    max-width: 36rem;
+    max-width: 30rem;
     width: 100%;
-    padding: var(--space-9) var(--space-8);
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
-    box-shadow: var(--shadow-md);
     text-align: center;
 }
-.error-code {
-    font-size: 4rem;
-    font-weight: 700;
-    line-height: 1;
-    color: var(--ds-accent-danger-ink);
-    margin-bottom: var(--space-1);
-    letter-spacing: -0.02em;
+.error-mark {
+    display: flex;
+    justify-content: center;
+    margin-bottom: var(--space-3);
+    color: var(--text-muted);
 }
+.error-mark svg { display: block; }
+.error-page--broken .error-mark { color: var(--ds-accent-danger-ink); }
 .error-title {
-    margin: 0 0 var(--space-3);
+    margin: 0 0 var(--space-2);
     font-size: var(--text-xl);
     font-weight: 600;
+    line-height: 1.25;
+    text-wrap: balance;
 }
 .error-message {
     color: var(--text-secondary);
-    margin: 0 0 var(--space-5);
-    line-height: 1.5;
+    margin: 0 auto var(--space-6);
+    max-width: 42ch;
+    line-height: 1.55;
 }
-.error-path {
-    margin: 0 0 var(--space-6);
-    font-size: var(--text-sm);
-}
-.error-path-label { color: var(--text-secondary); margin-right: var(--space-1); }
-.error-path code,
-.error-traceback pre,
-.error-request-id code {
-    background: var(--background);
-    border-radius: var(--radius-sm);
-    font-family: var(--font-mono);
-}
-.error-path code,
-.error-request-id code { padding: 0.15rem 0.4rem; font-size: 0.85em; }
-.error-traceback {
-    text-align: left;
-    margin: 0 0 var(--space-6);
-    padding: var(--space-3) var(--space-4);
-    background: var(--background);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-}
-.error-traceback summary {
-    cursor: pointer;
-    font-size: 0.85rem;
-    color: var(--text-secondary);
-    user-select: none;
-}
-.error-traceback pre {
-    margin: var(--space-3) 0 0;
-    font-size: var(--text-sm);
-    line-height: 1.4;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-.error-request-id {
-    margin: 0 0 var(--space-5);
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-}
-.error-request-id-label { margin-right: var(--space-1); }
-.error-request-id code { user-select: all; }
 .error-actions {
     display: flex;
     gap: var(--space-3);
     justify-content: center;
     flex-wrap: wrap;
+}
+/* The status code lives here now, beside the request id, instead of at
+   4rem in red above the headline. Support keeps every value it had; the
+   reader is no longer shouted at by a number that means nothing to them. */
+.error-ref {
+    margin: var(--space-6) 0 0;
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border);
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    user-select: all;
+}
+/* DEBUG=1 only — the path and traceback are developer surfaces, and the
+   path duplicated the address bar for everyone else. */
+/* Deliberately the lightest thing on the page: no panel, no border, no
+   chips. It is a developer aid on a page whose subject is the message above
+   it, and as a filled bordered box with tinted code chips it out-weighed
+   both the explanation and the actions. Only the traceback keeps a tint,
+   because a multi-line stack needs a block to read as one. */
+.error-debug {
+    text-align: left;
+    margin: var(--space-5) auto 0;
+    max-width: 34rem;
+}
+.error-debug summary {
+    cursor: pointer;
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+    user-select: none;
+}
+.error-debug p {
+    margin: var(--space-2) 0 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.error-debug code {
+    font-family: var(--font-mono);
+    font-size: 0.95em;
+    color: var(--text-muted);
+    background: none;
+    padding: 0;
+}
+.error-debug pre {
+    margin: var(--space-3) 0 0;
+    padding: var(--space-3);
+    font-size: var(--text-sm);
+    line-height: 1.4;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--background);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
 }
 
 /* =====================================================================

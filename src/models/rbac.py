@@ -67,6 +67,19 @@ class User(Base):
     # no matching column (frozen post-A3 schema): the check simply never fires
     # there, and `revoke_sessions()` is a documented no-op on that backend.
     session_revoked_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Issue #1534: service-account identities, PG-only (A3 ratchet — see
+    # migrations/versions/0096_users_kind.py). 'human' (default, every
+    # existing row) or 'service' (only ever written by
+    # UsersPgRepository.create_service_account). Never a foreign key or a
+    # separate table — every consumer (the session-mint guard in
+    # app/auth/jwt.py, the Admin-group-membership guard in
+    # user_group_members(_pg).add_member, the people-picker exclusion in
+    # search_recent) already loads the full row for other reasons, so a
+    # plain column read costs nothing extra. DuckDB has no matching column
+    # (frozen post-A3 schema): src/repositories/users.py's
+    # create_service_account/list_service_accounts are documented
+    # RequiresPostgresBackend raises there.
+    kind: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'human'"))
 
 
 class UserGroup(Base):

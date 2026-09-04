@@ -704,6 +704,59 @@ _MAX_QUESTION_ANSWERS = 8
 _MAX_QUESTION_KEY_CHARS = 2000
 _MAX_QUESTION_ANSWER_CHARS = 4000
 
+#: What the model is told when a question round-trip ends WITHOUT answers.
+#:
+#: Defined here, at the gate, but deliberately not private to it: the
+#: kai-agent engine provider runs the same round-trip over the engine's
+#: approval channel and posts these verbatim as the deny reason
+#: (``app/chat/kai_engine_provider.py``). Two runtimes, one set of words —
+#: a question that goes unanswered must read the same to the model whichever
+#: one asked it, or the two paths drift into two different behaviors behind
+#: one UI.
+QUESTION_DISMISSED_MESSAGE = (
+    "The user dismissed the questions without answering. Continue with "
+    "your best judgment; ask in plain text if you truly need an answer."
+)
+QUESTION_UNATTENDED_MESSAGE = (
+    "This session has no interactive client that can be shown a "
+    "question card (it runs through the agent API). Continue with "
+    "your best judgment, or state the question in your final answer."
+)
+
+
+def question_timeout_message(seconds: float) -> str:
+    """The model-facing text for a question nobody answered in time."""
+    return (
+        f"Nobody answered the questions within {int(seconds)}s. "
+        "Continue with your best judgment and note the open question in your answer."
+    )
+
+
+def clean_question_answers(raw) -> "dict[str, str]":
+    """Coerce an inbound answers payload to a bounded str→str dict.
+
+    Anything non-conforming is dropped rather than raising: the frame
+    crossed a process boundary from a browser, and a malformed answer
+    must degrade to "dismissed", not crash the turn.
+
+    Module-level for the same reason the messages above are: the engine
+    provider revalidates with these exact bounds before the answers reach
+    the engine's approval POST.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for key, value in raw.items():
+        if len(cleaned) >= _MAX_QUESTION_ANSWERS:
+            break
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text:
+            continue
+        cleaned[key[:_MAX_QUESTION_KEY_CHARS]] = text[:_MAX_QUESTION_ANSWER_CHARS]
+    return cleaned
+
 
 class QuestionGate:
     """In-process ``can_use_tool`` gate that turns the agent's
@@ -742,28 +795,6 @@ class QuestionGate:
         self._pending: "dict[str, asyncio.Future]" = {}
         self._counter = 0
 
-    @staticmethod
-    def _clean_answers(raw) -> "dict[str, str]":
-        """Coerce an inbound answers payload to a bounded str→str dict.
-
-        Anything non-conforming is dropped rather than raising: the frame
-        crossed a process boundary from a browser, and a malformed answer
-        must degrade to "dismissed", not crash the turn.
-        """
-        if not isinstance(raw, dict):
-            return {}
-        cleaned: dict[str, str] = {}
-        for key, value in raw.items():
-            if len(cleaned) >= _MAX_QUESTION_ANSWERS:
-                break
-            if not isinstance(key, str) or not isinstance(value, str):
-                continue
-            text = value.strip()
-            if not text:
-                continue
-            cleaned[key[:_MAX_QUESTION_KEY_CHARS]] = text[:_MAX_QUESTION_ANSWER_CHARS]
-        return cleaned
-
     def resolve(self, request_id: str, outcome) -> bool:
         """Deliver a user outcome to a pending request. ``outcome`` is the
         answers dict (answered), ``None`` (dismissed), or :data:`UNATTENDED`.
@@ -778,7 +809,7 @@ class QuestionGate:
             # {} cleans to "no usable answer" → dismissed, not answered-empty:
             # an empty answers dict would make the model read "Your questions
             # have been answered" with nothing attached.
-            fut.set_result(self._clean_answers(outcome) or None)
+            fut.set_result(clean_question_answers(outcome) or None)
         return True
 
     def cancel_all(self) -> None:
@@ -1690,26 +1721,10 @@ async def _real_agent_loop(
                     # answered: ..." result for the model.
                     return PermissionResultAllow(updated_input={**tool_input, "answers": answers})
                 if outcome == UNATTENDED:
-                    return PermissionResultDeny(
-                        message=(
-                            "This session has no interactive client that can be shown a "
-                            "question card (it runs through the agent API). Continue with "
-                            "your best judgment, or state the question in your final answer."
-                        )
-                    )
+                    return PermissionResultDeny(message=QUESTION_UNATTENDED_MESSAGE)
                 if outcome == "timeout":
-                    return PermissionResultDeny(
-                        message=(
-                            f"Nobody answered the questions within {int(question_gate.timeout_seconds)}s. "
-                            "Continue with your best judgment and note the open question in your answer."
-                        )
-                    )
-                return PermissionResultDeny(
-                    message=(
-                        "The user dismissed the questions without answering. Continue with "
-                        "your best judgment; ask in plain text if you truly need an answer."
-                    )
-                )
+                    return PermissionResultDeny(message=question_timeout_message(question_gate.timeout_seconds))
+                return PermissionResultDeny(message=QUESTION_DISMISSED_MESSAGE)
 
             options_kwargs["can_use_tool"] = _can_use_tool
 

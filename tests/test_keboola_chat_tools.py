@@ -9,6 +9,8 @@ truncated toolset — 33 tools instead of 37, no semantic-layer tools.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import re
 
 import pytest
@@ -1060,9 +1062,7 @@ def test_the_admin_page_renders_a_structured_error_detail():
     """
     import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = _ds_page_source.page_source()
     assert "function detailMessage(" in src
     assert "still_present" in src, "the partial-teardown list is never shown"
     assert 'showToast("Failed: " + (body.detail' not in src, "the chat-tools toast still stringifies an object"

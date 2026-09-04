@@ -1182,6 +1182,25 @@
   {% include "_page_hero.html" %}
   {% include "_admin_tabs.html" %}
 
+  {# You arrived from the package builder, which parked your draft and sent
+     you for a source it could not hand you itself. Say so, and give the way
+     back: without this the trip is one-way by feel, and an admin two clicks
+     into a warehouse credential has no reason to believe the half-written
+     package still exists. Unhidden by the deep-link block at the foot of
+     this page — `from` is only ever compared against a literal and the href
+     is a constant, so the untrusted param cannot steer the navigation. #}
+  <div class="apg-strip" id="ds-from-package" hidden>
+    <span aria-hidden="true">{{ ico.icon('package', 16) }}</span>
+    <div>
+      <strong>You were building a data package.</strong>
+      Connect what you need here — the draft is kept, and any tables you register
+      land in it already added.
+    </div>
+    <span class="apg-strip__end">
+      <a href="/admin/data-packages/new">Back to the package</a>
+    </span>
+  </div>
+
   {% if not vault_key_configured %}
   {# The shared context strip in its warn state (`.apg-strip`, admin_page.css),
      not a page-local banner: this is the same object People's identity strip
@@ -1277,429 +1296,9 @@
 <template id="ds-ico-chevron">{{ ico.icon('chevron', 13) }}</template>
 <template id="ds-ico-caret">{{ ico.icon('chevron-right', 16) }}</template>
 
-{# ── Add data wizard — connect → choose tables → bundle → share ────────
-   The redesign's one flow from "nothing connected" to "data in someone's
-   hands" (spec §3.6–3.8). Steps 1–2 are the previous Add-Keboola-project
-   wizard unchanged (connection retry-reuse, name adoption, project binding
-   all preserved); 3 bundles the just-registered tables into packages (the
-   dependency the product never used to say out loud), 4 shares them —
-   skippable, because an unshared package now warns on Overview and on
-   /admin/data-packages rather than failing silently. #}
-<div id="ds-wizard-overlay" class="ds-drawer ds-drawer--wide" role="dialog" aria-modal="true" aria-labelledby="ds-wizard-title">
-  <div class="ds-drawer__backdrop" data-wizard-close></div>
-  <div class="ds-drawer__panel">
-    <div class="ds-drawer__head">
-      <div class="ds-drawer__head-main">
-        <h2 class="ds-drawer__title" id="ds-wizard-title">Add data</h2>
-        <p class="ds-drawer__sub">Connect a project, choose its tables, bundle them, share them — stop after any step.</p>
-      </div>
-      <button type="button" class="ds-drawer__x" id="ds-wizard-close" aria-label="Close">&times;</button>
-    </div>
-    {# The strip is the flow's map AND its back button. A step you have
-       already been through is a real button — the admin who mistyped a
-       package name or missed a table gets back to it without cancelling and
-       starting over, and every selection they made on the way is still
-       there. A step you have not earned yet is `disabled`, so "not until the
-       one before it is done" is carried by the control's own state rather
-       than by a click that silently does nothing (drawer.css). #}
-    <div class="ds-drawer__steps" role="group" aria-label="Add data steps">
-      <button type="button" class="ds-drawer__step is-now" data-wstep="1"><span class="n">1</span><span class="lbl">Connect</span></button>
-      <button type="button" class="ds-drawer__step" data-wstep="2" disabled><span class="n">2</span><span class="lbl">Choose tables</span></button>
-      <button type="button" class="ds-drawer__step" data-wstep="3" disabled><span class="n">3</span><span class="lbl">Bundle</span></button>
-      <button type="button" class="ds-drawer__step" data-wstep="4" disabled><span class="n">4</span><span class="lbl">Share</span></button>
-    </div>
-    <div class="ds-drawer__body">
-
-      {# Step 1: connect — opens on a connector picker (spec §3.7). Each
-         connector brings its own connect form; steps 3–4 are identical for
-         all of them, because once tables exist, bundling and sharing don't
-         care where the data came from. CSV and Jira are honest guidance,
-         not forms: there is no CSV connector (files enter through Library
-         Collections) and Jira is configured instance-side + webhook. #}
-      <div class="ds-wizard-step active" id="ds-wizard-step-connect">
-        <div class="ds-srcpick" role="radiogroup" aria-label="Source type">
-          <button type="button" class="ds-srcopt on" data-wsrc="keboola">
-            <span class="so-logo so-logo--kbc">K</span>
-            <span class="so-name">Keboola project</span>
-            <span class="so-sub">Buckets &amp; tables, synced copies or live</span>
-          </button>
-          <button type="button" class="ds-srcopt" data-wsrc="bigquery">
-            <span class="so-logo so-logo--bq"><svg class="connector-logo" viewBox="0 0 24 24" fill="currentColor" role="img" aria-label="BigQuery"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg></span>
-            <span class="so-name">BigQuery</span>
-            <span class="so-sub">Live queries, no copy</span>
-          </button>
-          <button type="button" class="ds-srcopt" data-wsrc="snowflake">
-            <span class="so-logo so-logo--sf"><svg class="connector-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Snowflake"><path d="M12 3v18M4.5 6l15 12M4.5 18l15-12"/></svg></span>
-            <span class="so-name">Snowflake</span>
-            <span class="so-sub">Live or materialized, SQL warehouse</span>
-          </button>
-          <button type="button" class="ds-srcopt" data-wsrc="databricks">
-            <span class="so-logo so-logo--dbx"><svg class="connector-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" role="img" aria-label="Databricks"><path d="M12 2l8.7 5v10L12 22l-8.7-5V7L12 2z"/></svg></span>
-            <span class="so-name">Databricks</span>
-            <span class="so-sub">Live queries &amp; materialized · Unity Catalog</span>
-          </button>
-          <button type="button" class="ds-srcopt" data-wsrc="csv">
-            <span class="so-logo so-logo--csv">⇪</span>
-            <span class="so-name">CSV / files</span>
-            <span class="so-sub">Uploads via the Library</span>
-          </button>
-          <button type="button" class="ds-srcopt" data-wsrc="jira">
-            <span class="so-logo so-logo--jira">J</span>
-            <span class="so-name">Jira</span>
-            <span class="so-sub">Real-time via webhooks</span>
-          </button>
-          {# SharePoint runs its own three-step flow (connect -> scope -> share;
-             spec 2026-08-27 §13.2) in a separate drawer (#sp-wizard-overlay,
-             below) — the "bundle" step of this table wizard does not apply to
-             files, where the selected scope of collections IS the package. #}
-          <button type="button" class="ds-srcopt" data-wsrc="sharepoint">
-            <span class="so-logo so-logo--spo">SP</span>
-            <span class="so-name">SharePoint</span>
-            <span class="so-sub">Files → Collections, per-folder scope</span>
-          </button>
-        </div>
-
-        <div data-wsrcform="keboola">
-        {# Existing-source shortcut: the wizard is also the way to ADD MORE
-           tables from a project that is already connected — without it,
-           "add data" reads as "new connection only". It is the SHORTER of the
-           two paths on this screen and, for an instance that is already
-           running, the far more common one, so it is drawn as an offer rather
-           than as a grey utility strip above the real form: the shared
-           connect-banner shape (`.cbn--bar` in style-custom.css) — mark tile,
-           a sentence that says what you are being spared, action pushed
-           right. The "or" below is a real divider, because the thing this
-           screen has to make obvious is that there are TWO ways in. #}
-        <div class="ds-wexisting" id="ds-wexisting" hidden>
-          <span class="ds-wexisting__tile" aria-hidden="true">KB</span>
-          <div class="ds-wexisting__body">
-            {# The title is the connector-level fact and never varies; the
-               count belongs in the sentence that explains the picker beside
-               it. Saying "N Keboola projects" here would also re-plant the
-               exact phrase this page was rebuilt to stop using — the guard in
-               TestSourcesIsEveryConnector reads the whole body. #}
-            <div class="ds-wexisting__title" id="ds-wexisting-title">Keboola is already connected.</div>
-            <p class="ds-wexisting__copy" id="ds-wexisting-copy">Go straight to its tables — no URL, no token to paste again.</p>
-          </div>
-          <div class="ds-wexisting__act">
-            {# Options are rebuilt from _connections every time the wizard's
-               "share" step renders; the paired .ds-dropdown is kept in sync
-               by _syncWexistingDropdown() (see below). #}
-            <select id="ds-wexisting-select" class="ds-dropdown-native" aria-label="Which connected project"></select>
-            {{ ds.dropdown(id='ds-wexisting-select-dd', target='ds-wexisting-select',
-                           aria_label='Which connected project', options=[]) }}
-            <button type="button" class="ds-wexisting__cta" id="ds-wexisting-btn">Choose tables <span aria-hidden="true">→</span></button>
-          </div>
-        </div>
-        <div class="ds-wor" id="ds-wor" hidden><span>or connect a new project</span></div>
-        <div class="ds-field">
-          <label for="ds-new-name">Connection name</label>
-          <input type="text" id="ds-new-name" placeholder="e.g. Production (auto-detected if left blank)" autocomplete="off">
-          <div class="field-hint">Leave blank to use the project name Keboola returns once connected.</div>
-        </div>
-        <div class="ds-field">
-          <label for="ds-new-stack">Connection URL <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-          <input type="text" id="ds-new-stack" placeholder="https://connection.keboola.com" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="ds-field">
-          <label for="ds-new-token">Storage API token <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-          <input type="password" id="ds-new-token" placeholder="paste token here" autocomplete="off">
-          <div class="field-hint">Stored in the server vault, never echoed back.</div>
-        </div>
-        {# The second token, offered where it belongs. The semantic layer's
-           master-token requirement was previously discoverable only on the
-           semantic-layer page's empty state; here it is an option inside
-           Connect — skippable, and if skipped the Data sources page's
-           token-mismatch/missing warnings still catch it later. #}
-        <div class="ds-wsl-opt">
-          <label class="ds-wsl-opt__head">
-            <input type="checkbox" id="ds-new-semantic">
-            <span>Also sync business metrics &amp; glossary (semantic layer)</span>
-          </label>
-          <p>Keeps this project's metric definitions in {{ instance_brand or 'Agnes' }} so analysts and agents compute
-             metrics one way. Keboola's Metastore requires a second token for this — a project
-             <strong>owner</strong> token, separate from the storage token above.
-             <strong>Optional:</strong> skip it and tables still work; you can set it any time
-             later on this connection's card.</p>
-          <div class="ds-field ds-wsl-opt__field" hidden>
-            <label for="ds-new-master">Semantic-layer token <span class="optional">(project owner)</span></label>
-            <input type="password" id="ds-new-master" placeholder="paste owner token" autocomplete="off">
-            <div class="field-hint">Keboola calls this the project's <strong>master</strong> token — search your
-               Keboola project for that term if "owner token" turns up nothing.</div>
-          </div>
-        </div>
-        </div>
-
-        {# BigQuery — real: credentials are the instance service account
-           (managed on Instance secrets; status fetched live), tables are
-           registered as live queries in step 2. Saved queries / partitioning
-           keep their full editor on /admin/tables. #}
-        <div data-wsrcform="bigquery" hidden>
-          <div class="ds-field">
-            <label>Credentials</label>
-            <div class="ds-bqcred" id="ds-bqcred"><span class="ds-loading" style="padding:4px 0;">Checking service account…</span></div>
-            <div class="field-hint">BigQuery uses the instance-level service account — one credential for every dataset,
-              managed in <a href="/admin/datasource-credentials">Instance secrets</a>.</div>
-          </div>
-          <div class="ds-wsl-opt">
-            <div class="ds-wsl-opt__head" style="cursor:default;">Live queries, cost-guarded</div>
-            <p style="margin-left:0;">Tables you add here are registered as <strong>live queries</strong> — no copy, every query
-               runs in BigQuery behind the scan cap. For a <strong>saved query</strong> (materialized SQL on a schedule),
-               partitioning or custom SQL, use <a href="/admin/tables">Tables → Register new table</a> — the full editor stays there.</p>
-          </div>
-        </div>
-
-        {# Snowflake — real: coordinates live in server-config, password/key-pair in
-           datasource-secrets; tables register as remote or materialized. #}
-        <div data-wsrcform="snowflake" hidden>
-          <div class="ds-field">
-            <label for="ds-sf-account">Account <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-sf-account" placeholder="xy12345 or xy12345.eu-central-1" autocomplete="off" spellcheck="false">
-            <div class="field-hint">Snowflake account identifier, no <code>.snowflakecomputing.com</code> suffix.</div>
-          </div>
-          <div class="ds-field">
-            <label for="ds-sf-user">User <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-sf-user" placeholder="service user name" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="ds-field">
-            <label for="ds-sf-auth-type">Authentication <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <select id="ds-sf-auth-type" class="ds-dropdown-native">
-              <option value="password" selected>Password</option>
-              <option value="key_pair">Key-pair</option>
-            </select>
-            {{ ds.dropdown(
-              id='ds-sf-auth-type-dd', target='ds-sf-auth-type',
-              aria_label='Authentication', selected='password',
-              options=[
-                {'value': 'password', 'label': 'Password'},
-                {'value': 'key_pair', 'label': 'Key-pair'},
-              ],
-            ) }}
-            <div class="field-hint">Choose how the wizard stores the Snowflake credential.</div>
-          </div>
-          <div id="ds-sf-auth-password">
-            <div class="ds-field">
-              <label for="ds-sf-password">Password <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-              <input type="password" id="ds-sf-password" placeholder="paste password" autocomplete="off">
-              <div class="ds-sfcred" id="ds-sfcred-password"><span class="ds-loading" style="padding:4px 0;">Checking credential…</span></div>
-              <div class="field-hint">Stored write-only in the server vault as <code>SNOWFLAKE_PASSWORD</code>.</div>
-            </div>
-          </div>
-          <div id="ds-sf-auth-key" hidden>
-            <div class="ds-field">
-              <label for="ds-sf-private-key">Private key (PEM) <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-              <textarea id="ds-sf-private-key" rows="5" placeholder="-----BEGIN PRIVATE KEY-----..." autocomplete="off" spellcheck="false"></textarea>
-              <div class="ds-sfcred" id="ds-sfcred-key"><span class="ds-loading" style="padding:4px 0;">Checking credential…</span></div>
-              <div class="field-hint">Stored write-only in the server vault as <code>SNOWFLAKE_PRIVATE_KEY</code>.</div>
-            </div>
-            <div class="ds-field">
-              <label for="ds-sf-key-passphrase">Key passphrase <span class="optional">(optional)</span></label>
-              <input type="password" id="ds-sf-key-passphrase" placeholder="passphrase for encrypted key" autocomplete="off">
-              <div class="field-hint">Stored separately as <code>SNOWFLAKE_PRIVATE_KEY_PASSPHRASE</code> when provided.</div>
-            </div>
-          </div>
-          <div class="ds-field">
-            <label for="ds-sf-database">Database <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-sf-database" placeholder="default database for registered rows" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="ds-field">
-            <label for="ds-sf-warehouse">Warehouse <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-sf-warehouse" placeholder="compute warehouse" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="ds-field">
-            <label for="ds-sf-role">Role <span class="optional">(optional)</span></label>
-            <input type="text" id="ds-sf-role" placeholder="e.g. ACCOUNTADMIN" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="ds-wsl-opt">
-            <div class="ds-wsl-opt__head" style="cursor:default;">Live or materialized, cost-guarded</div>
-            <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs in Snowflake) or <strong>materialized</strong>
-               (a scheduled copy to parquet). For custom SQL or partitioning, use
-               <a href="/admin/tables">Tables → Register new table</a>.</p>
-          </div>
-          {# Semantic views (CREATE SEMANTIC VIEW) are not tables and are not
-             picked up by anything above — connecting Snowflake used to leave
-             them undiscoverable short of the CLI. Mirrors Keboola's own
-             semantic-layer opt-in (`ds-new-semantic` above): optional,
-             non-fatal, and reachable again later on its own page if skipped
-             or if it fails. #}
-          <div class="ds-wsl-opt">
-            <label class="ds-wsl-opt__head">
-              <input type="checkbox" id="ds-new-semantic-snowflake">
-              <span>Also sync semantic views (business metrics &amp; glossary)</span>
-            </label>
-            <p>Snowflake <strong>semantic views</strong> (<code>CREATE SEMANTIC VIEW</code>) are not tables — this
-               imports their logical tables, relationships and metrics into {{ instance_brand or 'Agnes' }}'s semantic
-               layer, using this connection's own credentials. Their metric SQL is Snowflake-flavour, so Agnes reads
-               it but will not run it locally. <strong>Optional:</strong> skip it and tables still work; sync any
-               time later on the <a href="/admin/semantic-sources">Semantic sources</a> page.</p>
-          </div>
-        </div>
-
-        {# Databricks — configured in the wizard; tables register through
-           /admin/tables where the full SQL warehouse / metric-view editor lives. #}
-        <div data-wsrcform="databricks" hidden>
-          <div class="ds-field">
-            <label for="ds-dbx-host">Host <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-dbx-host" placeholder="https://dbc-a1b2c3d4-e5f6.cloud.databricks.com" autocomplete="off" spellcheck="false">
-            <div class="field-hint">Databricks workspace URL, <code>https://</code> only, no path.</div>
-          </div>
-          <div class="ds-field">
-            <label for="ds-dbx-warehouse">Warehouse ID <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-dbx-warehouse" placeholder="SQL warehouse ID" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="ds-field">
-            <label for="ds-dbx-catalog">Catalog <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="text" id="ds-dbx-catalog" placeholder="main" autocomplete="off" spellcheck="false">
-            <div class="field-hint">Default Unity Catalog catalog. Bucket on registered rows is a schema inside it.</div>
-          </div>
-          <div class="ds-field">
-            <label for="ds-dbx-token">Token <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <input type="password" id="ds-dbx-token" placeholder="paste workspace PAT" autocomplete="off">
-            <div class="ds-dbxcred" id="ds-dbxcred"><span class="ds-loading" style="padding:4px 0;">Checking credential…</span></div>
-            <div class="field-hint">Stored write-only in this connection's own server vault slot.</div>
-          </div>
-          <div class="ds-wsl-opt">
-            <div class="ds-wsl-opt__head" style="cursor:default;">Live or materialized, SQL warehouse</div>
-            <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs on the SQL warehouse) or <strong>materialized</strong>
-               (a scheduled copy to parquet). For custom SQL, partitioning or metric views, use
-               <a href="/admin/tables">Tables → Register new table</a> — the full editor (live, materialized, custom SQL with <code>MEASURE()</code>) lives there.</p>
-          </div>
-          {# Mirrors the identical Snowflake opt-in above — see its comment. #}
-          <div class="ds-wsl-opt">
-            <label class="ds-wsl-opt__head">
-              <input type="checkbox" id="ds-new-semantic-databricks">
-              <span>Also sync semantic views (business metrics &amp; glossary)</span>
-            </label>
-            <p>Unity Catalog <strong>metric views</strong> are not ordinary tables — this imports their dimensions
-               and measures into {{ instance_brand or 'Agnes' }}'s semantic layer, using this connection's own
-               credentials. Their measure SQL uses <code>MEASURE()</code>, a Databricks-only aggregate, so Agnes
-               reads it but will not run it locally. <strong>Optional:</strong> skip it and tables still work; sync
-               any time later on the <a href="/admin/semantic-sources">Semantic sources</a> page.</p>
-          </div>
-        </div>
-
-        {# CSV / files — honest guidance: there is no CSV connector. Files
-           enter through Library Collections (per-file ingestion); a live
-           system's export belongs in a data package instead. #}
-        <div data-wsrcform="csv" hidden>
-          <div class="ds-wguide">
-            <h4>Files become searchable through the Library, not a connector.</h4>
-            <p>Upload documents (PDF, Markdown, CSV, …) into a <strong>Collection</strong> in the
-               <a href="/library">Library</a> — {{ instance_brand or 'Agnes' }} ingests them per file and analysts search them with citations.
-               A Collection is honest about being a snapshot: when the content changes, a person re-uploads.</p>
-            {# A CSV or spreadsheet is the exception, and the pane used to
-               bury it: `src/ingest/tabular.py` registers an uploaded tabular
-               file as a real queryable table, so an instance with no
-               warehouse behind it is NOT tableless — which is exactly the
-               conclusion an admin drew from the heading above. #}
-            <p><strong>A CSV or Excel file is also a table.</strong> Upload one to a Collection and
-               {{ instance_brand or 'Agnes' }} registers it as a queryable table you can bundle into a
-               data package and share, the same as a warehouse table — so an instance with no
-               warehouse behind it still has tables.</p>
-            <p>If the file is an <em>export of a live system</em>, that system is the source — connect it
-               (Keboola or BigQuery) and let a data package carry the tables, or the copy starts drifting
-               the moment it lands. The trade-offs: <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/admin/collections-vs-data-packages.md" rel="noopener">Collections vs. data packages</a>.</p>
-          </div>
-        </div>
-
-        {# Jira — honest guidance: webhook-driven connector configured
-           instance-side, not through a browser form. #}
-        <div data-wsrcform="jira" hidden>
-          <div class="ds-wguide">
-            <h4>Jira streams in over webhooks — set up once, fresh within seconds.</h4>
-            <p>The Jira connector is configured on the instance (site, credentials and a webhook registered in
-               Jira's admin), not through this form. Once wired, issues, sprints and worklogs update as they
-               change and surface as ordinary tables you can bundle and share like any other.</p>
-            <p>Setup recipe: <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/connectors/jira.md" rel="noopener">docs/connectors/jira.md</a>.</p>
-          </div>
-        </div>
-
-        <div id="ds-wizard-error" class="ds-wizard-error"></div>
-      </div>
-
-      {# Step 2: browse + register #}
-      <div class="ds-wizard-step" id="ds-wizard-step-tables">
-        <div class="ds-wizard-connected-banner" id="ds-wizard-connected-banner"></div>
-        <div id="ds-wizard-tables-body">
-          <div class="ds-loading">Loading buckets and tables…</div>
-        </div>
-      </div>
-
-      {# Step 3: bundle — arrange the registered tables into packages #}
-      <div class="ds-wizard-step" id="ds-wizard-step-bundle">
-        <p class="ds-wizard-lede">
-          Arrange the tables into <strong>data packages</strong> — the bundles analysts add to
-          their workspace. Tables reach analysts only through a package. Nothing is final:
-          merge, split or rename any time from Data packages.
-        </p>
-        <div class="ds-seed-row">
-          <span>Start from:</span>
-          <button type="button" class="ds-seed-chip" data-wseed="one">One package</button>
-          <button type="button" class="ds-seed-chip" data-wseed="bucket">Split by bucket</button>
-          {# New tables don't always deserve a NEW package — a fresh source's
-             churn table usually belongs in the Customer 360 that already
-             exists. Picking one adds an attach-only tray to the board: move
-             tables into it and Finish POSTs them to the package, creating
-             nothing and leaving its sharing exactly as it stands. Options
-             load on first open (the list is another page's data). #}
-          {# Options load lazily (see _refreshExistingPkgOptions below) — the
-             paired .ds-dropdown never receives the native `focus` event that
-             drives that load on the default theme (the branded button
-             intercepts all interaction, and the paper theme hides the real
-             select), so _refreshExistingPkgOptions is also called whenever
-             this step becomes visible and after each pick updates the board. #}
-          <select id="ds-existing-pkg-sel" class="ds-exist-sel ds-dropdown-native" aria-label="Add tables to an existing package">
-            <option value="">＋ Into existing package…</option>
-          </select>
-          {{ ds.dropdown(id='ds-existing-pkg-sel-dd', target='ds-existing-pkg-sel',
-                         aria_label='Add tables to an existing package',
-                         options=[{'value': '', 'label': '＋ Into existing package…'}]) }}
-          <span style="flex:1"></span>
-          <button type="button" class="btn btn-secondary" id="ds-new-tray-btn">＋ New package</button>
-        </div>
-        <div id="ds-bundle-board"></div>
-        <div class="ds-movebar" id="ds-movebar" hidden>
-          <span id="ds-movebar-label">0 selected</span>
-          <span class="mv-to">Move to:</span>
-          <span id="ds-movebar-targets"></span>
-        </div>
-      </div>
-
-      {# Step 4: share — one card per created package; skippable #}
-      <div class="ds-wizard-step" id="ds-wizard-step-share">
-        <div class="ds-wshare">
-          <p class="ds-wizard-lede">
-            Who gets these packages? Share now or skip — an unshared package stays private and
-            waits for you on the Overview. <strong>Optional</strong> shows it in members' Library
-            to add themselves; <strong>Automatic</strong> puts it in their workspace on the next sync.
-          </p>
-          <div id="ds-share-cards"><div class="ds-loading">Loading groups…</div></div>
-          <div id="ds-share-error" class="ds-wizard-error"></div>
-        </div>
-        <div class="ds-wdone" style="display:none;">
-          <div class="ds-wdone-slab" id="ds-wdone-slab"></div>
-        </div>
-      </div>
-
-    </div>
-    <div class="ds-drawer__foot">
-      <button type="button" class="btn btn-secondary" id="ds-wizard-cancel">Cancel</button>
-      <span class="ds-drawer__foot-gap"></span>
-      {# Step 2's refusal, stated where the refusing button is. It lived on the
-         step's own pane first, which put it under 576 rows of bucket list —
-         8500px below the fold, which is the same as nowhere. The foot is
-         sticky, so a message here is on screen whatever the list is doing. #}
-      <div id="ds-tables-error" class="ds-wizard-error ds-wizard-error--foot" role="alert"></div>
-      <button type="button" class="btn btn-secondary" id="ds-wizard-skip-btn" style="display:none;">Skip sharing for now</button>
-      <button type="button" class="btn btn-secondary" id="ds-wizard-finish-early-btn" style="display:none;" title="Register the selected tables and stop — bundle them later from Data packages.">Register only &amp; finish</button>
-      <button type="button" class="btn btn-primary" id="ds-wizard-connect-btn">Connect &amp; validate</button>
-      <button type="button" class="btn btn-primary" id="ds-wizard-register-btn" style="display:none;">Continue with selected tables</button>
-      <button type="button" class="btn btn-primary" id="ds-wizard-bundle-btn" style="display:none;">Create packages &amp; continue</button>
-      <button type="button" class="btn btn-primary" id="ds-wizard-share-btn" style="display:none;">Share &amp; finish</button>
-      <button type="button" class="btn btn-secondary" id="ds-wizard-done-btn" style="display:none;">Done</button>
-    </div>
-  </div>
-</div>
+{# The Add-data wizard drawer — markup in _add_data_wizard.html, shared with
+   the data-package builder (which opens it over the package being written). #}
+{% include "_add_data_wizard.html" %}
 
 {# ── SharePoint connect wizard (spec 2026-08-27 §13.2): connect -> scope ->
    share. A separate drawer from the table wizard above — the "bundle" step
@@ -1904,96 +1503,28 @@
 {# The Share step's "New group…" opens the SAME drawer /admin/access uses, so
    a group is created in one place rather than in a wizard-shaped copy. #}
 <script src="{{ static_url('js/components/group_drawer.js') }}" defer></script>
+{# NOT deferred, and before the inline block below on purpose: a deferred
+   script runs AFTER inline script, and everything in here is a global this
+   page's own code calls. See the file's own header for why it exists. #}
+<script src="{{ static_url('js/ds_helpers.js') }}"></script>
 <script>
 const API_CONNECTIONS = "/api/admin/source-connections";
+
+/* Set when the package builder sent us here (?from=package-builder). It
+   changes exactly one thing: the wizard stops after registering tables and
+   hands them back, instead of walking on into Bundle and Share. Those two
+   steps BUILD A DATA PACKAGE — offering them to an admin who is already
+   half-way through building one is the duplication that made this trip feel
+   broken in the first place. Read near the foot of this script, where the
+   deep-link block parses the query string. */
+let _fromPackageBuilder = false;
 const API_REGISTER_TABLE = "/api/admin/register-table";
 
-// Error text for a failed register-table call. `register-table` answers a
-// FAILED remote-extract rebuild with 500 + `{status:"rebuild_failed", detail,
-// message}` — the upstream reason (e.g. `Catalog Error: Table with name X does
-// not exist! Did you mean "Y"?`) is the single most useful thing on the page,
-// and reading only `detail` used to render a bare "✗ failed" for any endpoint
-// that put it under `message`. Falls back through both keys, then to a
-// non-empty default.
-function _registerErrorText(body) {
-  const b = body || {};
-  const text = typeof b.detail === "string" ? b.detail : typeof b.message === "string" ? b.message : "";
-  return text || "failed";
-}
 
-function _esc(s) {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
 
-// Hand-built `.ds-dropdown` markup (see _components.html's `dropdown` macro)
-// for pairing with a <select> built entirely in a JS template literal, where
-// the select doesn't exist yet at Jinja-render time. `options` is
-// `[{value, label}]`; the caller is responsible for calling
-// `window.dsDropdownInit` on the inserted host once, after the surrounding
-// innerHTML assignment — matching `dsDropdownMarkup()` in
-// admin_server_config.html.
-function _dropdownMarkupHtml(id, targetId, ariaLabel, options, selected) {
-  const current = options.some((o) => o.value === selected) ? selected : (options[0] ? options[0].value : null);
-  const currentLabel = (options.find((o) => o.value === current) || {}).label || "";
-  const items = options.map((o) => `<li class="ds-dropdown-menu-item${o.value === current ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o.value === current}" tabindex="0" data-value="${_esc(o.value)}">${_esc(o.label)}</li>`).join("");
-  const nameSpan = ariaLabel ? `<span class="ds-dropdown-name" id="${id}-name">${_esc(ariaLabel)}</span>` : "";
-  const labelledBy = ariaLabel ? ` aria-labelledby="${id}-name ${id}-btn-label"` : "";
-  return `<div class="ds-dropdown" data-ds-dropdown-target="${targetId}">
-    <button type="button" class="ds-dropdown-btn" id="${id}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${id}-menu"${labelledBy}>
-      ${nameSpan}<span class="ds-dropdown-btn-label" id="${id}-btn-label">${_esc(currentLabel)}</span>
-      <svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
-    </button>
-    <ul class="ds-dropdown-menu" id="${id}-menu" role="menu" aria-label="${_esc(ariaLabel || "Options")}" hidden>${items}</ul>
-  </div>`;
-}
 
-// ds_dropdown.js only pushes a selection FROM the custom button+menu ONTO the
-// paired native <select> — for a static option list (never rebuilt), setting
-// `.value` straight from code needs this explicit re-sync or the paper-theme
-// dropdown keeps showing whatever was picked last. Mutates the EXISTING
-// items in place rather than rebuilding, since the option list itself never
-// changes for these controls.
-function _syncDropdownFromSelect(sel) {
-  const dd = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${sel.id}"]`);
-  if (!dd) return;
-  const label = dd.querySelector(".ds-dropdown-btn-label");
-  const opt = sel.options[sel.selectedIndex];
-  dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach((item) => {
-    const isSelected = item.dataset.value === sel.value;
-    item.classList.toggle("is-selected", isSelected);
-    item.setAttribute("aria-checked", isSelected ? "true" : "false");
-  });
-  if (label && opt) label.textContent = opt.textContent.trim();
-}
 
-// Mirrors register_table's identifier derivation in app/api/admin.py BYTE FOR
-// BYTE: `request.name.strip().lower().replace(" ", "_")` validated against
-// `re.fullmatch(r"[a-z_][a-z0-9_]*", table_id)`. Kept in lockstep so the
-// bulk Keboola picker never treats a name as safe that the server then 422s
-// on (or the reverse). Do not drift from the server regex without updating
-// both.
-function _wouldPassRegisterCheck(rawName) {
-  const id = (rawName || "").trim().toLowerCase().replace(/ /g, "_");
-  return /^[a-z_][a-z0-9_]*$/.test(id);
-}
 
-// A suggested identifier for a raw Keboola name the check above rejects —
-// pre-filled into an editable input, never submitted silently (the "no
-// silent rewrite" policy also documented above the BigQuery register-table
-// check in admin.py). Broader than the server's own normalization: every RUN
-// of characters outside [a-z0-9] collapses to a single underscore, not just
-// spaces, so a Shopify-style `inventory-items` suggests `inventory_items`
-// instead of leaving the admin to find the hyphen by trial and error.
-function _suggestTableName(rawName) {
-  const id = (rawName || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  // Server requires the identifier start with a letter or underscore; a
-  // digit-leading name (e.g. `2024-orders`) would otherwise suggest an
-  // id the register check still rejects.
-  return /^[0-9]/.test(id) ? "_" + id : id;
-}
 
 // Server-rendered by the shared icon macro, read once and interpolated into
 // the JS-built cards. Trusted markup by construction — it never touches user
@@ -2107,22 +1638,7 @@ const CONNECTOR = {
   // is reused rather than adding a new one — this is a file source too.
   sharepoint: { abbr: "SP", cls: "local",     wizard: "sharepoint" },
 };
-function _connector(type) {
-  return CONNECTOR[type] || { abbr: (type || "?").slice(0, 2).toUpperCase(), cls: "local", wizard: "keboola" };
-}
-function _connectorLogo(type) {
-  return _SVG_LOGO[type] || "";
-}
 
-function _relAge(minutes) {
-  if (minutes === null || minutes === undefined) return "";
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes} min ago`;
-  const h = Math.floor(minutes / 60);
-  if (h < 24) return `${h} h ago`;
-  const d = Math.floor(h / 24);
-  return `${d} day${d === 1 ? "" : "s"} ago`;
-}
 
 /* A file source's pipeline is a DIFFERENT shape entirely — crawl → text
    extraction + scan transcription → facts → graph (spec §13.2 "Source
@@ -3577,18 +3093,6 @@ async function unbindProject(id) {
    teardown). Pasting it into a template literal renders "[object Object]"
    and throws away the one thing the admin needs — which is what the chat-
    tools toast did. One reader for every caller. (Devin Review.) */
-function detailMessage(body, fallback) {
-  const detail = body && body.detail;
-  if (detail && typeof detail === "object") {
-    let msg = detail.message || detail.error || fallback;
-    for (const key of ["tables", "still_present"]) {
-      const list = detail[key];
-      if (Array.isArray(list) && list.length) msg += " (" + list.join(", ") + ")";
-    }
-    return msg;
-  }
-  return detail || fallback;
-}
 
 function _chatToolsFactHtml(row) {
   // Exposes this Keboola project's own MCP tools (query_data, buckets, search,
@@ -3664,31 +3168,6 @@ function _syncGrantPickerDropdown(sel) {
   if (window.dsDropdownInit) window.dsDropdownInit(host);
 }
 
-// Rebuilds the paired `.ds-dropdown`'s button AND menu from a select's own
-// freshly-set <option>s, then re-runs ds_dropdown.js's init via the exported
-// `dsDropdownInit` hook. Unlike `_syncGrantPickerDropdown` above (safe to
-// touch only the menu because its host's whole row is discarded and rebuilt
-// fresh on every render), this is for statically-rendered `.ds-dropdown`
-// markup whose surrounding DOM persists across repeat calls — leaving the
-// same <button> node in place across two init() calls double-registers its
-// click handler and the menu never appears to open, so the button is
-// recreated too.
-function _syncDropdownRebuild(sel) {
-  const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${sel.id}"]`);
-  if (!host) return;
-  const ddId = `${sel.id}-dd`;
-  const opts = Array.from(sel.options);
-  const currentOpt = opts.find((o) => o.value === sel.value) || opts[0];
-  const menuEl = host.querySelector(".ds-dropdown-menu");
-  const ariaLabel = menuEl ? menuEl.getAttribute("aria-label") || "" : "";
-  const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="${ddId}-name">${_esc(ariaLabel)}</span>` : "";
-  const labelledBy = ariaLabel ? ` aria-labelledby="${ddId}-name ${ddId}-btn-label"` : "";
-  const items = opts
-    .map((o) => `<li class="ds-dropdown-menu-item${o === currentOpt ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${_esc(o.value)}">${_esc(o.textContent)}</li>`)
-    .join("");
-  host.innerHTML = `<button type="button" class="ds-dropdown-btn" id="${ddId}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${ddId}-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="${ddId}-btn-label">${currentOpt ? _esc(currentOpt.textContent) : ""}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="${ddId}-menu" role="menu" aria-label="${_esc(ariaLabel || "Options")}" hidden>${items}</ul>`;
-  if (window.dsDropdownInit) window.dsDropdownInit(host);
-}
 
 async function _fillGrantPickers() {
   const groups = await _loadGroups();
@@ -3802,14 +3281,6 @@ async function toggleBrowse(id) {
   }
 }
 
-function _scopeNote(data) {
-  // Server marks bucket-scoped (custom access) tokens whose listing came
-  // from the token's own bucketPermissions rather than the project-wide
-  // listing — tell the admin the picker is intentionally partial.
-  return data && data.scope === "token_buckets"
-    ? `<div class="ds-scope-note">Bucket-scoped token — showing only the buckets this token can read.</div>`
-    : "";
-}
 
 /* Buckets render CLOSED. On a real project this list is dozens of buckets and
    hundreds of tables; open, it is a wall nobody can navigate, and the one
@@ -6161,6 +5632,15 @@ document.getElementById("ds-wizard-register-btn").addEventListener("click", asyn
   try {
     const result = await _registerStepTwo();
     if (!result || !result.ok.length) return; // per-row statuses say why
+    /* Came from the package builder: the tables are registered, which is all
+       it needed, so go back to it. It works out which ones are new by
+       diffing the registry against what it saw before it left, so there is
+       nothing to hand over in the URL and nothing here to keep in step with
+       it. */
+    if (_fromPackageBuilder) {
+      window.location.href = "/admin/data-packages/new";
+      return;
+    }
     if (!_wizardBoard) {
       _wizardTables = result.ok;
       _seedBoard("one");
@@ -6331,7 +5811,28 @@ loadConnections().then(() => {
   // instance that cannot store a secret filled in the whole form behind a
   // banner that had already told them it would fail, and the attempt left a
   // credential-less connection row behind.
-  if (new URLSearchParams(window.location.search).has("add")) {
+  const _params = new URLSearchParams(window.location.search);
+  // The builder's round trip. Equality against a literal, so the param
+  // decides only whether a constant-href strip is shown.
+  if (_params.get("from") === "package-builder") {
+    _fromPackageBuilder = true;
+    const back = document.getElementById("ds-from-package");
+    if (back) back.hidden = false;
+    /* Say what the flow actually is on this entry: two steps, and the
+       primary names where the tables are going. A strip advertising Bundle
+       and Share that this entry never reaches is a map of somewhere else. */
+    document.querySelectorAll("#ds-wizard-overlay .ds-drawer__step").forEach((el) => {
+      if (Number(el.dataset.wstep) > 2) el.hidden = true;
+    });
+    const reg = document.getElementById("ds-wizard-register-btn");
+    if (reg) reg.textContent = "Add selected tables to your package";
+    const early = document.getElementById("ds-wizard-finish-early-btn");
+    if (early) {
+      early.textContent = "Register only";
+      early.title = "Register the selected tables and stay here — your package keeps waiting.";
+    }
+  }
+  if (_params.has("add")) {
     const addBtn = document.getElementById("ds-add-btn");
     if (addBtn && addBtn.disabled) {
       const strip = document.querySelector(".apg-strip--warn[role='alert']");
