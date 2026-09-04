@@ -1,4 +1,4 @@
-"""Everyone becomes a scope; ``marketplace_plugins.is_system`` is deleted.
+"""Everyone becomes a scope; ``marketplace_plugins.is_system`` is retired, not dropped.
 
 Three spellings of one idea collapse into one. Before this revision an
 instance could say "everyone gets this" in three ways that did not agree:
