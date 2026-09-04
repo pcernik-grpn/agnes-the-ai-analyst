@@ -2064,9 +2064,19 @@
     background: var(--ds-primary-light); border-radius: var(--ds-radius-btn);
     padding: 1px 7px; white-space: nowrap;
   }
+  /* Two lines, wrapping — not one with an ellipsis. Every other description
+     on this page is a name, and cutting a name short costs nothing; this one
+     carries a DEFINITION, and since #2256 the part that says which
+     identities the audience excludes is the last clause. Under `nowrap` that
+     clause sat past the cut at any viewport narrower than a wide monitor, so
+     the page stated the exclusion and displayed an ellipsis. Clamped at two
+     rather than left to grow, so the audience block cannot push the group
+     list down the page. (This is the LAST of three `.ax-gs__desc` rules;
+     the earlier two set the one-line treatment and are overridden here on
+     purpose, not by accident of order.) */
   .ax-gs__desc {
-    max-width: none;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    max-width: none; overflow: hidden; white-space: normal; text-overflow: clip;
   }
   /* ── The picker uses the app's own parts ──────────────────────────────
      Its sections are `.fbar-grouptoggle`, the Library's group header, so a
