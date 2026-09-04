@@ -1213,7 +1213,15 @@ class TestInheritedRowsCollapseToOneLine:
     def test_it_lands_in_set_elsewhere(self):
         """It is a fact about rows the admin cannot act on here."""
         body = self._grant_list()
-        assert 'const setElsewhere = inSection("set_elsewhere") + inheritedLine;' in body
+        assert 'const setElsewhereRows = inSection("set_elsewhere");' in body
+        assert "const setElsewhere = setElsewhereRows + inheritedLine;" in body
+
+    def test_it_is_not_a_row_the_column_header_heads(self):
+        """#2257 item 3. It is a sentence — no kind, no tier, nothing to
+        revoke — so on a group that holds nothing else the four column labels
+        headed a band label and nothing more."""
+        src = self._source()
+        assert "const colhd = holdingHeadsRows(changeHere, setElsewhereRows) ?" in src
 
     def test_the_everyone_entry_never_shows_it(self):
         """Zero by construction: `grantsFor` returns only direct rows for the
@@ -1246,9 +1254,21 @@ class TestReachIsTheServersNumber:
 
     def test_the_estimate_paints_first_and_the_server_paints_last(self):
         foot = self._picker_footer()
-        assert 'els.count.textContent = n ? line(reachOf(chosen)) : "No group selected";' in foot
+        # The empty selection is worded inside `sharePickerCount` now (it is
+        # the same sentence either way — see the node-executed guard in
+        # tests/test_admin_access_renderers.py), so this line no longer
+        # branches on `n`.
+        assert "els.count.textContent = line(reachOf(chosen));" in foot
         assert "fetchReach(chosen).then((count) =>" in foot
         assert foot.index("line(reachOf(chosen))") < foot.index("fetchReach(chosen)")
+
+    def test_the_count_and_the_button_read_the_selection_the_same_way(self):
+        """#2257 item 1. Both used to count the everyone SCOPE as one of the
+        groups ("2 groups · 10 people" / "Share with 2 groups"), in the one
+        control where the group/scope choice is made."""
+        src = self._source()
+        assert "const line = (reach) => sharePickerCount(chosen, reach);" in src
+        assert "els.apply.textContent = sharePickerApply(chosen);" in src
 
     def test_a_stale_answer_is_dropped(self):
         """The selection can change while a request is in flight."""
@@ -1393,6 +1413,31 @@ class TestTheLocalCopyKnowsWhenItIsStale:
         # `failed++` back after a one-line catch was mangled into a comment.
         i = src.index('if (err.message === "changed_elsewhere") { done++; continue; }')
         assert "failed++;" in src[i : i + 200]
+
+    def test_the_revoke_path_swallows_it_too(self):
+        """The fourth caller, found on a live run a release later (#2257): the
+        revoke handler printed "Could not change: changed_elsewhere" over the
+        very sentence `changedElsewhere` had just shown. It does not `return`
+        like the other two — the repaint and the focus restore below the catch
+        are still owed — so it guards the toast instead."""
+        src = self._source()
+        i = src.index('if (err.message !== "changed_elsewhere") {')
+        assert '"Could not change: " : "Could not revoke: "' in src[i : i + 260]
+        # And nowhere does a toast print the token unguarded.
+        assert 'toast("Could not change: " + err.message' not in src
+
+    def test_every_toast_that_prints_err_message_guards_the_sentinel(self):
+        """A census rather than three named call sites — which is how the
+        fourth one shipped. Any handler that puts `err.message` in front of a
+        reader has to let the sentinel through first, or the token is what the
+        reader gets instead of the sentence `changedElsewhere` just wrote."""
+        src = self._source()
+        sites = [m.start() for m in re.finditer(r"toast\([^;]*err\.message", src)]
+        assert len(sites) >= 3, "no toast prints err.message any more — retire this guard"
+        for i in sites:
+            assert "changed_elsewhere" in src[max(0, i - 400) : i], (
+                "an unguarded err.message toast at: " + src[i : i + 90]
+            )
 
     def test_returning_to_the_tab_refreshes_a_stale_copy(self):
         src = self._source()

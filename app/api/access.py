@@ -28,7 +28,8 @@ from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType, list_resource_types
 from src.grant_scopes import EVERYONE_TARGET_ID, EVERYONE_TARGET_LABEL, carrier_group_id
-from src.grant_scopes import reaches_everyone
+from src.grant_scopes import audience_id as audience_of_grant
+from src.grant_scopes import grants_reaching_user
 from src.grant_scopes import normalize as normalize_scope
 from src.grant_scopes import takes_everyone_scope
 from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
@@ -484,9 +485,11 @@ async def access_overview(
             # and there an everyone-grant IS a grant on the carrier. Reading
             # the column alone would leave a DuckDB instance unable to show
             # an Everyone audience at all.
-            "audience": (
-                EVERYONE_TARGET_ID if reaches_everyone(r, _carrier) else r["group_id"]
-            ),
+            #
+            # Through `src.grant_scopes.audience_id` rather than the test
+            # inlined here, because the effective-access reads ask the exact
+            # same question and used to answer it differently (#2254).
+            "audience": audience_of_grant(r, _carrier),
             # WHO the grant reaches. NULL/absent means the members of
             # `group_id`; 'everyone' means every account, and `group_id` is
             # then a carrier the page must not attribute the grant to.
@@ -1732,7 +1735,14 @@ async def remove_user_from_group(
 class EffectiveAccessItem(BaseModel):
     resource_type: str
     resource_id: str
-    via_groups: List[dict]  # [{group_id, group_name}]
+    #: `[{group_id, group_name, kind}]` — WHO each grant on this resource
+    #: reaches the person through. `kind` is `"group"` or `"scope"`; on a
+    #: scope row `group_id` is the `everyone` sentinel and NOT the carrier
+    #: group's id, which this payload must never surface (#2254): the account
+    #: is typically not a member of it, so naming it would answer the reader's
+    #: "through which of their groups?" with a group that has nothing to do
+    #: with them.
+    via_groups: List[dict]
     #: Human name for `resource_id`, resolved through the SAME
     #: `ResourceTypeSpec.list_blocks()` projection `/api/admin/access-overview`
     #: uses, so the two surfaces cannot disagree about what a thing is called.
@@ -1743,6 +1753,22 @@ class EffectiveAccessItem(BaseModel):
     href: Optional[str] = None
     #: True when the id could not be resolved to a live resource at all.
     unresolved: bool = False
+
+
+def _via(grant: dict) -> dict:
+    """One `via_groups` entry, from a row `grants_reaching_user` tagged.
+
+    The field keeps its name and its two original keys — three readers
+    (`/me/profile`, `/admin/users/{id}`, the Access page's person lens) print
+    `group_name` and link on `group_id` — and gains `kind`, which is what
+    lets a reader tell a group from the audience that is not one without
+    recognising the sentinel.
+    """
+    return {
+        "group_id": grant["audience"],
+        "group_name": grant["audience_name"],
+        "kind": grant["audience_kind"],
+    }
 
 
 def _resource_display_index(types_needed: set) -> dict:
@@ -2003,14 +2029,14 @@ async def user_effective_access(
     tables = _table_access_diagnoses(target_principal, conn)
 
     # Compose the effective-access view from the factory-backed repos so the
-    # endpoint stays backend-agnostic. Per-row JOIN isn't necessary — we have
-    # all the data via list_groups_with_meta_for_user + list_for_groups.
-    membership_rows = user_group_members_repo().list_groups_with_meta_for_user(user_id)
-    if not membership_rows:
-        return EffectiveAccessResponse(is_admin=is_user_admin(user_id), items=[], tables=tables)
-
-    by_gid = {m["group_id"]: m["name"] for m in membership_rows}
-    grants_rows = resource_grants_repo().list_for_groups(list(by_gid.keys()))
+    # endpoint stays backend-agnostic. `grants_reaching_user` is the shared
+    # resolution path — the same rule `/access-overview` labels its rows by —
+    # so this surface and the Access page cannot answer "who reaches this"
+    # two different ways (#2254). It also removes the membership short-circuit
+    # that stood here: an everyone-scoped grant reaches an account in no group
+    # at all, and returning early answered `items: []` for exactly that
+    # account.
+    grants_rows = grants_reaching_user(user_id)
 
     # Resolve display names once for the types actually granted, then sort by
     # NAME rather than id — an id sort is alphabetical over opaque keys, which
@@ -2023,11 +2049,10 @@ async def user_effective_access(
         key=lambda r: (
             r["resource_type"],
             (display.get((r["resource_type"], r["resource_id"])) or {}).get("name") or r["resource_id"],
-            by_gid.get(r["group_id"], ""),
+            r["audience_name"],
         ),
     ):
-        rt, rid, gid = gr["resource_type"], gr["resource_id"], gr["group_id"]
-        gname = by_gid.get(gid, gid)
+        rt, rid = gr["resource_type"], gr["resource_id"]
         key = (rt, rid)
         if key not in grouped:
             shown = display.get(key)
@@ -2039,7 +2064,7 @@ async def user_effective_access(
                 href=(shown or {}).get("href"),
                 unresolved=shown is None,
             )
-        grouped[key].via_groups.append({"group_id": gid, "group_name": gname})
+        grouped[key].via_groups.append(_via(gr))
 
     return EffectiveAccessResponse(
         is_admin=is_user_admin(user_id),
@@ -2217,17 +2242,15 @@ async def my_effective_access(
     user_id = user["id"]
     tables = _table_access_diagnoses(user, conn)
 
-    membership_rows = user_group_members_repo().list_groups_with_meta_for_user(user_id)
-    if not membership_rows:
-        return EffectiveAccessResponse(is_admin=is_user_admin(user_id), items=[], tables=tables)
-
-    by_gid = {m["group_id"]: m["name"] for m in membership_rows}
-    grants_rows = resource_grants_repo().list_for_groups(list(by_gid.keys()))
+    # The same shared resolver the admin read uses, for the same two reasons
+    # (#2254): a member who is in no group still reaches everything given to
+    # everyone, and the audience they reach it through is the scope — not the
+    # carrier group they have never been in.
+    grants_rows = grants_reaching_user(user_id)
 
     grouped: dict[tuple[str, str], EffectiveAccessItem] = {}
-    for gr in sorted(grants_rows, key=lambda r: (r["resource_type"], r["resource_id"], by_gid.get(r["group_id"], ""))):
-        rt, rid, gid = gr["resource_type"], gr["resource_id"], gr["group_id"]
-        gname = by_gid.get(gid, gid)
+    for gr in sorted(grants_rows, key=lambda r: (r["resource_type"], r["resource_id"], r["audience_name"])):
+        rt, rid = gr["resource_type"], gr["resource_id"]
         key = (rt, rid)
         if key not in grouped:
             grouped[key] = EffectiveAccessItem(
@@ -2235,7 +2258,7 @@ async def my_effective_access(
                 resource_id=rid,
                 via_groups=[],
             )
-        grouped[key].via_groups.append({"group_id": gid, "group_name": gname})
+        grouped[key].via_groups.append(_via(gr))
 
     return EffectiveAccessResponse(
         is_admin=is_user_admin(user_id),
