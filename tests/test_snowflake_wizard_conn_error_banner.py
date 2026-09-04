@@ -16,6 +16,8 @@ executing the script.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from tests._admin_data_sources_source import read_admin_data_sources_source
 
 
@@ -122,7 +124,13 @@ def test_conn_error_banner_reuses_the_design_system_danger_tokens():
     """Proper error styling, not the plain highlighted-line-of-text look the
     issue called out — same danger color tokens the rest of the page already
     uses (`.ds-src__health.is-err`, `.ds-conn-test-result.fail`, ...)."""
-    tpl = _template_text()
-    css_start = tpl.index(".ds-sf-conn-error")
-    css_block = tpl[css_start : css_start + 400]
+    # The rule lives in css/ds_page.css now (the page's three inline <style>
+    # blocks moved into a file so the data-package builder can load them too).
+    # Read the stylesheet rather than the assembled page: `.ds-sf-conn-error`
+    # appears in the wizard's JS as well, and in the assembled source the JS
+    # comes first — a windowed `index()` search would land on a
+    # querySelector call and assert nothing about the styling.
+    css = Path("app/web/static/css/ds_page.css").read_text(encoding="utf-8")
+    css_start = css.index(".ds-sf-conn-error")
+    css_block = css[css_start : css_start + 400]
     assert "var(--ds-accent-danger" in css_block
