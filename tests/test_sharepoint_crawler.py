@@ -5842,6 +5842,38 @@ class TestFactsStreaming:
         assert jobs[0]["id"] == existing["id"]
         assert any("not piling up" in r.getMessage() for r in caplog.records)
 
+    def test_an_active_provider_limit_condition_suppresses_the_streamed_enqueue(self, crawl_env, monkeypatch, caplog):
+        """TCRD-296 synthesis F.25, gaps #25/#48: before this check, a long
+        crawl crossing many ``stream_every`` thresholds while the provider
+        refuses every call kept enqueueing a fresh (doomed) pass at every
+        threshold — 161 failed job rows overnight in the live incident this
+        closes."""
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.streamed_pass_suppressed_by_provider_limit",
+            lambda: {"reason": "workspace_limit", "provider": "anthropic"},
+        )
+
+        with caplog.at_level(logging.INFO, logger="connectors.sharepoint.crawler"):
+            crawler._enqueue_streamed_facts_pass("conn1")  # must not raise
+
+        from src.repositories import jobs_repo
+
+        assert jobs_repo().list(kind="sharepoint-facts-extraction") == []
+        assert any("provider_limit condition" in r.getMessage() for r in caplog.records)
+
+    def test_a_cleared_provider_limit_condition_lets_the_streamed_enqueue_through_again(self, crawl_env, monkeypatch):
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.streamed_pass_suppressed_by_provider_limit", lambda: None
+        )
+
+        crawler._enqueue_streamed_facts_pass("conn1")
+
+        from src.repositories import jobs_repo
+
+        assert len(jobs_repo().list(kind="sharepoint-facts-extraction")) == 1
+
     def test_chained_tail_pass_skips_when_a_standalone_job_is_in_flight(self, crawl_env, monkeypatch, caplog):
         """Independent of ``stream_every``: an ALREADY in-flight standalone
         pass (a streamed enqueue or a manual trigger) makes the crawl's own

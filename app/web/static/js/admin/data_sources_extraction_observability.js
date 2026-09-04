@@ -166,6 +166,16 @@ function _extFactsJobLine(job) {
    pending document (`0`/`null` say nothing, matching every other line's
    "absence is the honest answer" convention here). */
 function _extFactsPendingLine(status) {
+  // TCRD-296 synthesis F.25 — a fleet-level provider refusal wins over the
+  // ordinary "continuing"/"not running" wording: an operator seeing this
+  // needs to know WHY nothing is chasing the backlog, not just that
+  // nothing currently is (which "not running" alone would also say for an
+  // unrelated reason, e.g. the continuation chain hit its cap).
+  const limit = status && status.provider_limit;
+  if (limit) {
+    const provider = _extEsc(limit.provider || "provider");
+    return `<div class="ext-sub ext-warn">paused: provider limit (${provider} — ${_extEsc(limit.reason || "")})</div>`;
+  }
   const n = status && status.facts_pending_documents;
   if (n === null || n === undefined || n <= 0) return "";
   const continuing = !!status.facts_pass_running;

@@ -1825,6 +1825,40 @@ class TestFactsPendingLine:
         )
         assert "pending facts extraction" not in out["html"]
 
+    def test_an_active_provider_limit_condition_wins_over_the_pending_line(self):
+        """TCRD-296 synthesis F.25 — an operator seeing a backlog needs to
+        know WHY nothing is chasing it, not just that nothing currently is
+        (which "not running" alone would also say for an unrelated reason,
+        e.g. the auto-continuation chain hitting its cap)."""
+        data = {
+            **self._IDLE,
+            "facts_pending_documents": 7,
+            "facts_pass_running": False,
+            "provider_limit": {"provider": "anthropic", "reason": "workspace_limit"},
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "paused: provider limit" in html
+        assert "anthropic" in html
+        assert "pending facts extraction" not in html
+
+    def test_no_provider_limit_condition_falls_back_to_the_pending_line(self):
+        data = {
+            **self._IDLE,
+            "facts_pending_documents": 7,
+            "facts_pass_running": False,
+            "provider_limit": None,
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        assert "paused: provider limit" not in out["html"]
+        assert "7 documents pending facts extraction" in out["html"]
+
 
 # --------------------------------------------------------------------------
 # Facts policy control (retry_mode / transport / provider) — the admin-UI

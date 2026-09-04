@@ -948,7 +948,13 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
                         "retry_mode": "off",
                         "run_timeout_s": 7200,
                         "provider": "vertex",
-                        "vertex_region": "europe-west4",
+                        # A documented bucket for the default (Haiku) model
+                        # — see `VERTEX_REGION_MODEL_MATRIX` (TCRD-296
+                        # synthesis F.25); an undocumented region×model
+                        # pairing is refused with a 422 (see
+                        # `test_an_undocumented_vertex_region_model_pairing_is_refused`
+                        # below).
+                        "vertex_region": "europe-west1",
                     },
                 }
             }
@@ -963,7 +969,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
     assert got["facts"]["retry_mode"] == "off"
     assert got["facts"]["run_timeout_s"] == 7200
     assert got["facts"]["provider"] == "vertex"
-    assert got["facts"]["vertex_region"] == "europe-west4"
+    assert got["facts"]["vertex_region"] == "europe-west1"
 
 
 @pytest.mark.parametrize(
@@ -998,3 +1004,59 @@ def test_vertex_region_global_is_accepted(seeded_app, monkeypatch):
     assert resp.status_code == 200, resp.text
     got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
     assert got["facts"]["vertex_region"] == "global"
+
+
+class TestVertexRegionModelMatrix:
+    """TCRD-296 synthesis F.25, live finding (b): a Vertex Claude quota
+    bucket that does not exist for a given region×model pairing answers
+    429 on EVERY call, even a 5-token one — refused here with a 422
+    instead of letting every pass discover it live."""
+
+    def test_sonnet_outside_global_is_refused(self, seeded_app, monkeypatch):
+        client, token = _client(seeded_app, monkeypatch)
+        resp = client.post(
+            "/api/admin/server-config",
+            json={
+                "sections": {
+                    "extraction": {"facts": {"model": "sonnet", "provider": "vertex", "vertex_region": "us-east5"}}
+                }
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "no documented Claude-on-Vertex quota bucket" in resp.json()["detail"]
+
+    def test_sonnet_in_global_is_accepted(self, seeded_app, monkeypatch):
+        client, token = _client(seeded_app, monkeypatch)
+        resp = client.post(
+            "/api/admin/server-config",
+            json={
+                "sections": {
+                    "extraction": {"facts": {"model": "sonnet", "provider": "vertex", "vertex_region": "global"}}
+                }
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_haiku_is_accepted_in_every_documented_region(self, seeded_app, monkeypatch):
+        client, token = _client(seeded_app, monkeypatch)
+        for region in ("global", "us-east5", "europe-west1"):
+            resp = client.post(
+                "/api/admin/server-config",
+                json={"sections": {"extraction": {"facts": {"model": "haiku", "vertex_region": region}}}},
+                headers=_auth(token),
+            )
+            assert resp.status_code == 200, resp.text
+
+    def test_an_unlisted_tier_is_unconstrained(self, seeded_app, monkeypatch):
+        """Opus (or a future tier this table does not name) is not in the
+        matrix — treated as unconstrained rather than refused on a stale
+        table."""
+        client, token = _client(seeded_app, monkeypatch)
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"facts": {"model": "opus", "vertex_region": "us-east5"}}}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text

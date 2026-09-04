@@ -5375,6 +5375,19 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
     scheduling a bonus pass must not fail a crawl that is still ingesting
     real documents.
 
+    ALSO skips (info, since this is the storm this check exists to stop —
+    TCRD-296 synthesis F.25, gaps #25/#48) while a fleet-level
+    ``provider_limit`` condition is active and still cooling down
+    (``streamed_pass_suppressed_by_provider_limit`` — a workspace/usage-
+    limit exhaustion, a saturated Vertex region×model quota bucket, or
+    billing disabled). Before this check, a long crawl crossing many
+    ``stream_every`` thresholds while the provider refuses every call kept
+    enqueueing (and failing) a fresh pass every threshold — 161 failed job
+    rows overnight in the incident this closes, with no single place
+    saying "facts are paused because the provider refuses". The MANUAL
+    trigger (``POST …/facts-extract``) is deliberately unaffected — see
+    that function's own docstring.
+
     Both helpers are imported from the connector-level module, never from
     ``app.api.admin_sharepoint``: that API module binds
     ``source_connections_repo`` at import time, so importing it lazily
@@ -5383,7 +5396,11 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
     cross-test leak this fixed).
     """
     from app.worker.registry import job_max_attempts
-    from connectors.sharepoint.facts_extraction import facts_extraction_idempotency_key, facts_extraction_readiness
+    from connectors.sharepoint.facts_extraction import (
+        facts_extraction_idempotency_key,
+        facts_extraction_readiness,
+        streamed_pass_suppressed_by_provider_limit,
+    )
     from src.repositories import jobs_repo
 
     try:
@@ -5393,6 +5410,16 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
                 "sharepoint crawl: connection %s — extraction.facts.stream_every is set but facts extraction "
                 "is not usable yet — not enqueueing a streamed pass",
                 connection_id,
+            )
+            return
+        condition = streamed_pass_suppressed_by_provider_limit()
+        if condition is not None:
+            logger.info(
+                "sharepoint crawl: connection %s — a provider_limit condition (%s, provider=%s) is active — "
+                "not enqueueing a streamed facts pass until it clears",
+                connection_id,
+                condition.get("reason"),
+                condition.get("provider"),
             )
             return
         job = jobs_repo().enqueue(

@@ -38,6 +38,7 @@ _SIGNATURES = (
     "function actionsCell(row) {",
     "function renderRow(row) {",
     "function renderJobsStrip(jobs) {",
+    "function renderProviderLimitBanner(conditions) {",
 )
 
 
@@ -319,6 +320,88 @@ console.log(JSON.stringify({ html: _el.innerHTML }));
 """
     )
     assert "starved" not in out["html"]
+
+
+# ---------------------------------------------------------------------------
+# Fleet-level provider-refusal banner (TCRD-296 synthesis F.25, gaps
+# #25/#48) — one strip per active `provider_limit` condition off the
+# fleet payload's own `conditions` list.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_limit_banner_hides_itself_when_there_are_no_conditions():
+    out = _run_node(
+        """
+const _el = { hidden: false, innerHTML: "x" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([]);
+console.log(JSON.stringify({ hidden: _el.hidden, html: _el.innerHTML }));
+"""
+    )
+    assert out["hidden"] is True
+    assert out["html"] == ""
+
+
+def test_provider_limit_banner_names_the_provider_and_message():
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "anthropic", reason: "workspace_limit", message: "workspace usage limit hit", retry_after_s: null },
+]);
+console.log(JSON.stringify({ hidden: _el.hidden, html: _el.innerHTML }));
+"""
+    )
+    assert out["hidden"] is False
+    assert "Facts extraction paused" in out["html"]
+    assert "anthropic" in out["html"]
+    assert "workspace usage limit hit" in out["html"]
+
+
+def test_provider_limit_banner_names_model_and_region_when_present():
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "vertex", model: "claude-sonnet-4-6", region: "us-east5", reason: "quota_exceeded",
+    message: "Quota exceeded", retry_after_s: 120 },
+]);
+console.log(JSON.stringify({ html: _el.innerHTML }));
+"""
+    )
+    assert "claude-sonnet-4-6" in out["html"]
+    assert "us-east5" in out["html"]
+    assert "retrying in 2m" in out["html"]
+
+
+def test_provider_limit_banner_renders_one_line_per_condition():
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "anthropic", reason: "workspace_limit", message: "m1", retry_after_s: null },
+  { provider: "vertex", reason: "quota_exceeded", message: "m2", retry_after_s: null },
+]);
+console.log(JSON.stringify({ html: _el.innerHTML }));
+"""
+    )
+    assert "m1" in out["html"]
+    assert "m2" in out["html"]
 
 
 # ---------------------------------------------------------------------------

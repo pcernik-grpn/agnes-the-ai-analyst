@@ -371,6 +371,82 @@ are still pending and whether a pass is currently chasing them ("N pending
 · continuing" vs. "N pending · not running") — the second phrase is the
 one that means an operator should intervene.
 
+### Provider limits (TCRD-296 synthesis F.25)
+
+A live incident hit two shapes of "the provider will refuse EVERY call, not
+just this one": an Anthropic workspace exhausting its on-demand usage limit
+(a 400 whose message names a reset date), and a Vertex Claude quota bucket
+with NO allocation at all for a region×model pair (a 429 that retrying the
+SAME region reproduces identically). Before this classification existed,
+both looked identical to any other model-call failure and FAILED THE JOB,
+while the crawl's `extraction.facts.stream_every` trigger kept enqueueing a
+fresh pass every threshold — 161 failed job rows overnight in the incident
+this closes, with no single place saying "facts are paused because the
+provider refuses."
+
+**Classification.** `connectors.sharepoint.facts_extraction.
+classify_provider_limit_error` recognizes a closed set of three reasons —
+`workspace_limit`, `quota_exceeded`, `billing_disabled` — by message content
+(neither provider exposes a distinct exception type or status code for
+"the account is out of usage" versus "this one request was malformed").
+This is deliberately DISTINCT from an ordinary transient 429/5xx, which the
+existing AIMD/backoff retry already absorbs: a non-retryable-shaped error
+(the Anthropic 400 case) classifies immediately, before any retry is
+attempted; a retryable-shaped 429 (the Vertex quota case) is classified only
+once every retry attempt has failed identically — telling a structural
+zero-allocation bucket apart from an ordinary saturated-but-recoverable rate
+limit.
+
+**A hit ends the pass CLEANLY, not with a failed job.** The pass reports
+`interrupted: true, interrupted_reason: "provider_limit"` and completes
+normally — same posture as a `timeout` interruption — rather than raising
+and failing the job. It also persists a fleet-level condition
+(`extraction_conditions_repo()`, Postgres-only — see `docs/migrations.md`):
+`{reason, provider, model, region, message, first_seen, last_seen,
+retry_after_s}`. Fleet-level, not per-connection: the underlying refusal is
+account/workspace/region-scoped, never tied to one SharePoint connection.
+
+**The crawl's own streamed trigger backs off while a condition is active.**
+`extraction.facts.stream_every`'s enqueue
+(`crawler._enqueue_streamed_facts_pass`) checks
+`streamed_pass_suppressed_by_provider_limit()` before enqueueing and skips
+while a condition is still within its cooldown — the provider's own
+`Retry-After` when given, else a 30-minute default. The self-continuation
+chain (`maybe_continue_pass`, above) needs no separate check: it only ever
+continues on `interrupted_reason == "timeout"`, and a provider-limit stop
+always reports `"provider_limit"` instead, so it simply resets and stops on
+its own. **The manual trigger (`POST …/facts-extract`,
+`agnes admin sharepoint facts-extract`) is deliberately NEVER suppressed** —
+an operator who just fixed the underlying limit should not have to wait out
+the cooldown to prove it, and a pass for that provider completing WITHOUT
+hitting a refusal is exactly what clears the condition for everyone else.
+
+**Where it surfaces.** `GET /api/admin/sharepoint/extraction/runs` (the
+fleet endpoint) gains a top-level `conditions[]` array — the `/admin/
+extraction` fleet page renders it as a banner ("Facts extraction paused:
+`<provider>` `<model>` in `<region>` — `<message>`; retrying after
+`<time>`"), and `agnes admin sharepoint runs` prints the same line in the
+terminal. Each connection's own `GET …/extraction/status` gains
+`provider_limit` (the active condition, if any, matching THAT connection's
+resolved facts provider) — the source card's facts line renders it as
+"paused: provider limit" in place of the ordinary "N pending · continuing/
+not running" wording.
+
+**Region×model matrix validation** (live finding (b) — Vertex quotas are
+per REGION and per MODEL: a project running Sonnet outside `global` answers
+429 on every call, even a 5-token one, because it has no regional bucket at
+all; Haiku's region buckets can also saturate at peak, a genuine capacity
+limit rather than a missing bucket). `VERTEX_REGION_MODEL_MATRIX` in
+`connectors/sharepoint/facts_extraction.py` documents the known-good
+pairings (`haiku: global, us-east5, europe-west1`; `sonnet: global`); both
+`POST /api/admin/server-config` (the `extraction.facts.vertex_region`
+instance-level setting) and `PATCH …/extraction/facts-config` (a per-
+connection override) refuse an undocumented region×model pairing with a
+`422` naming the mismatch, instead of letting every pass discover it live.
+A model tier the matrix does not name (`opus`, or a future tier) is treated
+as unconstrained — a known-bad-combination guardrail, not a closed
+allowlist.
+
 Each document's request is kept under a token budget
 (`extraction.facts.max_prompt_tokens`, default 150 000, hard-ceilinged at
 190 000 regardless of what is configured) on top of the flat character

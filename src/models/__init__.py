@@ -29,6 +29,7 @@ from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
 from src.models.extraction import ExtractionRun
+from src.models.extraction_conditions import ExtractionCondition
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
 from src.models.facts_llm_cache import FactsLlmCache
 from src.models.jobs import Job
@@ -140,6 +141,7 @@ __all__ = [
     "DataPackageTable",
     "DataPackageTool",
     "Edge",
+    "ExtractionCondition",
     "ExtractionRun",
     "Fact",
     "FactAlias",

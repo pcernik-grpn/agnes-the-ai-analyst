@@ -1601,6 +1601,21 @@ class TestFmtFactsBacklogSuffix:
 
         assert _fmt_facts(None) == "—"
 
+    def test_a_provider_limit_condition_wins_over_the_backlog_wording(self):
+        """TCRD-296 synthesis F.25 — same precedence the web fleet page's
+        own facts line takes."""
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {
+            "docs_done": None,
+            "facts_pending_documents": 12,
+            "facts_pass_running": False,
+            "provider_limit": {"provider": "anthropic", "reason": "workspace_limit"},
+        }
+        rendered = _fmt_facts(facts)
+        assert "paused: provider limit (anthropic)" in rendered
+        assert "backlog, not running" not in rendered
+
 
 class TestRuns:
     """`agnes admin sharepoint runs` — CLI counterpart to
@@ -1671,6 +1686,37 @@ class TestRuns:
             result = runner.invoke(app, ["admin", "sharepoint", "runs"])
         assert result.exit_code == 0, result.output
         assert "starved" in result.output
+
+    def test_an_active_provider_limit_condition_is_printed(self):
+        """TCRD-296 synthesis F.25 — the terminal counterpart to the fleet
+        web page's own banner."""
+        body = json.loads(json.dumps(_FLEET_BODY))
+        body["conditions"] = [
+            {
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "region": None,
+                "reason": "workspace_limit",
+                "message": "workspace usage limit hit",
+                "retry_after_s": None,
+            }
+        ]
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "Facts extraction paused" in result.output
+        assert "anthropic" in result.output
+        assert "workspace usage limit hit" in result.output
+
+    def test_a_body_with_no_conditions_key_prints_nothing_extra(self):
+        """An older server that has not shipped `conditions` yet must not
+        crash the command — the banner is simply absent."""
+        body = json.loads(json.dumps(_FLEET_BODY))
+        assert "conditions" not in body
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "Facts extraction paused" not in result.output
 
     def test_a_body_with_no_jobs_key_prints_no_strip(self):
         """An older server that has not shipped `jobs` yet must not crash
