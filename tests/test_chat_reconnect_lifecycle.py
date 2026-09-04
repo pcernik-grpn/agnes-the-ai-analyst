@@ -72,6 +72,11 @@ def _node(script: str) -> dict:
         "const clearTimeout = (id) => { if (id) scheduled[id - 1].cleared = true; };\n"
         "const statuses = [];\n"
         "const setStatus = (text, kind) => statuses.push({ text, kind });\n"
+        # #2156: a spent budget also stops the turn reading as running, since
+        # no frame — terminal or otherwise — can arrive on a socket we have
+        # given up re-opening. Recorded so the guard below can assert it.
+        "const turnFlags = [];\n"
+        "const setTurnInFlight = (on) => turnFlags.push(!!on);\n"
         "const opened = [];\n"
         "let currentChatId = 'c1';\n"
         "let ws = null;\n"
@@ -106,10 +111,16 @@ def test_three_attempts_on_an_exponential_schedule_then_one_line():
         process.stdout.write(JSON.stringify({
           delays: scheduled.map(s => s.delay),
           statuses,
+          turnFlags,
         }));
         """
     )
     assert res["delays"] == [1000, 2000, 4000], "schedule must be 2^n x 1000 ms, three attempts"
+    # The abandoned turn stops reading as running at the same moment (#2156):
+    # no terminal frame can reach a socket nobody is re-opening any more.
+    assert res["turnFlags"] == [False], (
+        "a spent budget must take the activity indicator and Stop button down"
+    )
     # Nothing said while retrying; exactly one line once the budget is spent.
     assert res["statuses"] == [
         {
