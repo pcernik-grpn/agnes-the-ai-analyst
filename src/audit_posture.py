@@ -78,6 +78,7 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/registry/{table_id}/policy/compile": "access_policy.compile",
     "POST /api/admin/registry/{table_id}/policy/preview": "access_policy.preview",
     "POST /api/admin/registry/{table_id}/policy/preview-groups": "access_policy.preview_groups",
+    "POST /api/admin/registry/{table_id}/policy/preview-matrix": "access_policy.preview_matrix",
     "POST /api/admin/run-audit-prune": "run_audit_prune",
     # Landed on `integration` in parallel with this wave.
     "POST /api/admin/upgrade-freeze": "upgrade_freeze.set",
@@ -356,6 +357,7 @@ POSTURE: dict[str, str] = {
     "POST /api/broker/anthropic/{subpath:path}": "broker_llm_auth_failure",
     "POST /api/broker/data-apps": "broker_admin_route_rejected",
     "POST /api/broker/data-apps.git/{slug}/{path:path}": "broker_data_apps_git_rejected",
+    "POST /api/broker/otlp/v1/{signal}": "broker_ticket_scope_mismatch",
     # -- app.api.cache_warmup --------------------------------------------------
     "POST /api/admin/cache-warmup/run": "cache_warmup.run",
     # -- app.api.catalog -------------------------------------------------------
@@ -610,6 +612,8 @@ POSTURE: dict[str, str] = {
     "DELETE /api/admin/semantic-model/coverage/tags/{tag_id}": "semantic_coverage_tag.delete",
     "POST /api/admin/semantic-layer/mutes": "semantic_health_mute.create",
     "POST /api/admin/semantic-model/coverage/tags": "semantic_coverage_tag.create",
+    # -- app.api.semantic_model_builder ------------------------------------------
+    "POST /api/semantic-models/builder/turn": "semantic_model.builder_turn",
     # -- app.api.semantic_models -----------------------------------------------
     "DELETE /api/admin/semantic-models/{model_id:path}": "semantic_model.delete",
     "DELETE /api/admin/semantic-sources/{source_id}": "semantic_source.delete",
@@ -918,6 +922,12 @@ READ_POSTURE: dict[str, str] = {
     # another user's data.
     "GET /api/admin/sharepoint/extraction/runs": "exempt:noise",
     # -- app.api.admin_sharepoint --
+    # TCRD-296 gap #79: who SharePoint itself says can see a scope root —
+    # captured periodically by the sharepoint-acl-sync job, independent of
+    # access_mode. Cataloged, not exempt: discloses principal display names
+    # (people, groups) with access, the same "another entity's identity
+    # data" class as an admin cross-user read.
+    "GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot": "sharepoint_connection.acl_snapshot_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
     # The source card's "Facts → graph" cell, fetched lazily per connection
@@ -1452,6 +1462,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /profile/sessions": "exempt:ui_support",
     "GET /profile/sessions/{filename}": "session_download",
     "GET /semantic-layer": "exempt:ui_support",
+    # The builder page renders a blank draft and reads nothing about the
+    # caller; the WRITE it leads to is POST /api/semantic-models/apply,
+    # which carries its own audit action.
+    "GET /semantic-layer/new": "exempt:ui_support",
     "GET /semantic-layer/{slug}": "exempt:ui_support",
     "GET /semantic-layer/{slug}/{object_id:path}": "exempt:ui_support",
     "GET /setup": "exempt:ui_support",
@@ -1730,6 +1744,9 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "schema": "catalog.schema",
     "describe": "catalog.sample",  # calls schema then sample; sample is the substantive read
     "query": "query.local",
+    # Self-service policy diagnosis (#2147) — self-calls GET /api/me/
+    # effective-access, itself declared exempt:self above.
+    "effective_access": "exempt:self",
     "skills": "exempt:ui_support",
     "chat_skills": "exempt:ui_support",
     "stack_browse": "exempt:self",

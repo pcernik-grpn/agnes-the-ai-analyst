@@ -12,6 +12,7 @@ import httpx
 import pyarrow.parquet as pq
 import typer
 
+from cli.query_hints import row_scope_note_from_header
 from cli.snapshot_meta import (
     SnapshotMeta,
     delete_snapshot,
@@ -169,6 +170,14 @@ def refresh_cmd(
     # -- the two are always stamped and stored together.
     policy_fingerprint_header = resp_headers.get("X-Agnes-Policy-Fingerprint") or None
     policy_table_id_header = resp_headers.get("X-Agnes-Policy-Table-Id") or None
+    # Table access policies (§10 disclosure): `/api/v2/scan` has no JSON
+    # body to carry `row_scope` in, so it ships the same envelope via the
+    # `X-Agnes-Row-Scope` response header instead -- print the same
+    # `[scope]` line `agnes query` prints, unconditionally on stderr.
+    # Malformed/missing header is a silent no-op (never crashes a refresh).
+    scope_note = row_scope_note_from_header(resp_headers.get("X-Agnes-Row-Scope"))
+    if scope_note:
+        typer.echo(scope_note, err=True)
 
     parquet_path = snap_dir / f"{name}.parquet"
     with snapshot_lock(snap_dir):
@@ -581,6 +590,12 @@ def _create_snapshot(
     # registry id, so this is the only thing `agnes pull` can resolve the
     # snapshot's source table by.
     policy_table_id_header = resp_headers.get("X-Agnes-Policy-Table-Id") or None
+    # Table access policies (§10 disclosure): same envelope, same reasoning
+    # as `refresh_cmd` above -- covers the `--from-query` path too, since
+    # both branches funnel through this one `_create_snapshot` fetch.
+    scope_note = row_scope_note_from_header(resp_headers.get("X-Agnes-Row-Scope"))
+    if scope_note:
+        typer.echo(scope_note, err=True)
 
     # Install under flock — re-check existence here to close the TOCTOU
     # window between the early check above and this write.

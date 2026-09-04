@@ -313,3 +313,25 @@ class TestTheSourcesPageHoldsTheOtherEndOfTheTrip:
         hand_back = register.index("if (_fromPackageBuilder)")
         seeds_board = register.index("_seedBoard(")
         assert hand_back < seeds_board, "the hand-back must come before the bundling path"
+
+    def test_the_builder_opens_the_wizard_over_itself(self) -> None:
+        """The whole point of lifting the wizard out of admin_data_sources:
+        "Connect a source" answers in place instead of navigating. The compact
+        drawer on /admin/tables cannot stack another overlay, so it passes no
+        hook and keeps the navigation — the host decides."""
+        builder = (TEMPLATES / "admin_package_builder.html").read_text(encoding="utf-8")
+        assert '{% include "_add_data_wizard.html" %}' in builder
+        for script in (
+            "js/admin/data_sources_page.js",
+            "js/admin/data_sources_sharepoint_wizard.js",
+            "js/admin/data_sources_extraction_observability.js",
+            "js/admin/data_sources_anon_preview.js",
+        ):
+            assert script in builder, script
+        assert "css/ds_page.css" in builder
+        assert "window.DS_BOOT" in builder, "it must hand over the values that page renders"
+        assert "openConnectWizard: function (onRegistered)" in builder
+        src = COMPONENT.read_text(encoding="utf-8")
+        leave = src.split("function leaveToConnect()", 1)[1].split("\n  }", 1)[0]
+        assert "st.openConnectWizard" in leave
+        assert "persistDraft('connect')" in leave, "the navigation stays as the fallback"

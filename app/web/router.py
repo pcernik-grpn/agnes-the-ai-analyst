@@ -4895,6 +4895,32 @@ def _glossary_count_label(count: int) -> str:
     return f"{_GLOSSARY_COUNT_LIMIT}+" if count >= _GLOSSARY_COUNT_LIMIT else str(count)
 
 
+def _can_author_semantic_model(user: dict, conn: duckdb.DuckDBPyConnection) -> bool:
+    """Whether authoring a semantic model can actually SUCCEED for this caller.
+
+    One flag behind three affordances — the **+ New model** card, the empty
+    state's authoring CTA, and the builder page itself — so they can never
+    disagree about who is invited. The list's own empty state already holds
+    this rule for its import CTA ("the CTA must be a path that can actually
+    succeed"); this extends it to the authoring door.
+
+    The asymmetry it encodes is `POST /api/semantic-models/apply`'s: the admin
+    branch is a plain admin write and always available, while the non-admin
+    branch queues an `authoring_suggestions` row and therefore answers
+    `403 studio_disabled` while the Studio surface is off — which it is by
+    default. So a non-admin on a default instance is not offered a door that
+    would 403 on Save.
+
+    The Studio dependency is worth calling out as a seam rather than a design:
+    a moderation queue is not conceptually part of the retired Studio surface,
+    and if that gate is ever moved off the Studio flag this function is the one
+    place that has to change.
+    """
+    if is_user_admin(user["id"], conn):
+        return True
+    return get_studio_enabled()
+
+
 @router.get("/semantic-layer", response_class=HTMLResponse)
 async def semantic_layer_list(
     request: Request,
@@ -5209,10 +5235,27 @@ async def semantic_layer_list(
     #: has no Domain, a metric projected from a document has no Domain of its
     #: own — which is the engine's existing behaviour for an empty attribute,
     #: not a special case.
+    #: A model contributes its OWN values here, not a placeholder row. Every
+    #: model used to be tallied as `_DIRECT_KEY` with an empty source, while
+    #: the card markup declared neither attribute — so the menu and the rows
+    #: disagreed in both directions at once: "Defined directly" counted every
+    #: model into a slice none of them could match, and selecting ANY model
+    #: emptied the Semantic models tab, including the option naming that very
+    #: model. A model IS its model on this axis, and its `source` is real,
+    #: which is why models were absent from the Source facet entirely. Keep in
+    #: step with the card's own `data-*` in semantic_layer_list.html.
     _all_rows = (
         [dict(m, facet_kind="metric") for m in metric_rows]
         + [dict(t, facet_kind="term") for t in glossary_terms]
-        + [{"facet_model": _DIRECT_KEY, "facet_domain": "", "facet_source": "", "facet_kind": "model"} for _ in models]
+        + [
+            {
+                "facet_model": str(m.get("slug") or ""),
+                "facet_domain": "",
+                "facet_source": str(m.get("source") or "manual"),
+                "facet_kind": "model",
+            }
+            for m in models
+        ]
     )
     page_facets = [
         f
@@ -5272,8 +5315,39 @@ async def semantic_layer_list(
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
         glossary_count_label=_glossary_count_label(glossary_count),
+        can_author_model=_can_author_semantic_model(user, conn),
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
+
+
+#: Registered BEFORE ``/semantic-layer/{slug}`` so the static ``new`` segment
+#: is not swallowed by the model-detail route — the same ordering
+#: ``/admin/studio/suggestions`` needs above, and
+#: ``tests/test_web_semantic_model_builder.py`` is what notices a reorder.
+@router.get("/semantic-layer/new", response_class=HTMLResponse)
+async def semantic_model_builder_page(
+    request: Request,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Author one Ossie document — the Definitions page's **+ New model** card.
+
+    Not admin-only, because ``POST /api/semantic-models/apply`` is not: an
+    admin's document is published, anyone else's is queued for moderation.
+    What *is* conditional is whether authoring can succeed at all — see
+    :func:`_can_author_semantic_model` — and a caller for whom it cannot gets
+    this page explaining why rather than a 404 (the feature exists) or a
+    redirect home (which loses the reason). Same posture as ``/admin/ontology``
+    with the ``facts`` flag off.
+    """
+    ctx = _build_context(
+        request,
+        user=user,
+        conn=conn,
+        can_author_model=_can_author_semantic_model(user, conn),
+        is_admin=is_user_admin(user["id"], conn),
+    )
+    return templates.TemplateResponse(request, "semantic_model_builder.html", ctx)
 
 
 @router.get("/semantic-layer/{slug}", response_class=HTMLResponse)
@@ -6112,6 +6186,40 @@ async def library_detail(
 
     managing = source_managing_connection(col["id"])
 
+    # SharePoint permissions captured as METADATA (TCRD-296 gap #79) — "in
+    # SharePoint, this folder is visible to: <names>", admin-only (Agnes's
+    # own access for this collection may differ — the Sharing rail fact
+    # above is the authority for that; this is purely informational). Fails
+    # SILENTLY closed on anything short of a full match — no snapshot, no
+    # backend, no scope row — the page must never break because a Graph
+    # read hasn't happened yet.
+    sharepoint_permissions_visible_to: list[str] | None = None
+    if is_admin and managing is not None and managing.get("source_type") == "sharepoint":
+        scope_row = next(
+            (
+                s
+                for s in (managing.get("config") or {}).get("scopes") or []
+                if isinstance(s, dict) and s.get("collection_id") == col["id"]
+            ),
+            None,
+        )
+        if scope_row is not None and scope_row.get("source_scope_id"):
+            from src.repositories import use_pg
+
+            if use_pg():
+                from connectors.sharepoint.acl_sync import acl_snapshot_kind
+                from src.repositories import sharepoint_state_repo
+
+                try:
+                    snap = sharepoint_state_repo().get(managing["id"], acl_snapshot_kind(scope_row["source_scope_id"]))
+                except Exception as e:  # noqa: BLE001 — informational only, never breaks the page
+                    logger.warning("/library/%s: ACL snapshot read failed: %s", slug, e)
+                    snap = None
+                if snap:
+                    names = [p.get("display_name") for p in (snap.get("principals") or []) if p.get("display_name")]
+                    if names:
+                        sharepoint_permissions_visible_to = names
+
     # The one set of "other active query params" every paginated section's
     # pager shares — see `_pager_href` above. Built once here so a Files
     # "Next" link can never drop an active Facts page (or vice versa), and a
@@ -6153,6 +6261,7 @@ async def library_detail(
         can_manage=is_admin or owner_id == user["id"],
         facts_summary=facts_summary,
         source_managed_by=(managing.get("name") or managing.get("id")) if managing else None,
+        sharepoint_permissions_visible_to=sharepoint_permissions_visible_to,
     )
     return templates.TemplateResponse(request, "library_detail.html", ctx)
 
@@ -6314,8 +6423,10 @@ async def catalog_table_detail(
             columns = []
         else:
             if effective_cols is not None:
-                visible_names = {c["name"] for c in effective_cols if not c.get("hidden")}
-                columns = [c for c in columns if c["name"] in visible_names]
+                by_name = {c["name"]: c for c in effective_cols if not c.get("hidden")}
+                columns = [
+                    {**c, "masked": by_name[c["name"]].get("masked", False)} for c in columns if c["name"] in by_name
+                ]
 
     last_sync_state = sync_state_repo().get_table_state(table_id) or {}
 

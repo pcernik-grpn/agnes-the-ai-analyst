@@ -70,13 +70,14 @@ from src.db import get_analytics_db, get_system_db
 # and several test harnesses ``importlib.reload`` this module, which would mint
 # a new class and silently unbind the app-wide 501 handler. See
 # ``src/repository_errors.py``.
-from src.repository_errors import RequiresPostgresBackend
+from src.repository_errors import PoliciedRowDistributionError, RequiresPostgresBackend
 
 __all__ = [
     "get_system_db",
     "get_analytics_db",
     "use_pg",
     "RequiresPostgresBackend",
+    "PoliciedRowDistributionError",
     # Core user / RBAC cluster
     "users_repo",
     "user_groups_repo",

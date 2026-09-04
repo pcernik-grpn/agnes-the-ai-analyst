@@ -712,6 +712,21 @@ _PACKAGE_BUILDER_TURN_REASON = (
     "through POST /api/admin/data-packages, which is grandfathered above."
 )
 
+_SEMANTIC_MODEL_BUILDER_TURN_REASON = (
+    "one turn of the /semantic-layer/new builder's CONVERSATION — web-UI-only "
+    "for the same reason as its four siblings above. It writes nothing (a "
+    "semantic model has no row until Save — the draft lives in the author's "
+    "browser), and its output is a patch the page merges into that draft for "
+    "review, not a resource. Its inputs are the page's own transient state "
+    "(the transcript, the unsaved draft) plus server-fetched grounding "
+    "candidates (the caller's readable registered tables, and a named "
+    "dataset's real columns) that a CLI invocation would have to invent or "
+    "re-derive. The model it helps produce is created through POST "
+    "/api/semantic-models/apply, which has its own coverage; the grounding "
+    "reads themselves (registered tables, column schema) are already "
+    "reachable via `agnes catalog`/`agnes schema`."
+)
+
 _ENTITY_PREVIEW_AGENT_REASON = (
     "points the caller's single scratch agent at the agent TEMPLATE they are "
     "drafting on /skills and returns its slug, so the builder's Preview tab "
@@ -1016,6 +1031,7 @@ _EXEMPT: dict[str, str] = {
     "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,
     "/api/admin/data-packages/builder/turn": _PACKAGE_BUILDER_TURN_REASON,
     "/api/admin/mcp-sources/builder/turn": _MCP_BUILDER_TURN_REASON,
+    "/api/semantic-models/builder/turn": _SEMANTIC_MODEL_BUILDER_TURN_REASON,
     "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
@@ -1108,6 +1124,32 @@ _EXEMPT: dict[str, str] = {
         "runs the policy AS EACH GROUP and returns rows_visible/rows_total, "
         "an audited, human-witnessed diagnostic action, not an agent-facing "
         "data operation. No CLI/MCP surface planned yet."
+    ),
+    # issue #2147, design doc §13.1 "The preview is a matrix, not a run":
+    # the persona MATRIX built from the SAME single-persona primitive
+    # `.../policy/preview` uses, run once per enumerated persona (the
+    # distinct group-sets of users who can reach the table, plus every
+    # group literal the policy body names). CLI-reachable (`agnes admin
+    # table-policy preview <id> --matrix`, mirroring plan Task 16's
+    # `--as`/`--as-groups` flags for the single-persona preview) -- same
+    # posture as the policy/preview exemption above: mirrors the
+    # grandfathered /api/admin/prompts/{kind}/preview exemption, and this
+    # endpoint too hands each enumerated persona's row/column slice to the
+    # calling admin -- an audited (access_policy.preview_matrix),
+    # human-witnessed diagnostic action, not an agent-facing data operation.
+    # No MCP analogue by design, same reasoning as policy/preview and
+    # policy/preview-groups above.
+    "/api/admin/registry/{table_id}/policy/preview-matrix": (
+        "admin-only access-policy persona-matrix preview (design doc §13.1, "
+        "issue #2147) -- reachable via `agnes admin table-policy preview "
+        "<id> --matrix` (mirroring plan Task 16's single-persona preview "
+        "CLI). No MCP analogue by design: mirrors the grandfathered "
+        "/api/admin/prompts/{kind}/preview exemption, and separately, this "
+        "endpoint runs the policy AS EACH ENUMERATED PERSONA and hands that "
+        "persona's row-filtered slice to the calling admin -- an audited, "
+        "human-witnessed diagnostic action (§13.1), not an agent-facing "
+        "data operation, same posture as policy/preview and "
+        "policy/preview-groups right above."
     ),
     # access-policy-builder-ux plan, Tasks 2/3: the no-SQL builder's
     # columns+samples list and structured-spec-to-SQL compile. Same posture
@@ -1341,6 +1383,15 @@ _EXEMPT: dict[str, str] = {
         "(agnes admin sharepoint shard-plan) but deliberately not MCP-exposed: an admin/ops "
         "display primitive over live Graph data, not an analyst query surface, same "
         "reasoning as split-plan below"
+    ),
+    # ACL-permissions snapshot (TCRD-296 gap #79) — reads ALREADY-CAPTURED
+    # Graph permissions (no live Graph call of its own), same admin/ops
+    # display-primitive class as shard-plan above.
+    "/api/admin/sharepoint/connections/{connection_id}/acl-snapshot": (
+        "who SharePoint itself says can see each scope, already captured by the "
+        "sharepoint-acl-sync job — CLI-reachable (agnes admin sharepoint acl-snapshot) but "
+        "deliberately not MCP-exposed: an admin/ops display primitive over already-captured "
+        "Graph permissions, not an analyst query surface, same reasoning as shard-plan above"
     ),
     "/api/admin/sharepoint/connections/{connection_id}/split-plan": (
         "read-only preview of a folder-based site split (greedy-packed groups + "
@@ -1714,6 +1765,7 @@ _EXEMPT: dict[str, str] = {
     "/api/broker/anthropic/{subpath}": _BROKER_REASON,
     "/api/broker/agnes-api": _BROKER_REASON,
     "/api/broker/agnes-mcp": _BROKER_REASON,
+    "/api/broker/otlp/v1/{signal}": _BROKER_REASON,
     # Embedded kai-agent turn engine host wiring (app/api/kai.py). Both routes
     # are handshake/credential surfaces for the engine, not analyst features:
     # /sessions mints the engine's own session token for the calling user

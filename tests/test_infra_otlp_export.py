@@ -145,3 +145,26 @@ def test_module_grants_the_headers_secret_per_instance():
     assert 'resource "google_secret_manager_secret_iam_member" "vm_otlp"' in main
     assert "for_each  = local.otlp_secrets" in main
     assert "inst.otlp_headers_secret" in main
+
+
+def test_engine_otlp_url_is_a_separate_flag_not_a_side_effect_of_the_endpoint():
+    """`HOST_BROKER_OTLP_URL` is a two-sided switch on the engine (it makes the
+    sandbox initialize OTel AND arms an `otlp` relay scope every turn needs a
+    ticket for), so it must ride its own per-VM flag rather than follow
+    `otlp_endpoint` — an app older than the route that mints the ticket would
+    fail every turn. The flag in turn requires the endpoint at plan time."""
+    body = TPL.read_text()
+    assert (
+        "%{ if kai_agent_broker_otlp_enabled ~}\nHOST_BROKER_OTLP_URL=$SERVER_URL/api/broker/otlp\n%{ endif ~}\n"
+        in body
+    )
+    # Never derived from the endpoint alone.
+    assert "HOST_BROKER_OTLP_URL" not in body.split("%{ if kai_agent_broker_otlp_enabled ~}")[0]
+    tf = VARIABLES_TF.read_text()
+    assert tf.count("kai_agent_broker_otlp_enabled = optional(bool, false)") == 2
+    assert (
+        'kai_agent_broker_otlp_enabled || (var.prod_instance.kai_agent_enabled && var.prod_instance.otlp_endpoint != "")'
+        in tf
+    )
+    main = MAIN_TF.read_text()
+    assert re.search(r"kai_agent_broker_otlp_enabled\s+= each\.value\.kai_agent_broker_otlp_enabled", main)

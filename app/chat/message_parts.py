@@ -170,6 +170,32 @@ def parts_to_tool_calls(parts: Optional[list[dict]]) -> Optional[list[dict]]:
     return calls or None
 
 
+def parts_to_tool_results(parts: Optional[list[dict]]) -> Optional[list[Any]]:
+    """Project ``parts`` to just what the tools RETURNED, in call order.
+
+    The sibling of :func:`parts_to_tool_calls`, and deliberately a second
+    projection rather than a widening of the first: ``tool_calls`` is
+    persisted on every assistant message and is the shape
+    ``chat.js::formatToolCall`` expects, so folding results into it would put
+    a tool's whole output on every row forever.
+
+    The one reader is the sources verdict, which needs the results because a
+    document's name is an OUTPUT — no fact tool takes a filename argument, so
+    a citation checked against arguments alone could never verify (see
+    ``app/chat/sources.py::verify``). ``parts`` is where a result survives,
+    which is also what the reader sees rendered, so the badge and the
+    transcript are judged on the same turn.
+
+    ``None`` when the turn returned nothing, matching the other projections —
+    a turn whose tools all failed to report leaves the verdict exactly where
+    it was before results reached it.
+    """
+    if not parts:
+        return None
+    results = [p.get("result") for p in parts if p.get("type") == "tool" and p.get("result") is not None]
+    return results or None
+
+
 def parts_to_content(parts: Optional[list[dict]]) -> str:
     """Join a turn's text parts the way both producers build ``content``.
 

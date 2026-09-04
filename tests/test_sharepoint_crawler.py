@@ -3963,10 +3963,13 @@ def _with_min_modified(scope: Dict[str, Any], cutoff: str) -> Dict[str, Any]:
 
 
 class TestResolveMinModified:
-    """``crawler.resolve_min_modified`` — the per-connection-only resolver
-    (no instance-level fallback: a cutoff date is inherently connection-
-    specific), mirroring the ``(value, source)`` shape of
-    ``facts_extraction.resolve_retry_mode``."""
+    """``crawler.resolve_min_modified`` — a SCOPE's own override first
+    (TCRD-296 gap #80), the connection-wide default second, absent means no
+    filter, mirroring the ``(value, source)`` shape of
+    ``facts_extraction.resolve_retry_mode``. Every pre-gap-#80 call site
+    passes no ``scope`` at all and is covered unchanged by the first block
+    below; ``TestScopeMinModifiedFilter`` covers the resolution end-to-end
+    through an actual crawl."""
 
     def test_no_connection_is_unfiltered(self):
         assert crawler.resolve_min_modified(None) == (None, "none")
@@ -3988,6 +3991,44 @@ class TestResolveMinModified:
     def test_a_blank_connection_override_is_unfiltered(self):
         connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": ""}}}}
         assert crawler.resolve_min_modified(connection) == (None, "none")
+
+    # -- scope= (TCRD-296 gap #80) -----------------------------------------
+
+    def test_no_scope_falls_back_to_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        assert crawler.resolve_min_modified(connection, scope=None) == (date(2023, 12, 31), "connection")
+
+    def test_a_scope_with_no_own_override_falls_back_to_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        scope = {"source_scope_id": "s1"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2023, 12, 31), "connection")
+
+    def test_a_scopes_own_override_wins_over_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-01-01"}}}}
+        scope = {"source_scope_id": "s1", "min_modified": "2024-06-01"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2024, 6, 1), "scope")
+
+    def test_a_scopes_own_override_applies_even_with_no_connection_default(self):
+        connection = {"id": "conn1", "config": {}}
+        scope = {"source_scope_id": "s1", "min_modified": "2024-06-01"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2024, 6, 1), "scope")
+
+    def test_an_invalid_scope_override_falls_back_to_the_connection_default_and_logs(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        scope = {"source_scope_id": "s1", "min_modified": "not-a-date"}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_min_modified(connection, scope=scope) == (date(2023, 12, 31), "connection")
+        assert "min_modified" in caplog.text
+
+    def test_a_blank_scope_override_falls_back_to_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        scope = {"source_scope_id": "s1", "min_modified": ""}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2023, 12, 31), "connection")
+
+    def test_neither_scope_nor_connection_set_is_unfiltered(self):
+        connection = {"id": "conn1", "config": {}}
+        scope = {"source_scope_id": "s1"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (None, "none")
 
 
 class TestIsValidCrawlSchedule:
@@ -4202,6 +4243,179 @@ class TestMinModifiedFilter:
         assert report["deleted"] == 1
         assert FakeIngestor.instances[-1].deleted == ["graph:item1"]
         assert "graph:item1" not in _state(crawl_env)["ctags"]
+
+
+# --------------------------------------------------------------------------
+# Per-SCOPE min_modified override (TCRD-296 gap #80) — the filter belongs to
+# the scope's own definition, not just the connection's extraction-config
+# drawer. `resolve_min_modified`'s own unit tests (`TestResolveMinModified`)
+# cover the resolution rule in isolation; these drive it end-to-end through
+# an actual inline crawl (`_run_crawl_async`'s per-scope loop).
+# --------------------------------------------------------------------------
+
+
+class TestScopeMinModifiedFilter:
+    def test_a_scopes_own_filter_applies_even_with_no_connection_default(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")
+        report = _run(_connection([scope]), monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_a_scopes_own_filter_wins_over_a_wider_connection_default(self, crawl_env, monkeypatch):
+        """The connection default alone would KEEP this item (it is after
+        2020-01-01) — the scope's own, later cutoff must still filter it."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")
+        conn = _connection([scope])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2020-01-01"}}
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_a_scope_without_its_own_filter_still_inherits_the_connection_default(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2019-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1")  # no scope-level override
+        conn = _connection([scope])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2020-01-01"}}
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_two_scopes_on_one_connection_apply_their_own_filters_independently(self, crawl_env, monkeypatch):
+        """Scope A has its own (later) cutoff; scope B has none and follows
+        the connection default — a run touching both must not let one
+        scope's resolved cutoff leak onto the other's items."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "b!drive1" in url and "/delta" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("itemA", modified="2023-06-01T00:00:00Z")],
+                        "@odata.deltaLink": f"{DRIVE_DELTA}?scope=A&t=1",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item("itemB", modified="2019-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?scope=B&t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope_a = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")  # filters itemA
+        scope_b = _drive_scope(source_scope_id="b!drive2", collection_id="col2", drive_id="b!drive2")
+        conn = _connection([scope_a, scope_b])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2015-01-01"}}  # keeps itemB
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        ingested_ids = {row["stable_id"] for row in FakeIngestor.instances[-1].ingested}
+        assert ingested_ids == {"graph:itemB"}
+
+    def test_an_invalid_scope_filter_falls_back_to_the_connection_default(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2019-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="not-a-date")
+        conn = _connection([scope])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2020-01-01"}}
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+
+class TestShardChildScopeMinModifiedFilter:
+    """The shard child crawl path (`run_shard_crawl` ->
+    `_run_shard_crawl_async`) resolves the SAME per-scope filter as the
+    inline path above — a shard crawls exactly one scope, so this pins that
+    it is not left reading only the connection-wide default."""
+
+    def test_the_shard_childs_scope_applies_its_own_filter(self, crawl_env, monkeypatch):
+        _install_fake_state_store(monkeypatch, FakeStateStore())
+        _install_runs_repo(monkeypatch)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")
+        connection = _connection([scope])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "A",
+            "expected": 1,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": "A"}],
+        }
+        report = crawler.run_shard_crawl(
+            {"connection_id": "conn1", "parent_run_id": "er_parent1", "shard_index": 1, "shard": shard}
+        )
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
 
 
 # --------------------------------------------------------------------------

@@ -122,18 +122,55 @@ def test_unmask_empty_allowlist_always_masks():
     assert 'CASE WHEN FALSE THEN "email" ELSE \'*****\' END AS "email"' in out.sql
 
 
-def test_unknown_columns_are_dropped_with_a_warning():
+def test_unknown_mask_columns_are_dropped_with_a_warning():
+    """A mask on a column the table no longer has is fail-CLOSED, so dropping
+    it with a warning is safe: the projection is assembled from the DESCRIBEd
+    column list only, so a column the mask names but the table does not have
+    is never projected in the first place -- there is no plaintext copy left
+    behind for the dropped mask to have covered."""
     spec = {
         "table": "invoices",
-        "row_rules": [{"column": "does_not_exist", "op": "in_caller_groups"}],
+        "row_rules": [],
         "row_combine": "and",
         "column_masks": {"ghost": "hide"},
     }
     out = compile_policy(spec, COLS)
-    # neither the unknown row rule nor the unknown mask reaches the SQL
-    assert "does_not_exist" not in out.sql
     assert "ghost" not in out.sql
     assert any("ghost" in w for w in out.warnings)
+
+
+def test_unknown_row_rule_column_is_refused_not_dropped():
+    """A row rule on an unknown column is fail-OPEN if dropped: a spec whose
+    only rule references a renamed column would compile to a WHERE-less
+    policy that hands every caller the whole table. Refuse the compile
+    instead, naming the column and the op so the admin can fix the rule."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [{"column": "does_not_exist", "op": "in_caller_groups"}],
+        "row_combine": "and",
+        "column_masks": {},
+    }
+    with pytest.raises(ValueError) as exc:
+        compile_policy(spec, COLS)
+    assert "does_not_exist" in str(exc.value)
+    assert "in_caller_groups" in str(exc.value)
+
+
+def test_unknown_row_rule_column_is_refused_even_beside_a_valid_rule():
+    """The whole-table failure mode needs only ONE surviving rule to hide it:
+    a dropped rule beside a kept one silently WIDENS the policy instead of
+    emptying the WHERE clause, which is harder to notice, not easier."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [
+            {"column": "cost_center", "op": "in_caller_groups"},
+            {"column": "renamed_away", "op": "eq_caller_email"},
+        ],
+        "row_combine": "and",
+        "column_masks": {},
+    }
+    with pytest.raises(ValueError, match="renamed_away"):
+        compile_policy(spec, COLS)
 
 
 def test_eq_and_in_row_ops_use_literals():
@@ -386,3 +423,500 @@ def test_a_column_definition_outside_a_type_is_still_refused():
     stray = list(ddl.find_all(exp.ColumnDef))
     assert stray, "expected a ColumnDef in a CREATE TABLE"
     assert not any(_is_inside_data_type(d) for d in stray)
+
+
+# ── Partial masks: `last4` and `email_partial` ─────────────────────────────
+#
+# Both are TEXT-ONLY, type-preserving (VARCHAR in -> VARCHAR out, same output
+# column name) and expressed entirely within the save-time validator's existing
+# function allowlist -- no widening of `_ALLOWED_FUNCTION_NAMES` was needed, and
+# none is acceptable: every name added there widens what an admin's arbitrary
+# SQL may do on every analyst request.
+
+_LAST4_SQL = (
+    'CASE WHEN "national_id" IS NULL THEN NULL '
+    "WHEN LENGTH(\"national_id\") <= 4 THEN '****' "
+    'ELSE CONCAT(\'****\', SUBSTRING("national_id", -4)) END AS "national_id"'
+)
+
+_EMAIL_PARTIAL_SQL = (
+    'CASE WHEN "email" IS NULL THEN NULL '
+    "WHEN \"email\" LIKE '_%@%' "
+    "THEN CONCAT(SUBSTRING(\"email\", 1, 1), '*****', REGEXP_REPLACE(\"email\", '^[^@]*', '')) "
+    "ELSE '*****' END AS \"email\""
+)
+
+
+def test_last4_mask_sql_snapshot():
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": "last4"},
+    }
+    out = compile_policy(spec, COLS)
+    assert _LAST4_SQL in out.sql
+    # The masked column is projected exactly once -- no plaintext sibling.
+    assert out.sql.count('"national_id"') == _LAST4_SQL.count('"national_id"')
+    assert out.excluded == ["national_id"]
+    assert out.derived == ["national_id"]
+
+
+def test_email_partial_mask_sql_snapshot():
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"email": "email_partial"},
+    }
+    out = compile_policy(spec, COLS)
+    assert _EMAIL_PARTIAL_SQL in out.sql
+    assert out.sql.count('"email"') == _EMAIL_PARTIAL_SQL.count('"email"')
+    assert out.excluded == ["email"]
+    assert out.derived == ["email"]
+
+
+@pytest.mark.parametrize("choice", ["last4", "email_partial"])
+def test_partial_masks_refuse_non_text_columns(choice):
+    """Both masks are string surgery. Applying one to a BIGINT/DOUBLE/STRUCT
+    column would either change the output column's type (breaking the
+    compiler's type-preservation invariant, which downstream `DESCRIBE`-based
+    schema surfaces depend on) or silently CAST -- so it is refused at compile
+    time, naming the column and its type, exactly like an unknown mask."""
+    cols = COLS + [{"name": "tags", "type": "VARCHAR[]"}]
+    for col in ("invoice_id", "amount_eur", "tags"):
+        spec = {"table": "invoices", "row_rules": [], "row_combine": "and", "column_masks": {col: choice}}
+        with pytest.raises(ValueError) as exc:
+            compile_policy(spec, cols)
+        assert col in str(exc.value)
+        assert choice in str(exc.value)
+
+
+@pytest.mark.parametrize("choice", ["last4", "email_partial"])
+def test_partial_masks_pass_the_real_validator_including_remote(choice):
+    from src.access_policy_validate import validate_policy_sql
+
+    spec = {
+        "table": "invoices",
+        "row_rules": [{"column": "cost_center", "op": "in_caller_groups"}],
+        "row_combine": "and",
+        "column_masks": {"email": choice, "national_id": choice},
+    }
+    out = compile_policy(spec, COLS)
+    for for_remote in (False, True):
+        validate_policy_sql(
+            out.sql,
+            table_id="invoices",
+            table_name="invoices",
+            mapping_table_names=set(),
+            for_remote=for_remote,
+        )
+
+
+def _run(sql: str, values: list):
+    """Execute a compiled policy body over an in-memory single-column table."""
+    import duckdb
+
+    conn = duckdb.connect()
+    try:
+        conn.execute('CREATE TABLE "invoices" ("email" VARCHAR, "national_id" VARCHAR)')
+        conn.executemany('INSERT INTO "invoices" VALUES (?, ?)', [(v, v) for v in values])
+        return [r[0] for r in conn.execute(sql).fetchall()]
+    finally:
+        conn.close()
+
+
+def test_last4_executes_on_duckdb_with_the_documented_edge_cases():
+    """`****1234` for a long value; a value of four characters or fewer is
+    fully redacted rather than shown whole; NULL stays NULL (a CONCAT-only
+    form would turn it into `****`, since DuckDB's CONCAT ignores NULLs)."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": "last4", "email": "hide"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+    values = ["123456789", "abcde", "abcd", "abc", "", None]
+    assert _run(out.sql, values) == ["****6789", "****bcde", "****", "****", "****", None]
+
+
+def test_email_partial_executes_on_duckdb_with_the_documented_edge_cases():
+    """First character, a FIXED five-asterisk run (a run that tracked the local
+    part's length would leak that length), then the domain verbatim. Anything
+    without a local part AND an `@` is fully redacted -- never partially."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"email": "email_partial", "national_id": "hide"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+    values = ["john.doe@example.com", "a@b.co", "no-at-sign", "@example.com", "", None]
+    assert _run(out.sql, values) == [
+        "j*****@example.com",
+        "a*****@b.co",
+        "*****",
+        "*****",
+        "*****",
+        None,
+    ]
+
+
+def test_partial_masks_transpile_to_both_remote_engines():
+    """Tripwire on the ACTUAL remote form, not just "it transpiles".
+
+    Both masks were chosen for expressions whose semantics are identical on
+    all three engines: a negative `SUBSTRING` start counts from the end on
+    DuckDB, BigQuery and Databricks alike, and the `REGEXP_REPLACE` pattern
+    carries no capture group, so none of the three engines' incompatible
+    backreference spellings (`\\1` / `\\\\1` / `$1`) or `REGEXP_EXTRACT`
+    group-index conventions can be reached. If a sqlglot upgrade starts
+    emitting a different shape, this fails loudly instead of silently
+    changing what a remote caller sees.
+    """
+    import sqlglot
+
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"email": "email_partial", "national_id": "last4"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+
+    bq = sqlglot.transpile(out.sql, read="duckdb", write="bigquery")[0]
+    assert bq == (
+        "SELECT CASE WHEN `email` IS NULL THEN NULL WHEN `email` LIKE '_%@%' "
+        "THEN CONCAT(COALESCE(SUBSTRING(`email`, 1, 1), ''), '*****', "
+        "COALESCE(REGEXP_REPLACE(`email`, '^[^@]*', ''), '')) ELSE '*****' END AS `email`, "
+        "CASE WHEN `national_id` IS NULL THEN NULL WHEN LENGTH(`national_id`) <= 4 THEN '****' "
+        "ELSE CONCAT('****', COALESCE(SUBSTRING(`national_id`, -4), '')) END AS `national_id` "
+        "FROM `invoices`"
+    )
+
+    dbx = sqlglot.transpile(out.sql, read="duckdb", write="databricks")[0]
+    assert dbx == (
+        "SELECT CASE WHEN `email` IS NULL THEN NULL WHEN `email` LIKE '_%@%' "
+        "THEN CONCAT(COALESCE(SUBSTRING(`email`, 1, 1), ''), '*****', "
+        "COALESCE(REGEXP_REPLACE(`email`, '^[^@]*', ''), '')) ELSE '*****' END AS `email`, "
+        "CASE WHEN `national_id` IS NULL THEN NULL WHEN LENGTH(`national_id`) <= 4 THEN '****' "
+        "ELSE CONCAT('****', COALESCE(SUBSTRING(`national_id`, -4), '')) END AS `national_id` "
+        "FROM `invoices`"
+    )
+    # Neither remote form may reach for a backreference or a group index.
+    for form in (bq, dbx):
+        assert "REGEXP_EXTRACT" not in form.upper()
+        assert "\\1" not in form and "$1" not in form
+
+
+# ── Multi-tier unmask: `groups` as a modifier, and ordered tier chains ──────
+#
+# Wave 1 had exactly one group-aware mask (`unmask`), whose ELSE branch was a
+# CONSTANT (`'*****'` / `CAST(NULL AS <type>)`). Wave 2 generalizes that ELSE
+# branch to any mask builder, in two shapes:
+#
+#   {"choice": "<mask>", "groups": [...]}  -- listed groups see the column
+#                                             verbatim, everyone else gets
+#                                             `<mask>` instead of the constant
+#   {"choice": "tiered", "tiers": [...], "default": "<mask>"}
+#                                          -- an ordered CASE chain, first
+#                                             matching tier wins
+#
+# Every branch of the emitted CASE keeps the column's own type (the text-only
+# masks are refused on a non-text column, so a chain can never mix VARCHAR with
+# the column's real type), which is what keeps the type-preservation invariant
+# true for tiers as well.
+
+_NULLIFY_WITH_GROUPS_SQL = (
+    'CASE WHEN list_contains($user_groups, \'Finance\') THEN "amount_eur" ELSE CAST(NULL AS DOUBLE) END AS "amount_eur"'
+)
+
+_LAST4_WITH_GROUPS_SQL = (
+    "CASE WHEN list_contains($user_groups, 'Finance') OR list_contains($user_groups, 'Legal') "
+    'THEN "national_id" ELSE CASE WHEN "national_id" IS NULL THEN NULL '
+    "WHEN LENGTH(\"national_id\") <= 4 THEN '****' "
+    'ELSE CONCAT(\'****\', SUBSTRING("national_id", -4)) END END AS "national_id"'
+)
+
+_TIERED_SQL = (
+    "CASE WHEN list_contains($user_groups, 'Compliance') THEN \"national_id\" "
+    "WHEN list_contains($user_groups, 'Finance') OR list_contains($user_groups, 'Support') "
+    'THEN CASE WHEN "national_id" IS NULL THEN NULL '
+    "WHEN LENGTH(\"national_id\") <= 4 THEN '****' "
+    "ELSE CONCAT('****', SUBSTRING(\"national_id\", -4)) END "
+    'ELSE CAST(NULL AS VARCHAR) END AS "national_id"'
+)
+
+_TIERED_SPEC = {
+    "choice": "tiered",
+    "tiers": [
+        {"groups": ["Compliance"], "reveal": "show"},
+        {"groups": ["Finance", "Support"], "reveal": "last4"},
+    ],
+    "default": "nullify",
+}
+
+
+def _compile_one(mask, cols=None):
+    """Compile a spec whose only column mask is ``mask`` on ``national_id``."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": mask},
+    }
+    return compile_policy(spec, cols or COLS)
+
+
+def test_nullify_with_groups_modifier_sql_snapshot():
+    """`groups` on a plain mask means "these groups see it verbatim, everyone
+    else gets the mask" -- the wave-1 `unmask` shape, now available on any
+    mask rather than only against a constant fallback."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"amount_eur": {"choice": "nullify", "groups": ["Finance"]}},
+    }
+    out = compile_policy(spec, COLS)
+    assert _NULLIFY_WITH_GROUPS_SQL in out.sql
+    assert out.excluded == ["amount_eur"]
+    assert out.derived == ["amount_eur"]
+    # Exactly one output column named amount_eur -- no plaintext sibling.
+    assert out.sql.count('AS "amount_eur"') == 1
+
+
+def test_last4_with_groups_modifier_sql_snapshot():
+    out = _compile_one({"choice": "last4", "groups": ["Finance", "Legal"]})
+    assert _LAST4_WITH_GROUPS_SQL in out.sql
+    assert out.sql.count('AS "national_id"') == 1
+
+
+def test_groups_modifier_on_a_non_text_column_still_refuses_a_text_only_mask():
+    """The `groups` modifier does not buy a text-only mask a way onto a
+    numeric column: the ELSE branch would still be VARCHAR while the THEN
+    branch is DOUBLE."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"amount_eur": {"choice": "last4", "groups": ["Finance"]}},
+    }
+    with pytest.raises(ValueError, match="text columns only"):
+        compile_policy(spec, COLS)
+
+
+@pytest.mark.parametrize("groups", [[], None])
+def test_empty_groups_modifier_falls_back_to_the_plain_mask(groups):
+    """An empty allowlist must degrade to the MASK, never to "everyone sees
+    it" -- the fail-closed direction. It also emits no CASE at all, so the
+    wave-1 snapshots for a bare mask keep holding."""
+    mask = {"choice": "hash"}
+    if groups is not None:
+        mask["groups"] = groups
+    out = _compile_one(mask)
+    assert 'md5("national_id") AS "national_id"' in out.sql
+    assert "CASE" not in out.sql
+
+
+def test_hide_with_groups_is_refused():
+    """A column cannot be conditionally absent from a fixed projection: the
+    output schema would depend on the caller. `unmask` (or a tier whose
+    default is `nullify`) is the expressible form."""
+    with pytest.raises(ValueError) as exc:
+        _compile_one({"choice": "hide", "groups": ["Finance"]})
+    msg = str(exc.value)
+    assert "hide" in msg
+    assert "projection" in msg or "absent" in msg
+
+
+def test_show_with_groups_is_refused():
+    """`show` + groups reads as "only these groups see it" but would compile
+    to "everyone sees it" -- a fail-OPEN misreading. Refuse and name the mask
+    the admin meant."""
+    with pytest.raises(ValueError) as exc:
+        _compile_one({"choice": "show", "groups": ["Finance"]})
+    assert "unmask" in str(exc.value)
+
+
+def test_tiered_mask_sql_snapshot():
+    out = _compile_one(_TIERED_SPEC)
+    assert _TIERED_SQL in out.sql
+    # One CASE chain, one output column, no plaintext sibling.
+    assert out.sql.count('AS "national_id"') == 1
+    assert out.excluded == ["national_id"]
+    assert out.derived == ["national_id"]
+
+
+def _run_as(sql: str, values: list, groups: list):
+    """Execute a compiled body with ``$user_groups`` bound, the way
+    ``src/access_policy.py`` binds it at enforcement time."""
+    import duckdb
+
+    conn = duckdb.connect()
+    try:
+        conn.execute('CREATE TABLE "invoices" ("email" VARCHAR, "national_id" VARCHAR)')
+        conn.executemany('INSERT INTO "invoices" VALUES (?, ?)', [(v, v) for v in values])
+        return [r[0] for r in conn.execute(sql, {"user_groups": groups}).fetchall()]
+    finally:
+        conn.close()
+
+
+def test_tiered_precedence_executes_top_down_on_duckdb():
+    """First matching tier wins, and a caller in BOTH tier 1 and tier 2 gets
+    tier 1 -- the whole point of an ordered chain over a set of independent
+    unmask rules."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": _TIERED_SPEC, "email": "hide"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+    values = ["123456789"]
+    assert _run_as(out.sql, values, ["Compliance", "Finance"]) == ["123456789"]
+    assert _run_as(out.sql, values, ["Compliance"]) == ["123456789"]
+    assert _run_as(out.sql, values, ["Finance"]) == ["****6789"]
+    assert _run_as(out.sql, values, ["Support"]) == ["****6789"]
+    assert _run_as(out.sql, values, ["Marketing"]) == [None]
+    assert _run_as(out.sql, values, []) == [None]
+
+
+@pytest.mark.parametrize(
+    "mask, needle",
+    [
+        ({"choice": "tiered", "default": "nullify"}, "at least one tier"),
+        ({"choice": "tiered", "tiers": [], "default": "nullify"}, "at least one tier"),
+        (
+            {"choice": "tiered", "tiers": [{"groups": [], "reveal": "show"}], "default": "nullify"},
+            "group",
+        ),
+        (
+            {"choice": "tiered", "tiers": [{"groups": ["Finance"], "reveal": "show"}], "default": "show"},
+            "default",
+        ),
+        (
+            {"choice": "tiered", "tiers": [{"groups": ["Finance"], "reveal": "show"}], "default": "hide"},
+            "default",
+        ),
+        (
+            {"choice": "tiered", "tiers": [{"groups": ["Finance"], "reveal": "show"}]},
+            "default",
+        ),
+        (
+            {"choice": "tiered", "tiers": [{"groups": ["Finance"], "reveal": "obfuscate"}], "default": "nullify"},
+            "obfuscate",
+        ),
+        (
+            {"choice": "tiered", "tiers": [{"groups": ["Finance"], "reveal": "hide"}], "default": "nullify"},
+            "hide",
+        ),
+        (
+            {"choice": "tiered", "tiers": [{"groups": ["Finance"], "reveal": "unmask"}], "default": "nullify"},
+            "unmask",
+        ),
+    ],
+)
+def test_tiered_refusals(mask, needle):
+    """Every one of these compiles to something the admin did not mean --
+    a chain that matches nobody, one that matches everybody, or a no-op --
+    so each is refused at compile time rather than silently normalized."""
+    with pytest.raises(ValueError) as exc:
+        _compile_one(mask)
+    assert needle in str(exc.value)
+
+
+def test_tiered_reveal_on_a_non_text_column_refuses_a_text_only_mask():
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {
+            "amount_eur": {
+                "choice": "tiered",
+                "tiers": [{"groups": ["Finance"], "reveal": "last4"}],
+                "default": "nullify",
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="text columns only"):
+        compile_policy(spec, COLS)
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        {"choice": "nullify", "groups": ["Finance"]},
+        {"choice": "hash", "groups": ["Finance", "Legal"]},
+        {"choice": "last4", "groups": ["Finance"]},
+        {"choice": "email_partial", "groups": ["Finance"]},
+        _TIERED_SPEC,
+    ],
+)
+def test_tiered_and_modifier_masks_pass_the_real_validator_including_remote(mask):
+    """Nothing here may need a wider validator allowlist: a tier chain is
+    CASE + `list_contains($user_groups, ...)` + the existing mask
+    expressions, all already permitted."""
+    from src.access_policy_validate import validate_policy_sql
+
+    spec = {
+        "table": "invoices",
+        "row_rules": [{"column": "cost_center", "op": "in_caller_groups"}],
+        "row_combine": "and",
+        "column_masks": {"national_id": mask},
+    }
+    out = compile_policy(spec, COLS)
+    for for_remote in (False, True):
+        validate_policy_sql(
+            out.sql,
+            table_id="invoices",
+            table_name="invoices",
+            mapping_table_names=set(),
+            for_remote=for_remote,
+        )
+
+
+def test_tiered_chain_transpiles_to_both_remote_engines():
+    """Tripwire on the ACTUAL remote form of a tier chain, not just "it
+    transpiles": a policy is enforced on BigQuery and Databricks by
+    transpiling this SQL, so a sqlglot change that reshaped the nested CASE
+    would change what a remote caller sees, silently."""
+    import sqlglot
+
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": _TIERED_SPEC, "email": "hide"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+
+    # Both engines keep the ORDER of the chain and, decisively, keep every
+    # group value out of the SQL text: the `$user_groups` placeholder becomes
+    # BigQuery's `@user_groups` and Databricks' `:user_groups`, still bound as a
+    # parameter (`src/access_policy.py` §6.2) rather than inlined.
+    bq = sqlglot.transpile(out.sql, read="duckdb", write="bigquery")[0]
+    assert bq == (
+        "SELECT CASE WHEN EXISTS(SELECT 1 FROM UNNEST(@user_groups) AS _col WHERE _col = 'Compliance') "
+        "THEN `national_id` "
+        "WHEN EXISTS(SELECT 1 FROM UNNEST(@user_groups) AS _col WHERE _col = 'Finance') "
+        "OR EXISTS(SELECT 1 FROM UNNEST(@user_groups) AS _col WHERE _col = 'Support') "
+        "THEN CASE WHEN `national_id` IS NULL THEN NULL WHEN LENGTH(`national_id`) <= 4 THEN '****' "
+        "ELSE CONCAT('****', COALESCE(SUBSTRING(`national_id`, -4), '')) END "
+        "ELSE CAST(NULL AS STRING) END AS `national_id` FROM `invoices`"
+    )
+
+    dbx = sqlglot.transpile(out.sql, read="duckdb", write="databricks")[0]
+    assert dbx == (
+        "SELECT CASE WHEN ARRAY_CONTAINS(:user_groups, 'Compliance') THEN `national_id` "
+        "WHEN ARRAY_CONTAINS(:user_groups, 'Finance') OR ARRAY_CONTAINS(:user_groups, 'Support') "
+        "THEN CASE WHEN `national_id` IS NULL THEN NULL WHEN LENGTH(`national_id`) <= 4 THEN '****' "
+        "ELSE CONCAT('****', COALESCE(SUBSTRING(`national_id`, -4), '')) END "
+        "ELSE CAST(NULL AS STRING) END AS `national_id` FROM `invoices`"
+    )
+    # The chain is one expression per engine -- never a per-tier UNION or a
+    # rewritten predicate order, and never a group value inlined as a literal
+    # comparison against the column.
+    for form in (bq, dbx):
+        assert form.count("SELECT CASE") == 1

@@ -1367,7 +1367,7 @@ def run(
                     )
                 elif use_extension:
                     try:
-                        _extract_via_extension(conn, tc, pq_path)
+                        _extract_via_extension(conn, tc, pq_path, keboola_url, keboola_token)
                     except Exception as ext_err:
                         # ATTACH succeeded but the per-table COPY failed —
                         # most commonly a Keboola QueryService permission error
@@ -1503,7 +1503,13 @@ def _register_local_meta(
     )
 
 
-def _extract_via_extension(conn: duckdb.DuckDBPyConnection, tc: Dict[str, Any], pq_path: str) -> None:
+def _extract_via_extension(
+    conn: duckdb.DuckDBPyConnection,
+    tc: Dict[str, Any],
+    pq_path: str,
+    keboola_url: Optional[str] = None,
+    keboola_token: Optional[str] = None,
+) -> None:
     """Extract a table using the DuckDB Keboola extension.
 
     Backs ``sync_strategy='full_refresh'``, the primary Keboola sync path —
@@ -1512,6 +1518,19 @@ def _extract_via_extension(conn: duckdb.DuckDBPyConnection, tc: Dict[str, Any], 
     never observe a half-written ``pq_path``; a direct ``COPY ... TO
     '<pq_path>'`` here used to leave exactly that window open, on the most
     central connector, for however long the COPY takes.
+
+    #2265: the extension's QueryService COPY serves whatever types Keboola
+    reports for the table — correct for a natively-typed table, but
+    all-VARCHAR for a linked/alias table whose own ``columnMetadata`` is
+    empty (its real types live only on the source table, resolved by
+    ``KeboolaClient.get_pyarrow_schema()``'s ``sourceTable.columnMetadata``
+    cascade). The CSV/legacy path (`_extract_via_legacy`) and the
+    materialize path (`materialize_query` → `_retype_best_effort`) already
+    retype from that resolved schema; this was the one write path that
+    didn't. ``keboola_url``/``keboola_token`` are optional so a caller that
+    doesn't care about typing (e.g. a test exercising only the COPY/publish
+    mechanics) can omit them — the retype is then skipped rather than
+    attempted with no credentials.
     """
     from connectors.keboola.storage_api import normalize_source_table
 
@@ -1531,6 +1550,32 @@ def _extract_via_extension(conn: duckdb.DuckDBPyConnection, tc: Dict[str, Any], 
             f"COPY (SELECT * FROM kbc.{quote_ident(bucket)}.{quote_ident(source_table)}) "
             f"TO '{safe_tmp_lit}' (FORMAT PARQUET)"
         )
+        # Best-effort retype (#2265). Reuses `_retype_best_effort` — the
+        # same fetch+degrade+retype body the CSV/legacy and materialize
+        # paths already share — rather than a third copy of its degrade
+        # logic. A real `KeboolaStorageClient` built from url+token
+        # satisfies `_retype_best_effort`'s `(storage_client.token,
+        # storage_client.base)` contract with no shim needed: constructing
+        # one does no network I/O, so this costs nothing beyond the object
+        # itself. Perf note: `_retype_parquet_streaming` no-ops (returns
+        # before rewriting) once types already match, so a natively-typed
+        # table pays one parquet-footer read plus one metadata API call per
+        # sync — that metadata call is new on this path; kept best-effort
+        # (never raise for a typing problem) so an outage there never fails
+        # a sync that used to succeed.
+        if keboola_url and keboola_token:
+            try:
+                from connectors.keboola.storage_api import KeboolaStorageClient
+
+                storage_client = KeboolaStorageClient(url=keboola_url, token=keboola_token)
+                _retype_best_effort(tmp_dest, storage_client, f"{bucket}.{source_table}")
+            except Exception as e:
+                logger.warning(
+                    "Keboola extension-path retype skipped for %s.%s (%s); keeping native (extension-served) types",
+                    bucket,
+                    source_table,
+                    e,
+                )
 
 
 def _legacy_worker(tc_pq, keboola_url: str, keboola_token: str):

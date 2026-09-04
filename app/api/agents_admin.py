@@ -214,6 +214,34 @@ def _audit(actor: str, action: str, target: str, params: Optional[dict] = None) 
         pass
 
 
+def _policied_tables_disclosure(knowledge: List[str], owner_user_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Tables in ``knowledge`` (this agent's attached data packages) that
+    carry an access policy, diagnosed for the agent's OWNER (design doc
+    §12). Bounded and cheap in the common case: an empty ``knowledge`` list
+    (most agents) short-circuits before any query, and a live per-table
+    check only runs for a package a caller has actually attached — the same
+    self-audit cost `/api/me/effective-access` already accepts, applied to
+    a strictly smaller set (this agent's own scope, not every table the
+    caller can reach).
+
+    A Slack channel bound to this agent, or a scheduled run, answers
+    EVERYONE with this OWNER's slice — never the person actually asking —
+    so the owner must see it here, on every read of their own agent,
+    whether that read lands on the `/agents` page or `agnes agent show`.
+    A direct caller (agent-as-API, chat, a delegated turn) is filtered by
+    ITS OWN identity instead (`src/access_policy.py::_resolve_identity`)
+    and is unaffected by what this reports.
+    """
+    if not knowledge or not owner_user_id:
+        return []
+    owner = users_repo().get_by_id(owner_user_id)
+    if not owner:
+        return []
+    from app.services.agent_ingredients import policy_disclosure_for_knowledge
+
+    return policy_disclosure_for_knowledge(knowledge, {"id": owner["id"], "email": owner.get("email")})
+
+
 def _serialize(
     row: Dict[str, Any],
     *,
@@ -264,6 +292,22 @@ def _serialize(
     out["knowledge"] = knowledge
     out["plugins"] = plugins
     out["surfaces"] = _decode(row.get("surfaces"), {})
+    # Design doc §12 disclosure — computed from the HYDRATED `knowledge`
+    # above (not the raw JSON column), so a governance-scoped agent whose
+    # declaration only lives in `agent_scope` rows is covered too.
+    #
+    # Surfaced to the OWNER (and an admin) only. `GET /api/v1/agents*` also
+    # admits a READ-only grantee (`_load_agent`'s auth matrix), and this
+    # block carries the owner's live `rows_visible` / `reason` / `note` on
+    # tables the grantee may hold no grant on at all — owner-private, the
+    # same way the memory notebook is (see `list_memories`). A grantee's
+    # own runs bind the grantee's identity, so the owner's slice is of no
+    # operational use to them either; they get an empty list, never a 404.
+    owner_id_for_disclosure = row.get("owner_user_id")
+    disclose = uid is not None and (uid == owner_id_for_disclosure or is_user_admin(uid))
+    policied = _policied_tables_disclosure(knowledge, owner_id_for_disclosure) if disclose else []
+    out["policied_tables"] = policied
+    out["policied_tables_in_scope"] = [t["table_id"] for t in policied]
     if uid is not None:
         mine = row.get("owner_user_id") == uid
         out["mine"] = mine

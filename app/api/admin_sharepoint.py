@@ -52,6 +52,16 @@ Surface:
                                                                 removes the row, leaves any
                                                                 already-created collection
                                                                 alone.
+  GET    /api/admin/sharepoint/connections/{id}/acl-snapshot — SharePoint permissions captured as
+                                                                METADATA (TCRD-296 gap #79): who
+                                                                SharePoint itself says can see each
+                                                                scope, for every scope regardless of
+                                                                ``access_mode`` — never mutates Agnes
+                                                                access. Aggregate always included;
+                                                                ``?scopes=true`` adds every scope's
+                                                                own captured principal list. PG-only
+                                                                (typed ``501`` on a DuckDB-backed
+                                                                instance).
   GET    /api/admin/sharepoint/connections/{id}/certificate  — read-only certificate metadata
                                                                 (thumbprint, subject/issuer, expiry)
                                                                 derived at request time from the
@@ -176,7 +186,7 @@ from app.auth.access import require_admin, require_facts_enabled
 from app.auth.public_url import public_base_url
 from app.resource_types import ResourceType
 from src.audit_helpers import log_safe
-from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, zone_rows
+from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, acl_snapshot_kind, aggregate_acl_snapshot, zone_rows
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
@@ -277,9 +287,13 @@ class ConfirmScopeBody(BaseModel):
     # ``access_mode='mirrored'`` (the ACL sync needs both a drive id and an
     # item id to read `.../permissions`; see connectors/sharepoint/
     # acl_sync.py's module docstring "Gap closed" note). Optional for
-    # ``manual`` scopes, which never read it. ``None`` means "not supplied
-    # on this call" — same always-overwritten-on-confirm semantics as
-    # ``access_mode``/``anonymize``.
+    # ``manual`` scopes, which never read it for grant mirroring — but DO
+    # read it for the informational ACL-permissions snapshot (TCRD-296 gap
+    # #79, ``connectors/sharepoint/acl_sync.py::_snapshot_scope``): a manual
+    # scope confirmed without a ``drive_id`` simply gets no snapshot
+    # captured, same degradation as a pre-Task-5 mirrored scope. ``None``
+    # means "not supplied on this call" — same always-overwritten-on-confirm
+    # semantics as ``access_mode``/``anonymize``.
     drive_id: Optional[str] = None
     # Step 3: applied as ordinary `resource_grants` rows on the collection —
     # never stored on the scope row itself (see module docstring). ``None``
@@ -310,6 +324,19 @@ class ConfirmScopeBody(BaseModel):
     # 2/step 3 confirm that says nothing about audience tiers must not
     # silently wipe a configured mapping.
     audience_classes: Optional[List[AudienceClassIn]] = None
+    # TCRD-296 gap #80 — the "modified since" crawl filter belongs to the
+    # scope, not just the connection's extraction-config drawer: an ISO
+    # ``YYYY-MM-DD`` date, or ``None`` (the default) to have this scope
+    # inherit the connection-wide ``PATCH …/extraction/crawl-config``
+    # default. Always persisted on confirm — same "not omitted-means-
+    # unchanged" semantics as ``access_mode``/``anonymize``/
+    # ``include_excluded_subtrees`` above, so clearing a scope's own
+    # override back to "inherit the default" is just re-confirming with
+    # this field omitted/null, not a separate call. Validated the same way
+    # as the connection-level field (:func:`_validate_min_modified`) —
+    # ``400 invalid_min_modified`` for anything that is not a parseable ISO
+    # date.
+    min_modified: Optional[str] = None
 
 
 class ScopeCollectionRef(BaseModel):
@@ -380,6 +407,14 @@ class BulkScopeBody(BaseModel):
     # scope), so a ``mirrored`` bulk-add never hits the
     # ``400 missing_drive_id`` a single :func:`confirm_scope` call can.
     access_mode: Literal["manual", "mirrored"] = "manual"
+    # TCRD-296 gap #80 — a BULK DEFAULT: every scope THIS call creates gets
+    # this "modified since" filter as its own stored ``min_modified``, same
+    # vocabulary/validation as :attr:`ConfirmScopeBody.min_modified`
+    # (``None``, the default, leaves each new scope with no override of its
+    # own — it inherits the connection-wide default, same as today). There
+    # is no per-path override in this call — a path that needs a DIFFERENT
+    # cutoff than its siblings is a job for :func:`confirm_scope` afterward.
+    min_modified: Optional[str] = None
 
 
 class BulkScopeModeBody(BaseModel):
@@ -926,6 +961,22 @@ def _scope_audience_classes_out(scope: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
+def _scope_min_modified_out(scope: Dict[str, Any], connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``{value, source, own_value}`` for one scope's "modified since" crawl
+    filter (TCRD-296 gap #80) — see :func:`_scope_out`'s own docstring for
+    what each key means. Lazy import: ``connectors.sharepoint.crawler`` is
+    never imported at module scope in this file (see the imports at the top)."""
+    own_value = scope.get("min_modified") if isinstance(scope.get("min_modified"), str) else None
+    from connectors.sharepoint.crawler import resolve_min_modified
+
+    cutoff, source = resolve_min_modified(connection, scope=scope)
+    return {
+        "value": cutoff.isoformat() if cutoff else None,
+        "source": source,
+        "own_value": own_value,
+    }
+
+
 def _scope_out(
     scope: Dict[str, Any],
     declared_corpus_ids: Optional[set] = None,
@@ -998,6 +1049,19 @@ def _scope_out(
             if isinstance(item, dict)
         ],
         "include_excluded_subtrees": bool(scope.get("include_excluded_subtrees")),
+        # TCRD-296 gap #80 — the "modified since" crawl filter belongs to the
+        # scope, not just the connection's extraction-config drawer.
+        # `own_value` is this scope's OWN stored override (`None` when it has
+        # none, in which case it inherits the connection-wide default);
+        # `value`/`source` are the EFFECTIVE, resolved filter this scope's
+        # next crawl would actually apply (`"scope"`, `"connection"`, or
+        # `"none"`) — the same `{value, source}` shape
+        # `…/extraction/config`'s connection-level `min_modified` uses, so
+        # the wizard/source-card badge can render either without a second
+        # shape to learn. Resolved against `connection` when the caller
+        # supplied one; a bare own-value-only read (no `"connection"`/
+        # `"none"` distinction) when it did not.
+        "min_modified": _scope_min_modified_out(scope, connection),
     }
     audience_classes = _scope_audience_classes_out(scope)
     out["audience_classes"] = audience_classes
@@ -1581,6 +1645,62 @@ async def search_tree(
         ) from exc
 
 
+@router.get("/connections/{connection_id}/acl-snapshot")
+def read_acl_snapshot(
+    connection_id: str,
+    scopes: bool = Query(False, description="Include every scope's own captured principal list"),
+    _user: dict = Depends(require_admin),
+):
+    """SharePoint permissions captured as METADATA (TCRD-296 gap #79) — who
+    SharePoint itself says can see each of this connection's scopes,
+    independent of ``access_mode``. Distinct from the RBAC layer entirely:
+    this never changes what Agnes grants; it only reports what SharePoint's
+    own permission list says, for every scope (manual scopes included) —
+    only a ``mirrored`` scope's Agnes access is actually derived from it (see
+    ``docs/sharepoint-extraction.md`` -> "SharePoint permissions as metadata
+    vs. mirrored access").
+
+    Captured by the ``sharepoint-acl-sync`` job (every few hours, and on the
+    admin "sync now" trigger) into ``sharepoint_connection_state`` rows
+    (``connectors/sharepoint/acl_sync.py::_store_acl_snapshot`` /
+    :func:`connectors.sharepoint.acl_sync.snapshot_principals`) — this route
+    only reads what is already stored, never calls Graph itself.
+
+    Always returns ``aggregate`` — the connection-wide rollup
+    (:func:`connectors.sharepoint.acl_sync.aggregate_acl_snapshot`): distinct
+    Entra groups, distinct site groups, how many scopes have an
+    "organization" sharing link, how many name an individual person
+    directly, how many scopes have been captured at all, and the latest
+    capture time. ``?scopes=true`` additionally returns ``scopes`` — every
+    captured scope's own ``{source_scope_id, display_path, captured_at,
+    principals, summary}`` — heavier, so it is opt-in (the source card's
+    compact summary line never needs it; its "View" disclosure does).
+
+    PG-only (A3 ratchet — ``sharepoint_connection_state`` postdates the
+    freeze): a DuckDB-backed instance gets the typed ``501`` from
+    ``sharepoint_state_repo()`` via the app-wide handler in ``app/main.py``,
+    same as every other route reaching an A3-ratchet PG-only repo.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    from src.repositories import sharepoint_state_repo
+
+    repo = sharepoint_state_repo()
+    snapshots: List[Dict[str, Any]] = []
+    for scope in _scopes(row):
+        source_scope_id = scope.get("source_scope_id")
+        if not source_scope_id:
+            continue
+        payload = repo.get(connection_id, acl_snapshot_kind(source_scope_id))
+        if payload:
+            snapshots.append(payload)
+
+    result: Dict[str, Any] = {"aggregate": aggregate_acl_snapshot(snapshots)}
+    if scopes:
+        result["scopes"] = snapshots
+    return result
+
+
 @router.get("/connections/{connection_id}/scopes")
 async def list_scopes(
     connection_id: str,
@@ -1713,6 +1833,12 @@ async def confirm_scope(
     override on — see the audit playbook's "never write both for the same
     event" rule; every other confirm (no override transition) is still
     covered by the fallback, unchanged.
+
+    ``min_modified`` (TCRD-296 gap #80) sets THIS scope's own "modified
+    since" crawl filter — ``None`` (the default) has it inherit the
+    connection-wide ``PATCH …/extraction/crawl-config`` default, same as
+    every scope before this field existed. ``400 invalid_min_modified`` for
+    anything that is not a parseable ISO ``YYYY-MM-DD`` date.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
@@ -1726,6 +1852,7 @@ async def confirm_scope(
         )
     if body.drive_id:
         _validate_graph_id(body.drive_id, "drive_id")
+    _validate_min_modified(body.min_modified)
 
     if body.include_excluded_subtrees:
         from app.switches import switch_value
@@ -1788,6 +1915,7 @@ async def confirm_scope(
         existing["access_mode"] = body.access_mode
         existing["drive_id"] = body.drive_id
         existing["include_excluded_subtrees"] = body.include_excluded_subtrees
+        existing["min_modified"] = body.min_modified
     else:
         # Re-adopt before minting: unticking and re-ticking the SAME folder
         # must map back to the scope's previous collection, never fork a
@@ -1810,6 +1938,7 @@ async def confirm_scope(
                 "access_mode": body.access_mode,
                 "drive_id": body.drive_id,
                 "include_excluded_subtrees": body.include_excluded_subtrees,
+                "min_modified": body.min_modified,
             }
         )
 
@@ -2007,6 +2136,12 @@ async def bulk_add_scopes(
     hits the ``400 missing_drive_id`` a single :func:`confirm_scope` call
     can.
 
+    ``min_modified`` (TCRD-296 gap #80), when given, is stored as every
+    scope THIS call creates' OWN "modified since" filter — a bulk default,
+    not a per-path choice (same one-shape-for-the-whole-batch rule
+    ``access_mode`` already applies). ``400 invalid_min_modified`` for
+    anything that is not a parseable ISO ``YYYY-MM-DD`` date.
+
     Never all-or-nothing: every path is resolved and reported independently
     in the response, ``{"created": [...], "skipped": [...], "failed":
     [{"path", "reason"}]}`` —
@@ -2055,6 +2190,7 @@ async def bulk_add_scopes(
     existing scope.
     """
     row = _sharepoint_connection_or_404(connection_id)
+    _validate_min_modified(body.min_modified)
 
     if body.collection_id and body.collection:
         raise HTTPException(
@@ -2167,6 +2303,7 @@ async def bulk_add_scopes(
                 "access_mode": body.access_mode,
                 "drive_id": drive_id,
                 "include_excluded_subtrees": False,
+                "min_modified": body.min_modified,
             }
             scopes.append(scope_row)
             existing_by_id[source_scope_id] = scope_row

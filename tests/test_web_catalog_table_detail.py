@@ -255,6 +255,25 @@ class TestCatalogTableDetailAccessPolicy:
         assert resp.status_code == 200, resp.text
         assert "national_id" in resp.text
 
+    def test_masked_column_is_badged(self, policied_invoices, monkeypatch):  # noqa: F811
+        """The canonical ``md5(email) AS email`` column stays visible (it's
+        masked, not hidden) but is badged so a reader can tell it apart from
+        an untouched pass-through column."""
+        monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
+        _seed_profile(
+            "invoices",
+            [
+                {"name": "id", "type": "VARCHAR", "nullable": True},
+                {"name": "email", "type": "VARCHAR", "nullable": True},
+                {"name": "cost_center", "type": "VARCHAR", "nullable": True},
+            ],
+        )
+        c = policied_invoices["client"]
+        resp = c.get("/catalog/t/invoices", headers=_auth(policied_invoices["finance_token"]))
+        assert resp.status_code == 200, resp.text
+        assert "email" in resp.text
+        assert 'class="td-masked-badge"' in resp.text
+
     def test_non_policied_sibling_is_unaffected(self, policied_invoices, monkeypatch):  # noqa: F811
         """The inert case: a table with no access_policy_sql renders exactly
         as before — no effective_schema call, no filtering."""
@@ -264,3 +283,4 @@ class TestCatalogTableDetailAccessPolicy:
         resp = c.get("/catalog/t/products", headers=_auth(policied_invoices["finance_token"]))
         assert resp.status_code == 200, resp.text
         assert "sku" in resp.text
+        assert 'class="td-masked-badge"' not in resp.text
