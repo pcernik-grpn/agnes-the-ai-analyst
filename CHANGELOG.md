@@ -39,6 +39,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   unset, and requiring it would make linked apps impossible on exactly the
   servers the feature exists for. (#2154)
 
+- **A Keboola linked/alias table synced via the primary (DuckDB-extension)
+  full_refresh path no longer materializes as all-VARCHAR.** The extension's
+  QueryService serves whatever types Keboola reports for a table — correct
+  for a natively-typed one, but all-VARCHAR for a linked/alias table whose
+  own `columnMetadata` is empty (its real types live only on the source
+  table). `_extract_via_extension` published that COPY verbatim; the
+  CSV/legacy path and the materialize path already retyped from the
+  resolved schema (`KeboolaClient.get_pyarrow_schema()`'s `sourceTable`
+  cascade), so this was the one write path that didn't. It now applies the
+  same best-effort retype inside the same atomic publish, reusing the
+  existing `_retype_best_effort` helper: an uncastable value (e.g. an empty
+  string in a numeric column) becomes NULL rather than failing the sync,
+  and a metadata-API outage degrades to the native types with a logged
+  warning rather than failing a sync that used to succeed. A natively-typed
+  table pays one extra parquet-footer read plus one metadata API call per
+  sync; the rewrite itself is skipped whenever the types already match.
+  Closes #2265.
+
 ### Removed
 
 ### Internal
