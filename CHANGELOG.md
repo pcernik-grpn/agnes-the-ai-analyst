@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **The customer-instance Terraform module can switch on the OTLP export per VM.** Four new per-instance fields on both `prod_instance` and `dev_instances`: `otlp_endpoint` (the collector's base URL, not a secret), `otlp_headers_secret` (a Secret Manager secret NAME whose value is the whole `OTEL_EXPORTER_OTLP_HEADERS` string — the module grants `secretAccessor` and the startup script fetches it at boot into `/opt/agnes/.env` with the `runtime_secret_env` escape set, so the credential never sits in Terraform state, VM metadata or a command line), `otlp_capture_content` (off by default) and `deployment_env`. The last one writes `AGNES_DEPLOYMENT_ENV` for EVERY VM, defaulting to the VM's name — until now the line was absent and the logs' `env` field said `unknown`, so a fleet-wide log view could not tell instances apart. Per-VM so a dev pilot never reaches prod; a headers secret without an endpoint fails the plan. Startup-script-owned, so it lands on VM recreate (`-replace`), not on apply.
 
 ### Changed
 
