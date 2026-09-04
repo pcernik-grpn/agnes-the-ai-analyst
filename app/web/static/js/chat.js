@@ -347,6 +347,14 @@ function _resetWsReconnect() {
 function _scheduleWsReconnect(chatId) {
   if (_wsReconnectAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
     setStatus(WS_RECONNECT_FAILED_COPY, "error");
+    // A turn nobody can reach any more has stopped, whatever the server is
+    // still doing with it: no frame can arrive on a socket we have given up
+    // re-opening, so no terminal frame is coming to take the signal down.
+    // Before #2156 this left a stale Stop button, which was already wrong;
+    // deriving the indicator from the same state would have upgraded it to a
+    // spinner running forever under an abandoned answer. The copy above is
+    // what the reader acts on, and it says to send the message again.
+    setTurnInFlight(false);
     return;
   }
   const delay = 2 ** _wsReconnectAttempts * 1000;
@@ -3007,6 +3015,14 @@ async function loadAndRenderHistory(chatId) {
   $("chat-messages").innerHTML = "";
   _endToolGroup();
   clearThinkingPlaceholder();
+  // The wipe above detached every card, so the per-turn maps are now holding
+  // nodes that are no longer on screen. That was already harmless for the
+  // result frames (renderToolCallEnd would update a detached node nobody can
+  // see), but #2156 made `inFlightToolCalls` load-bearing for what the reader
+  // sees: left stale, a mid-turn `full_refresh` would suppress the activity
+  // indicator for the rest of that turn.
+  inFlightToolCalls.clear();
+  _currentTurnToolCards = [];
   // Reset recall state for the chat being loaded up front, not after a
   // successful fetch — a failed fetch must not leave ArrowUp/ArrowDown
   // browsing the PREVIOUS conversation's prompts under the new chatId.
@@ -3141,9 +3157,7 @@ function _renderRestoreFailure(detail) {
   _syncSessionUrl(null);
   markActiveSidebar(null);
   _markConversationNotStarted();
-  clearThinkingPlaceholder();
-  const cancelBtn = $("cancel-btn");
-  if (cancelBtn) cancelBtn.hidden = true;
+  setTurnInFlight(false);
   const host = $("chat-messages");
   if (host) host.innerHTML = "";
   showCapabilities();
@@ -3171,9 +3185,7 @@ function _renderRestoreFailure(detail) {
  *  retry: both routes back (send a message, or reload this same URL) re-mint a
  *  ticket for this same session. */
 function _renderResumeFailure(detail) {
-  clearThinkingPlaceholder();
-  const cancelBtn = $("cancel-btn");
-  if (cancelBtn) cancelBtn.hidden = true;
+  setTurnInFlight(false);
   renderSystemNote(
     "Could not reconnect to this conversation just now. Nothing is lost — " +
       "send a message or reload the page to try again." + (detail ? ` (${detail})` : ""),
@@ -3331,19 +3343,18 @@ async function openSession(chatId, wsUrlOverride, { restoring = false, reconnect
       return;
     }
   }
-  // Paint the working state BEFORE the socket: attaching can take seconds
-  // (a paused sandbox has to resume), and for that whole window a reload
+  // Set the working state BEFORE the socket: attaching can take seconds (a
+  // paused sandbox has to resume), and for that whole window a reload
   // mid-answer used to show no spinner and no Stop button — the silence that
   // invited the second reload behind the duplicated questions in #1973. The
-  // spinner is the signal, and it is about the ANSWER, not the socket: the
-  // reattach itself gets no status line. The replayed turn frames land in
-  // this same bubble.
-  if (turnInFlight) {
-    showThinkingPlaceholder();
-    _reattachPlaceholder = true;
-    const cancelBtn = $("cancel-btn");
-    if (cancelBtn) cancelBtn.hidden = false;
-  }
+  // signal is about the ANSWER, not the socket: the reattach itself gets no
+  // status line. The replayed turn frames land in this same bubble.
+  // Unconditional, both ways: attaching to a conversation whose turn has
+  // already finished has to take DOWN a Stop button left over from the
+  // conversation being switched away from, which the old `if (turnInFlight)`
+  // guard could not do (#2156).
+  _reattachGuessedTurn = !!turnInFlight;
+  setTurnInFlight(!!turnInFlight, { immediate: true });
 
   // Reconnect replay (wave-2F task 3): tell the server the highest seq we
   // already saw for this chat so it can resend anything we missed (or
@@ -3445,15 +3456,13 @@ function handleFrame(frame) {
       // #1973: the attach's own verdict on whether a turn is running. The
       // ticket's flag is a pre-socket guess (and is always false on a replica
       // with no ChatManager) — this corrects it, in both directions, but only
-      // for a placeholder the REATTACH painted: a submit's own placeholder is
-      // waiting for a message the server has not received yet.
-      if (_reattachPlaceholder && frame.turn_in_flight === false) {
-        clearThinkingPlaceholder();
-        $("cancel-btn").hidden = true;
-      } else if (frame.turn_in_flight === true && !thinkingEl) {
-        showThinkingPlaceholder();
-        _reattachPlaceholder = true;
-        $("cancel-btn").hidden = false;
+      // for a turn the REATTACH guessed at: a submit's own turn is waiting on
+      // a message the server has not received yet.
+      if (_reattachGuessedTurn && frame.turn_in_flight === false) {
+        setTurnInFlight(false);
+      } else if (frame.turn_in_flight === true && !_turnInFlight) {
+        _reattachGuessedTurn = true;
+        setTurnInFlight(true, { immediate: true });
       }
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
@@ -3559,8 +3568,7 @@ function handleFrame(frame) {
       _flushStreamingTail();
       renderSystemNote("Turn cancelled.", "warn");
       setStatus(`Cancelled tool: ${frame.tool || ""}`, "warn");
-      $("cancel-btn").hidden = true;
-      clearThinkingPlaceholder();
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       break;
@@ -3574,8 +3582,7 @@ function handleFrame(frame) {
         "warn",
       );
       setStatus("Tool budget reached.", "warn");
-      $("cancel-btn").hidden = true;
-      clearThinkingPlaceholder();
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       break;
@@ -3586,8 +3593,7 @@ function handleFrame(frame) {
       // or an admin reading over a shoulder can still see `frame.kind`, and
       // it is not the sentence the user is being asked to act on.
       setStatus(`Error: ${frame.kind} (${frame.message || ""})`, "error");
-      $("cancel-btn").hidden = true;
-      clearThinkingPlaceholder();
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       break;
@@ -3596,7 +3602,7 @@ function handleFrame(frame) {
       // an exception — no trailing assistant_message) must not leave the
       // stream pointers armed, or the next turn appends into this bubble.
       _resetStreamingState();
-      $("cancel-btn").hidden = true;
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       // The session-files block listens for this to refresh its count and to
@@ -3631,6 +3637,13 @@ function handleFrame(frame) {
       if (currentChatId) loadAndRenderHistory(currentChatId);
       break;
   }
+  // Every state the indicator derives from changes on a frame, so re-deriving
+  // once here — after the case has done its work, never inside it — is what
+  // makes the signal outlive the first frame (#2156). Doing it per-case is
+  // what the old code effectively did, and it is how the eight clears and one
+  // show drifted apart. Placed after the switch so no half-applied state (a
+  // segment sealed, its tool card not yet appended) is ever painted.
+  syncActivityIndicator();
 }
 
 /** Apply a server-pushed title update for a session — fires when the
@@ -4451,18 +4464,111 @@ function syncJumpToLatest() {
   }
 })();
 
-// ---------- "Agnes is thinking…" placeholder -----------------------------
-// Rendered the moment the user submits, removed as soon as the first
-// server frame (token / tool_call / assistant_message) arrives. Bridges
-// the gap between "I sent a message" and "the agent has started".
+// ---------- Turn activity: one state, two surfaces -----------------------
+// The dots used to be a SUBMIT-only affordance: painted on send, removed by
+// the first server frame, never rendered again. The Stop button meanwhile
+// lived until a terminal frame, off twelve separate `hidden` assignments. So
+// for the whole body of a multi-tool turn — which on a research question is
+// the whole turn — the only thing on screen disagreeing with "this answer is
+// finished" was a button down in the composer that nobody watches while they
+// read (#2156). A partial answer read as final is the text people quote
+// onward, so this is a correctness problem, not a comfort one.
+//
+// Both surfaces now DERIVE from `_turnInFlight`, whose only writer is
+// `setTurnInFlight`, called where a turn starts and where one stops. They
+// cannot contradict each other by construction.
 
 let thinkingEl = null;
-/** True while the placeholder on screen was painted by a REATTACH (#1973 —
- *  openSession found `turn_in_flight` on the ticket) rather than by a submit.
- *  Only such a placeholder may be taken down by the `ready` frame's own
- *  verdict; a submit's placeholder must survive a `ready` that arrives before
- *  the server has even received the message. */
-let _reattachPlaceholder = false;
+/** True while the in-flight turn is one a REATTACH guessed at (#1973 —
+ *  openSession found `turn_in_flight` on the ticket) rather than one this tab
+ *  submitted. Only such a turn may be called off by the `ready` frame's own
+ *  verdict; a submit's turn must survive a `ready` that arrives before the
+ *  server has even received the message. */
+let _reattachGuessedTurn = false;
+let _turnInFlight = false;
+
+/** The turn's running/stopped state, and the ONLY writer of it.
+ *
+ *  `immediate` skips the settle delay on the way up: a submit has to
+ *  acknowledge the keypress on the same tick, and so does a reattach that
+ *  already knows a turn is running. Taking the signal down is never delayed.
+ */
+function setTurnInFlight(on, { immediate = false } = {}) {
+  _turnInFlight = !!on;
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = !_turnInFlight;
+  // A turn that has stopped is no longer a turn a reattach is guessing about
+  // (#1973). This reset lived in `clearThinkingPlaceholder`, which is exactly
+  // where it stopped being correct once the placeholder became a thing that
+  // comes and goes many times inside one live turn: clearing the flag on any
+  // of those would let a late `ready` frame call off a running turn.
+  if (!_turnInFlight) _reattachGuessedTurn = false;
+  syncActivityIndicator({ immediate });
+  // Complaint 2 on #2156: the indicator at the foot of the transcript is
+  // invisible to the one reader who most needs it — whoever scrolled up to
+  // read the partial answer. The way back is already on their screen, so it
+  // carries a pulse for as long as the turn runs. Marked here rather than in
+  // `syncJumpToLatest`, which stays a pure function of scroll position: the
+  // class rides the element whether or not the button is currently shown, so
+  // scrolling up mid-turn reveals a button already carrying it.
+  const jumpBtn = $("chat-jump-latest");
+  if (jumpBtn) jumpBtn.classList.toggle("is-working", _turnInFlight);
+}
+
+//: How long the transcript may sit still before it owes the reader a signal.
+//: Most of the gaps this bridges are short — a settled tool result to the
+//: next token is often tens of ms — and painting a bubble into the foot of
+//: the transcript for that long is a flicker that also nudges the scroll.
+//: Long enough to swallow those hops, short enough that a reader waiting on a
+//: thinking agent is never the one waiting on this.
+const _ACTIVITY_SETTLE_MS = 400;
+let _activitySettleTimer = null;
+
+/** Is something OTHER than the dots already telling the reader the turn is
+ *  moving — or that it is waiting on them?
+ *
+ *  Ordered cheapest-first on purpose: a `token` frame arrives many times a
+ *  second and must settle on the first term without touching the DOM.
+ */
+function _turnShowsItsOwnActivity() {
+  if (currentAssistantArticle) return true;     // its own caret, or "Finishing…"
+  if (inFlightToolCalls.size > 0) return true;  // a card animating in place
+  // An open approval or question card is the turn waiting on THIS READER,
+  // which must never be dressed up as the agent making progress. Read off the
+  // DOM rather than pendingApprovalFrames/pendingQuestionFrames: a turn that
+  // died with a card still open leaves those maps holding an entry nobody will
+  // ever resolve, and would suppress the indicator for every later turn in the
+  // conversation. The class is on the card actually on screen, so this
+  // self-heals where the maps do not.
+  return !!document.querySelector(".cloud-chat-approval.is-running, .cloud-chat-question.is-running");
+}
+
+/** Re-derive the activity indicator from the turn state.
+ *
+ *  Idempotent, and cheap enough to call after every frame — which is how it
+ *  is driven (see the tail of `handleFrame`), so no state transition can
+ *  leave the screen claiming the turn ended when it has not, or the reverse.
+ */
+function syncActivityIndicator({ immediate = false } = {}) {
+  if (_activitySettleTimer) {
+    clearTimeout(_activitySettleTimer);
+    _activitySettleTimer = null;
+  }
+  if (!_turnInFlight || _turnShowsItsOwnActivity()) {
+    clearThinkingPlaceholder();
+    return;
+  }
+  if (immediate) {
+    showThinkingPlaceholder();
+    return;
+  }
+  _activitySettleTimer = setTimeout(() => {
+    _activitySettleTimer = null;
+    // Re-ask rather than trust the reading that armed the timer: 400 ms is
+    // long enough for the very frame that makes this wrong to have landed.
+    if (_turnInFlight && !_turnShowsItsOwnActivity()) showThinkingPlaceholder();
+  }, _ACTIVITY_SETTLE_MS);
+}
 
 function showThinkingPlaceholder() {
   if (thinkingEl) return;
@@ -4478,9 +4584,6 @@ function showThinkingPlaceholder() {
 }
 
 function clearThinkingPlaceholder() {
-  // Whatever the placeholder was for, it is gone — so is any claim that a
-  // reattach owns it (#1973). Every terminal frame routes through here.
-  _reattachPlaceholder = false;
   if (!thinkingEl) return;
   thinkingEl.remove();
   thinkingEl = null;
@@ -5876,7 +5979,9 @@ function renderToolCallStart(frame) {
   inFlightToolCalls.set(_toolCallId(frame), wrap);
   _currentTurnToolCards.push(wrap);
   maybeScrollToBottom();
-  $("cancel-btn").hidden = false;
+  // A running tool proves a running turn — belt and braces for a reattach
+  // whose `ready` verdict was wrong, or arrived before the turn restarted.
+  setTurnInFlight(true);
 }
 
 //: Where a duration stops being noise and starts being the reason the reader
@@ -5987,6 +6092,43 @@ function _collapseFinishedToolCalls() {
   for (const group of groups) {
     group.open = false;
     _updateToolGroupSummary(group);
+  }
+  // A call that never got its result frame — the turn was cancelled, errored
+  // or hit its budget while the tool was still out. Both the card and the
+  // in-flight map went on claiming it was running for the rest of the
+  // session: the card kept "running…" under a finished transcript, and the
+  // map kept an entry nobody would ever delete. The second one is what made
+  // this belong to #2156 — `_turnShowsItsOwnActivity` reads that map and that
+  // class, so one interrupted call would have suppressed the activity
+  // indicator for every later turn in the conversation. Per-turn bookkeeping,
+  // reset where the turn ends.
+  for (const wrap of inFlightToolCalls.values()) {
+    wrap.classList.remove("is-running");
+    const icon = wrap.querySelector(".cloud-chat-tool-icon");
+    if (icon) icon.replaceChildren(iconEl("ban"));
+    const meta = wrap.querySelector(".cloud-chat-tool-meta");
+    // Not an error: the call did not fail, the turn stopped around it. Same
+    // distinction the group summary already draws for absorbed failures.
+    if (meta) meta.textContent = "did not finish";
+    _updateToolGroupSummary(wrap.closest(".cloud-chat-tool-group"));
+  }
+  inFlightToolCalls.clear();
+  // Same rule for a decision card the turn died under. The server normally
+  // resolves these itself (`approval_resolved` with decision "cancelled"
+  // arrives before the terminal frame, and resolveApprovalCard/
+  // resolveQuestionCard settle the card), so this is usually a no-op — but
+  // `_turnShowsItsOwnActivity` reads that same `is-running` class, so a
+  // resolution that never comes would silence the activity indicator for the
+  // rest of the conversation. Stop claiming a pending decision, and disable
+  // controls that answer a turn nobody is listening to any more. Deliberately
+  // no outcome badge: what the decision WAS is resolveApprovalCard's to say,
+  // from the server's own frame, and inventing one here would be a worse lie
+  // than the one being fixed.
+  for (const card of document.querySelectorAll(
+    ".cloud-chat-approval.is-running, .cloud-chat-question.is-running",
+  )) {
+    card.classList.remove("is-running");
+    card.querySelectorAll("button, input").forEach((x) => { x.disabled = true; });
   }
   _endToolGroup();
   _currentTurnToolCards = [];
@@ -7014,16 +7156,15 @@ async function submitUserMessage(text) {
     // user typed ("add sales"), and an appended attachment line is not part
     // of that sentence.
     if (await onboardingOnUserMessage(rawText, {})) {
-      $("cancel-btn").hidden = true;
+      setTurnInFlight(false);
       return;
     }
   } catch (_) {
     /* onboarding is best-effort — never block the chat on it */
   }
 
-  showThinkingPlaceholder();
-  _reattachPlaceholder = false;   // this one belongs to the submit, not a reattach
-  $("cancel-btn").hidden = false;
+  _reattachGuessedTurn = false;   // this turn is the submit's, not a reattach's guess
+  setTurnInFlight(true, { immediate: true });
   // Arm the long-run nudge here — AFTER the onboarding takeover check, so a
   // turn that never reaches the model (gap resolver, "add X") doesn't start a
   // clock, and BEFORE the runner-ready wait, because a slow runner is exactly
@@ -7042,7 +7183,11 @@ async function submitUserMessage(text) {
     ]);
   } catch (err) {
     setStatus(`Runner did not become ready: ${err.message}`, "error");
-    clearThinkingPlaceholder();
+    // The turn never started, so it must not keep reading as one: before
+    // #2156 these two paths cleared the dots and left the Stop button up for
+    // the rest of the session — the same lie as the bug this fixes, told the
+    // other way round.
+    setTurnInFlight(false);
     // These two bail out before any frame is ever received, so the terminal-frame
     // handlers above never fire — disarm the nudge here or it would fire 45 s
     // later against a turn that died at the door.
@@ -7051,7 +7196,7 @@ async function submitUserMessage(text) {
   }
   if (!ws || ws.readyState !== 1) {
     setStatus("WebSocket dropped before runner became ready.", "error");
-    clearThinkingPlaceholder();
+    setTurnInFlight(false);
     onboardingNoteTurnEnded();
     return;
   }

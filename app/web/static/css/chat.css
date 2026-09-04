@@ -2211,6 +2211,35 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   outline-offset: var(--ds-focus-outline-offset);
 }
 
+/* The turn is still running, and this reader scrolled up and so cannot see the
+   indicator at the foot of the transcript (#2156). A pulsing dot on the way
+   back is the whole signal: the button's job and its label do not change, and
+   the dot is generated content so the accessible name stays "Jump to latest".
+   Toggled from setTurnInFlight off the same `_turnInFlight` the Stop button
+   reads, which is what keeps the two from ever disagreeing — and toggled
+   there rather than in syncJumpToLatest, so the class rides the element even
+   while the button is hidden and scrolling up mid-turn reveals one already
+   carrying it. */
+.cloud-chat-jump.is-working::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-primary);
+  animation: cloudchat-jump-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cloudchat-jump-pulse {
+  50% { opacity: 0.25; }
+}
+
+/* Reduced motion keeps the DOT (it is the signal) and drops only the pulse —
+   the same trade the thinking dots and the "Finishing…" pill already make. */
+@media (prefers-reduced-motion: reduce) {
+  .cloud-chat-jump.is-working::before { animation: none; }
+}
+
 /* ============================================================ slash menu
    Filterable "/" catalog (GET /api/chat/skills) — pops up above the
    composer, anchored to .cloud-chat-form's position: relative. Visual
