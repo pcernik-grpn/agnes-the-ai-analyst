@@ -417,10 +417,13 @@ class TestAnEveryoneAudienceIsNotARoster:
         defs = src.count('=== 1 ? "member" : "members"')
         assert defs == 1, f"expected exactly one member-label definition, found {defs}"
         assert "const memberLabel = (n) =>" in src
-        # The arrow declaration does not itself contain a call, so this is
-        # the callers alone: seven that used to hand-roll the ternary, plus
-        # the roster strip.
-        assert src.count("memberLabel(") == 8, src.count("memberLabel(")
+        # A LOWER bound, not the exact count. The arrow declaration holds no
+        # call, so this counts callers alone — and how many there are is a
+        # property of the page's current renderers, not of this rule: the
+        # branch stacked above deletes one of them (the collapsed line drops
+        # its count entirely, which is a better answer than relabelling it).
+        # Pinning the number would fail there on code that is right.
+        assert src.count("memberLabel(") >= 6, src.count("memberLabel(")
 
 
 class TestTheGrantListSplitsOnWhatCanBeActedOn:
