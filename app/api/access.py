@@ -527,7 +527,7 @@ async def access_overview(
         # Everyone's reach, at O(1) — see the `member_ids` note above. Also
         # the ceiling for any reach figure the UI prints: no set of groups
         # can reach more people than there are accounts.
-        "account_total": users_repo().count_all(),
+        "account_total": users_repo().count_people(),
     }
 
 
@@ -677,20 +677,31 @@ async def groups_reach(
     always right, on the screen where reach is being decided.
 
     Computed here instead, where the memberships are. ``everyone`` — the
-    scope sentinel, not a group — short-circuits to the account total: it is
-    every account by construction, so no union can exceed it and none is
-    needed. Ordinary groups union their distinct member ids. The answer is
-    still clamped to the account total, but as an invariant rather than a
-    patch: no set of audiences reaches more people than there are accounts.
+    scope sentinel, not a group — short-circuits to the people total: it is
+    every account a person signs in as, by construction, so no union can
+    exceed it and none is needed. Ordinary groups union their distinct member
+    ids, counting the same population. The answer is still clamped to that
+    total, but as an invariant rather than a patch: no set of audiences
+    reaches more people than there are people.
+
+    "People" excludes service accounts and the identities Agnes seeds for
+    itself (``src.service_accounts.is_person``, issue #2256) — the same
+    definition ``scope='everyone'`` enforces, so the number an admin reads
+    beside Apply is the number of colleagues the share will reach.
 
     ``ids`` is required (422 when absent, from FastAPI, identically on both
     app-state backends). Declared before ``/groups/{group_id}`` so the
     literal segment is not captured as a group id.
     """
     from src.grant_scopes import EVERYONE_TARGET_ID
+    from src.service_accounts import is_person
 
     wanted = [g.strip() for g in ids.split(",") if g.strip()]
-    account_total = users_repo().count_all()
+    # People, not rows in `users` (issue #2256). `count_all` counts service
+    # accounts and the identities Agnes seeds for itself, and an
+    # everyone-scoped grant reaches neither — so it was both the wrong
+    # short-circuit for the scope and the wrong ceiling for a group's union.
+    account_total = users_repo().count_people()
     if EVERYONE_TARGET_ID in wanted:
         return {"count": account_total, "account_total": account_total}
     members_repo = user_group_members_repo()
@@ -698,7 +709,13 @@ async def groups_reach(
     for gid in wanted:
         for m in members_repo.list_members_for_group(gid):
             uid = m.get("id") or m.get("user_id")
-            if uid:
+            # A group MAY hold a service account — that is the only way one
+            # acquires any authority at all (#1534) — but this figure is
+            # printed as "N people", so counting it here would put a CI token
+            # in the headcount an admin reads when deciding how wide a share
+            # is. It would also break the clamp below, which is an invariant
+            # only while both sides count the same population.
+            if uid and is_person(m):
                 seen.add(str(uid))
     return {"count": min(len(seen), account_total), "account_total": account_total}
 
@@ -1666,7 +1683,7 @@ def _resource_display_index(types_needed: set) -> dict:
             logger.exception("effective-access: list_blocks failed for %s", raw)
             continue
         for block in blocks or []:
-            for item in (block.get("items") or []):
+            for item in block.get("items") or []:
                 rid = item.get("resource_id")
                 if not rid:
                     continue
@@ -1922,8 +1939,7 @@ async def user_effective_access(
         grants_rows,
         key=lambda r: (
             r["resource_type"],
-            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name")
-            or r["resource_id"],
+            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name") or r["resource_id"],
             by_gid.get(r["group_id"], ""),
         ),
     ):

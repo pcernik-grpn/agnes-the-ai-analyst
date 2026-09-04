@@ -136,6 +136,32 @@ def _user_group_ids(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = No
     return set(user_group_members_repo().list_groups_for_user(user_id))
 
 
+def _reaches_everyone_scope(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
+    """Whether an ``scope='everyone'`` grant reaches this account (#2256).
+
+    An everyone-scoped grant names no group, so nothing else in this module
+    can narrow it — without this check a service account's PAT would widen
+    every time an admin shared something company-wide, and the seeded system
+    identities would inherit the lot. One PK lookup, alongside the
+    membership read this function's only caller already performs.
+
+    Fails OPEN on a missing row, matching the surrounding code: an unknown
+    user reaches nothing anyway, because the grant lookup below still has to
+    find a matching row.
+    """
+    from src.repositories import use_pg, users_repo
+    from src.service_accounts import is_person
+
+    if not use_pg():
+        # The DuckDB app-state ladder is frozen and has no `scope` column, so
+        # there is no everyone-term for this answer to narrow — the repo
+        # drops the argument. Skip the lookup rather than spend a query on a
+        # value nothing reads.
+        return True
+    row = users_repo().get_by_id(user_id)
+    return is_person(row) if row else True
+
+
 def is_user_admin(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
     """True iff the user is a member of the Admin system group.
 
@@ -314,6 +340,7 @@ def can_access(
     # would deny access the grants say exists.
     from src.repositories import use_pg, resource_grants_repo
 
+    include_everyone = _reaches_everyone_scope(user_id, conn=conn)
     if conn is not None and not use_pg():
         from src.repositories.resource_grants import ResourceGrantsRepository
 
@@ -321,11 +348,13 @@ def can_access(
             list(group_ids),
             resource_type,
             resource_id,
+            include_everyone=include_everyone,
         )
     return resource_grants_repo().has_grant(
         list(group_ids),
         resource_type,
         resource_id,
+        include_everyone=include_everyone,
     )
 
 
@@ -356,17 +385,20 @@ def _allowed_ids_for_user(
     # would deny access the grants say exists.
     from src.repositories import use_pg, resource_grants_repo
 
+    include_everyone = _reaches_everyone_scope(user_id, conn=conn)
     if conn is not None and not use_pg():
         from src.repositories.resource_grants import ResourceGrantsRepository
 
         rows = ResourceGrantsRepository(conn).list_for_groups(
             list(group_ids),
             resource_type,
+            include_everyone=include_everyone,
         )
     else:
         rows = resource_grants_repo().list_for_groups(
             list(group_ids),
             resource_type,
+            include_everyone=include_everyone,
         )
     return frozenset(r["resource_id"] for r in rows)
 
@@ -416,17 +448,20 @@ def required_store_entity_ids(
     from app.resource_types import ResourceType
     from src.repositories import resource_grants_repo, use_pg
 
+    include_everyone = _reaches_everyone_scope(user_id, conn=conn)
     if conn is not None and not use_pg():
         from src.repositories.resource_grants import ResourceGrantsRepository
 
         rows = ResourceGrantsRepository(conn).list_for_groups(
             list(group_ids),
             ResourceType.STORE_ENTITY.value,
+            include_everyone=include_everyone,
         )
     else:
         rows = resource_grants_repo().list_for_groups(
             list(group_ids),
             ResourceType.STORE_ENTITY.value,
+            include_everyone=include_everyone,
         )
     return frozenset(r["resource_id"] for r in rows if (r.get("requirement") or "available") == "required")
 
@@ -465,6 +500,7 @@ def has_explicit_grant(
     # would deny access the grants say exists.
     from src.repositories import use_pg, resource_grants_repo
 
+    include_everyone = _reaches_everyone_scope(user_id, conn=conn)
     if conn is not None and not use_pg():
         from src.repositories.resource_grants import ResourceGrantsRepository
 
@@ -472,11 +508,13 @@ def has_explicit_grant(
             list(group_ids),
             resource_type,
             resource_id,
+            include_everyone=include_everyone,
         )
     return resource_grants_repo().has_grant(
         list(group_ids),
         resource_type,
         resource_id,
+        include_everyone=include_everyone,
     )
 
 

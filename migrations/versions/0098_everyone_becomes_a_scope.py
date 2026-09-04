@@ -13,9 +13,16 @@ instance could say "everyone gets this" in three ways that did not agree:
 
 Afterwards there is one: ``resource_grants.scope = 'everyone'``.
 
-THE GOVERNING RULE: an upgrade must never change who can see what. Every
-step below is chosen so the set of (person, thing) pairs is identical before
-and after, and the step ORDER is part of that — step 2 has to run before
+THE GOVERNING RULE: an upgrade must never change who can see what. Note the
+word PERSON: the audience this revision creates reaches accounts a person
+signs in as, never a service account and never the identities Agnes seeds
+for itself (issue #2256). There is exactly one place that costs anything.
+``marketplace_plugins.is_system`` reached every row in ``users``
+unconditionally, so step 4's conversion takes a system plugin away from
+those non-person accounts — a Claude Code bundle a headless identity never
+installs, and an admin who wants one there puts the account in a named
+group, which is how it gets everything else it has. Every step below is
+chosen so the set of (person, thing) pairs is identical before and after, and the step ORDER is part of that — step 2 has to run before
 anything reads ``Everyone`` as unconditional, because doing it the other way
 round is exactly how an upgrade widens access on a mirrored instance.
 ``tests/db_pg/test_alembic_0098_everyone_scope.py`` snapshots the effective
@@ -25,6 +32,10 @@ Steps, in order:
 
 1. (revision 0097) add the column. Additive, behaviour-neutral, safe under
    the old code.
+1b. Name the seeded system identities (``kind='system'``). A prerequisite,
+   not a tidy-up: step 3 refuses to convert while any account sits outside
+   the group, and these three never join it, so without this the guard
+   fires on every instance and the revision converts nothing at all.
 2. Convert the Workspace narrowing. Where ``AGNES_GROUP_EVERYONE_EMAIL`` is
    set, ``Everyone`` was never everyone — it was a real group wearing the
    word. It becomes one: a group named after the Workspace group it mirrored,
@@ -33,7 +44,9 @@ Steps, in order:
    pseudo-group. Nobody gains or loses access.
 3. Grants still on ``Everyone`` become ``scope='everyone'`` — for the types
    where "everyone" is a coherent audience, and only once the group is
-   verified to hold every account. After step 2 on a mirrored instance there
+   verified to hold every PERSON and no one else. Both directions are
+   guarded: a person outside would gain the group's grants, and a service
+   account inside would lose them, since the scope reaches people only. After step 2 on a mirrored instance there
    are none of those left; the rows moved. On every other instance these are
    the genuinely instance-wide ones. The four withheld types
    (``SCOPE_WITHHELD_TYPES``) keep their rows as ordinary grants on the
@@ -144,12 +157,48 @@ SYNC_CREATED_BY = "system:google-sync"
 
 ENV_EVERYONE_EMAIL = "AGNES_GROUP_EVERYONE_EMAIL"
 
+#: Mirrors ``src.service_accounts`` — inlined for the same reason as the
+#: constants above. ``'human'`` is 0096's server default, so every row that
+#: was not created through ``create_service_account`` already carries it.
+HUMAN_KIND = "human"
+SERVICE_ACCOUNT_KIND = "service"
+SYSTEM_IDENTITY_KIND = "system"
+SYSTEM_IDENTITY_EMAILS = (
+    "scheduler@system.local",
+    "semantic-drafter@system.local",
+    "memory-curator@system.local",
+)
+
 
 def _everyone_group_id(conn) -> Optional[str]:
     row = conn.execute(
         sa.text(f"SELECT id FROM user_groups WHERE name = '{EVERYONE_GROUP_NAME}'")  # noqa: S608
     ).first()
     return row[0] if row else None
+
+
+def _step1_mark_system_identities(conn) -> None:
+    """Name the identities Agnes seeded for itself, before anything counts
+    accounts (issue #2256).
+
+    Three rows — the scheduler, the semantic drafter, the memory curator —
+    are created by the instance for its own use, through a bare
+    ``users.create()`` that never joins them to any group. They are not
+    people, and they are on every instance that has booted, which is what
+    makes this a prerequisite rather than a tidy-up: step 3 below refuses to
+    convert while a single account sits outside the group, so without this
+    step that guard fires everywhere and the whole revision converts nothing.
+
+    Not ``kind='service'``. That kind carries two behaviours these rows
+    cannot survive — the semantic drafter mints an interactive token through
+    the broker, and the scheduler is a member of the Admin group.
+    """
+    conn.execute(
+        sa.text("UPDATE users SET kind = :k WHERE lower(email) IN :emails").bindparams(
+            sa.bindparam("emails", expanding=True)
+        ),
+        {"k": SYSTEM_IDENTITY_KIND, "emails": list(SYSTEM_IDENTITY_EMAILS)},
+    )
 
 
 def _step2_convert_workspace_narrowing(conn) -> None:
@@ -252,9 +301,9 @@ def _step2_convert_workspace_narrowing(conn) -> None:
         params,
     )
     conn.execute(
-        sa.text(
-            f"UPDATE resource_grants SET group_id = :target WHERE group_id = :src AND {movable}"
-        ).bindparams(sa.bindparam("markers", expanding=True)),
+        sa.text(f"UPDATE resource_grants SET group_id = :target WHERE group_id = :src AND {movable}").bindparams(
+            sa.bindparam("markers", expanding=True)
+        ),
         params,
     )
 
@@ -296,13 +345,17 @@ def _step3_scope_everyone_grants(conn) -> None:
     if not convertible:
         return
 
+    # Widening arm: a PERSON outside the group would gain everything it
+    # holds. Only people — a service account and a seeded system identity
+    # are not in the everyone audience (#2256), so their absence from the
+    # group is the normal state and never a reason to refuse.
     outside = conn.execute(
         sa.text(
-            "SELECT COUNT(*) FROM users u WHERE NOT EXISTS ("
+            "SELECT COUNT(*) FROM users u WHERE u.kind = :human AND NOT EXISTS ("
             "  SELECT 1 FROM user_group_members m "
             "  WHERE m.user_id = u.id AND m.group_id = :g)"
         ),
-        {"g": everyone_id},
+        {"g": everyone_id, "human": HUMAN_KIND},
     ).scalar_one()
     if outside:
         logger.warning(
@@ -313,6 +366,37 @@ def _step3_scope_everyone_grants(conn) -> None:
             "accounts to the group if they should have it; a later release "
             "converts the rows once the group holds every account.",
             outside,
+            EVERYONE_GROUP_NAME,
+        )
+        return
+
+    # Narrowing arm, and the reason the guard has two. An admin may add a
+    # service account to this group — nothing refuses it, and the people
+    # picker offers it deliberately, because a group is the only way a
+    # headless identity acquires any authority at all. Such an account holds
+    # these grants TODAY. Converting them to a scope that reaches only people
+    # would take them away, which is the governing rule broken in the other
+    # direction, and the redesigned Access page no longer draws this group's
+    # roster to put them back from.
+    non_people_inside = conn.execute(
+        sa.text(
+            "SELECT COUNT(*) FROM users u "
+            "JOIN user_group_members m ON m.user_id = u.id AND m.group_id = :g "
+            "WHERE u.kind <> :human"
+        ),
+        {"g": everyone_id, "human": HUMAN_KIND},
+    ).scalar_one()
+    if non_people_inside:
+        logger.warning(
+            "0098: %d non-person account(s) — service accounts or seeded system "
+            "identities — are members of the %r group and hold its grants today. "
+            "Those grants were NOT converted to scope='everyone', which reaches "
+            "people only, because converting would have taken the access away. "
+            "They remain ordinary group grants and reach exactly who they reach "
+            "now. Move those accounts to a named group of their own if they "
+            "should keep the access; a later release converts the rows once the "
+            "group holds people only.",
+            non_people_inside,
             EVERYONE_GROUP_NAME,
         )
         return
@@ -363,8 +447,7 @@ def _step4_system_flag_becomes_a_grant(conn) -> None:
     """
     system_rows = conn.execute(
         sa.text(
-            "SELECT marketplace_id, name FROM marketplace_plugins "
-            "WHERE is_system = TRUE AND admin_disabled = FALSE"
+            "SELECT marketplace_id, name FROM marketplace_plugins WHERE is_system = TRUE AND admin_disabled = FALSE"
         )
     ).all()
 
@@ -411,6 +494,7 @@ def _step4_system_flag_becomes_a_grant(conn) -> None:
 
 def upgrade() -> None:
     conn = op.get_bind()
+    _step1_mark_system_identities(conn)
     _step2_convert_workspace_narrowing(conn)
     _step3_scope_everyone_grants(conn)
     _step4_system_flag_becomes_a_grant(conn)
