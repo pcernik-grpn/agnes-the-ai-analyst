@@ -11,6 +11,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+## [0.98.0] - 2026-09-04
+
+### Added
 - **Opt-in OpenTelemetry export of every LLM completion.** Set the standard `OTEL_EXPORTER_OTLP_ENDPOINT` (and `OTEL_EXPORTER_OTLP_HEADERS` for the collector's credential) and each process ships OTLP/HTTP trace spans: one per completion that transits the chat broker — every chat surface and every engine, since all of a session's LLM traffic goes through that one route — carrying the GenAI attributes (request and response model; uncached input, output, cache-read and cache-write tokens reported separately, because folding the cache kinds into `input_tokens` undercounts an agentic run by orders of magnitude; finish reason; upstream status) and the Agnes identity of the call (session, user, agent, ticket scope), plus one per server-side generation already wrapped by `trace_generation`. The resource carries `service.name=agnes`, `service.version`, `deployment.environment` (the same `AGNES_DEPLOYMENT_ENV` label the logs use, so one instance is one value in both signals) and `service.instance.id`; `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` override them. Prompt and completion text is exported only with `AGNES_OTEL_CAPTURE_CONTENT=1` — off by default, for the same reason the logs never carry it — and capped per attribute. An unset endpoint leaves the API's no-op tracer in place: no exporter, no thread, no cost. See `docs/observability.md` → *OpenTelemetry export*.
 
 ### Changed
