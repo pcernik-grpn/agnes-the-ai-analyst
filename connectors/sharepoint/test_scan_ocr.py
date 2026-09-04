@@ -299,6 +299,203 @@ def test_an_unopenable_pdf_is_a_typed_failure(tmp_path, monkeypatch):
         ScanTranscriber(settings, client=client).transcribe(path)
 
 
+# --------------------------------- permanent provider refusal (TCRD-296 #68)
+#
+# A 400/401/403, or a closed-set `workspace_limit`/`quota_exceeded`/
+# `billing_disabled` refusal, must not be retried per page and must pause
+# scan OCR for the REST OF THE RUN — not just this document — so a crawl of
+# a thousand scans does not burn a bounded set of failed attempts per
+# document against a provider that will refuse every one of them.
+
+
+class _ProviderError(Exception):
+    """A provider refusal carrying a real HTTP-shaped ``status_code`` —
+    everything ``_permanent_refusal_reason``/``_is_retryable`` classify on."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _fixed_provider(monkeypatch, provider="anthropic", region=None):
+    """Pin :func:`scan_ocr._resolved_provider_and_region` so these tests
+    never depend on ambient instance.yaml state — provider resolution
+    itself is covered separately in ``tests/test_anonymization_ner.py``."""
+    monkeypatch.setattr(scan_ocr, "_resolved_provider_and_region", lambda: (provider, region))
+
+
+def test_a_400_pauses_the_run_after_one_attempt_never_retried(tmp_path, monkeypatch):
+    client = _FakeClient(_ProviderError(400, "invalid_request_error: unsupported model"))
+    settings = _enable(monkeypatch, client, max_attempts=3)
+    _fixed_provider(monkeypatch)
+
+    markdown = ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=2))
+
+    assert markdown == ""
+    assert len(client.calls) == 1, "a 400 must not be retried per page"
+    disabled = scan_ocr.run_disabled()
+    assert disabled == {"disabled_reason": "http_400", "provider_error": "invalid_request_error: unsupported model"}
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_401_and_403_pause_the_run_exactly_like_400(tmp_path, monkeypatch, status):
+    client = _FakeClient(_ProviderError(status, "refused"))
+    settings = _enable(monkeypatch, client, max_attempts=3)
+    _fixed_provider(monkeypatch)
+
+    markdown = ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    assert markdown == ""
+    assert len(client.calls) == 1
+    assert scan_ocr.run_disabled()["disabled_reason"] == f"http_{status}"
+
+
+def test_a_workspace_limit_400_pauses_the_run_with_the_classified_reason(tmp_path, monkeypatch):
+    """The exact live shape (TCRD-296): a 400 whose MESSAGE names a
+    workspace usage-limit exhaustion — classified by
+    ``classify_provider_limit_error``, same as the facts pass."""
+    client = _FakeClient(_ProviderError(400, "Your workspace has hit the API usage limits for on-demand daily spend."))
+    settings = _enable(monkeypatch, client, max_attempts=3)
+    _fixed_provider(monkeypatch)
+
+    markdown = ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    assert markdown == ""
+    assert scan_ocr.run_disabled()["disabled_reason"] == "workspace_limit"
+
+
+def test_a_quota_exceeded_429_is_retried_before_pausing(tmp_path, monkeypatch):
+    """429 is retryable-SHAPED, so the AIMD/backoff gets its chances first —
+    a structural zero-allocation quota bucket is told apart from an ordinary
+    transient spike only once every attempt fails identically, exactly the
+    two-stage order ``_Extractor.call`` uses for the facts pass."""
+    quota_error = _ProviderError(429, "Quota exceeded for quota metric X and limit Y for consumer Z")
+    client = _FakeClient(quota_error, quota_error, quota_error)
+    settings = _enable(monkeypatch, client, max_attempts=3, backoff_s=0.0)
+    _fixed_provider(monkeypatch)
+
+    markdown = ScanTranscriber(settings, client=client, sleep=lambda _s: None).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    assert markdown == ""
+    assert len(client.calls) == 3, "429 must exhaust its retries before being classified as permanent"
+    assert scan_ocr.run_disabled()["disabled_reason"] == "quota_exceeded"
+
+
+def test_a_document_that_discovers_the_refusal_is_convert_empty_not_convert_failed(tmp_path, monkeypatch):
+    """The document that discovers the break gets the SAME `convert_empty`
+    outcome every later document gets — never a one-off `convert_failed`
+    for just this one."""
+    client = _FakeClient(_ProviderError(400, "refused"))
+    _enable(monkeypatch, client, max_attempts=1)
+    _fixed_provider(monkeypatch)
+
+    result = convert_to_markdown(_scan_pdf(tmp_path, pages=2), "application/pdf")
+
+    assert result.markdown == ""
+    assert result.engine == "empty"
+
+
+def test_the_rest_of_the_run_makes_no_further_provider_calls(tmp_path, monkeypatch):
+    """The FIRST permanent refusal wins; every document reached after it —
+    even a fresh ``ScanTranscriber`` — returns "" without rendering a page
+    or contacting the provider at all."""
+    client = _FakeClient(_ProviderError(400, "refused"))
+    settings = _enable(monkeypatch, client, max_attempts=1)
+    _fixed_provider(monkeypatch)
+
+    ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=2, name="one.pdf"))
+    assert len(client.calls) == 1
+
+    def _boom(*args, **kwargs):  # pragma: no cover - asserted by not firing
+        raise AssertionError("scan OCR must not contact the provider once the run is paused")
+
+    client.messages.create = _boom
+    second = ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=3, name="two.pdf"))
+
+    assert second == ""
+
+
+def test_a_permanent_refusal_records_the_fleet_level_provider_limit_condition(tmp_path, monkeypatch):
+    """Reuses (never reimplements) the facts pass's own
+    ``record_provider_limit_condition`` — the ``ocr_`` prefix on ``reason``
+    is the ONLY thing distinguishing an OCR-authored condition from a
+    facts-authored one in that shared table."""
+    captured = {}
+
+    def fake_record(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.record_provider_limit_condition", fake_record)
+
+    client = _FakeClient(_ProviderError(400, "workspace refused"))
+    settings = _enable(monkeypatch, client, max_attempts=1)
+    _fixed_provider(monkeypatch, provider="vertex", region="us-central1")
+
+    ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    assert captured["reason"] == "ocr_http_400"
+    assert captured["provider"] == "vertex"
+    assert captured["model"] == settings.model
+    assert captured["region"] == "us-central1"
+    assert captured["message"] == "workspace refused"
+
+
+def test_a_transient_failure_is_unaffected_by_the_pause_mechanism(tmp_path, monkeypatch):
+    """Negative control: an ordinary transient (5xx-shaped) failure still
+    goes through the pre-existing bounded retry and recovers, never the
+    whole-run pause."""
+    transient = RuntimeError("503 upstream")
+    transient.status_code = 503  # type: ignore[attr-defined]
+    client = _FakeClient(transient, "recovered")
+    settings = _enable(monkeypatch, client, max_attempts=2, backoff_s=0.0)
+    _fixed_provider(monkeypatch)
+
+    markdown = ScanTranscriber(settings, client=client, sleep=lambda _s: None).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    assert markdown == "recovered"
+    assert scan_ocr.run_disabled() is None
+
+
+def test_reset_run_usage_clears_the_paused_state(tmp_path, monkeypatch):
+    client = _FakeClient(_ProviderError(400, "refused"))
+    settings = _enable(monkeypatch, client, max_attempts=1)
+    _fixed_provider(monkeypatch)
+
+    ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1))
+    assert scan_ocr.run_disabled() is not None
+
+    scan_ocr.reset_run_usage()
+
+    assert scan_ocr.run_disabled() is None
+
+
+def test_the_run_report_carries_the_disabled_reason_and_provider_error(tmp_path, monkeypatch):
+    client = _FakeClient(_ProviderError(403, "credential revoked"))
+    settings = _enable(monkeypatch, client, max_attempts=1)
+    _fixed_provider(monkeypatch)
+
+    ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    report = scan_ocr.triage_run_usage()
+    assert report["disabled_reason"] == "http_403"
+    assert report["provider_error"] == "credential revoked"
+
+
+def test_the_provider_is_logged_once_per_run_not_once_per_document(tmp_path, monkeypatch, caplog):
+    client = _FakeClient("p1", "p2")
+    settings = _enable(monkeypatch, client)
+    _fixed_provider(monkeypatch, provider="vertex", region="us-central1")
+
+    with caplog.at_level("INFO", logger="connectors.sharepoint.scan_ocr"):
+        ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1, name="one.pdf"))
+        ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1, name="two.pdf"))
+
+    provider_lines = [r for r in caplog.records if "using provider=" in r.getMessage()]
+    assert len(provider_lines) == 1
+    assert "provider=vertex" in provider_lines[0].getMessage()
+    assert "region=us-central1" in provider_lines[0].getMessage()
+
+
 # ------------------------------------------------------- usage accounting
 
 

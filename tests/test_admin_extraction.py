@@ -810,6 +810,35 @@ class TestRunProjection:
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["facts_progress"] is None
 
+    def test_scan_ocr_is_absent_when_the_crawl_never_reported_one(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "running", "phase": "crawl", "progress": {"new": 5}})
+        assert out["scan_ocr"] is None
+
+    def test_scan_ocr_carries_the_disabled_reason_once_the_crawl_reports_it(self):
+        """`connectors.sharepoint.scan_ocr.triage_run_usage` — the crawl's
+        own `report["scan_ocr"]` block — rides straight through, same
+        "layered onto report/progress" contract as `facts_progress`."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {
+                    "scan_ocr": {
+                        "disabled_reason": "http_400",
+                        "provider_error": "Your workspace has hit the API usage limits ...",
+                    }
+                },
+            }
+        )
+        assert out["scan_ocr"] == {
+            "disabled_reason": "http_400",
+            "provider_error": "Your workspace has hit the API usage limits ...",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7, plan Task 8) —

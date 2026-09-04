@@ -29,7 +29,7 @@ second transcription backend plugs in behind :meth:`ScanTranscriber._transcribe_
 
 Failure model
 -------------
-Three failures, three different answers, in ascending order of severity:
+Four failures, four different answers, in ascending order of severity:
 
 * **one page** fails to render or to transcribe — counted in
   ``failed_pages``, contributes an empty chunk so the ``---`` separators stay
@@ -40,12 +40,25 @@ Three failures, three different answers, in ascending order of severity:
   rendered)
   pages are transcribed and a truncation marker naming the cap is appended.
   A 500-page scan must not burn a budget silently.
-* **the model is unreachable** (no credential, no SDK, every call failing) —
-  :class:`ScanOcrUnavailable`, which the converter turns into a
-  ``ConversionError`` and the crawl counts in ``convert_failed``. This is the
-  load-bearing one: once OCR is enabled the caller was PROMISED text, and a
-  silently empty document would be indistinguishable from a genuinely blank
-  scan. Fail loud.
+* **the provider refuses PERMANENTLY** (a 400/401/403, or a closed-set
+  ``workspace_limit``/``quota_exceeded``/``billing_disabled`` refusal — see
+  "Which LLM path this reuses" above) — never retried per page, and after the
+  FIRST such refusal in a run, scan OCR pauses itself for every document that
+  follows: no further render, no further call, the document returns ``""``
+  exactly as it would with the feature off, so it lands in ``convert_empty``
+  (never ``convert_failed``) and ``retry-empty`` can replay it once an
+  operator fixes the provider. The run report's ``scan_ocr`` block gains
+  ``disabled_reason``/``provider_error``, and the SAME fleet-level
+  ``provider_limit`` condition the facts pass records
+  (:func:`connectors.sharepoint.facts_extraction.record_provider_limit_condition`)
+  is written so `/admin/extraction` and `agnes admin sharepoint runs` name
+  it. See :func:`_mark_run_disabled`.
+* **the model is unreachable** (no credential, no SDK, every call failing for
+  an UNCLASSIFIED reason) — :class:`ScanOcrUnavailable`, which the converter
+  turns into a ``ConversionError`` and the crawl counts in
+  ``convert_failed``. This is the load-bearing one: once OCR is enabled the
+  caller was PROMISED text, and a silently empty document would be
+  indistinguishable from a genuinely blank scan. Fail loud.
 
 Cost is per page, and so is latency: a 50-page scan is fifty round-trips.
 ``extraction.scan_ocr.concurrency`` (default 3, clamped to ``[1, 8]``) runs
@@ -57,18 +70,37 @@ sequential and byte-identical.
 
 Which LLM path this reuses
 --------------------------
-Exactly the one Agnes already has. Credentials resolve through
-``src.anonymization_ner.build_client`` — ``ANTHROPIC_API_KEY`` →
-``LLM_API_KEY`` → Vertex ADC, with the Vertex client built by
-``connectors.llm.vertex_provider.create_vertex_client`` and the model id
-translated by ``to_vertex_model_id`` — which is the same ladder
-``src/ingest/vision.py::extract_image_text`` walks for image ingest. No second
-credential path is invented here, and no key is ever placed on argv, in a URL,
-or in a log line. The model is resolved from configuration
-(``extraction.scan_ocr.model`` → ``extraction.model`` → the existing
-``AGNES_VISION_MODEL`` knob → :data:`FALLBACK_MODEL`) through
+Exactly the one Agnes already has. Credentials AND provider selection resolve
+through ``src.anonymization_ner.build_client``, which this module's own
+:func:`build_client` wraps with ``own_setting_path=("extraction", "scan_ocr",
+"provider")`` — an explicit ``extraction.scan_ocr.provider`` wins outright;
+otherwise ``extraction.facts.provider``; otherwise this instance's own
+``ai.provider`` (``connectors.llm.factory.vertex_config_or_none``); only once
+none of those resolve to Vertex does a static ``ANTHROPIC_API_KEY``/
+``LLM_API_KEY`` apply (see ``src.anonymization_ner.resolve_llm_provider``).
+This fixes a live incident (TCRD-296 gap #68): a stale ``ANTHROPIC_API_KEY``
+in the environment (an exhausted workspace) previously kept winning over an
+instance that had migrated everything else — chat, facts extraction — to
+Vertex, so every scan burned a bounded set of failed attempts against a
+provider this instance was not even configured to use. The Vertex client is
+built by ``connectors.llm.vertex_provider.create_vertex_client`` and the
+model id translated by ``to_vertex_model_id``. No second credential path is
+invented here, and no key is ever placed on argv, in a URL, or in a log
+line — only the resolved provider/model/region themselves are (one line, once
+per run; see :func:`ScanTranscriber._ensure_client`). The model is resolved
+from configuration (``extraction.scan_ocr.model`` → ``extraction.model`` →
+the existing ``AGNES_VISION_MODEL`` knob → :data:`FALLBACK_MODEL`) through
 ``connectors.llm.factory.resolve_model_tier``, so ``haiku``/``sonnet``/``opus``
-work as well as a pinned id.
+work as well as a pinned id. (``src/ingest/vision.py::extract_image_text``
+walks a similar-looking but INDEPENDENT ladder for ad hoc image ingest — it
+still resolves a static key ahead of Vertex, and is out of scope here.)
+
+A provider refusal Agnes recognizes as PERMANENT — a 400/401/403, or the
+closed-set ``workspace_limit``/``quota_exceeded``/``billing_disabled``
+classification ``connectors.sharepoint.facts_extraction.
+classify_provider_limit_error`` already uses for the facts pass — pauses scan
+OCR for the REST OF THE RUN rather than retrying it per page or per document:
+see "Failure model" above and :func:`_mark_run_disabled`.
 
 The page image is untrusted third-party content. The rules ride the separate
 ``system`` channel and the prompt states that the page is DATA, never
@@ -807,24 +839,54 @@ def encode_page_image(pil_image: Any) -> tuple[bytes, str]:
 # --------------------------------------------------------------------------
 
 
+#: This stage's OWN provider-selection knob, checked ahead of
+#: ``extraction.facts.provider``/``ai.provider`` by
+#: ``src.anonymization_ner.resolve_llm_provider`` — see the module
+#: docstring's "Which LLM path this reuses" section.
+_PROVIDER_SETTING_PATH = ("extraction", "scan_ocr", "provider")
+
+
 def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
-    """Build the Anthropic client for ``model``; returns ``(client, model)``.
+    """Build the Anthropic (direct or Vertex) client for ``model``; returns
+    ``(client, model)``.
 
     Delegates to ``src.anonymization_ner.build_client`` — the repo's one
-    server-side credential ladder (static key → Vertex ADC), shared rather
-    than re-implemented so a future change to how Agnes authenticates reaches
-    this path automatically. Its ``DetectionUnavailable`` is translated here so
-    a caller of this module only ever has to know one exception type.
+    server-side credential ladder, shared rather than re-implemented so a
+    future change to how Agnes authenticates reaches this path
+    automatically — with :data:`_PROVIDER_SETTING_PATH` as this stage's own
+    provider-selection knob (see the module docstring). Its
+    ``DetectionUnavailable`` is translated here so a caller of this module
+    only ever has to know one exception type.
     """
     from src.anonymization_ner import DetectionUnavailable, build_client as _build
 
     try:
-        return _build(model, timeout_s)
+        return _build(model, timeout_s, own_setting_path=_PROVIDER_SETTING_PATH)
     except DetectionUnavailable as exc:
         raise ScanOcrUnavailable(
             f"scan OCR needs LLM credentials: {exc}. Set extraction.scan_ocr.enabled "
             "to false to keep converting scans to empty documents instead."
         ) from exc
+
+
+def _resolved_provider_and_region() -> tuple[str, Optional[str]]:
+    """The provider/region THIS run's OCR client resolves to — a cheap,
+    stateless config read (never a credential/network operation), used only
+    for the one-line startup log (:func:`_log_provider_once`) and to name
+    the fleet-level ``provider_limit`` condition a permanent refusal records
+    (:func:`_mark_run_disabled`). Independent of :func:`build_client`'s own
+    lazy client construction, and safe to call even when no client has been
+    built yet.
+    """
+    from src.anonymization_ner import resolve_llm_provider
+
+    provider, _source = resolve_llm_provider(*_PROVIDER_SETTING_PATH)
+    if provider != "vertex":
+        return provider, None
+    from connectors.llm.factory import vertex_config_or_none
+
+    vertex = vertex_config_or_none()
+    return provider, (vertex[1] if vertex else None)
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -851,6 +913,75 @@ def _is_retryable(exc: BaseException) -> bool:
             anthropic.InternalServerError,
         ),
     )
+
+
+def _permanent_refusal_reason(exc: BaseException) -> Optional[str]:
+    """One of the closed set of reasons the facts pass already recognizes as
+    a whole-account/workspace/region refusal
+    (``connectors.sharepoint.facts_extraction.classify_provider_limit_error``
+    — message-based: ``"workspace_limit"``/``"quota_exceeded"``/
+    ``"billing_disabled"``), or a bare ``"http_400"``/``"http_401"``/
+    ``"http_403"`` for a status that classifier does not recognize by
+    message. ``None`` for everything else — a plain 5xx/429/timeout stays
+    this page's own bounded retry (:func:`_is_retryable`), never escalated
+    to a whole-run pause.
+
+    A bare status check (rather than requiring the message match too) is
+    deliberate here in a way it is NOT for facts extraction: the live
+    finding this closes (TCRD-296 gap #68) was a 400 whose message the
+    classifier happened to match, but scan OCR has no per-document
+    "prompt is too long" failure mode the way facts extraction does (a
+    page image is never too long), so a 400/401/403 here is never
+    legitimately document-specific — it is always the provider refusing
+    the credential/request shape outright.
+    """
+    try:
+        from connectors.sharepoint.facts_extraction import classify_provider_limit_error
+
+        limit_reason = classify_provider_limit_error(exc)
+    except Exception:  # noqa: BLE001 — an import hiccup must not mask a real refusal
+        limit_reason = None
+    if limit_reason is not None:
+        return limit_reason
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in (400, 401, 403):
+        return f"http_{status}"
+    return None
+
+
+class _PermanentProviderRefusal(RuntimeError):
+    """Internal: a page or triage-classify call hit a refusal that will not
+    clear within this run (see :func:`_permanent_refusal_reason`).
+
+    Raised from :meth:`ScanTranscriber._transcribe_page` /
+    :meth:`ScanTranscriber._classify_preview` — deliberately NEVER retried
+    (no backoff sleep, no second attempt) — and caught exactly once, in
+    :meth:`ScanTranscriber.transcribe`, which marks the run disabled
+    (:func:`_mark_run_disabled`) and returns ``""`` for THIS document too:
+    never re-raised as :class:`ScanOcrUnavailable`, so the crawl records
+    ``convert_empty`` — never ``convert_failed`` — exactly as it would with
+    the feature off, and ``retry-empty`` can replay the whole backlog once
+    an operator fixes the provider.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: The active run-level "scan OCR is paused" state
+#: (``{"disabled_reason", "provider_error"}``), or ``None`` — set once by
+#: :func:`_mark_run_disabled`, read by :func:`run_disabled` and (merged into
+#: the crawl report's ``scan_ocr`` block) by :func:`triage_run_usage`,
+#: cleared by :func:`reset_run_usage`. Guarded by :data:`_USAGE_LOCK` below
+#: (declared here; the lock itself is defined further down this module,
+#: alongside the token-usage state it already guards — one lock for every
+#: piece of module-level run state this file publishes).
+_RUN_DISABLED: Optional[dict[str, str]] = None
+
+#: Whether :func:`_log_provider_once` has already logged for this run —
+#: reset alongside :data:`_RUN_DISABLED` by :func:`reset_run_usage`.
+_PROVIDER_LOGGED = False
 
 
 def _usage_value(usage: Any, field: str) -> int:
@@ -947,6 +1078,13 @@ class ScanTranscriber:
         self._client = client
         self._call_model = self.settings.model
         self._sleep = sleep
+        #: The provider/region THIS run's client resolved to
+        #: (:func:`_resolved_provider_and_region`) — ``None`` until
+        #: :meth:`_ensure_client` first runs, used to name the fleet-level
+        #: ``provider_limit`` condition a permanent refusal records
+        #: (:meth:`_mark_disabled`) and the one-line startup log.
+        self._resolved_provider: Optional[str] = None
+        self._resolved_region: Optional[str] = None
         # Guards the two usage dicts and the lazy client handshake: with
         # ``concurrency > 1`` several page workers write them at once.
         self._lock = threading.RLock()
@@ -957,7 +1095,29 @@ class ScanTranscriber:
         with self._lock:
             if self._client is None:
                 self._client, self._call_model = build_client(self.settings.model, self.settings.timeout_s)
+            if self._resolved_provider is None:
+                # A cheap config read, not a credential/network operation —
+                # safe (and cheap) to resolve even when ``client=`` was
+                # injected directly (the test seam), which skips the branch
+                # above entirely.
+                self._resolved_provider, self._resolved_region = _resolved_provider_and_region()
+                _log_provider_once(
+                    provider=self._resolved_provider, model=self._call_model, region=self._resolved_region
+                )
             return self._client, self._call_model
+
+    def _mark_disabled(self, exc: "_PermanentProviderRefusal") -> None:
+        """Pause scan OCR for the rest of this run — see
+        :func:`_mark_run_disabled`. Called exactly once, from
+        :meth:`transcribe`'s own catch of :class:`_PermanentProviderRefusal`.
+        """
+        _mark_run_disabled(
+            reason=exc.reason,
+            message=str(exc),
+            provider=self._resolved_provider or "anthropic",
+            model=self.settings.model,
+            region=self._resolved_region,
+        )
 
     # -- one page ----------------------------------------------------------
 
@@ -1020,7 +1180,17 @@ class ScanTranscriber:
             self.total_usage[field] += amount
 
     def _transcribe_page(self, index: int, image: bytes, media_type: str) -> str:
-        """One page, with bounded retry. Raises :class:`_PageFailed` on exhaustion.
+        """One page, with bounded retry. Raises :class:`_PageFailed` on
+        exhaustion of an UNCLASSIFIED failure, or
+        :class:`_PermanentProviderRefusal` IMMEDIATELY (no retry, no backoff
+        sleep) — the FIRST attempt, if the failure is non-retryable-shaped
+        (a 400/401/403 always is), or after retries exhaust for a
+        retryable-shaped one (a 429 that turns out to be a structural quota
+        refusal, not a transient spike) — for a failure
+        :func:`_permanent_refusal_reason` classifies as a whole-run
+        refusal. Same two-stage classification order
+        ``connectors.sharepoint.facts_extraction._Extractor.call`` uses for
+        the facts pass, reused rather than reinvented.
 
         Runs on a worker thread when ``concurrency > 1``, so it touches only
         the client (thread-safe by the SDK's contract) and the lock-guarded
@@ -1028,7 +1198,9 @@ class ScanTranscriber:
         calling thread before submission.
         """
         last_error: BaseException | None = None
+        attempts_made = 0
         for attempt in range(1, self.settings.max_attempts + 1):
+            attempts_made = attempt
             try:
                 response = self._create(image, media_type)
             except ScanOcrUnavailable:
@@ -1038,7 +1210,12 @@ class ScanTranscriber:
                 raise
             except Exception as exc:  # noqa: BLE001 — classified here
                 last_error = exc
-                if not _is_retryable(exc) or attempt == self.settings.max_attempts:
+                if not _is_retryable(exc):
+                    limit_reason = _permanent_refusal_reason(exc)
+                    if limit_reason is not None:
+                        raise _PermanentProviderRefusal(limit_reason, str(exc)) from exc
+                    break
+                if attempt == self.settings.max_attempts:
                     break
                 delay = self.settings.backoff_s * (2 ** (attempt - 1))
                 logger.warning(
@@ -1054,9 +1231,13 @@ class ScanTranscriber:
             self._record(response)
             return _reply_text(response).strip()
 
+        if last_error is not None:
+            limit_reason = _permanent_refusal_reason(last_error)
+            if limit_reason is not None:
+                raise _PermanentProviderRefusal(limit_reason, str(last_error)) from last_error
+
         raise _PageFailed(
-            f"page {index + 1} transcription failed after {self.settings.max_attempts} "
-            f"attempt(s): {type(last_error).__name__}"
+            f"page {index + 1} transcription failed after {attempts_made} attempt(s): {type(last_error).__name__}"
         )
 
     # -- rendering ---------------------------------------------------------
@@ -1186,6 +1367,13 @@ class ScanTranscriber:
                         # Credentials / SDK: permanent for every page.
                         _cancel_pending(pending)
                         raise
+                    except _PermanentProviderRefusal:
+                        # A whole-run provider refusal: caught one level up,
+                        # in `transcribe`. Cancel the rest of this wave's
+                        # not-yet-started pages rather than paying for calls
+                        # that will fail identically.
+                        _cancel_pending(pending)
+                        raise
 
                     leading_failures = 0
                     self._bump("transcribed_pages")
@@ -1216,10 +1404,24 @@ class ScanTranscriber:
                 credential is missing, or every page failed. Never returns an
                 empty string because transcription broke — only because the
                 pages genuinely carry no text.
+
+        A PERMANENT provider refusal (see the module docstring's "Failure
+        model") is different from every case above: it does not raise at
+        all. :func:`run_disabled` is checked FIRST, before anything else —
+        no render, no client build, no call — for every document reached
+        after this run's first such refusal; a refusal discovered mid-THIS
+        document is caught below and turned into the same ``""`` return
+        (:meth:`_mark_disabled`), so the very document that revealed the
+        break gets the same ``convert_empty`` outcome as every one after
+        it, not a one-off ``convert_failed``.
         """
 
         self.last_usage = dict(_empty_usage(), model=self.settings.model, concurrency=self.concurrency)
         self.total_usage["concurrency"] = max(self.total_usage["concurrency"], self.concurrency)
+
+        if run_disabled() is not None:
+            return ""
+
         pdfium = _import_pdfium()
         # Probed up front, not per page: a missing Pillow is a deployment
         # fault that would otherwise be reported as N identical page failures.
@@ -1249,15 +1451,19 @@ class ScanTranscriber:
                     settings=self.settings,
                 )
 
-            if decision.action != "full":
-                return self._transcribe_triaged(pdf, total=total, limit=limit, decision=decision)
-            if self.settings.triage_enabled:
-                logger.info(
-                    "scan OCR triage: %s decision=full reason=%s",
-                    self.source_path or "<document>",
-                    decision.reason or "-",
-                )
-            return self._transcribe_full(pdf, total, limit)
+            try:
+                if decision.action != "full":
+                    return self._transcribe_triaged(pdf, total=total, limit=limit, decision=decision)
+                if self.settings.triage_enabled:
+                    logger.info(
+                        "scan OCR triage: %s decision=full reason=%s",
+                        self.source_path or "<document>",
+                        decision.reason or "-",
+                    )
+                return self._transcribe_full(pdf, total, limit)
+            except _PermanentProviderRefusal as exc:
+                self._mark_disabled(exc)
+                return ""
         finally:
             close = getattr(pdf, "close", None)
             if callable(close):
@@ -1294,12 +1500,20 @@ class ScanTranscriber:
     def _classify_preview(self, preview_text: str) -> TriageVerdict:
         """The ONE extra, TEXT-ONLY call stage 1 adds — see the module
         docstring's "Triage" section for why this is a separate call rather
-        than folded into a page's own transcription. ANY failure here
-        (network, auth, an unexpected reply shape) is conservative — never a
-        guessed ``continue=True`` — because the preview transcription this
-        call rides on top of already proved the credential/model work; a
-        narrower failure of just this call is not grounds to burn the whole
-        document's remaining budget on a guess."""
+        than folded into a page's own transcription. A failure this module
+        recognizes as a whole-run provider refusal
+        (:func:`_permanent_refusal_reason`) raises
+        :class:`_PermanentProviderRefusal` — caught by :meth:`transcribe`,
+        same as a page's own — rather than being absorbed here: a refusal
+        this consistent will not clear for the rest of the run either, and
+        treating it as merely "this one call failed" would still spend the
+        provider on every remaining document's preview. Any OTHER failure
+        here (network, an unexpected reply shape) stays conservative —
+        never a guessed ``continue=True`` — because the preview
+        transcription this call rides on top of already proved the
+        credential/model work; a narrower failure of just this call is not
+        grounds to burn the whole document's remaining budget on a guess.
+        """
         client, model = self._ensure_client()
         try:
             response = client.messages.create(
@@ -1317,6 +1531,9 @@ class ScanTranscriber:
                 messages=[{"role": "user", "content": [{"type": "text", "text": _fence_preview(preview_text)}]}],
             )
         except Exception as exc:  # noqa: BLE001 — classified as "stop", never guessed "continue"
+            limit_reason = _permanent_refusal_reason(exc)
+            if limit_reason is not None:
+                raise _PermanentProviderRefusal(limit_reason, str(exc)) from exc
             logger.warning(
                 "scan OCR triage: classification call failed (%s) — stopping conservatively",
                 type(exc).__name__,
@@ -1443,24 +1660,42 @@ def run_usage() -> dict[str, int]:
 
 
 def triage_run_usage() -> dict[str, Any]:
-    """Triage decision counters since the last :func:`reset_run_usage` — the
-    crawl report's ``scan_ocr`` block. ``{}`` when triage never previewed a
-    single document this run (the switch off, or every document went
-    straight through the untriaged ``full`` path) — the same zero-collapse
-    honesty :func:`run_usage`'s caller (``crawler._ocr_run_usage``) already
-    applies to token usage, so an idle block reads as "nothing to report",
-    never as a measured zero.
+    """Triage decision counters, PLUS (once hit) the run's own permanent-
+    refusal state — since the last :func:`reset_run_usage`. This is the
+    crawl report's whole ``scan_ocr`` block, both halves of it: the triage
+    DECISION counters (``previewed``/``continued``/``stopped``/
+    ``pages_transcribed``/``stop_reasons``) below, and — merged in when
+    :func:`_mark_run_disabled` has fired this run —
+    ``disabled_reason``/``provider_error`` naming why scan OCR paused
+    itself. The two are unrelated concepts sharing one report key because
+    ``connectors.sharepoint.crawler`` reads exactly one function for the
+    ``scan_ocr`` block (:func:`transcribe`'s docstring's "Failure model");
+    keeping this the single source avoids a second, easy-to-forget crawler
+    change every time this module gains a new thing worth reporting.
+
+    ``{}`` only when NEITHER half has anything to say (triage never
+    previewed a single document this run — the switch off, or every
+    document went straight through the untriaged ``full`` path — AND no
+    permanent refusal has fired) — the same zero-collapse honesty
+    :func:`run_usage`'s caller (``crawler._ocr_run_usage``) already applies
+    to token usage, so an idle block reads as "nothing to report", never as
+    a measured zero.
     """
     with _USAGE_LOCK:
-        if not _TRIAGE_RUN["previewed"]:
+        if not _TRIAGE_RUN["previewed"] and _RUN_DISABLED is None:
             return {}
-        return {
-            "previewed": _TRIAGE_RUN["previewed"],
-            "continued": _TRIAGE_RUN["continued"],
-            "stopped": _TRIAGE_RUN["stopped"],
-            "pages_transcribed": _TRIAGE_RUN["pages_transcribed"],
-            "stop_reasons": dict(_TRIAGE_RUN["stop_reasons"]),
-        }
+        out: dict[str, Any] = {}
+        if _TRIAGE_RUN["previewed"]:
+            out.update(
+                previewed=_TRIAGE_RUN["previewed"],
+                continued=_TRIAGE_RUN["continued"],
+                stopped=_TRIAGE_RUN["stopped"],
+                pages_transcribed=_TRIAGE_RUN["pages_transcribed"],
+                stop_reasons=dict(_TRIAGE_RUN["stop_reasons"]),
+            )
+        if _RUN_DISABLED is not None:
+            out.update(_RUN_DISABLED)
+        return out
 
 
 def _record_triage_document(*, continued: bool, pages: int, stop_category: str | None) -> None:
@@ -1479,14 +1714,88 @@ def _record_triage_document(*, continued: bool, pages: int, stop_category: str |
             _TRIAGE_RUN["stop_reasons"][key] = _TRIAGE_RUN["stop_reasons"].get(key, 0) + 1
 
 
+def run_disabled() -> Optional[dict[str, str]]:
+    """The active run-level "scan OCR is paused" state
+    (``{"disabled_reason", "provider_error"}``), or ``None`` — set once by
+    :func:`_mark_run_disabled`, cleared by :func:`reset_run_usage`. Checked
+    at the top of :meth:`ScanTranscriber.transcribe` so a document reached
+    AFTER the pause never renders a page or contacts the provider at all —
+    it returns ``""`` exactly as it would with the feature off.
+    """
+    with _USAGE_LOCK:
+        return dict(_RUN_DISABLED) if _RUN_DISABLED is not None else None
+
+
+def _mark_run_disabled(*, reason: str, message: str, provider: str, model: str, region: Optional[str]) -> None:
+    """Pause scan OCR for the REST of this run — the FIRST permanent
+    provider refusal wins; a later one (from a concurrent page, or the next
+    document) is a no-op, since the condition is already recorded and every
+    document is already returning ``""``.
+
+    Also persists the SAME fleet-level ``provider_limit`` condition
+    ``connectors.sharepoint.facts_extraction.record_provider_limit_condition``
+    writes for the facts pass — reused, not reimplemented, so `/admin/
+    extraction` and `agnes admin sharepoint runs` name a scan-OCR refusal
+    exactly the way they already name a facts one. ``reason`` is recorded
+    there with an ``ocr_`` prefix (``"ocr_workspace_limit"``,
+    ``"ocr_http_400"``, ...) — the ONLY thing distinguishing an OCR-authored
+    row from a facts-authored one in that shared, kindless table; the
+    prefix is what the CLI/web rendering keys off to say "OCR" instead of
+    "Facts" (see ``docs/sharepoint-extraction.md`` → *Provider limits*). The
+    run report's own ``disabled_reason`` (:func:`triage_run_usage`) keeps
+    the reason UNPREFIXED — that block is already scoped to ``scan_ocr``,
+    so the prefix would only be noise there.
+    """
+    global _RUN_DISABLED
+    with _USAGE_LOCK:
+        if _RUN_DISABLED is not None:
+            return
+        _RUN_DISABLED = {"disabled_reason": reason, "provider_error": message}
+    logger.warning(
+        "scan OCR: provider refused (%s) — pausing scan OCR for the rest of this run: %s",
+        reason,
+        message,
+    )
+    try:
+        from connectors.sharepoint.facts_extraction import record_provider_limit_condition
+
+        record_provider_limit_condition(
+            reason=f"ocr_{reason}",
+            provider=provider,
+            model=model,
+            region=region,
+            message=message,
+            retry_after_s=None,
+        )
+    except Exception:  # noqa: BLE001 — observability, never load-bearing
+        logger.debug("scan OCR: could not persist the provider_limit condition — continuing", exc_info=True)
+
+
+def _log_provider_once(*, provider: str, model: str, region: Optional[str]) -> None:
+    """One line naming the provider/model/region THIS run's scan OCR uses —
+    logged the first time a client is built (:meth:`ScanTranscriber.
+    _ensure_client`), never again this run, so a thousand-document crawl
+    does not repeat it once per document."""
+    global _PROVIDER_LOGGED
+    with _USAGE_LOCK:
+        if _PROVIDER_LOGGED:
+            return
+        _PROVIDER_LOGGED = True
+    scope = f" region={region}" if region else ""
+    logger.info("scan OCR: using provider=%s model=%s%s for this run", provider, model, scope)
+
+
 def reset_run_usage() -> None:
-    """Zero the run totals (token/call usage AND triage decision counters).
-    A crawl calls this once, before its first file."""
-    global _RUN_USAGE, _LAST_USAGE, _TRIAGE_RUN
+    """Zero the run totals (token/call usage, triage decision counters, AND
+    the permanent-refusal pause state). A crawl calls this once, before its
+    first file."""
+    global _RUN_USAGE, _LAST_USAGE, _TRIAGE_RUN, _RUN_DISABLED, _PROVIDER_LOGGED
     with _USAGE_LOCK:
         _RUN_USAGE = _empty_usage()
         _LAST_USAGE = dict(_empty_usage())
         _TRIAGE_RUN = _empty_triage_usage()
+        _RUN_DISABLED = None
+        _PROVIDER_LOGGED = False
 
 
 def _publish(usage: dict[str, int | str]) -> None:

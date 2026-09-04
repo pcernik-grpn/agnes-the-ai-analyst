@@ -27,6 +27,7 @@ _SIGNATURES = (
     "function fmtNextRun(iso) {",
     "function fmtRate(rate) {",
     "function fmtCost(usd) {",
+    "function fmtErrorCell(run) {",
     "function tokenTotals(usage) {",
     "function factsCell(facts) {",
     "function phaseCell(run) {",
@@ -39,6 +40,7 @@ _SIGNATURES = (
     "function actionsCell(row) {",
     "function renderRow(row) {",
     "function renderJobsStrip(jobs) {",
+    "function conditionLabel(c) {",
     "function renderProviderLimitBanner(conditions) {",
 )
 
@@ -182,6 +184,34 @@ def test_no_run_at_all_renders_no_age_filter_note():
     row["run"] = None
     html = _run_row_js(row)
     assert "filtered by age" not in html
+
+
+# ---------------------------------------------------------------------------
+# ERROR cell — a scan-OCR pause (TCRD-296 gap #68) reads as "OCR: paused —
+# provider refused (…)" when the run itself carries no error of its own.
+# ---------------------------------------------------------------------------
+
+
+def test_error_cell_is_blank_with_neither_a_run_error_nor_a_scan_ocr_pause():
+    html = _run_row_js(_ROW)
+    assert "ext-error-cell" not in html
+
+
+def test_error_cell_shows_a_scan_ocr_pause_when_the_run_has_no_error():
+    row = json.loads(json.dumps(_ROW))
+    row["run"]["scan_ocr"] = {"disabled_reason": "http_400"}
+    html = _run_row_js(row)
+    assert "OCR: paused" in html
+    assert "http_400" in html
+
+
+def test_error_cell_prefers_a_real_run_error_over_a_scan_ocr_pause():
+    row = json.loads(json.dumps(_ROW))
+    row["run"]["error"] = "lease expired after max attempts"
+    row["run"]["scan_ocr"] = {"disabled_reason": "http_400"}
+    html = _run_row_js(row)
+    assert "lease expired" in html
+    assert "OCR: paused" not in html
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +527,27 @@ console.log(JSON.stringify({ html: _el.innerHTML }));
     assert "claude-sonnet-4-6" in out["html"]
     assert "us-east5" in out["html"]
     assert "retrying in 2m" in out["html"]
+
+
+def test_provider_limit_banner_names_ocr_for_an_ocr_prefixed_reason():
+    """TCRD-296 gap #68 — the `ocr_` prefix on `reason` is the ONLY thing
+    distinguishing an OCR-authored condition from a facts-authored one in
+    that shared, kindless table."""
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "vertex", reason: "ocr_workspace_limit", message: "workspace usage limit hit", retry_after_s: null },
+]);
+console.log(JSON.stringify({ html: _el.innerHTML }));
+"""
+    )
+    assert "OCR extraction paused" in out["html"]
+    assert "Facts extraction paused" not in out["html"]
 
 
 def test_provider_limit_banner_renders_one_line_per_condition():

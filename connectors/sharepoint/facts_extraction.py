@@ -1235,15 +1235,15 @@ def resolve_effective_provider(connection: Optional[Dict[str, Any]] = None) -> T
     (the default) — meaning "follow this instance's ai.provider", read the
     same way every other server-side LLM call-site reads it
     (``connectors.llm.factory.vertex_config_or_none``, the SAME resolution
-    ``ai.provider: vertex`` gets everywhere else). This is deliberately a
-    DIFFERENT resolution than ``src.anonymization_ner.build_client``'s own
-    ladder, which lets a static ``ANTHROPIC_API_KEY``/``LLM_API_KEY`` win
-    over Vertex even when ``ai.provider: vertex`` is configured — the right
-    default for the anonymization detector, which has no per-connection
-    override of its own, and the wrong one here: an instance that migrated
-    its chat traffic to Vertex but left a now-exhausted Anthropic key in the
-    environment must not have facts extraction silently keep spending
-    against it.
+    ``ai.provider: vertex`` gets everywhere else). ``src.anonymization_ner.
+    build_client``'s own ladder (:func:`src.anonymization_ner.
+    resolve_llm_provider`) resolves the SAME way for its OWN callers —
+    ``extraction.facts.provider``/``ai.provider`` before a static
+    ``ANTHROPIC_API_KEY``/``LLM_API_KEY`` — with one addition this function
+    has no need for: a caller-named per-stage knob
+    (``extraction.anonymization.provider``/``extraction.scan_ocr.provider``)
+    that wins ahead of even ``extraction.facts.provider``, for a stage that
+    has no per-connection override of its own the way this one does.
 
     ``source`` extends :func:`resolve_provider`'s own with a ``:inherit``
     suffix when the setting resolved through ``ai.provider`` rather than
@@ -2141,16 +2141,18 @@ def _build_facts_client(
 ) -> Tuple[Any, str]:
     """The client for one pass's resolved :func:`resolve_effective_provider`.
 
-    ``"anthropic"`` delegates to ``src.anonymization_ner.build_client`` — its
-    own static-key-then-Vertex-ADC ladder, unchanged, and shared with the
-    anonymization detector and scan OCR. ``"vertex"`` builds an
+    ``"anthropic"`` delegates to ``src.anonymization_ner.build_client``
+    (called with no ``own_setting_path`` — this pass has already resolved
+    its OWN provider, so it only needs that shared function's
+    ``extraction.facts.provider``/``ai.provider``-then-static-key tail, not
+    a second per-stage override level). ``"vertex"`` builds an
     ``AnthropicVertex`` client DIRECTLY instead, deliberately bypassing that
-    ladder: the caller already resolved WHICH provider this pass must use
-    (an explicit ``extraction.facts.provider: vertex``, or ``inherit``
-    reading ``ai.provider: vertex``), and a static ``ANTHROPIC_API_KEY`` /
-    ``LLM_API_KEY`` sitting in the environment for an unrelated reason — the
-    root cause of the incident this knob exists to fix — must never
-    silently override that choice.
+    ladder entirely: the caller already resolved WHICH provider this pass
+    must use (an explicit ``extraction.facts.provider: vertex``, or
+    ``inherit`` reading ``ai.provider: vertex``), and a static
+    ``ANTHROPIC_API_KEY`` / ``LLM_API_KEY`` sitting in the environment for an
+    unrelated reason — the root cause of the incident this knob exists to
+    fix — must never silently override that choice.
 
     ``vertex_region`` is the caller's already-resolved
     :func:`resolve_vertex_region` answer — a truthy value wins over the

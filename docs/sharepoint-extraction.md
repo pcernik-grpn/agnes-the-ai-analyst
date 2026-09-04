@@ -549,7 +549,46 @@ terminal. Each connection's own `GET …/extraction/status` gains
 `provider_limit` (the active condition, if any, matching THAT connection's
 resolved facts provider) — the source card's facts line renders it as
 "paused: provider limit" in place of the ordinary "N pending · continuing/
-not running" wording.
+not running" wording. A condition written by scan OCR (below) carries an
+`ocr_`-prefixed `reason` (`ocr_workspace_limit`, `ocr_http_400`, …) — the
+only thing distinguishing it from a facts-authored row in that shared,
+kindless table — and every rendering surface reads that prefix to say "OCR
+extraction paused" instead of "Facts extraction paused".
+
+**Which provider each stage uses.** Scan OCR and the built-in LLM name
+detector (`extraction.anonymization.detector: "llm"`) resolve their
+provider through the SAME ladder facts extraction does, not independently:
+an explicit per-stage setting (`extraction.scan_ocr.provider` /
+`extraction.anonymization.provider`, both `inherit` by default) wins first;
+otherwise `extraction.facts.provider`; otherwise this instance's own
+`ai.provider`; and only once none of those resolve to Vertex does a static
+`ANTHROPIC_API_KEY`/`LLM_API_KEY` apply. This closes TCRD-296 gap #68: an
+instance that had migrated chat and facts extraction to Vertex but still
+had a stale `ANTHROPIC_API_KEY` in the environment (an exhausted workspace)
+found scan OCR alone still building an Anthropic client against it — every
+scanned page failing `BadRequestError` for the whole crawl. One line is
+logged per run naming the resolved provider/model/region the first time
+scan OCR builds a client.
+
+**Scan OCR joins the provider-limit mechanism too**, with one difference
+from the facts pass: scan OCR has no per-document failure mode a 400/401/403
+could legitimately mean (a page image is never "too long" the way a prompt
+can be), so ANY 400/401/403 — not only one `classify_provider_limit_error`
+recognizes by message — counts as permanent, immediately, with no retry.
+After the FIRST such refusal in a run, scan OCR pauses itself: no further
+page render, no further provider call, for the rest of the run. Documents
+reached after the pause — and the very document that discovered it — return
+empty exactly as they would with `extraction.scan_ocr.enabled: false`, so
+they land in the ordinary `convert_empty` backlog (never `convert_failed`)
+and `POST …/extraction/retry-empty` replays them once an operator fixes the
+provider. The run report's `scan_ocr` block gains `disabled_reason`/
+`provider_error` alongside its triage counters, and the SAME fleet-level
+condition mechanism above is written (`ocr_`-prefixed reason) so the pause
+is visible fleet-wide, not just in that one crawl's own report. A 429
+`classify_provider_limit_error` recognizes as `quota_exceeded` still gets
+its full retry ladder first — same as the facts pass — since a 429 is
+retryable-SHAPED and might be a transient spike rather than a zero-
+allocation bucket.
 
 **Region×model matrix validation** (live finding (b) — Vertex quotas are
 per REGION and per MODEL: a project running Sonnet outside `global` answers
