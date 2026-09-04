@@ -908,6 +908,12 @@ READ_POSTURE: dict[str, str] = {
     # another user's data.
     "GET /api/admin/sharepoint/extraction/runs": "exempt:noise",
     # -- app.api.admin_sharepoint --
+    # TCRD-296 gap #79: who SharePoint itself says can see a scope root —
+    # captured periodically by the sharepoint-acl-sync job, independent of
+    # access_mode. Cataloged, not exempt: discloses principal display names
+    # (people, groups) with access, the same "another entity's identity
+    # data" class as an admin cross-user read.
+    "GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot": "sharepoint_connection.acl_snapshot_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
     # The source card's "Facts → graph" cell, fetched lazily per connection

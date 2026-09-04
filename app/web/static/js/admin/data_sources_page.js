@@ -865,6 +865,12 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
   </div>
   ${scopesHtml}
+  <div class="ds-src__fact" id="ds-sp-acl-${row.id}">
+    <span class="ds-src__fact-k" title="Who can see this content in SharePoint itself — informational metadata, independent of Agnes access (the Sharing row above). Only a scope confirmed with access mode 'mirrored' actually derives Agnes access from this; see docs/sharepoint-extraction.md.">SharePoint permissions</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">loading…</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpAclSnapshotDrawer('${row.id}')">View</button></span>
+  </div>
+  <div class="ds-sp-scopes-drawer" id="ds-sp-acl-drawer-${row.id}" hidden></div>
   ${anonRowHtml}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Last run</span>
@@ -1052,6 +1058,53 @@ async function toggleSpScopesDrawer(connId) {
       : `<div class="ds-empty">No confirmed scopes yet.</div>`;
   } catch (e) {
     el.innerHTML = `<div class="ds-empty">Couldn't load scopes — ${_esc(e && e.message)}.</div>`;
+  }
+}
+
+/* SharePoint permissions captured as METADATA (TCRD-296 gap #79) — who
+   SharePoint itself says can see each scope, fetched-on-expand exactly like
+   `toggleSpScopesDrawer` above (its own per-scope principal list is never
+   needed until an admin actually asks for it). PG-only: a DuckDB-backed
+   instance's `GET .../acl-snapshot` answers a typed 501, rendered as an
+   honest one-liner rather than the generic "Couldn't load" error. */
+function _spAclSnapshotScopeRowHtml(scope) {
+  const principals = scope.principals || [];
+  const names = principals.length
+    ? principals
+        .map(
+          (p) =>
+            `${_esc(p.display_name || p.principal_kind || "unknown")} <span style="color:var(--ds-text-muted)">(${_esc(p.principal_kind || "unknown")})</span>`
+        )
+        .join(", ")
+    : `<span style="color:var(--ds-text-muted)">no principals</span>`;
+  return `<li><b>${_esc(scope.display_path || scope.source_scope_id || "")}</b><br>${names}</li>`;
+}
+
+async function toggleSpAclSnapshotDrawer(connId) {
+  const el = document.getElementById(`ds-sp-acl-drawer-${connId}`);
+  if (!el) return;
+  if (!el.hidden) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `<div class="ds-empty">Loading…</div>`;
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/acl-snapshot?scopes=true`, {
+      credentials: "include",
+    });
+    if (r.status === 501) {
+      el.innerHTML = `<div class="ds-empty">SharePoint permissions metadata needs a Postgres backend.</div>`;
+      return;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    const scopes = body.scopes || [];
+    el.innerHTML = scopes.length
+      ? `<ul class="ds-sp-scopes">${scopes.map(_spAclSnapshotScopeRowHtml).join("")}</ul>`
+      : `<div class="ds-empty">No permissions captured yet — the next sharepoint-acl-sync run (every few hours) will capture them.</div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="ds-empty">Couldn't load permissions — ${_esc(e && e.message)}.</div>`;
   }
 }
 
@@ -1286,6 +1339,52 @@ function _fetchSharepointGraphCounts() {
   }
 }
 
+// SharePoint permissions captured as METADATA (TCRD-296 gap #79) — the
+// connection-wide aggregate, fetched per SharePoint connection AFTER the
+// cards are on screen, same lazy shape as `_fetchSharepointGraphCounts`
+// above (this reads the PG-only `sharepoint_connection_state` table, so it
+// is never part of first paint). The per-scope detail is fetched only when
+// the "View" disclosure is opened (`toggleSpAclSnapshotDrawer`).
+function _fetchSharepointAclSnapshot() {
+  for (const row of _connections) {
+    if (row.source_type !== "sharepoint") continue;
+    const cell = document.getElementById(`ds-sp-acl-${row.id}`);
+    if (!cell) continue;
+    const v = cell.querySelector(".ds-src__fact-v");
+    fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(row.id)}/acl-snapshot`, {
+      credentials: "include",
+    })
+      .then((r) => {
+        if (r.status === 501) return { _unavailable: true };
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((body) => {
+        if (!v) return;
+        if (body._unavailable) {
+          v.textContent = "needs a Postgres backend";
+          return;
+        }
+        const agg = body.aggregate || {};
+        if (!agg.scopes_captured) {
+          v.textContent = "not captured yet";
+          return;
+        }
+        const ago = agg.captured_at
+          ? _relAge(Math.round((Date.now() - new Date(agg.captured_at).getTime()) / 60000))
+          : "unknown";
+        v.textContent =
+          `${agg.entra_groups || 0} Entra group${agg.entra_groups === 1 ? "" : "s"} · ` +
+          `${agg.site_groups || 0} site group${agg.site_groups === 1 ? "" : "s"} · ` +
+          `${agg.folders_with_org_links || 0} folder${agg.folders_with_org_links === 1 ? "" : "s"} with org links · ` +
+          `captured ${ago}`;
+      })
+      .catch(() => {
+        if (v) v.textContent = "unavailable";
+      });
+  }
+}
+
 function renderConnList() {
   const list = document.getElementById("ds-conn-list");
   setConnCount(_connections.length);
@@ -1305,6 +1404,7 @@ function renderConnList() {
   // that extract a curated function subset (e.g. `TestRefreshSourcePipelines
   // Behavior`) rather than the whole script.
   if (typeof _fetchSharepointGraphCounts === "function") _fetchSharepointGraphCounts();
+  if (typeof _fetchSharepointAclSnapshot === "function") _fetchSharepointAclSnapshot();
 }
 
 /* ── Keeping the strip true after a mutation ───────────────────────────────

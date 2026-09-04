@@ -1444,6 +1444,7 @@ whole map, so mapping a second site group never clobbers the first).
 - /api/admin/sharepoint/subscriptions/run-due
 - /api/admin/sharepoint/anonymization/preview
 - /api/admin/sharepoint/connections/{connection_id}/changes
+- /api/admin/sharepoint/connections/{connection_id}/acl-snapshot
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
 - /api/admin/sharepoint/connections/{connection_id}/facts-extract
@@ -1798,6 +1799,20 @@ are left completely untouched (an admin who wants to fully remove one can
 still use the generic `DELETE /api/admin/source-connections/{id}`).
 PG-only (A3 ratchet) — `501 requires_postgres_backend` on a DuckDB-backed
 instance.
+
+`GET …/acl-snapshot` (TCRD-296 gap #79) reads the SharePoint permissions
+snapshot the `sharepoint-acl-sync` job captures for EVERY scope, regardless
+of `access_mode` — who SharePoint itself says can see each scope, purely
+informational (only a `mirrored` scope also derives real Agnes access from
+the same read). Always returns `{aggregate: {entra_groups, site_groups,
+folders_with_org_links, folders_with_individual_users, scopes_captured,
+captured_at}}`; `?scopes=true` additionally returns `scopes: [{source_
+scope_id, display_path, captured_at, principals: [{principal_kind,
+principal_id, display_name, roles, via}], summary}]`. CLI: `agnes admin
+sharepoint acl-snapshot <id> [--scopes] [--json]`. PG-only (A3 ratchet —
+`sharepoint_connection_state`) — `501 requires_postgres_backend` on a
+DuckDB-backed instance; see [`sharepoint-extraction.md`](sharepoint-
+extraction.md) → "SharePoint permissions as metadata vs. mirrored access".
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues

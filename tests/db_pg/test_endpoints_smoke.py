@@ -3670,6 +3670,13 @@ KNOWN_UNTESTED = {
     # realistic upload/update/rename/delete fixture, pagination, and the
     # DuckDB typed-501 are all in tests/db_pg/test_sharepoint_changes_pg.py.
     "GET /api/admin/sharepoint/connections/{connection_id}/changes",
+    # ACL-permissions snapshot (TCRD-296 gap #79) — reads the SAME PG-only
+    # `sharepoint_connection_state` table as the crawl/facts state store.
+    # Storage, run-wiring, the aggregate/`?scopes=true` shapes, auth matrix,
+    # 404-before-work, and the audit row are all in
+    # tests/db_pg/test_sharepoint_acl_snapshot_pg.py; the DuckDB typed-501
+    # is in tests/test_admin_sharepoint.py::TestAclSnapshotFailsCleanOnDuckDB.
+    "GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot",
     # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
     # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
     # EXISTING jobs table, no new schema surface" reasoning as the
