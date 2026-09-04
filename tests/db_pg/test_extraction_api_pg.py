@@ -816,6 +816,92 @@ def test_fleet_total_de_duplicates_a_run_shared_by_two_connections_own_collectio
     assert body["totals"]["cost_note"]
 
 
+def test_fleet_response_never_serializes_the_facts_ingest_runs_id_list(tmp_path, monkeypatch, pg_engine):
+    """Payload-size regression: the fleet response must carry only the
+    AGGREGATE facts-ingest figures per connection, never the underlying
+    per-run id list `llm_usage_rollup_by_corpus_ids` returns internally to
+    let the server de-duplicate the page total. `facts_ingest_runs` is
+    append-only and only grows, a single connection's own collection can
+    match a large share of it, and the fleet page polls every 5s —
+    serializing that list on every poll would ship ids the browser never
+    reads."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-many-runs")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_many"}]}
+    )
+    for _ in range(25):
+        facts_ingest_runs_repo().create(
+            corpus_ids=["col_many"],
+            caller="scheduler@system.local",
+            documents_seen=1,
+            claims_written=0,
+            claims_rejected=[],
+            deferred=[],
+            subjects_created=0,
+            subjects_deleted=0,
+            review_items=[],
+            llm_usage={"input_tokens": 100, "output_tokens": 10, "models": ["claude-haiku-4-5"]},
+        )
+
+    resp = client.get(f"{FLEET_URL}?all=1", headers=_auth(token))
+    body = resp.json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+
+    assert row["facts"]["facts_ingest_usage"]["runs_with_usage"] == 25
+    assert "runs" not in row["facts"]["facts_ingest_usage"]
+    # Belt and braces: no `ir_`-prefixed facts_ingest_runs id anywhere in
+    # the raw response body — proves the list is gone, not just renamed
+    # or nested one level deeper.
+    assert "ir_" not in resp.text
+
+
+def test_fleet_row_cost_shared_is_not_marked_when_the_shared_run_is_unpriced(tmp_path, monkeypatch, pg_engine):
+    """The shared badge is gated on the row actually showing a priced
+    dollar figure — a row whose only facts-ledger run is unpriceable (no
+    single named model) renders an em-dash for cost, and `cost_shared`
+    must stay `False` even though the SAME run is attributed to another
+    connection too, or the badge would explain a number the row does not
+    display."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-unpriced-shared-a")
+    conn_b = _connection(client, token, name="sp-unpriced-shared-b")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_a, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_unpriced_shared"}]}
+    )
+    source_connections_repo().update(
+        conn_b, config={"scopes": [{"source_scope_id": "s2", "collection_id": "col_unpriced_shared"}]}
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_unpriced_shared"],
+        caller="scheduler@system.local",
+        documents_seen=5,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 100},  # no model named — unpriceable
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    by_id = {r["connection_id"]: r for r in body["connections"]}
+    row_a, row_b = by_id[conn_a], by_id[conn_b]
+
+    for row in (row_a, row_b):
+        assert row["cost_status"] == "unpriced"
+        assert row["estimated_cost_usd"] is None
+        assert row["cost_shared"] is False
+        assert row["cost_shared_with"] == []
+
+
 def test_fleet_total_does_not_deduplicate_two_genuinely_different_runs(tmp_path, monkeypatch, pg_engine):
     """A sibling proof for the de-duplication test above: two connections
     with their OWN, non-overlapping collections and their OWN separate

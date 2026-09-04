@@ -702,8 +702,38 @@ _NO_FACTS_INGEST_USAGE: Dict[str, Any] = {
     # de-duplication key `fleet_extraction_runs` uses to keep a shared
     # collection's spend out of the page TOTAL while still showing it in
     # full on every connection that can see it (never mutated in place).
+    # SERVER-SIDE ONLY: :func:`_public_facts_ingest_usage` strips this
+    # before a connection-level usage dict is ever assigned onto a
+    # response row — see that function's own docstring for why.
     "runs": [],
 }
+
+
+#: Keys of the per-connection facts-ingest-ledger shape that are safe to
+#: ship to the browser — everything in :data:`_NO_FACTS_INGEST_USAGE`
+#: EXCEPT ``runs``. Payload-size fix: ``facts_ingest_runs`` is append-only
+#: and only grows, a single connection's own collection can match a large
+#: share of it, and the fleet page polls every 5s — serializing a run-id
+#: list of that size on every poll ships identifiers the browser never
+#: reads, for no benefit. The list still exists in the repository's own
+#: return value and in the local ``facts_ingest_usage``
+#: :func:`fleet_extraction_runs` computes with (needed there to
+#: de-duplicate the page total and mark a row ``cost_shared`` — see that
+#: function's own docstring); it is simply never copied onto a row's own
+#: ``facts.facts_ingest_usage`` on the way out.
+_PUBLIC_FACTS_INGEST_USAGE_FIELDS = tuple(k for k in _NO_FACTS_INGEST_USAGE if k != "runs")
+
+
+def _public_facts_ingest_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The CLIENT-facing projection of a per-connection facts-ingest-ledger
+    entry — every aggregate field, never the internal ``runs`` id/cost
+    list (see :data:`_PUBLIC_FACTS_INGEST_USAGE_FIELDS`'s own docstring for
+    why). ``None`` renders as the zeroed :data:`_NO_FACTS_INGEST_USAGE`
+    shape, same fallback :func:`_fleet_facts` already used before this
+    split existed.
+    """
+    source = usage if usage is not None else _NO_FACTS_INGEST_USAGE
+    return {field: source.get(field) for field in _PUBLIC_FACTS_INGEST_USAGE_FIELDS}
 
 
 #: The empty facts shape — a connection whose latest run never reached the
@@ -758,8 +788,10 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     # spend came from never touches `extraction_runs` at all. Always
     # overwritten by `_fleet_facts`'s own final assignment (never left at
     # this default once a real lookup ran), listed here purely so this
-    # dict documents the complete shape of one row's `facts` object.
-    "facts_ingest_usage": dict(_NO_FACTS_INGEST_USAGE),
+    # dict documents the complete shape of one row's `facts` object —
+    # the CLIENT-facing shape (see `_public_facts_ingest_usage`), never
+    # the internal `runs` id/cost list.
+    "facts_ingest_usage": _public_facts_ingest_usage(None),
 }
 
 
@@ -862,11 +894,15 @@ def _fleet_facts(
     ``provider_limit`` above. ``None`` (the default) renders as
     :data:`_NO_FACTS_INGEST_USAGE`; :func:`fleet_extraction_runs` always
     passes a real (possibly zeroed) entry for every connection it renders.
+    The ``runs`` id/cost list on that entry is intentionally NOT part of
+    this function's own ``out["facts_ingest_usage"]`` — see
+    :func:`_public_facts_ingest_usage`'s own docstring (payload-size fix):
+    the caller's LOCAL ``facts_ingest_usage`` argument still carries it for
+    its own de-duplication/``cost_shared`` computation, only the copy
+    riding on this row's response is stripped.
     """
     out = dict(_EMPTY_FLEET_FACTS)
-    out["facts_ingest_usage"] = (
-        dict(facts_ingest_usage) if facts_ingest_usage is not None else dict(_NO_FACTS_INGEST_USAGE)
-    )
+    out["facts_ingest_usage"] = _public_facts_ingest_usage(facts_ingest_usage)
     if run:
         progress = run.get("progress") or {}
         report = run.get("report") or {}
@@ -1114,7 +1150,10 @@ def fleet_extraction_runs(
     ``cost_shared_with`` name when that is happening for a row, rather than
     leaving it implicit (see :func:`_fleet_row_cost`'s docstring for why a
     proportional split was rejected in favor of full attribution plus this
-    marker).
+    marker). ``cost_shared`` is gated on the row's own ``cost_status`` being
+    ``"priced"`` — a ``"no_usage"``/``"unpriced"`` row already renders an
+    em-dash, and a "shared" badge next to no dollar figure at all would
+    explain a number the row does not show.
 
     ``totals.estimated_cost_usd`` is NOT the sum of the rows' own
     ``estimated_cost_usd`` — that would count a shared collection's run
@@ -1289,10 +1328,18 @@ def fleet_extraction_runs(
         # SEE when that figure is not this connection's alone: any run this
         # connection's own ledger slice carries that ALSO belongs to
         # another connection (`shared_facts_run_ids`, built once above).
+        # `rendered_facts_run_ids` still accumulates regardless of
+        # `cost_status` — the TOTAL's own de-duplication scope needs every
+        # rendered row's run ids, priced or not (an unpriced run
+        # contributes 0 to the sum either way). The `cost_shared` MARKER
+        # is gated on this row actually showing a priced dollar figure: a
+        # "no_usage"/"unpriced" row already renders an em-dash, and a
+        # "shared" badge next to a number that is not there would explain
+        # something the row does not display.
         row_run_ids = {str(r.get("id")) for r in facts_ingest_usage.get("runs") or []}
         rendered_facts_run_ids |= row_run_ids
         row_shared_run_ids = row_run_ids & shared_facts_run_ids
-        cost_shared = bool(row_shared_run_ids)
+        cost_shared = row_cost["cost_status"] == "priced" and bool(row_shared_run_ids)
         cost_shared_with: List[str] = []
         if cost_shared:
             other_connection_ids: set = set()

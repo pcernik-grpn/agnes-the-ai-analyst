@@ -1273,11 +1273,27 @@ class TestFleetFacts:
         assert out_other["facts_pending_documents"] == 0
         assert out_other["facts_pass_running"] is False
 
-    def test_facts_ingest_usage_defaults_to_the_no_usage_shape_when_omitted(self, seeded_app):
-        from app.api.admin_extraction import _NO_FACTS_INGEST_USAGE, _fleet_facts
+    def test_facts_ingest_usage_defaults_to_the_public_no_usage_shape_when_omitted(self, seeded_app):
+        """Pins the CLIENT-facing shape — every aggregate field, but no
+        `runs` key at all, not even an empty list (payload-size fix:
+        `runs` is server-side-only, see `_public_facts_ingest_usage`)."""
+        from app.api.admin_extraction import _fleet_facts
 
         out = _fleet_facts(None, "conn-none")
-        assert out["facts_ingest_usage"] == _NO_FACTS_INGEST_USAGE
+        usage = out["facts_ingest_usage"]
+        assert "runs" not in usage
+        assert usage == {
+            "runs_with_usage": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 0,
+            "wall_seconds": 0.0,
+            "models": [],
+            "priced_runs": 0,
+            "estimated_cost_usd": None,
+        }
 
     def test_facts_ingest_usage_passes_through_the_callers_batched_slice(self, seeded_app):
         """Passed in, never resolved inside `_fleet_facts` itself — the
@@ -1296,9 +1312,47 @@ class TestFleetFacts:
             "models": ["claude-haiku-4-5"],
             "priced_runs": 3,
             "estimated_cost_usd": 4.5,
+            "runs": [{"id": "ir_a", "estimated_cost_usd": 1.5}],
         }
         out = _fleet_facts(None, "conn-ledger", facts_ingest_usage=ledger_entry)
-        assert out["facts_ingest_usage"] == ledger_entry
+        assert out["facts_ingest_usage"] == {
+            "runs_with_usage": 3,
+            "input_tokens": 5000,
+            "output_tokens": 900,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 40,
+            "wall_seconds": 12.0,
+            "models": ["claude-haiku-4-5"],
+            "priced_runs": 3,
+            "estimated_cost_usd": 4.5,
+        }
+
+    def test_facts_ingest_usage_never_serializes_the_internal_runs_list(self, seeded_app):
+        """Payload-size regression pin: a caller's ledger slice carrying a
+        (potentially large — thousands of entries on a live deployment)
+        `runs` id/cost list must NEVER reach the row's own
+        `facts_ingest_usage`, only the aggregate fields it needs to
+        de-duplicate the fleet total server-side."""
+        from app.api.admin_extraction import _fleet_facts
+
+        big_runs = [{"id": f"ir_{i}", "estimated_cost_usd": 0.01} for i in range(500)]
+        ledger_entry = {
+            "runs_with_usage": 500,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 1,
+            "wall_seconds": 1.0,
+            "models": ["claude-haiku-4-5"],
+            "priced_runs": 500,
+            "estimated_cost_usd": 5.0,
+            "runs": big_runs,
+        }
+        out = _fleet_facts(None, "conn-big-ledger", facts_ingest_usage=ledger_entry)
+        assert "runs" not in out["facts_ingest_usage"]
+        assert "ir_0" not in str(out["facts_ingest_usage"])
 
 
 FLEET_URL = "/api/admin/sharepoint/extraction/runs"
