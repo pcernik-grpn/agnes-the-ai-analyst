@@ -100,3 +100,92 @@ def test_requires_admin(seeded_app):
     client = seeded_app["client"]
     r = client.get("/api/admin/groups/reach", params={"ids": "everyone"}, headers=_auth(seeded_app["analyst_token"]))
     assert r.status_code == 403
+
+
+class TestTheHeadcountIsPeople:
+    """Issue #2256. The figure is printed as "N groups · M people", and it was
+    computed from `count_all()` — every row in `users`, service accounts and
+    the identities Agnes seeds for itself included. An everyone-scoped grant
+    reaches neither (`src.service_accounts.is_person`), so the number beside
+    Apply counted a CI token as a colleague and the clamp stopped being an
+    invariant the moment a group held one.
+
+    Driven through the handler with stubbed repos rather than through a
+    seeded instance, because a `kind='service'` account is Postgres-only
+    (#1534, Alembic 0096) and the DuckDB row shape — no `kind` column at all
+    — is half of what needs asserting.
+    """
+
+    @staticmethod
+    def _call(monkeypatch, members, people_total, ids):
+        import asyncio
+
+        from app.api import access as access_mod
+
+        class _Members:
+            def list_members_for_group(self, gid):
+                return members if gid == "grp-1" else []
+
+        class _Users:
+            def count_people(self):
+                return people_total
+
+            def count_all(self):  # pragma: no cover - must not be consulted
+                raise AssertionError("reach must count people, not every row in `users`")
+
+        monkeypatch.setattr(access_mod, "user_group_members_repo", lambda: _Members())
+        monkeypatch.setattr(access_mod, "users_repo", lambda: _Users())
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(access_mod.groups_reach(ids=ids, user={"id": "admin1", "email": "admin@x"}))
+        finally:
+            loop.close()
+
+    def test_a_service_account_in_a_group_is_not_a_person(self, monkeypatch):
+        """A group MAY hold one — that is the only way it gets any authority
+        (#1534) — but it is not a colleague the share reaches."""
+        members = [
+            {"id": "u-human", "email": "ada@example.com", "kind": "human"},
+            {"id": "u-svc", "email": "ci@example.com", "kind": "service"},
+        ]
+        got = self._call(monkeypatch, members, people_total=1, ids="grp-1")
+        assert got == {"count": 1, "account_total": 1}
+
+    def test_a_seeded_system_identity_is_not_a_person_either(self, monkeypatch):
+        members = [
+            {"id": "u-human", "email": "ada@example.com", "kind": "human"},
+            {"id": "u-curator", "email": "memory-curator@system.local", "kind": "system"},
+        ]
+        got = self._call(monkeypatch, members, people_total=1, ids="grp-1")
+        assert got == {"count": 1, "account_total": 1}
+
+    def test_a_system_identity_is_excluded_with_no_kind_column_at_all(self, monkeypatch):
+        """The DuckDB row shape: `kind` arrived in PG-only Alembic 0096, so
+        `list_members_for_group` cannot select it there. `is_person` falls
+        back to the address, which is why the exclusion still holds on the
+        frozen backend — and a service account, the one case the fallback
+        cannot see, cannot exist there to begin with."""
+        members = [
+            {"id": "u-human", "email": "ada@example.com"},
+            {"id": "u-curator", "email": "memory-curator@system.local"},
+            {"id": "u-sched", "email": "scheduler@system.local"},
+        ]
+        got = self._call(monkeypatch, members, people_total=1, ids="grp-1")
+        assert got == {"count": 1, "account_total": 1}
+
+    def test_everyone_short_circuits_to_the_people_total(self, monkeypatch):
+        """No union for the scope — and the total it returns is the people
+        count, so the audience the page calls "everyone" and the number
+        beside it describe the same population."""
+        got = self._call(monkeypatch, [], people_total=7, ids="everyone")
+        assert got == {"count": 7, "account_total": 7}
+
+    def test_the_clamp_is_an_invariant_again(self, monkeypatch):
+        """Both sides count people now, so a union can never exceed the
+        total — previously a group holding a service account could, and the
+        clamp silently hid it."""
+        members = [{"id": f"u{i}", "email": f"p{i}@example.com", "kind": "human"} for i in range(3)] + [
+            {"id": "u-svc", "email": "ci@example.com", "kind": "service"}
+        ]
+        got = self._call(monkeypatch, members, people_total=3, ids="grp-1")
+        assert got == {"count": 3, "account_total": 3}

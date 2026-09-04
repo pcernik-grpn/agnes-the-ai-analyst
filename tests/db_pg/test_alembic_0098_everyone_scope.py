@@ -140,13 +140,16 @@ def _pairs_after(conn) -> Pairs:
 
         UNION ALL
 
-        -- An everyone-scoped grant reaches every account. `group_id` is a
+        -- An everyone-scoped grant reaches every PERSON. `group_id` is a
         -- carrier and is deliberately not joined on: an account in no group
         -- at all is reached, which is what the old group model could not say.
+        -- `kind` is joined on for the other half of the definition: the
+        -- audience is people, never a service account or one of the
+        -- identities Agnes seeds for itself (#2256).
         SELECT u.id, rg.resource_type, rg.resource_id, rg.requirement
         FROM resource_grants rg
         CROSS JOIN users u
-        WHERE rg.scope = 'everyone'
+        WHERE rg.scope = 'everyone' AND u.kind = 'human'
     ) reach(user_id, rtype, rid, req)
     WHERE {_REACH_EXCLUSIONS}
     """
@@ -273,6 +276,8 @@ def _seed_instance(
     *,
     hand_set_grant_on_system_plugin: bool = False,
     include_account_outside_everyone: bool = False,
+    include_system_identities: bool = False,
+    include_service_account_in_everyone: bool = False,
 ) -> Dict[str, str]:
     """One instance, carrying every shape this migration has to preserve.
 
@@ -296,6 +301,29 @@ def _seed_instance(
         _add_member(conn, u_analyst, analysts, source="google_sync")
         _add_member(conn, u_analyst, admin)
         u_outside = _add_user(conn, "outside") if include_account_outside_everyone else ""
+
+        # The shape EVERY upgraded instance actually has. Agnes seeds these
+        # for itself at boot, through a bare `users.create()` that never
+        # joins any group, so they sit outside Everyone on every instance
+        # that has run current code (#2256).
+        if include_system_identities:
+            for email in ("scheduler", "semantic-drafter", "memory-curator"):
+                conn.execute(
+                    sa.text("INSERT INTO users (id, email, name) VALUES (:id, :e, :n)"),
+                    {"id": f"u-sys-{email}", "e": f"{email}@system.local", "n": email},
+                )
+
+        # An admin may put a service account in Everyone — nothing refuses
+        # it, and the people picker offers it on purpose, because a group is
+        # the only way a headless identity gets any authority at all.
+        u_svc = ""
+        if include_service_account_in_everyone:
+            u_svc = "u-svc-etl"
+            conn.execute(
+                sa.text("INSERT INTO users (id, email, name, kind) VALUES (:id, :e, :n, 'service')"),
+                {"id": u_svc, "e": "etl@service.local", "n": "ETL"},
+            )
+            _add_member(conn, u_svc, everyone, source="admin")
 
         # Grants on Everyone, across the tiers and across a type that DOES
         # take an everyone-scope and one that does not.
@@ -334,6 +362,7 @@ def _seed_instance(
         "u_plain": u_plain,
         "u_analyst": u_analyst,
         "u_outside": u_outside,
+        "u_svc": u_svc,
         "hand_set_grant": hand_set or "",
     }
 
@@ -350,6 +379,8 @@ def _run(
     everyone_email: str | None,
     hand_set: bool = False,
     account_outside_everyone: bool = False,
+    system_identities: bool = False,
+    service_account_in_everyone: bool = False,
 ):
     """Seed at 0097, snapshot, upgrade to 0098, snapshot. Returns both plus
     the seeded ids."""
@@ -366,6 +397,8 @@ def _run(
         pg_engine,
         hand_set_grant_on_system_plugin=hand_set,
         include_account_outside_everyone=account_outside_everyone,
+        include_system_identities=system_identities,
+        include_service_account_in_everyone=service_account_in_everyone,
     )
 
     with pg_engine.connect() as conn:
@@ -686,3 +719,104 @@ def test_0098_an_everyone_scope_reaches_an_account_added_after_the_upgrade(pg_en
     assert ("marketplace_plugin", "acme/mandatory") in reached
     assert ("collection", "col-analysts") not in reached, "a group grant leaked to a non-member"
     assert ids["everyone"], "sanity: the seeded group still exists as the carrier"
+
+
+def _split_non_person(pairs: Pairs, non_person_ids: set[str]) -> tuple[Pairs, Pairs]:
+    """Partition a snapshot into the people half and the machine half."""
+    people = {k: v for k, v in pairs.items() if k[0] not in non_person_ids}
+    machines = {k: v for k, v in pairs.items() if k[0] in non_person_ids}
+    return people, machines
+
+
+def test_0098_converts_on_an_instance_carrying_the_seeded_system_identities(pg_engine, monkeypatch):
+    """The shape every upgraded instance actually has (issue #2256).
+
+    `memory-curator@system.local` and its two siblings are created at boot
+    through a bare `users.create()` that joins no group, so they sit outside
+    Everyone everywhere. Counted as accounts, they hold step 3's guard shut
+    on every instance in the fleet and the revision converts nothing at all
+    — silently, with only a warning. Step 1 names them first, so the guard
+    sees what it is actually for: a PERSON who would gain access.
+    """
+    before, after, ids = _run(pg_engine, monkeypatch, everyone_email=None, system_identities=True)
+    assert before, "snapshot is empty — the seed did not take, so this proves nothing"
+
+    seeded = {"u-sys-scheduler", "u-sys-semantic-drafter", "u-sys-memory-curator"}
+    people_before, machines_before = _split_non_person(before, seeded)
+    people_after, machines_after = _split_non_person(after, seeded)
+
+    # Nothing moves for a person. That is still the governing rule.
+    assert people_after == people_before, _diff_message(people_before, people_after)
+
+    # The machines DO lose something, and it is the definition change doing
+    # its job rather than a defect: `is_system` reached every row in `users`
+    # unconditionally, and an everyone-scope reaches people. The only thing
+    # it can cost them is a marketplace plugin — a Claude Code bundle a
+    # headless identity never installs — and an admin who wants one there
+    # puts the account in a named group, which is how it gets everything
+    # else it has. See the migration's GOVERNING RULE note.
+    assert machines_before, "the seed gave the identities nothing, so this proves nothing"
+    assert machines_after == {}, "a seeded identity kept reach an everyone-scope should not give it"
+    assert {k[1] for k in machines_before} == {"marketplace_plugin"}
+
+    with pg_engine.connect() as conn:
+        scopes = {
+            r[0]: r[1]
+            for r in conn.execute(
+                sa.text("SELECT resource_type, scope FROM resource_grants WHERE group_id = :g"),
+                {"g": ids["everyone"]},
+            ).all()
+        }
+        kinds = dict(
+            conn.execute(
+                sa.text("SELECT email, kind FROM users WHERE email LIKE '%@system.local'")
+            ).all()
+        )
+
+    assert scopes["chat"] == "everyone", "the guard fired on the seeded identities and converted nothing"
+    assert scopes["data_package"] == "everyone"
+    assert set(kinds.values()) == {"system"}, "step 1 left a seeded identity unmarked"
+
+
+def test_0098_refuses_to_convert_when_a_service_account_holds_the_group(pg_engine, monkeypatch):
+    """The guard's other direction, and the reason it has two arms.
+
+    An admin may add a service account to Everyone; the people picker offers
+    it deliberately, because a group is the only way a headless identity
+    acquires any authority. Such an account holds the group's grants today,
+    and an everyone-scope reaches people only — so converting would TAKE the
+    access away, and the redesigned Access page no longer draws this group's
+    roster to put it back from. Refusing beats narrowing.
+    """
+    before, after, ids = _run(
+        pg_engine, monkeypatch, everyone_email=None, service_account_in_everyone=True
+    )
+    people_before, _ = _split_non_person(before, {"u-svc-etl"})
+    people_after, machines_after = _split_non_person(after, {"u-svc-etl"})
+    assert people_after == people_before, _diff_message(people_before, people_after)
+
+    # The grants an admin gave this account through the group survive whole
+    # — that is what the guard is protecting. Only the `is_system` plugin
+    # goes, for the reason spelled out in the sibling test.
+    assert {k[1] for k in machines_after} >= {"chat", "data_package"}
+
+    with pg_engine.connect() as conn:
+        scopes = {
+            r[0]: r[1]
+            for r in conn.execute(
+                sa.text("SELECT resource_type, scope FROM resource_grants WHERE group_id = :g"),
+                {"g": ids["everyone"]},
+            ).all()
+        }
+        reached = conn.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM resource_grants rg "
+                "JOIN user_group_members m ON m.group_id = rg.group_id "
+                "WHERE m.user_id = :u AND rg.scope IS NULL"
+            ),
+            {"u": ids["u_svc"]},
+        ).scalar_one()
+
+    assert scopes["chat"] is None, "step 3 scoped a grant a service account holds today"
+    assert scopes["data_package"] is None
+    assert reached > 0, "the service account lost the grants it had before the upgrade"

@@ -46,7 +46,7 @@ class UserGroupMembersPgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        """SELECT u.id, u.email, u.name, u.active,
+                        """SELECT u.id, u.email, u.name, u.active, u.kind,
                               m.source, m.added_at, m.added_by
                        FROM user_group_members m
                        JOIN users u ON u.id = m.user_id

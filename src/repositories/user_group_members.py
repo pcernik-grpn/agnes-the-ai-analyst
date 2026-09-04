@@ -73,7 +73,19 @@ class UserGroupMembersRepository:
         return [r[0] for r in rows]
 
     def list_members_for_group(self, group_id: str) -> List[Dict[str, Any]]:
-        """All users in a group, joined with users table for display data."""
+        """All users in a group, joined with users table for display data.
+
+        No ``kind`` column here, unlike the Postgres sibling: it arrived in
+        PG-only Alembic ``0096`` and this ladder is frozen (A3). The reader
+        that wants it — ``src.service_accounts.is_person``, via
+        ``/api/admin/groups/reach`` — is written for that: it consults
+        ``kind`` when present and falls back to the email otherwise, which is
+        the right answer here because neither kind it looks for can exist on
+        this backend. A service account is PG-only by construction
+        (``create_service_account`` has no DuckDB implementation), and the
+        seeded system identities are matched by their ``@system.local``
+        addresses.
+        """
         rows = self.conn.execute(
             """SELECT u.id, u.email, u.name, u.active,
                       m.source, m.added_at, m.added_by
