@@ -226,6 +226,9 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "facts.merge": AuditEvent("facts.merge", "mutation", "Two fact-graph nodes were merged."),
     "facts.split": AuditEvent("facts.split", "mutation", "A fact-graph node was split."),
+    "facts.stats.rebuild": AuditEvent(
+        "facts.stats.rebuild", "mutation", "The fact-graph collection-stats summary was rebuilt."
+    ),
     "initial_workspace.applied": AuditEvent(
         "initial_workspace.applied", "mutation", "An initial-workspace override was applied to a client."
     ),

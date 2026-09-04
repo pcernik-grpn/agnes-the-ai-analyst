@@ -1550,6 +1550,19 @@ _EXEMPT: dict[str, str] = {
         "an agent should not be able to spend the instance's LLM budget over an "
         "entire corpus with one tool call"
     ),
+    # TCRD-296 synthesis E.21: the collection-stats summary rebuild — same
+    # admin/ops maintenance-op class as facts-extract above. CLI-reachable
+    # (`agnes admin facts stats rebuild`) for an operator repairing a stale
+    # summary or backfilling it after the migration that creates the
+    # tables, but deliberately not MCP-exposed: an unscoped call recomputes
+    # every collection in the graph, an operator decision no analyst query
+    # needs.
+    "/api/admin/facts/stats/rebuild": (
+        "admin/ops maintenance trigger for the fact-graph collection-stats "
+        "summary — CLI-reachable (agnes admin facts stats rebuild) but "
+        "deliberately not MCP-exposed: an unscoped call recomputes every "
+        "collection in the graph, an operator decision no analyst query needs"
+    ),
     # TCRD-296 gap #62's recovery surface: one-time backlog fix for a facts
     # ledger entry a PRE-fix pass wrote as done despite carrying no claims —
     # same admin/ops maintenance-op class as facts-extract right above.

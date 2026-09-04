@@ -400,6 +400,41 @@ degrades, it does not break. Unit-test both branches by faking `alembic.op`
 count) rather than actually seeding millions of rows — see
 `tests/db_pg/test_corpus_chunks_fts_index_migration.py`.
 
+## Adding a new table that needs a data backfill on an already-huge sibling
+
+Sibling problem to the index one above: a NEW table can be created cheaply
+(`CREATE TABLE` is instant, no lock contention), but if it needs to be
+POPULATED from an existing, already-huge table, that backfill itself is the
+expensive part — and the same "don't run it inside the migration's own
+boot-time transaction" reasoning applies.
+
+`migrations/versions/0104_fact_collection_stats.py` (TCRD-296 synthesis
+E.21) is the worked example: `fact_collection_stats`/`fact_collection_
+membership`/`edge_collection_membership` are a maintained summary over
+`claims` (already at 2M+ rows on a live instance), and the migration
+creates the tables ONLY — no backfill. Two things make that safe:
+
+1. **New writes are covered from the moment the migration lands** — every
+   `INSERT INTO claims` from that point on maintains the summary
+   incrementally in the SAME transaction (`FactsPgRepository.add_claim` ->
+   `_bump_collection_stats_on_new_claim`), so the table is never MORE than
+   one deploy behind reality for anything written after the upgrade.
+2. **Every reader of the summary has a built-in fallback** to the original
+   full-scan query, embedded in the SQL itself (an uncorrelated `NOT EXISTS
+   (SELECT 1 FROM fact_collection_stats)` branch inside the same `UNION`,
+   not a Python-side round trip) — so a database that hasn't been backfilled
+   yet simply serves the pre-migration behavior, slower but correct, never
+   a wrong answer.
+
+The backfill itself is a REPOSITORY method (`rebuild_collection_stats`,
+bounded per collection — never one giant transaction over the whole
+table) an operator runs once, out of band, after the upgrade:
+`agnes admin facts stats rebuild` / `POST /api/admin/facts/stats/rebuild`.
+This is the "operator runs the CLI once after upgrade" escape hatch this
+doc's own "Adding an index…" section above mentions — pick it whenever the
+backfill's cost is unpredictable (scales with existing data, not with the
+migration's own DDL) rather than a fixed, small `UPDATE`.
+
 ## The four load-bearing tests
 
 These run on every PR and protect against the most dangerous mistakes:

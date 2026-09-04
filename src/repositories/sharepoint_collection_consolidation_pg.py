@@ -258,6 +258,15 @@ class SharePointCollectionConsolidationPgRepository:
                 {"sources": source_ids},
             )
 
+        # TCRD-296 E.21: the re-pointed `claims.corpus_id` rows above leave
+        # `fact_collection_stats`/`*_collection_membership` stale for both
+        # the (now-emptied) sources and the target — a scoped rebuild after
+        # this transaction commits is the same one-line hook every other
+        # bulk claims-mutation path in `facts_pg.py` uses.
+        from src.repositories import facts_repo
+
+        facts_repo().rebuild_collection_stats(corpus_ids=[*source_ids, target_id])
+
         return {
             "files_moved": files_moved,
             "chunks_moved": chunks_moved,

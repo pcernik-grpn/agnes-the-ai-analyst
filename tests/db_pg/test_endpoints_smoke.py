@@ -3644,6 +3644,15 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestFactsExtractionTrigger; not
     # duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/facts-extract",
+    # Fact-graph collection-stats summary rebuild (TCRD-296 synthesis
+    # E.21) — NEW schema surface (fact_collection_stats/*_membership,
+    # PG-only, A3 ratchet), so unlike the "no new schema" admin/ops
+    # triggers above it IS covered per-backend, just not in this file:
+    # maintenance on ingest/purge/reassign/merge/split/consolidation,
+    # rebuild idempotence, and reader parity between the fallback and
+    # summary paths are in tests/db_pg/test_fact_collection_stats_pg.py;
+    # auth matrix and the DuckDB typed-501 are in tests/test_admin_facts.py.
+    "POST /api/admin/facts/stats/rebuild",
     # Split-a-large-site pair (bulk scope-add from folder paths + connection
     # clone): both write only `source_connections` (config_patch / insert), a
     # frozen pre-A3 pair present on BOTH backends, and both need a body — not
