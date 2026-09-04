@@ -51,8 +51,15 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/").lower()
+
 
 DEFAULT_PREFIX = "loadbot"
 DEFAULT_GROUP = "loadtest"
@@ -91,6 +98,11 @@ class ProvisionState:
     group_id: str
     grant_ids: list[str]
     identities: list[Identity]
+    #: Grants THIS run created, a subset of ``grant_ids``. Revoked on teardown
+    #: unconditionally — a grant we added to somebody else's group elevates
+    #: every one of its members for as long as it survives, so its lifetime
+    #: must not depend on whether we also own the group.
+    created_grant_ids: list[str] = field(default_factory=list)
     #: Whether THIS run created the group, as opposed to adopting one that
     #: already existed. Teardown purges only what it made: a name collision
     #: with an operator's own group would otherwise delete that group and
@@ -108,6 +120,7 @@ class ProvisionState:
             "group_name": self.group_name,
             "group_id": self.group_id,
             "grant_ids": self.grant_ids,
+            "created_grant_ids": self.created_grant_ids,
             "group_created": self.group_created,
             "identity_kind": self.identity_kind,
             "identities": [asdict(i) for i in self.identities],
@@ -120,6 +133,7 @@ class ProvisionState:
             group_name=raw["group_name"],
             group_id=raw["group_id"],
             grant_ids=list(raw.get("grant_ids") or []),
+            created_grant_ids=list(raw.get("created_grant_ids") or []),
             # Absent in a state file written before this field existed. False
             # is the safe default: refuse to delete a group we cannot prove
             # we made.
@@ -243,7 +257,7 @@ def ensure_group(api: AdminApi, name: str) -> tuple[str, bool]:
     return str(created["id"]), True
 
 
-def ensure_grants(api: AdminApi, group_id: str, grants: list[str]) -> list[str]:
+def ensure_grants(api: AdminApi, group_id: str, grants: list[str]) -> tuple[list[str], list[str]]:
     """Grant ``group_id`` each ``resource_type:resource_id`` pair.
 
     A 409 means the grant is already there — reuse it rather than failing,
@@ -252,6 +266,7 @@ def ensure_grants(api: AdminApi, group_id: str, grants: list[str]) -> list[str]:
     existing = api.expect("GET", "/api/admin/grants", ok=(200,))
     by_key = {(g.get("group_id"), g.get("resource_type"), g.get("resource_id")): str(g.get("id")) for g in existing}
     ids: list[str] = []
+    created: list[str] = []
     for spec in grants:
         rtype, _, rid = spec.partition(":")
         if not rtype or not rid:
@@ -261,15 +276,16 @@ def ensure_grants(api: AdminApi, group_id: str, grants: list[str]) -> list[str]:
             print(f"[grant] reusing {spec}", file=sys.stderr)
             ids.append(by_key[key])
             continue
-        created = api.expect(
+        row = api.expect(
             "POST",
             "/api/admin/grants",
             json_body={"group_id": group_id, "resource_type": rtype, "resource_id": rid},
             ok=(201,),
         )
         print(f"[grant] created {spec}", file=sys.stderr)
-        ids.append(str(created["id"]))
-    return ids
+        ids.append(str(row["id"]))
+        created.append(str(row["id"]))
+    return ids, created
 
 
 def create_identity(
@@ -435,50 +451,63 @@ def create_user_identity(
 def cmd_create(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
     if state_path.exists():
-        # --force may only overwrite a file that holds no credentials.
-        # Overwriting one that does is how a run leaves live PATs behind
-        # with nothing left on disk that names the accounts holding them —
-        # the exact state teardown cannot recover from.
+        # --force may only overwrite a file with nothing left to tear down.
+        # Overwriting one that still owns identities, a group we created, or
+        # grants we added destroys the only record of them — the exact state
+        # teardown cannot recover from. An unreadable file is treated as
+        # occupied, not empty: "we cannot tell what it owns" is a reason to
+        # stop, not to proceed.
         try:
-            stale = ProvisionState.from_json(json.loads(state_path.read_text())).identities
-        except Exception:
-            stale = []
-        if stale:
+            stale = ProvisionState.from_json(json.loads(state_path.read_text()))
+        except Exception as exc:
             raise SystemExit(
-                f"{state_path} holds {len(stale)} identities with live tokens — run `teardown` "
-                "first. Overwriting it would orphan them."
+                f"{state_path} exists but could not be read ({exc!r:.120}). It may still own "
+                "identities, grants or a group. Refusing to overwrite — inspect it, or move it aside."
+            )
+        owned = []
+        if stale.identities:
+            owned.append(f"{len(stale.identities)} identities")
+        if stale.created_grant_ids:
+            owned.append(f"{len(stale.created_grant_ids)} grants")
+        if stale.group_created:
+            owned.append(f"the group {stale.group_name!r}")
+        if owned:
+            raise SystemExit(
+                f"{state_path} still owns {', '.join(owned)} — run `teardown` first. Overwriting it would orphan them."
             )
         if not args.force:
-            raise SystemExit(f"{state_path} exists (no identities) — pass --force to overwrite")
+            raise SystemExit(f"{state_path} exists (owns nothing) — pass --force to overwrite")
 
     with AdminApi(args.base_url, args.admin_token) as api:
         preflight(api)
-        group_id, group_created = ensure_group(api, args.group)
-        grant_ids = ensure_grants(api, group_id, args.grant)
 
-        # `identities` is the SAME list the state file is written from, and
-        # each create appends its account to it before minting, so the
-        # `finally` below persists a half-provisioned account rather than
-        # losing it.
         identities: list[Identity] = []
         state = ProvisionState(
             base_url=args.base_url.rstrip("/"),
             group_name=args.group,
-            group_id=group_id,
-            grant_ids=grant_ids,
+            group_id="",
+            grant_ids=[],
             identities=identities,
-            group_created=group_created,
             identity_kind=args.identity_kind,
         )
-        pacer = LoginPacer()
+        # From here on every step that can leave something behind on the
+        # server is followed by a write, so a crash — or a response lost
+        # after the server already acted — still leaves a teardown record.
         try:
+            state.group_id, state.group_created = ensure_group(api, args.group)
+            _write_state(state_path, state)
+
+            state.grant_ids, state.created_grant_ids = ensure_grants(api, state.group_id, args.grant)
+            _write_state(state_path, state)
+
+            pacer = LoginPacer()
             for idx in range(1, args.count + 1):
                 if args.identity_kind == "user":
                     ident = create_user_identity(
                         api,
                         idx=idx,
                         prefix=args.prefix,
-                        group_id=group_id,
+                        group_id=state.group_id,
                         email_domain=args.email_domain,
                         token_ttl_days=args.token_ttl_days,
                         pacer=pacer,
@@ -489,15 +518,12 @@ def cmd_create(args: argparse.Namespace) -> int:
                         api,
                         idx=idx,
                         prefix=args.prefix,
-                        group_id=group_id,
+                        group_id=state.group_id,
                         token_ttl_days=args.token_ttl_days,
                         staged=identities,
                     )
                 print(f"[identity] {idx}/{args.count} ready ({ident.email})", file=sys.stderr)
         finally:
-            # Always persist what exists so a crash mid-loop is still
-            # tearable-down — half-provisioned accounts are the failure
-            # mode that leaves credentials behind.
             _write_state(state_path, state)
 
     print(f"[done] {len(state.identities)} identities -> {state_path} (mode 0600)", file=sys.stderr)
@@ -526,8 +552,22 @@ def cmd_teardown(args: argparse.Namespace) -> int:
         raise SystemExit(f"{state_path} not found — nothing to tear down")
     state = ProvisionState.from_json(json.loads(state_path.read_text()))
 
+    # The admin token here is an interactive session JWT — the credential that
+    # mints every other one. A mistyped --base-url would present it to whatever
+    # host was typed, so the state file's own record of the instance wins
+    # unless the operator overrides deliberately.
+    target = args.base_url or state.base_url
+    if args.base_url and state.base_url and _origin(args.base_url) != _origin(state.base_url):
+        if not args.allow_host_mismatch:
+            raise SystemExit(
+                f"{state_path} was provisioned against {_origin(state.base_url)}, but --base-url is "
+                f"{_origin(args.base_url)}. Refusing to send the admin session token there. "
+                "Pass --allow-host-mismatch if that is genuinely what you want."
+            )
+        print(f"[teardown] host mismatch overridden — targeting {_origin(target)}", file=sys.stderr)
+
     failures: list[str] = []
-    with AdminApi(args.base_url or state.base_url, args.admin_token) as api:
+    with AdminApi(target, args.admin_token) as api:
         for ident in state.identities:
             # Deactivation is what actually revokes the credential — every
             # PAT resolves through the account's `active` flag — so it comes
@@ -556,17 +596,23 @@ def cmd_teardown(args: argparse.Namespace) -> int:
                 else:
                     print(f"[teardown] {ident.slug} deleted", file=sys.stderr)
 
+        # Grants this run created are revoked whether or not we own the group.
+        # Leaving one on an operator's group permanently elevates its members,
+        # which is a worse outcome than any tidiness argument for keeping it.
+        for grant_id in state.created_grant_ids:
+            status, _ = api.request("DELETE", f"/api/admin/grants/{grant_id}")
+            if status not in (204, 404):
+                failures.append(f"grant {grant_id}: {status}")
+            else:
+                print(f"[teardown] grant {grant_id} revoked", file=sys.stderr)
+
         if args.purge_group and not state.group_created:
             print(
                 f"[teardown] group {state.group_name} was adopted, not created by this run — "
-                "leaving it and its grants alone",
+                "its own grants are left alone; only ours were revoked",
                 file=sys.stderr,
             )
         elif args.purge_group:
-            for grant_id in state.grant_ids:
-                status, _ = api.request("DELETE", f"/api/admin/grants/{grant_id}")
-                if status not in (204, 404):
-                    failures.append(f"grant {grant_id}: {status}")
             status, _ = api.request("DELETE", f"/api/admin/groups/{state.group_id}")
             if status not in (204, 404):
                 failures.append(f"group {state.group_name}: {status}")
@@ -685,6 +731,11 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("teardown", help="deactivate every identity in a state file")
     common(t, base_required=False)
     t.add_argument("--state", required=True)
+    t.add_argument(
+        "--allow-host-mismatch",
+        action="store_true",
+        help="target a --base-url the state file was not provisioned against",
+    )
     t.add_argument("--purge-group", action="store_true", help="also delete the grants and the group")
     t.add_argument(
         "--purge-identities",

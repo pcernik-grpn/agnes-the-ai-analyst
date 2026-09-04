@@ -152,6 +152,21 @@ class Journey:
             kind = str(item["kind"])
             if kind not in _STEP_KINDS:
                 raise SystemExit(f"{path}: step {i} has unknown kind {kind!r}; known: {sorted(_STEP_KINDS)}")
+            if kind == "http":
+                # httpx applies the client's Authorization header to an
+                # ABSOLUTE request URL too, so a journey naming another host
+                # would hand it the load identity's PAT — the identities-file
+                # host check cannot see this, because the journey is a
+                # separate input.
+                step_path = str(item.get("path", "/"))
+                if "://" in step_path or step_path.startswith("//"):
+                    raise SystemExit(
+                        f"{path}: step {i} path {step_path!r} is absolute. Journey paths must be "
+                        "origin-relative — an absolute one would send the identity's token to "
+                        "that host."
+                    )
+                if not step_path.startswith("/"):
+                    raise SystemExit(f"{path}: step {i} path {step_path!r} must start with '/'")
             steps.append(Step(phase=str(item.get("phase", f"{kind}{i}")), kind=kind, raw=item))
         return Journey(name=str(raw.get("name", path.stem)), steps=steps)
 
@@ -161,7 +176,19 @@ _STEP_KINDS = {"http", "chat_open", "chat_reopen", "turn", "ws_close", "sleep"}
 # Frames that mean the agent itself has started producing something the
 # viewer can see. Deliberately excludes ``ready``, which the manager emits
 # on seating the socket whether or not a runner exists behind it.
-_ACTIVITY_FRAMES = {"token", "tool_call", "tool_result", "assistant_message"}
+_ACTIVITY_FRAMES = {
+    "token",
+    "tool_call",
+    "tool_result",
+    "assistant_message",
+    # The browser renders these as cards the moment they arrive
+    # (app/web/static/js/chat.js), so to the person watching, the screen has
+    # stopped being blank. A turn whose first act is to ask for approval
+    # would otherwise report no activity at all and then be blamed for a
+    # first-token timeout the user never experienced as one.
+    "approval_request",
+    "question_request",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +265,13 @@ class UserContext:
     abort_file: Optional[Path] = None
     chat_id: Optional[str] = None
     ws: Any = None
+    #: Set when a turn ended without a `done` frame. The server may still be
+    #: working, and its late frames arrive on this same socket carrying only a
+    #: session sequence — nothing ties a frame to the turn that asked for it.
+    #: Measuring the next turn on such a socket attributes the previous turn's
+    #: output to it. (This is what produced ~0.2 ms "first activity" readings
+    #: on reattached sockets in an early run.)
+    turn_outstanding: bool = False
     _client: Optional[httpx.AsyncClient] = None
 
     def request_id(self, phase: str) -> str:
@@ -344,11 +378,20 @@ async def _do_chat_open(ctx: UserContext, step: Step) -> None:
     row = ctx.base_row(step)
     row["request_id"] = rid
     t0 = time.monotonic()
-    resp = await ctx.client.post(
-        "/api/chat/sessions",
-        json={"surface": str(step.raw.get("surface", "web"))},
-        headers={"x-request-id": rid},
-    )
+    try:
+        resp = await ctx.client.post(
+            "/api/chat/sessions",
+            json={"surface": str(step.raw.get("surface", "web"))},
+            headers={"x-request-id": rid},
+        )
+    except Exception as exc:
+        # Without this the exception escapes before any row is written, and
+        # the journey reports a generic failure — so connection refusals
+        # under load, the very thing a ramp is looking for, vanish from the
+        # per-phase error summary.
+        row.update(ms=round((time.monotonic() - t0) * 1000, 1), error="transport", detail=repr(exc)[:300])
+        await ctx.recorder.emit(row)
+        raise
     ms = (time.monotonic() - t0) * 1000
     try:
         body = resp.json() if resp.content else {}
@@ -370,6 +413,9 @@ async def _do_chat_open(ctx: UserContext, step: Step) -> None:
     await ctx.recorder.emit(row)
     ctx.log(f"{step.phase} session {ctx.chat_id} {row['ms']}ms")
 
+    # A reopened socket is a fresh sink: whatever the old one had outstanding
+    # cannot arrive on it as an unattributed frame.
+    ctx.turn_outstanding = False
     await _open_ws(ctx, Step(phase=f"{step.phase}.ws_open", kind="ws_open", raw={}), str(body["ws_url"]))
 
 
@@ -386,10 +432,15 @@ async def _do_chat_reopen(ctx: UserContext, step: Step) -> None:
     row = ctx.base_row(step)
     row["request_id"] = rid
     t0 = time.monotonic()
-    resp = await ctx.client.post(
-        f"/api/chat/sessions/{ctx.chat_id}/ticket",
-        headers={"x-request-id": rid},
-    )
+    try:
+        resp = await ctx.client.post(
+            f"/api/chat/sessions/{ctx.chat_id}/ticket",
+            headers={"x-request-id": rid},
+        )
+    except Exception as exc:
+        row.update(ms=round((time.monotonic() - t0) * 1000, 1), error="transport", detail=repr(exc)[:300])
+        await ctx.recorder.emit(row)
+        raise
     try:
         body = resp.json() if resp.content else {}
     except ValueError:
@@ -407,6 +458,9 @@ async def _do_chat_reopen(ctx: UserContext, step: Step) -> None:
         raise RuntimeError(f"ticket failed: {resp.status_code} {err}")
     await ctx.recorder.emit(row)
     ctx.log(f"{step.phase} ticket {row['ms']}ms")
+    # A reopened socket is a fresh sink: whatever the old one had outstanding
+    # cannot arrive on it as an unattributed frame.
+    ctx.turn_outstanding = False
     await _open_ws(ctx, Step(phase=f"{step.phase}.ws_open", kind="ws_open", raw={}), str(body["ws_url"]))
 
 
@@ -440,6 +494,19 @@ async def _do_turn(ctx: UserContext, step: Step) -> None:
     """
     if ctx.ws is None:
         raise RuntimeError("turn before an open WS")
+    if ctx.turn_outstanding:
+        # Refuse rather than produce a number that cannot be trusted. A
+        # missing measurement is a gap; a wrong one is a false finding.
+        await ctx.recorder.emit(
+            {
+                **ctx.base_row(step),
+                "error": "skipped_outstanding_turn",
+                "detail": "a previous turn on this socket never sent `done`; its late frames "
+                "would be measured as this turn",
+            }
+        )
+        ctx.log(f"{step.phase} SKIPPED — previous turn still outstanding")
+        return
     client_msg_id = str(uuid.uuid4())
     row = ctx.base_row(step)
     row["client_msg_id"] = client_msg_id
@@ -541,6 +608,8 @@ async def _do_turn(ctx: UserContext, step: Step) -> None:
     done_ms = (time.monotonic() - t0) * 1000
     if error is None and frames and first_token_ms is None:
         error = "truncated"
+    # `done` is the only frame that says the server finished with this turn.
+    ctx.turn_outstanding = error is not None
     row.update(
         ready_ms=round(ready_ms, 1) if ready_ms is not None else None,
         first_activity_ms=round(first_activity_ms, 1) if first_activity_ms is not None else None,

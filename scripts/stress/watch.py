@@ -170,7 +170,6 @@ def _stream_with_retry(
         # silently gone.
         try:
             proc = ssh.popen(remote_factory())
-            consecutive_setup_failures = 0
         except BaseException as exc:  # SystemExit included: it must not kill the thread
             consecutive_setup_failures += 1
             print(
@@ -189,9 +188,19 @@ def _stream_with_retry(
             continue
         if attempt:
             print(f"[watch:{label}] stream reconnected (attempt {attempt})", file=sys.stderr, flush=True)
+        produced = False
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
+                produced = True
+                # Opening the process proves nothing: a missing cgroup path or
+                # a vanished container yields a stream that exits at once. Only
+                # a stream that actually delivered a line has proved healthy,
+                # so the failure counter is cleared here and not at popen —
+                # otherwise an open/exit loop retries forever, never reaches
+                # the limit, and leaves an empty capture file behind a
+                # apparently clean run.
+                consecutive_setup_failures = 0
                 if stop.is_set():
                     break
                 on_line(line)
@@ -199,9 +208,17 @@ def _stream_with_retry(
             proc.terminate()
         if stop.is_set():
             return
+        if not produced:
+            consecutive_setup_failures += 1
+            if consecutive_setup_failures >= _SETUP_FAILURE_LIMIT:
+                on_dead(
+                    f"{label}: the stream opened but produced nothing "
+                    f"{_SETUP_FAILURE_LIMIT} times running — this evidence stream is gone"
+                )
+                return
         attempt += 1
         print(
-            f"[watch:{label}] stream ended unexpectedly (rc={proc.returncode}) — reconnecting",
+            f"[watch:{label}] stream ended unexpectedly (rc={proc.returncode}, produced={produced}) — reconnecting",
             file=sys.stderr,
             flush=True,
         )
@@ -439,6 +456,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.service:
         args.service = ["app"]
 
+    # Pure input validation first, before anything reaches for the network:
+    # an operator's bad regex should be a startup error, not an exception
+    # inside a daemon thread that kills only that thread and lets the watcher
+    # exit cleanly with no log capture at all.
+    patterns = DEFAULT_PATTERNS + list(args.pattern or [])
+    try:
+        re.compile("|".join(patterns))
+    except re.error as exc:
+        raise SystemExit(f"--pattern does not compile: {exc}")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ssh = Ssh(args.ssh)
@@ -461,7 +488,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     aborter = Aborter(abort_path)
 
     stop = threading.Event()
-    patterns = DEFAULT_PATTERNS + list(args.pattern or [])
     threads: list[threading.Thread] = []
     for service, container_id, stat_path in located_services:
         threads.append(
@@ -511,6 +537,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         while not stop.is_set():
             if deadline and time.monotonic() > deadline:
+                break
+            if aborter.dead_streams:
+                # Continuing would run the rest of the wave blind and then
+                # report a record that is missing exactly the part nobody can
+                # reconstruct afterwards.
+                print(
+                    "[watch] a capture stream is gone — stopping rather than watching blind",
+                    file=sys.stderr,
+                )
                 break
             time.sleep(0.5)
     except KeyboardInterrupt:

@@ -599,3 +599,138 @@ def test_a_server_error_frame_survives_a_later_timeout(stub_server, tmp_path):
     cold = next(r for r in _rows(tmp_path) if r["phase"] == "turn_cold")
     assert cold["error"] == "frame_error"
     assert "boom" in cold["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Second review round (PR #2243)
+# ---------------------------------------------------------------------------
+
+
+def test_a_journey_may_not_name_another_host(tmp_path):
+    """An absolute URL would hand the identity's PAT to that host.
+
+    httpx applies the client's Authorization header to absolute request URLs
+    too, and the identities-file host check cannot see this because the
+    journey is a separate input.
+    """
+    path = tmp_path / "evil.yaml"
+    path.write_text("name: x\nsteps:\n  - {phase: p, kind: http, method: GET, path: 'https://elsewhere.example/x'}\n")
+    with pytest.raises(SystemExit, match="absolute"):
+        Journey.load(path)
+
+    path.write_text("name: x\nsteps:\n  - {phase: p, kind: http, method: GET, path: '//elsewhere.example/x'}\n")
+    with pytest.raises(SystemExit, match="absolute"):
+        Journey.load(path)
+
+    path.write_text("name: x\nsteps:\n  - {phase: p, kind: http, method: GET, path: 'catalog'}\n")
+    with pytest.raises(SystemExit, match="must start with"):
+        Journey.load(path)
+
+
+def test_a_turn_that_never_finished_poisons_the_socket(stub_server, tmp_path):
+    """A late frame from a timed-out turn must not be measured as the next one.
+
+    Outbound frames carry a session sequence, not the id of the turn that
+    asked for them, so a turn following an unfinished one on the same socket
+    cannot be attributed. Refusing is a gap in the data; measuring it is a
+    false number.
+    """
+    base_url, behavior = stub_server
+    behavior["silent_after_ready"] = True
+    args = _args(base_url, tmp_path, users=1, journey=_write_journey(tmp_path))
+
+    from scripts.stress import runner as runner_mod
+
+    original = dict(runner_mod.DEFAULT_TIMEOUTS)
+    runner_mod.DEFAULT_TIMEOUTS.update({"first_token": 1.0, "turn_done": 2.0})
+    try:
+        asyncio.run(run_step(args))
+    finally:
+        runner_mod.DEFAULT_TIMEOUTS.update(original)
+
+    rows = {r["phase"]: r for r in _rows(tmp_path) if r["kind"] in ("turn", "assert") or "turn" in r["phase"]}
+    assert rows["turn_cold"]["error"] == "first_token_timeout"
+    # The follow-up on the same socket is refused, not measured...
+    assert rows["turn_warm"]["error"] == "skipped_outstanding_turn"
+    # ...and the reattach gives a clean socket, so the last turn runs again.
+    assert rows["turn_resumed"]["error"] != "skipped_outstanding_turn"
+
+
+def test_an_approval_card_counts_as_activity(stub_server, tmp_path):
+    """The screen stopped being blank when the card appeared."""
+    from scripts.stress.runner import _ACTIVITY_FRAMES
+
+    assert {"approval_request", "question_request"} <= _ACTIVITY_FRAMES
+
+
+def test_provision_refuses_to_overwrite_state_it_cannot_read(tmp_path):
+    from scripts.stress.provision import build_parser, cmd_create
+
+    state = tmp_path / "identities.json"
+    state.write_text("{ this is not json")
+    args = build_parser().parse_args(
+        ["create", "--base-url", "https://h", "--count", "1", "--state", str(state), "--force"]
+    )
+    args.admin_token = "t"
+    args.grant = ["chat:chat"]
+    with pytest.raises(SystemExit, match="could not be read"):
+        cmd_create(args)
+
+
+def test_provision_refuses_to_overwrite_state_that_still_owns_resources(tmp_path):
+    from scripts.stress.provision import build_parser, cmd_create
+
+    state = tmp_path / "identities.json"
+    state.write_text(
+        json.dumps(
+            {
+                "base_url": "https://h",
+                "group_name": "loadtest",
+                "group_id": "g1",
+                "grant_ids": ["x"],
+                "created_grant_ids": ["x"],
+                "group_created": True,
+                "identity_kind": "user",
+                "identities": [],
+            }
+        )
+    )
+    args = build_parser().parse_args(
+        ["create", "--base-url", "https://h", "--count", "1", "--state", str(state), "--force"]
+    )
+    args.admin_token = "t"
+    args.grant = ["chat:chat"]
+    with pytest.raises(SystemExit, match="still owns"):
+        cmd_create(args)
+
+
+def test_teardown_refuses_a_base_url_the_state_was_not_provisioned_against(tmp_path):
+    """The admin token here mints every other credential."""
+    from scripts.stress.provision import build_parser, cmd_teardown
+
+    state = tmp_path / "identities.json"
+    state.write_text(
+        json.dumps(
+            {
+                "base_url": "https://the-real-instance.example",
+                "group_name": "loadtest",
+                "group_id": "g1",
+                "grant_ids": [],
+                "created_grant_ids": [],
+                "group_created": False,
+                "identity_kind": "user",
+                "identities": [],
+            }
+        )
+    )
+    args = build_parser().parse_args(["teardown", "--base-url", "https://typo.example", "--state", str(state)])
+    args.admin_token = "t"
+    with pytest.raises(SystemExit, match="Refusing to send the admin session token"):
+        cmd_teardown(args)
+
+
+def test_watch_rejects_an_uncompilable_pattern_before_touching_the_network():
+    from scripts.stress.watch import main as watch_main
+
+    with pytest.raises(SystemExit, match="does not compile"):
+        watch_main(["--ssh", "echo", "--out-dir", "/tmp/never-created", "--pattern", "[unclosed"])
