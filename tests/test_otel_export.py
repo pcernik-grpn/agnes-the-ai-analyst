@@ -118,7 +118,9 @@ def test_trace_generation_emits_a_span(otel_exporter):
     assert attrs["agnes.prompt_chars"] == 5
     assert attrs["agnes.completion_chars"] == 6
     assert attrs["agnes.user_id"] == "u1"
+    assert attrs["agnes.kind"] == "generation"
     assert "gen_ai.input.messages" not in attrs  # sizes, never text
+    assert span.events == ()
     assert span.status.status_code.name == "OK"
 
 
@@ -358,10 +360,13 @@ def test_broker_completion_emits_one_span(otel_broker, otel_exporter):
     assert attrs["agnes.upstream"] == "anthropic"
     assert attrs["agnes.stream"] is False
     assert attrs["http.response.status_code"] == 200
+    assert attrs["agnes.kind"] == "completion"
     assert span.status.status_code.name == "OK"
-    # Content stays home unless opted in.
+    # Sizes always; content stays home unless opted in — no attribute, no event.
+    assert attrs["agnes.prompt_chars"] > 0 and attrs["agnes.completion_chars"] > 0
     assert "gen_ai.input.messages" not in attrs
     assert "gen_ai.output.messages" not in attrs
+    assert span.events == ()
     assert "secret answer" not in json.dumps(attrs)
 
 
@@ -420,6 +425,8 @@ def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_
     (span,) = otel_exporter.get_finished_spans()
     attrs = dict(span.attributes)
     assert attrs["agnes.stream"] is True
+    assert attrs["agnes.stream_complete"] is True
+    assert attrs["agnes.response_bytes"] > 0
     assert attrs["agnes.ticket_scope"] == "llm"
     assert attrs["agnes.session_id"] == session.id
     assert attrs["agnes.user_email"] == "otel-user@test.com"
@@ -428,12 +435,45 @@ def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_
     assert attrs["gen_ai.usage.output_tokens"] == 4  # the stream's final (max) figure, not a sum
     assert attrs["gen_ai.usage.cache_read_input_tokens"] == 50
     assert tuple(attrs["gen_ai.response.finish_reasons"]) == ("end_turn",)
-    inputs = json.loads(attrs["gen_ai.input.messages"])
+    # Content rides two span EVENTS, never attributes: a collector stores the
+    # attribute object with keys in alphabetical order, and a long prompt
+    # under `gen_ai.input…` pushed everything after it past preview caps.
+    assert "gen_ai.input.messages" not in attrs and "gen_ai.output.messages" not in attrs
+    events = {e.name: dict(e.attributes) for e in span.events}
+    assert set(events) == {otel.PROMPT_EVENT, otel.COMPLETION_EVENT}
+    inputs = json.loads(events[otel.PROMPT_EVENT]["gen_ai.prompt"])
     assert inputs[0] == {"role": "system", "parts": [{"type": "text", "content": "Be kind."}]}
     assert inputs[1]["parts"][0]["content"] == "say hello"
-    outputs = json.loads(attrs["gen_ai.output.messages"])
+    outputs = json.loads(events[otel.COMPLETION_EVENT]["gen_ai.completion"])
     assert outputs == [{"role": "assistant", "parts": [{"type": "text", "content": "Hello world"}]}]
+    assert attrs["agnes.prompt_chars"] == len(events[otel.PROMPT_EVENT]["gen_ai.prompt"])
+    assert attrs["agnes.completion_chars"] == len(events[otel.COMPLETION_EVENT]["gen_ai.completion"])
     assert "agnes.content_truncated" not in attrs
+
+
+def test_broker_aborted_stream_is_marked_incomplete(otel_broker, otel_exporter):
+    """A stream the client dropped before the model finished — only
+    ``message_start`` ever arrived — carries no answer and no final usage;
+    the span says so instead of looking like a silently lost export."""
+    _FakeUpstream.content_type = "text/event-stream"
+    _FakeUpstream.sse_chunks = _sse(
+        [
+            (
+                "message_start",
+                {"type": "message_start", "message": {"model": "m", "usage": {"input_tokens": 3, "output_tokens": 1}}},
+            )
+        ]
+    )
+    tok = ticket_repo().mint("chat_otel_abort", "main", ttl_seconds=60)
+
+    r = _post(otel_broker, tok, "/api/broker/anthropic/v1/messages", {"model": "m", "stream": True, "messages": []})
+    assert r.status_code == 200
+
+    (span,) = otel_exporter.get_finished_spans()
+    attrs = dict(span.attributes)
+    assert attrs["agnes.stream_complete"] is False
+    assert attrs["agnes.response_bytes"] > 0
+    assert "gen_ai.response.finish_reasons" not in attrs
 
 
 def test_broker_upstream_error_marks_the_span(otel_broker, otel_exporter):
