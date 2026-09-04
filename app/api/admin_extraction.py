@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -647,15 +648,30 @@ def _files_per_min(run: Dict[str, Any]) -> Optional[float]:
 
 
 def _run_total_cost_usd(run: Optional[Dict[str, Any]]) -> float:
-    """Every stage's own priced cost, summed. ``usage`` is keyed by stage
-    (``ner`` / ``ocr`` / ``facts``), each carrying its OWN
-    ``estimated_cost_usd`` (see ``connectors.sharepoint.crawler.
-    _detector_usage`` / ``_ocr_run_usage`` and ``connectors.sharepoint.
-    facts_extraction._Report.render`` — the one place per stage a token
-    count becomes USD). A stage absent from ``usage`` spent nothing and
-    contributes 0, never an invented estimate. Written once, at
-    ``finish()`` — a still-``running`` run's cost is genuinely unknown
-    until then, not zero.
+    """Every stage's own priced cost, summed, for the CRAWL RUN's own
+    inline ``usage`` block only. ``usage`` is keyed by stage (``ner`` /
+    ``ocr`` / ``facts``), each carrying its OWN ``estimated_cost_usd`` (see
+    ``connectors.sharepoint.crawler._detector_usage`` / ``_ocr_run_usage``
+    and ``connectors.sharepoint.facts_extraction._Report.render`` — the one
+    place per stage a token count becomes USD). A stage absent from
+    ``usage`` spent nothing and contributes 0, never an invented estimate.
+    Written once, at ``finish()`` — a still-``running`` run's cost is
+    genuinely unknown until then, not zero.
+
+    This is deliberately ONE of the fleet's two cost sources, not the whole
+    figure: when the facts stage runs as a SEPARATE standalone
+    ``sharepoint-facts-extraction`` job (the normal production path for a
+    streamed/partitioned pass) rather than inline inside this crawl run,
+    its spend never reaches this ``usage`` block at all — it is persisted
+    on ``facts_ingest_runs.llm_usage`` instead, attributed back to this
+    connection by ``corpus_ids`` overlap
+    (:meth:`~src.repositories.facts_ingest_runs_pg.FactsIngestRunsPgRepository
+    .llm_usage_rollup_by_corpus_ids`). :func:`fleet_extraction_runs` sums
+    BOTH sources into each row's own ``estimated_cost_usd`` — see that
+    function's docstring for how the two are combined without double
+    counting, and ``cost_status`` for how a genuinely-zero figure stays
+    tellable apart from "nothing recorded here" or "tokens known, model
+    unpriceable".
     """
     if not run:
         return 0.0
@@ -665,6 +681,60 @@ def _run_total_cost_usd(run: Optional[Dict[str, Any]]) -> float:
         if isinstance(stage, dict):
             total += float(stage.get("estimated_cost_usd") or 0)
     return total
+
+
+#: The empty per-connection facts-ingest-ledger shape (see
+#: :meth:`~src.repositories.facts_ingest_runs_pg.FactsIngestRunsPgRepository
+#: .llm_usage_rollup_by_corpus_ids`'s own return shape, which this mirrors)
+#: — a connection with no attributable ``facts_ingest_runs`` spend at all.
+#: Never mutated in place; each use makes its own copy.
+_NO_FACTS_INGEST_USAGE: Dict[str, Any] = {
+    "runs_with_usage": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "documents": 0,
+    "wall_seconds": 0.0,
+    "models": [],
+    "priced_runs": 0,
+    "estimated_cost_usd": None,
+    # One entry per contributing `facts_ingest_runs` row — the
+    # de-duplication key `fleet_extraction_runs` uses to keep a shared
+    # collection's spend out of the page TOTAL while still showing it in
+    # full on every connection that can see it (never mutated in place).
+    # SERVER-SIDE ONLY: :func:`_public_facts_ingest_usage` strips this
+    # before a connection-level usage dict is ever assigned onto a
+    # response row — see that function's own docstring for why.
+    "runs": [],
+}
+
+
+#: Keys of the per-connection facts-ingest-ledger shape that are safe to
+#: ship to the browser — everything in :data:`_NO_FACTS_INGEST_USAGE`
+#: EXCEPT ``runs``. Payload-size fix: ``facts_ingest_runs`` is append-only
+#: and only grows, a single connection's own collection can match a large
+#: share of it, and the fleet page polls every 5s — serializing a run-id
+#: list of that size on every poll ships identifiers the browser never
+#: reads, for no benefit. The list still exists in the repository's own
+#: return value and in the local ``facts_ingest_usage``
+#: :func:`fleet_extraction_runs` computes with (needed there to
+#: de-duplicate the page total and mark a row ``cost_shared`` — see that
+#: function's own docstring); it is simply never copied onto a row's own
+#: ``facts.facts_ingest_usage`` on the way out.
+_PUBLIC_FACTS_INGEST_USAGE_FIELDS = tuple(k for k in _NO_FACTS_INGEST_USAGE if k != "runs")
+
+
+def _public_facts_ingest_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The CLIENT-facing projection of a per-connection facts-ingest-ledger
+    entry — every aggregate field, never the internal ``runs`` id/cost
+    list (see :data:`_PUBLIC_FACTS_INGEST_USAGE_FIELDS`'s own docstring for
+    why). ``None`` renders as the zeroed :data:`_NO_FACTS_INGEST_USAGE`
+    shape, same fallback :func:`_fleet_facts` already used before this
+    split existed.
+    """
+    source = usage if usage is not None else _NO_FACTS_INGEST_USAGE
+    return {field: source.get(field) for field in _PUBLIC_FACTS_INGEST_USAGE_FIELDS}
 
 
 #: The empty facts shape — a connection whose latest run never reached the
@@ -710,6 +780,19 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     # final assignment; listed here purely so this dict documents the
     # complete shape of one row's `facts` object.
     "provider_limit": None,
+    # Cost-truth fix — this connection's OWN attributable slice of
+    # `facts_ingest_runs.llm_usage`, resolved by `corpus_ids` overlap
+    # against its scope collections (:func:`fleet_extraction_runs`'s
+    # single batched `llm_usage_rollup_by_corpus_ids` call for the whole
+    # page). Connection-level, same "not read off the run row" reasoning
+    # as `facts_pending_documents` above — the standalone facts job this
+    # spend came from never touches `extraction_runs` at all. Always
+    # overwritten by `_fleet_facts`'s own final assignment (never left at
+    # this default once a real lookup ran), listed here purely so this
+    # dict documents the complete shape of one row's `facts` object —
+    # the CLIENT-facing shape (see `_public_facts_ingest_usage`), never
+    # the internal `runs` id/cost list.
+    "facts_ingest_usage": _public_facts_ingest_usage(None),
 }
 
 
@@ -755,6 +838,7 @@ def _fleet_facts(
     *,
     connection: Optional[Dict[str, Any]] = None,
     provider_limit: Optional[Dict[str, Any]] = None,
+    facts_ingest_usage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The facts stage's own numbers for one connection's latest run — read
     off the SAME row the crawl side already reads, never a second
@@ -802,8 +886,24 @@ def _fleet_facts(
     (:func:`_facts_throughput_and_eta`) need ``connection`` (the full row,
     not just its id) to resolve its own collections — omitted (``None``
     for both) when the caller has no connection dict handy.
+
+    ``facts_ingest_usage`` (cost-truth fix) is this connection's own SLICE
+    of the caller's single, page-wide batched
+    :meth:`~src.repositories.facts_ingest_runs_pg.FactsIngestRunsPgRepository
+    .llm_usage_rollup_by_corpus_ids` call — passed in, never resolved here,
+    same "look it up ONCE for the whole page" discipline as
+    ``provider_limit`` above. ``None`` (the default) renders as
+    :data:`_NO_FACTS_INGEST_USAGE`; :func:`fleet_extraction_runs` always
+    passes a real (possibly zeroed) entry for every connection it renders.
+    The ``runs`` id/cost list on that entry is intentionally NOT part of
+    this function's own ``out["facts_ingest_usage"]`` — see
+    :func:`_public_facts_ingest_usage`'s own docstring (payload-size fix):
+    the caller's LOCAL ``facts_ingest_usage`` argument still carries it for
+    its own de-duplication/``cost_shared`` computation, only the copy
+    riding on this row's response is stripped.
     """
     out = dict(_EMPTY_FLEET_FACTS)
+    out["facts_ingest_usage"] = _public_facts_ingest_usage(facts_ingest_usage)
     if run:
         progress = run.get("progress") or {}
         report = run.get("report") or {}
@@ -841,6 +941,126 @@ def _fleet_facts(
         out.update(_facts_throughput_and_eta(connection, pending=pending))
     out["provider_limit"] = provider_limit
     return out
+
+
+def _crawl_run_models(run: Optional[Dict[str, Any]]) -> List[str]:
+    """Model name(s) the crawl run's own inline ``usage`` stages actually
+    ran on — each stage dict names its own model
+    (``connectors.sharepoint.facts_extraction._Report.render``'s
+    ``priced["model"] = model``, and the NER/OCR detectors' own usage
+    dicts the same way) — sorted, deduplicated, ``[]`` when ``usage`` is
+    empty or carries no ``model`` key (older rows, predating this field)."""
+    if not run:
+        return []
+    usage = run.get("usage") or {}
+    names = {stage.get("model") for stage in usage.values() if isinstance(stage, dict) and stage.get("model")}
+    return sorted(names)
+
+
+def _fleet_row_cost(run: Optional[Dict[str, Any]], facts_ingest_usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Combine the crawl run's own inline cost (:func:`_run_total_cost_usd`)
+    with this connection's attributable slice of ``facts_ingest_runs``
+    (``facts_ingest_usage`` — one entry of :meth:`~src.repositories.
+    facts_ingest_runs_pg.FactsIngestRunsPgRepository
+    .llm_usage_rollup_by_corpus_ids`'s batched return) into ONE row figure,
+    without double counting: these are genuinely two DIFFERENT usage
+    sources — a crawl run's own inline ``usage`` block is written only when
+    the facts stage runs INSIDE that run
+    (``connectors.sharepoint.crawler._RunRecorder.checkpoint_facts``); the
+    ledger is written by the SEPARATE standalone ``sharepoint-facts-
+    extraction`` job a streamed/partitioned pass runs as instead — a given
+    facts pass is always exactly one or the other, never both, so summing
+    them is additive, never a double count.
+
+    Returns ``{estimated_cost_usd, cost_status, cost_models, token_totals,
+    crawl_cost_usd}``:
+
+    - ``cost_status`` is ``"no_usage"`` when NEITHER source recorded
+      anything for this connection (``estimated_cost_usd: None`` — never a
+      fabricated ``0.0``, the exact bug this fixes: a connection whose
+      facts stage ran only through the standalone job used to read as $0
+      here because the crawl run's own ``usage`` was empty).
+    - ``"unpriced"`` when the crawl run has no usage of its own but the
+      ledger DOES have attributable runs, none of which could be honestly
+      priced (a run naming zero or more than one model — see
+      :meth:`llm_usage_rollup_by_corpus_ids`) — tokens are known
+      (``token_totals`` is real), a dollar figure is not
+      (``estimated_cost_usd: None``), and the two claims must stay
+      distinguishable.
+    - ``"priced"`` otherwise — ``estimated_cost_usd`` sums whatever IS
+      known from each source (the crawl run's cost, which is always fully
+      priced whenever it has usage at all — see ``_Report.render`` — plus
+      the ledger's own priced portion, ``0.0`` if the ledger's own runs
+      were unpriceable while the crawl side still had something to show).
+      ``cost_models`` is every model seen across both sources — the
+      "state the model(s) so the figure can be re-derived" contract.
+
+    ``crawl_cost_usd`` is the crawl-run-only portion (``_run_total_cost_usd``
+    verbatim) — surfaced separately so :func:`fleet_extraction_runs` can
+    build the PAGE TOTAL out of "every row's own crawl cost" (never shared
+    between connections — one ``extraction_runs`` row belongs to exactly
+    one connection) plus a SEPARATELY de-duplicated sum of the ledger
+    portion, rather than summing this function's own combined
+    ``estimated_cost_usd`` across rows, which double-counts a
+    ``facts_ingest_runs`` run two-or-more connections share (see this
+    function's own note below, and ``llm_usage_rollup_by_corpus_ids``'s
+    docstring).
+
+    This function's OWN ``estimated_cost_usd`` deliberately stays a FULL,
+    un-split attribution — see ``llm_usage_rollup_by_corpus_ids``'s
+    docstring for why the underlying ledger figure is already "what did
+    THIS connection's collections see", not a partition of instance
+    spend. A proportional split (divide a shared run's cost by the number
+    of connections that can see it) was considered and rejected: Agnes has
+    no signal that would make such a split honest — an ingest run's LLM
+    calls are not attributed to a specific document, let alone a specific
+    connection, at that granularity, so a fraction here would look precise
+    while being invented. Full attribution plus a visible marker
+    (``cost_shared``/``cost_shared_with`` — computed by the caller, which
+    alone has the whole page's cross-connection picture) is preferred:
+    every row states a real, re-derivable number, and the marker says
+    when it is not this connection's alone.
+    """
+    crawl_usage = (run or {}).get("usage") or {}
+    crawl_cost = _run_total_cost_usd(run)
+    crawl_models = _crawl_run_models(run)
+    crawl_input = sum(int(stage.get("input_tokens") or 0) for stage in crawl_usage.values() if isinstance(stage, dict))
+    crawl_output = sum(
+        int(stage.get("output_tokens") or 0) for stage in crawl_usage.values() if isinstance(stage, dict)
+    )
+
+    facts_cost = facts_ingest_usage.get("estimated_cost_usd")
+    facts_has_usage = bool(facts_ingest_usage.get("runs_with_usage"))
+    facts_models = facts_ingest_usage.get("models") or []
+
+    token_totals = {
+        "input_tokens": crawl_input + int(facts_ingest_usage.get("input_tokens") or 0),
+        "output_tokens": crawl_output + int(facts_ingest_usage.get("output_tokens") or 0),
+    }
+
+    if not crawl_usage and not facts_has_usage:
+        return {
+            "estimated_cost_usd": None,
+            "cost_status": "no_usage",
+            "cost_models": [],
+            "token_totals": token_totals,
+            "crawl_cost_usd": crawl_cost,
+        }
+    if not crawl_usage and facts_has_usage and facts_cost is None:
+        return {
+            "estimated_cost_usd": None,
+            "cost_status": "unpriced",
+            "cost_models": sorted(set(facts_models)),
+            "token_totals": token_totals,
+            "crawl_cost_usd": crawl_cost,
+        }
+    return {
+        "estimated_cost_usd": round(crawl_cost + (facts_cost or 0.0), 4),
+        "cost_status": "priced",
+        "cost_models": sorted(set(crawl_models) | set(facts_models)),
+        "token_totals": token_totals,
+        "crawl_cost_usd": crawl_cost,
+    }
 
 
 @router.get("/extraction/runs")
@@ -909,12 +1129,67 @@ def fleet_extraction_runs(
     carry (:func:`_crawl_schedule_next_run_at`) — pure computation, no extra
     query per row.
 
+    ``estimated_cost_usd``/``cost_status``/``cost_models``/``token_totals``
+    on each row (cost-truth fix) come from :func:`_fleet_row_cost`, which
+    combines the crawl run's own inline usage with this connection's
+    attributable slice of ``facts_ingest_runs`` — the SEPARATE ledger a
+    standalone ``sharepoint-facts-extraction`` job writes to instead of the
+    crawl's own row. That per-connection slice is resolved by ONE batched
+    call, :meth:`~src.repositories.facts_ingest_runs_pg
+    .FactsIngestRunsPgRepository.llm_usage_rollup_by_corpus_ids`, across
+    every connection this page is about to render — never one round trip
+    per row, same discipline as ``children_for`` above — keyed by each
+    connection's own scope collections
+    (``connectors.sharepoint.facts_extraction.collection_ids_for``, the
+    SAME resolution ``_facts_throughput_and_eta`` already uses for its own
+    per-connection throughput signal). Each row's OWN figure is a full,
+    un-split attribution: a bulk-add's shared-collection option or a
+    collection consolidation can legitimately route more than one
+    connection at the SAME collection (``app/api/admin_sharepoint.py::
+    _collection_still_referenced``), and a run touching that collection
+    counts in full toward every connection that can see it — ``cost_shared``/
+    ``cost_shared_with`` name when that is happening for a row, rather than
+    leaving it implicit (see :func:`_fleet_row_cost`'s docstring for why a
+    proportional split was rejected in favor of full attribution plus this
+    marker). ``cost_shared`` is gated on the row's own ``cost_status`` being
+    ``"priced"`` — a ``"no_usage"``/``"unpriced"`` row already renders an
+    em-dash, and a "shared" badge next to no dollar figure at all would
+    explain a number the row does not show.
+
+    ``totals.estimated_cost_usd`` is NOT the sum of the rows' own
+    ``estimated_cost_usd`` — that would count a shared collection's run
+    once per connection that can see it. It is each row's own crawl-run
+    cost (never shared — one ``extraction_runs`` row belongs to exactly one
+    connection) plus the ``facts_ingest_runs`` ledger cost, de-duplicated
+    by run id ONCE across every connection this page renders
+    (``run_owner_connections``/``unique_facts_run_cost_by_id``, built from
+    the SAME batched lookup, no second query). ``totals.cost_note`` states
+    this in the response itself, not only here. A row whose own status is
+    ``"no_usage"``/``"unpriced"`` contributes nothing to either half, same
+    "coverage, not a lie" reasoning :meth:`llm_usage_rollup` documents.
+
+    ``llm_usage_totals`` (top-level, cost-truth fix) is the SAME
+    instance-wide cumulative rollup ``GET /api/facts/ingest-runs`` already
+    returns (:meth:`FactsIngestRunsPgRepository.llm_usage_rollup`) — every
+    ``facts_ingest_runs`` row this instance has EVER persisted, not scoped
+    to the connections rendered on this page. Distinct on purpose from
+    ``totals`` (this page's own per-page aggregate): an operator must be
+    able to tell "what this page shows" from "everything this instance has
+    ever spent on fact extraction" — the summary strip renders it as its
+    own, clearly-labelled tile.
+
     Plain ``def`` (not ``async def``, zero ``await``s below): blocking,
     synchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread
     pool rather than the single event loop (Tier-1 convention,
     ``tests/test_event_loop_offload_guard.py``).
     """
-    from src.repositories import extraction_runs_repo, jobs_repo, sharepoint_state_repo, source_connections_repo
+    from src.repositories import (
+        extraction_runs_repo,
+        facts_ingest_runs_repo,
+        jobs_repo,
+        sharepoint_state_repo,
+        source_connections_repo,
+    )
 
     connections = sorted(
         source_connections_repo().list(source_type="sharepoint"),
@@ -936,12 +1211,67 @@ def fleet_extraction_runs(
     # ONE read for the whole page (never one query per connection), keyed
     # by provider so each connection's row can look up whether ITS
     # resolved facts provider is the one currently refusing.
-    from connectors.sharepoint.facts_extraction import resolve_effective_provider
+    from connectors.sharepoint.facts_extraction import collection_ids_for, resolve_effective_provider
 
     conditions_by_provider = {str(c["provider"]): c for c in _active_provider_limit_conditions()}
 
+    # Cost-truth fix — this connection's OWN attributable slice of
+    # `facts_ingest_runs.llm_usage`, ONE batched query for every connection
+    # this page is about to render (never one round trip per row), keyed by
+    # each connection's own scope collections. `_fleet_row_cost` combines
+    # this with the crawl run's own inline usage per row below.
+    facts_usage_by_connection = facts_ingest_runs_repo().llm_usage_rollup_by_corpus_ids(
+        {str(c["id"]): collection_ids_for(c) for c in connections}
+    )
+    # The SAME instance-wide cumulative rollup `GET /api/facts/ingest-runs`
+    # already exposes — see this function's own docstring for why it rides
+    # alongside, not inside, this page's own per-page `totals`.
+    llm_usage_totals = facts_ingest_runs_repo().llm_usage_rollup()
+
+    # Shared-collection double-count fix — a SharePoint bulk-add's shared-
+    # collection option, or collection consolidation, can legitimately
+    # route more than one connection's scope at the SAME collection (see
+    # `app/api/admin_sharepoint.py::_collection_still_referenced`), so one
+    # `facts_ingest_runs` row can appear in more than one connection's own
+    # `runs` list above. Built ONCE for the whole page from that SAME
+    # batched lookup, never a second query: `run_owner_connections` maps a
+    # run id to every connection id that saw it; `shared_facts_run_ids` is
+    # the subset more than one connection saw; `unique_facts_run_cost_by_id`
+    # keeps each run's own priced cost exactly ONCE regardless of how many
+    # connections' lists it appears in — the page TOTAL below sums THIS,
+    # never the rows' own (deliberately full-attribution, per-row) figures,
+    # which would count a shared run's cost once per connection that can
+    # see it.
+    # Deliberately built from EVERY SharePoint connection's own ledger
+    # slice, not just the ones this call ends up rendering as rows — a
+    # row's own `cost_shared_with` names the truth ("this run is also
+    # attributed to Legal SharePoint") whether or not that other
+    # connection happens to be visible under the current `active`/`all`
+    # scope. The page TOTAL below is scoped separately (only run ids a
+    # RENDERED row actually carries), since `totals` is documented as
+    # "this page's own per-page aggregate".
+    run_owner_connections: Dict[str, List[str]] = {}
+    unique_facts_run_cost_by_id: Dict[str, Optional[float]] = {}
+    for _cid, _usage in facts_usage_by_connection.items():
+        for _run_entry in _usage.get("runs") or []:
+            _run_id = str(_run_entry.get("id"))
+            run_owner_connections.setdefault(_run_id, []).append(_cid)
+            unique_facts_run_cost_by_id[_run_id] = _run_entry.get("estimated_cost_usd")
+    shared_facts_run_ids = {rid for rid, owners in run_owner_connections.items() if len(set(owners)) > 1}
+    connection_names_by_id = {str(c["id"]): str(c.get("name") or c["id"]) for c in connections}
+    # Populated during the row loop below with only the run ids a RENDERED
+    # row actually carries — what scopes `facts_ledger_total_cost` (summed
+    # after the loop) to what this call's `active`/`all` scope actually
+    # shows, matching `crawl_cost_total`'s own scoping.
+    rendered_facts_run_ids: set = set()
+
     now = datetime.now(timezone.utc)
     rows: List[Dict[str, Any]] = []
+    # Every row's own crawl-run cost, accumulated as the page total's OTHER
+    # half — never shared between connections (one `extraction_runs` row
+    # belongs to exactly one connection), so a plain per-row sum is
+    # correct for this half, unlike the ledger half above.
+    crawl_cost_total = 0.0
     totals: Dict[str, Any] = {
         "connections": 0,
         "active": 0,
@@ -982,11 +1312,44 @@ def fleet_extraction_runs(
         )
 
         effective_provider, _provider_source = resolve_effective_provider(connection)
+        facts_ingest_usage = facts_usage_by_connection.get(connection_id) or dict(_NO_FACTS_INGEST_USAGE)
         facts = _fleet_facts(
-            run, connection_id, connection=connection, provider_limit=conditions_by_provider.get(effective_provider)
+            run,
+            connection_id,
+            connection=connection,
+            provider_limit=conditions_by_provider.get(effective_provider),
+            facts_ingest_usage=facts_ingest_usage,
         )
-        cost = _run_total_cost_usd(run)
+        row_cost = _fleet_row_cost(run, facts_ingest_usage)
         backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
+
+        # Shared-collection marker (cost-truth fix) — THIS row's own
+        # attribution stays full (see `_fleet_row_cost`'s docstring for why
+        # a proportional split was rejected), but a reader must be able to
+        # SEE when that figure is not this connection's alone: any run this
+        # connection's own ledger slice carries that ALSO belongs to
+        # another connection (`shared_facts_run_ids`, built once above).
+        # `rendered_facts_run_ids` still accumulates regardless of
+        # `cost_status` — the TOTAL's own de-duplication scope needs every
+        # rendered row's run ids, priced or not (an unpriced run
+        # contributes 0 to the sum either way). The `cost_shared` MARKER
+        # is gated on this row actually showing a priced dollar figure: a
+        # "no_usage"/"unpriced" row already renders an em-dash, and a
+        # "shared" badge next to a number that is not there would explain
+        # something the row does not display.
+        row_run_ids = {str(r.get("id")) for r in facts_ingest_usage.get("runs") or []}
+        rendered_facts_run_ids |= row_run_ids
+        row_shared_run_ids = row_run_ids & shared_facts_run_ids
+        cost_shared = row_cost["cost_status"] == "priced" and bool(row_shared_run_ids)
+        cost_shared_with: List[str] = []
+        if cost_shared:
+            other_connection_ids: set = set()
+            for shared_run_id in row_shared_run_ids:
+                other_connection_ids.update(run_owner_connections.get(shared_run_id) or [])
+            other_connection_ids.discard(connection_id)
+            cost_shared_with = sorted(
+                {connection_names_by_id.get(other_id, other_id) for other_id in other_connection_ids}
+            )
 
         totals["connections"] += 1
         if stored_status == "running":
@@ -1003,7 +1366,13 @@ def fleet_extraction_runs(
             totals["facts_docs_done"] += int(facts["docs_done"] or 0)
         if facts.get("docs_total"):
             totals["facts_docs_total"] += int(facts["docs_total"] or 0)
-        totals["estimated_cost_usd"] += cost
+        # This row's own crawl-run cost is never shared with another
+        # connection — accumulate it straight into the page total. The
+        # ledger half is summed SEPARATELY, once per unique run id, AFTER
+        # the loop (`facts_ledger_total_cost` below, from
+        # `rendered_facts_run_ids`) — never here, or a shared collection's
+        # run would be counted once per connection that can see it.
+        crawl_cost_total += row_cost["crawl_cost_usd"]
 
         rows.append(
             {
@@ -1014,7 +1383,28 @@ def fleet_extraction_runs(
                 "checkpoint_age_s": checkpoint_age_s,
                 "stuck": stuck,
                 "facts": facts,
-                "estimated_cost_usd": round(cost, 4),
+                "estimated_cost_usd": row_cost["estimated_cost_usd"],
+                # Honesty markers (cost-truth fix, mirrors `GET
+                # /api/admin/telemetry/chat-cost`'s `cache_accounting`/
+                # `priced_as`): "no_usage" (nothing recorded anywhere for
+                # this connection), "unpriced" (tokens known, no model this
+                # can honestly price), or "priced" (a real figure) — never
+                # collapsed into a bare `0.0` a reader would mistake for a
+                # measurement. `cost_models` names what a "priced" figure
+                # was actually priced at, so it can be re-derived.
+                "cost_status": row_cost["cost_status"],
+                "cost_models": row_cost["cost_models"],
+                "token_totals": row_cost["token_totals"],
+                # `cost_shared`/`cost_shared_with` (shared-collection fix) —
+                # `True` when at least one `facts_ingest_runs` run counted
+                # into THIS row's own `estimated_cost_usd` is ALSO
+                # attributed to another connection (a shared collection),
+                # naming which connection(s) — never left implicit: this
+                # row's own figure is a full, un-split attribution (see
+                # `_fleet_row_cost`'s docstring for why), so a reader must
+                # be able to see it is not this connection's alone.
+                "cost_shared": cost_shared,
+                "cost_shared_with": cost_shared_with,
                 # Same persisted-backlog counts `extraction/status` carries —
                 # what the fleet table's own "Retry failed (N)"/"Retry empty
                 # (N)" buttons show, so an operator does not need to open a
@@ -1031,13 +1421,38 @@ def fleet_extraction_runs(
         )
 
     totals["files_per_min"] = round(totals["files_per_min"], 2)
-    totals["estimated_cost_usd"] = round(totals["estimated_cost_usd"], 4)
+    # De-duplicated page total (shared-collection fix): every RENDERED
+    # row's own crawl-run cost (never shared) plus the facts_ingest_runs
+    # ledger cost, counted ONCE per unique run id among the runs those
+    # rendered rows actually carry (`rendered_facts_run_ids`, collected
+    # during the loop above) — even when several connections share a
+    # collection. Never the sum of the rows' own `estimated_cost_usd`,
+    # which is each row's full attribution and double-counts a shared run;
+    # and never the UNSCOPED `unique_facts_run_cost_by_id` built earlier
+    # (that one spans every SharePoint connection, not just what this
+    # `active`/`all` call is rendering).
+    facts_ledger_total_cost = sum(
+        cost
+        for run_id in rendered_facts_run_ids
+        if (cost := unique_facts_run_cost_by_id.get(run_id)) is not None
+    )
+    totals["estimated_cost_usd"] = round(crawl_cost_total + facts_ledger_total_cost, 4)
+    totals["cost_note"] = (
+        "sums each row's own crawl-run cost (never shared between connections) plus every "
+        "attributable facts_ingest_runs run, counted ONCE per run even when a collection is "
+        "shared across connections (see cost_shared/cost_shared_with on the affected rows) — "
+        "this is NOT the sum of the rows' own estimated_cost_usd, which is each row's full, "
+        "un-split attribution and would double-count a shared run"
+    )
 
     jobs = jobs_repo().counts_by_kind(list(_EXTRACTION_JOB_KINDS))
 
     return {
         "connections": rows,
         "totals": totals,
+        # Instance-wide cumulative rollup (cost-truth fix) — see this
+        # function's own docstring for why it is separate from `totals`.
+        "llm_usage_totals": llm_usage_totals,
         "jobs": jobs,
         "as_of": now.isoformat(),
         # Fleet-level provider-refusal conditions (TCRD-296 synthesis
@@ -1170,6 +1585,13 @@ def cancel_extraction_run(
 _FACTS_JOB_KIND = "sharepoint-facts-extraction"
 _FACTS_JOB_LIVE_STATUSES = ("running", "queued")
 
+#: The crawl trigger's own job kind and "in flight" statuses — the same
+#: pair :func:`_crawl_job_in_flight` below reasons about, mirroring
+#: :data:`_FACTS_JOB_KIND` / :data:`_FACTS_JOB_LIVE_STATUSES` for
+#: `corpus-extraction` instead of the standalone facts pass.
+_CRAWL_JOB_KIND = "corpus-extraction"
+_CRAWL_JOB_LIVE_STATUSES = ("running", "queued")
+
 
 def _iso_or_none(value: Any) -> Optional[str]:
     if value is None:
@@ -1210,6 +1632,40 @@ def _facts_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
     repo = jobs_repo()
     for status in _FACTS_JOB_LIVE_STATUSES:
         for job in repo.list(status=status, kind=_FACTS_JOB_KIND, limit=200):
+            if job.get("idempotency_key") != key:
+                continue
+            return {
+                "id": job["id"],
+                "status": job["status"],
+                "created_at": _iso_or_none(job.get("created_at")),
+                "started_at": _iso_or_none(job.get("started_at")),
+            }
+    return None
+
+
+def _crawl_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
+    """The queued-or-running ``corpus-extraction`` job for this connection,
+    projected to ``{id, status, created_at, started_at}`` — or ``None`` when
+    there is none. Mirrors :func:`_facts_job_in_flight` exactly, for the
+    crawl trigger's own job kind instead of the standalone facts pass.
+
+    Fills the state-chip's ``Queued`` rung (§2.1 of the source-card
+    redesign): a job can sit ``queued`` for a while before a worker claims
+    it and opens the first ``extraction_runs`` row, and until then
+    ``running``/``last_completed``/``last_failed`` are all ``null`` — the
+    card would otherwise show "never run" for a connection that in fact has
+    work waiting. Matched on the trigger's own idempotency key
+    (:func:`app.api.admin_sharepoint._extraction_idempotency_key`), same
+    reasoning as the facts lookup: a second copy of that key's format here
+    would be a silent-drift hazard.
+    """
+    from app.api.admin_sharepoint import _extraction_idempotency_key
+    from src.repositories import jobs_repo
+
+    key = _extraction_idempotency_key(connection_id)
+    repo = jobs_repo()
+    for status in _CRAWL_JOB_LIVE_STATUSES:
+        for job in repo.list(status=status, kind=_CRAWL_JOB_KIND, limit=200):
             if job.get("idempotency_key") != key:
                 continue
             return {
@@ -1413,6 +1869,20 @@ def extraction_status(
     docstring), so it is read off whichever of ``running``/``last_failed``/
     ``last_completed`` above is most recent, in that order, and is ``null``
     when none of the three exist.
+
+    ``files_per_min`` is :func:`_files_per_min` over ``running`` (``null``
+    when nothing is running or the rate is not yet computable) — the source
+    card's live line (source-card redesign §2.1) reads this rather than
+    dividing absolute counters itself, the same windowed-rate computation
+    the fleet view's own ``files_per_min`` column already uses.
+
+    ``crawl_job`` is the queued/running ``corpus-extraction`` job for this
+    connection (:func:`_crawl_job_in_flight`) or ``null`` — mirrors
+    ``facts_job`` above, for the crawl trigger's own job kind. Fills the
+    window between a trigger enqueueing a job and a worker claiming it and
+    opening the first ``extraction_runs`` row, where ``running`` is still
+    ``null`` but the connection is not truly idle — the state chip's
+    ``Queued`` rung.
     """
     connection = _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo, sharepoint_state_repo
@@ -1462,6 +1932,8 @@ def extraction_status(
         "last_completed": last_completed_out,
         "last_failed": last_failed_out,
         "runs_total": repo.count_for_connection(connection_id),
+        "files_per_min": _files_per_min(running) if running else None,
+        "crawl_job": _crawl_job_in_flight(connection_id),
         "facts_job": facts_job,
         # TCRD-296 gap #61: a pass that stopped on its own time budget left
         # nothing visible once the crawl that triggered it was long over —
@@ -2647,6 +3119,429 @@ async def extraction_completeness(
         "cached": was_cached,
         "provisional": _completeness_crawl_running(connection_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Extraction breakdown (2026-09-04) — "how many documents did we get, how
+# many did we not, broken down by file type and by reason" — the answer an
+# operator finishing a large crawl cannot get from any other screen today,
+# only by hand-writing SQL against Postgres on the box. A SEPARATE surface
+# from A6 completeness above: completeness answers "does the corpus match
+# what Graph Search says exists" (an external reference count); this
+# answers "of what the crawl itself touched, what became of it" — entirely
+# from data the crawl and the corpus already persisted, no Graph calls.
+# ---------------------------------------------------------------------------
+
+#: Field names :func:`_run_out` already normalizes per run as ``live =
+#: report or progress`` (present in BOTH a finished run's report and a
+#: live/abandoned run's progress checkpoint) — reused here rather than
+#: re-deriving the same report-or-progress pick a second time.
+_BREAKDOWN_LIVE_FIELDS: Tuple[str, ...] = (
+    "new",
+    "changed",
+    "unchanged",
+    "renamed",
+    "deleted",
+    "bytes_downloaded",
+    "http_429",
+    "throttle_wait_s",
+    "filtered_by_age",
+    "age_unknown",
+    "skipped_unsupported",
+    "skipped_doomed",
+    "oversize_files",
+)
+
+#: Scalars ``_progress_snapshot`` (``connectors/sharepoint/crawler.py``)
+#: never carries — only a run that finished long enough to call
+#: ``CrawlStats.report()`` has them. An "abandoned" run (worker killed
+#: outright, closed by ``ExtractionRunsPgRepository.abandon_stale_
+#: running`` with whatever ``report`` it already had — see this module's
+#: own docstring on the interrupted-run trap) contributes NOTHING to these,
+#: never a lowball number silently averaged in. Read straight off
+#: ``report`` (not through ``_run_out``, which does not expose them).
+_BREAKDOWN_REPORT_ONLY_FIELDS: Tuple[str, ...] = (
+    "permission_skips",
+    "excluded_subtree_skips",
+    "requests",
+    "item_seconds",
+    "duration_s",
+)
+
+#: The one ``reason_type`` this surface calls out separately from every
+#: other convert-stage failure: the document converted fine and produced no
+#: extractable text (``CrawlStats.note_failed_item``'s ``convert_empty``
+#: call site, reason text always exactly "conversion succeeded but produced
+#: no extractable text") — usually a scanned PDF that needs OCR, not a
+#: broken pipeline, and typically the single largest cohort in
+#: ``failed_items``.
+_EMPTY_TEXT_REASON_TYPE = "convert_empty"
+
+#: Every item that reaches the download/convert stage is fetched to a local
+#: temp file first (``tempfile.mkstemp()``, default ``"tmp"`` prefix —
+#: ``connectors/sharepoint/crawler.py``'s ``download_to_temp``), and a
+#: convert-stage exception's message is built as ``f"{filename}: {message}"``
+#: (``ConversionError.__init__``, ``src/ingest/convert.py``) where
+#: ``filename`` is that temp file's own basename — so 1 444 files that all
+#: hit the SAME underlying fault ("markitdown could not convert this file")
+#: read as 1 444 DIFFERENT reason strings under a naive ``GROUP BY reason``,
+#: one per random temp filename. This strips exactly that prefix so they
+#: collapse back into one row. Bounded quantifiers only (no nested/unbounded
+#: repetition) — linear-time over tenant-controlled text, per the security
+#: playbook; a reason with no such prefix (most non-``ConversionError``
+#: faults, e.g. a bare timeout message) passes through unchanged, since
+#: those already read the same across files with no per-file noise to strip.
+_TMP_FILENAME_PREFIX_RE = re.compile(r"^tmp[\w\-]{1,64}\.[\w]{1,12}:\s*")
+
+
+def _normalize_failure_reason(reason: str) -> str:
+    """A ``failed_items[].reason`` string, with a leading local-temp-filename
+    prefix stripped (see :data:`_TMP_FILENAME_PREFIX_RE`) so every file that
+    hit the same underlying fault groups under the same row."""
+    reason = (reason or "").strip()
+    if not reason:
+        return "(no reason recorded)"
+    stripped = _TMP_FILENAME_PREFIX_RE.sub("", reason, count=1).strip()
+    return stripped or reason
+
+
+def _extension_of_suffix(suffix: Any) -> str:
+    """``failed_items``/``skips`` items carry their OWN ``suffix`` (set by
+    the crawler at note-time, already the real extension, lowercased,
+    ``Path(name).suffix.lower()`` — never a stored-artifact type like
+    ``corpus_files.file_type``, which is always ``"md"`` for a converted
+    document). Normalized to match :meth:`CorpusFilesRepository.
+    extension_status_counts`'s own convention: lowercase, no leading dot,
+    ``""`` when absent — so the two sources bucket under the same key."""
+    return str(suffix or "").lower().lstrip(".")
+
+
+def _parse_window_bound(value: Optional[str], *, param: str) -> Optional[datetime]:
+    """A ``since``/``until`` query param — ``None`` when absent, else a
+    tz-aware ``datetime``. ``400 invalid_{param}`` on anything
+    ``datetime.fromisoformat`` rejects (accepts both a bare ``YYYY-MM-DD``
+    and a full ISO timestamp) — the same "never build a filter from an
+    unchecked value, name which param" posture ``_validate_min_modified``
+    (``app/api/admin_sharepoint.py``) already uses for its own date filter.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"error": f"invalid_{param}"}) from None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _breakdown_scalars(runs: List[Dict[str, Any]], *, now: datetime) -> Dict[str, Any]:
+    """The run-level reconciliation scalars, summed across every run in the
+    window — the raw material for "seen reconciles to indexed with nothing
+    unexplained in between".
+
+    Each :data:`_BREAKDOWN_LIVE_FIELDS` key is read through :func:`_run_out`
+    (the SAME ``live = report or progress`` pick the status/history/fleet
+    endpoints already use — reused, not re-derived) so a value present on
+    either a finished run's report OR a still-checkpointing run's progress
+    counts; :data:`_BREAKDOWN_REPORT_ONLY_FIELDS` are read straight off
+    ``report`` and are simply absent from a run that never got one — see
+    both data structures' own docstrings for why the split matters (the
+    task's own live-fleet trap: an 82-of-96-interrupted connection's
+    ``bytes_downloaded`` undercounts by ~3x if only ``report`` is read).
+    ``contributed_runs`` names, per key, how many of the window's runs
+    actually had a value to add — the honest complement to a bare sum: a
+    ``permission_skips`` total built from 14 of 96 runs is a different claim
+    than one built from all 96, and this is what lets a caller tell them
+    apart instead of reading one indistinguishable number.
+    """
+    totals: Dict[str, float] = {}
+    contributed: Dict[str, int] = {}
+    runs_with_report = 0
+    runs_progress_only = 0
+
+    def _add(key: str, value: Any) -> None:
+        if value is None:
+            return
+        totals[key] = totals.get(key, 0.0) + float(value)
+        contributed[key] = contributed.get(key, 0) + 1
+
+    for run in runs:
+        report = run.get("report") or {}
+        if report:
+            runs_with_report += 1
+        else:
+            runs_progress_only += 1
+        out = _run_out(run, now=now)
+        for key in _BREAKDOWN_LIVE_FIELDS:
+            _add(key, out.get(key))
+        for key in _BREAKDOWN_REPORT_ONLY_FIELDS:
+            _add(key, report.get(key))
+        _add("concurrency_downshifts", (report.get("concurrency") or {}).get("downshifts"))
+        _add("oversize_bytes", (report.get("skipped_oversize") or {}).get("bytes"))
+
+    # Every summed field here is an integer count/byte/request tally except
+    # `throttle_wait_s`/`item_seconds`/`duration_s`, which are seconds —
+    # rounding those to 1 decimal keeps sub-second precision without a
+    # trailing float artifact (`12.300000000000001`) on the wire.
+    seconds_keys = {"throttle_wait_s", "item_seconds", "duration_s"}
+    values = {k: (round(v, 1) if k in seconds_keys else int(v)) for k, v in totals.items()}
+    return {
+        "runs_considered": len(runs),
+        "runs_with_report": runs_with_report,
+        "runs_progress_only": runs_progress_only,
+        "values": values,
+        "contributed_runs": contributed,
+    }
+
+
+def _breakdown_failures(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """``report.failed_items`` across every run in the window, split into
+    the "converted fine, produced no text" cohort
+    (:data:`_EMPTY_TEXT_REASON_TYPE`) and everything else, the latter
+    grouped by NORMALIZED reason (:func:`_normalize_failure_reason`) —
+    without this, 1 444 files failing the SAME markitdown fault would list
+    as 1 444 one-row reasons, exactly the naive-``GROUP BY`` bug this
+    endpoint exists to not reproduce.
+
+    ``listed`` is the number of itemized failures actually available across
+    every contributing run's own (5000-item-capped) ``failed_items`` list —
+    NOT a true total: a run's ``failed_items_truncated`` flag says it hit
+    its own cap, but the crawl does not persist how many MORE there were
+    past it, so this can only ever be a lower bound when ``truncated`` is
+    true, never a number this endpoint invents. A run with an empty
+    ``report`` (progress-only — see :func:`_breakdown_scalars`) contributes
+    no items here at all, since ``failed_items`` is never in ``progress``
+    either — this cohort is understated by exactly the same runs that
+    undercount every other report-only figure.
+    """
+    empty_text_count = 0
+    empty_text_by_ext: Dict[str, int] = {}
+    failed_by_ext: Dict[str, int] = {}
+    reasons: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    listed = 0
+    truncated = False
+
+    for run in runs:
+        report = run.get("report") or {}
+        items = report.get("failed_items") or []
+        if report.get("failed_items_truncated"):
+            truncated = True
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            listed += 1
+            ext = _extension_of_suffix(item.get("suffix"))
+            reason_type = str(item.get("reason_type") or "unknown")
+            if reason_type == _EMPTY_TEXT_REASON_TYPE:
+                empty_text_count += 1
+                empty_text_by_ext[ext] = empty_text_by_ext.get(ext, 0) + 1
+                continue
+            failed_by_ext[ext] = failed_by_ext.get(ext, 0) + 1
+            normalized = _normalize_failure_reason(str(item.get("reason") or ""))
+            key = (reason_type, normalized)
+            bucket = reasons.setdefault(
+                key, {"reason_type": reason_type, "reason": normalized, "count": 0, "by_extension": {}}
+            )
+            bucket["count"] += 1
+            bucket["by_extension"][ext] = bucket["by_extension"].get(ext, 0) + 1
+
+    by_reason = sorted(reasons.values(), key=lambda r: -r["count"])
+    return {
+        "empty_text": {
+            "count": empty_text_count,
+            "by_extension": empty_text_by_ext,
+            "note": "conversion succeeded but produced no extractable text — usually needs OCR, not a broken pipeline",
+        },
+        "failed": {
+            # `listed` counts every item this loop visited (both cohorts);
+            # subtracting the empty-text share leaves the real-failure one
+            # without a second pass over every run's `failed_items`.
+            "count": listed - empty_text_count,
+            "by_extension": failed_by_ext,
+        },
+        "by_reason": by_reason,
+        "listed": listed,
+        "truncated": truncated,
+    }
+
+
+def _breakdown_by_extension(
+    corpus_counts: Dict[str, Dict[str, Dict[str, int]]],
+    *,
+    failed_by_ext: Dict[str, int],
+    empty_text_by_ext: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """One row per file extension — ``corpus_files.path``-derived (via
+    :meth:`CorpusFilesRepository.extension_status_counts`, NEVER
+    ``filename``/``file_type`` — see that method's own docstring for the
+    trap) merged with the failure counts from :func:`_breakdown_failures`,
+    keyed the same way (:func:`_extension_of_suffix`).
+
+    ``indexed``/``rejected``/``processing``/``pending``/``needs_review``
+    reflect the corpus's CURRENT state — every file ever landed for this
+    connection, not scoped to the run window — while ``failed``/
+    ``empty_text`` are windowed (only the runs the caller selected). The two
+    are DIFFERENT populations by construction whenever a window narrower
+    than "every run" is requested; see the response's own
+    ``reconciliation.note``. ``needs_review`` (``src/ingest/runner.py``) is
+    a DIFFERENT "produced no text" signal from ``empty_text`` above — it
+    fires when conversion succeeded and chunking still yielded zero chunks
+    (e.g. all-whitespace content), one stage later in the pipeline than the
+    crawler's own ``convert_empty`` — kept as its own column rather than
+    merged into either sibling.
+    """
+    _EMPTY_STATUS = {"count": 0, "bytes": 0}
+    extensions = set(corpus_counts) | set(failed_by_ext) | set(empty_text_by_ext)
+    rows: List[Dict[str, Any]] = []
+    for ext in extensions:
+        statuses = corpus_counts.get(ext, {})
+        rows.append(
+            {
+                "extension": ext or "(none)",
+                "indexed": statuses.get("indexed", _EMPTY_STATUS),
+                "rejected": statuses.get("rejected", _EMPTY_STATUS),
+                "processing": statuses.get("processing", _EMPTY_STATUS),
+                "pending": statuses.get("pending", _EMPTY_STATUS),
+                "needs_review": statuses.get("needs_review", _EMPTY_STATUS),
+                "failed": failed_by_ext.get(ext, 0),
+                "empty_text": empty_text_by_ext.get(ext, 0),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            -(
+                r["indexed"]["count"]
+                + r["rejected"]["count"]
+                + r["processing"]["count"]
+                + r["pending"]["count"]
+                + r["needs_review"]["count"]
+                + r["failed"]
+                + r["empty_text"]
+            )
+        )
+    )
+    return rows
+
+
+@router.get("/connections/{connection_id}/extraction/breakdown")
+def extraction_breakdown(
+    connection_id: str,
+    since: Optional[str] = Query(None, description="Only runs started on/after this ISO date/datetime"),
+    until: Optional[str] = Query(None, description="Only runs started before this ISO date/datetime"),
+    _user: dict = Depends(require_admin),
+):
+    """ "How many documents did we get, how many did we not, broken down by
+    file type and by reason, and how much of the corpus is silently empty"
+    (2026-09-04) — read entirely from what the crawl and the corpus already
+    persisted (``extraction_runs``/``corpus_files``), no Graph calls, unlike
+    A6 completeness above.
+
+    ``since``/``until`` scope which RUNS contribute to ``scalars``/
+    ``failures``/``skips`` (default: every run on record for this
+    connection — the "everywhere" default the rest of Agnes's read surfaces
+    use, per the command-UX scope model — capped defensively at 500 runs,
+    newest first, by :meth:`ExtractionRunsPgRepository.list_full_for_
+    connection`). ``by_extension``'s ``indexed``/``rejected``/
+    ``processing``/``pending`` counts are UNSCOPED by design — they read
+    the corpus's current state, not just what this window's runs touched —
+    so narrowing the window makes ``reconciliation.unexplained`` an
+    increasingly approximate figure; see its own ``note``.
+
+    Every run selected — PARENT (planner) rows AND shard children alike,
+    unlike the fleet/history endpoints above which show only parents — so a
+    sharded site's real per-shard failures are counted once each rather
+    than folded into (or missing from) a near-empty parent report.
+
+    ``400 invalid_since``/``invalid_until`` for a malformed bound (mirrors
+    ``_validate_min_modified``'s own posture). ``404`` for an unknown or
+    non-SharePoint connection id.
+
+    PG-only, same as every other route in this module: both
+    ``extraction_runs`` and ``corpus_files`` resolve through their own
+    ``*_repo()`` factory, so a DuckDB-backed instance gets the typed
+    ``501`` from whichever resolves first via the app-wide handler in
+    ``app/main.py`` — nothing here needs its own DuckDB fallback.
+    """
+    connection = _sharepoint_connection_or_404(connection_id)
+    since_dt = _parse_window_bound(since, param="since")
+    until_dt = _parse_window_bound(until, param="until")
+
+    from connectors.sharepoint.facts_extraction import collection_ids_for
+    from src.repositories import corpus_files_repo, extraction_runs_repo
+
+    now = datetime.now(timezone.utc)
+    runs = extraction_runs_repo().list_full_for_connection(connection_id, since=since_dt, until=until_dt)
+
+    scalars = _breakdown_scalars(runs, now=now)
+    failures = _breakdown_failures(runs)
+
+    corpus_ids = collection_ids_for(connection)
+    corpus_counts = corpus_files_repo().extension_status_counts(corpus_ids) if corpus_ids else {}
+    by_extension = _breakdown_by_extension(
+        corpus_counts,
+        failed_by_ext=failures["failed"]["by_extension"],
+        empty_text_by_ext=failures["empty_text"]["by_extension"],
+    )
+
+    indexed_total = sum(row["indexed"]["count"] for row in by_extension)
+    needs_review_total = sum(row["needs_review"]["count"] for row in by_extension)
+    values = scalars["values"]
+    seen = (
+        values.get("new", 0) + values.get("changed", 0) + values.get("unchanged", 0) + values.get("filtered_by_age", 0)
+    )
+    accounted_for = (
+        indexed_total
+        + needs_review_total
+        + failures["failed"]["count"]
+        + failures["empty_text"]["count"]
+        + values.get("skipped_unsupported", 0)
+        + values.get("permission_skips", 0)
+        + values.get("excluded_subtree_skips", 0)
+        + values.get("oversize_files", 0)
+    )
+
+    return {
+        "connection_id": connection_id,
+        "window": {
+            "since": since_dt.isoformat() if since_dt else None,
+            "until": until_dt.isoformat() if until_dt else None,
+        },
+        "runs": {
+            "considered": scalars["runs_considered"],
+            "with_report": scalars["runs_with_report"],
+            "progress_only": scalars["runs_progress_only"],
+            "note": (
+                "counters below use each run's REPORT when it finished normally, and its live "
+                "PROGRESS checkpoint otherwise (an interrupted run whose worker died before writing "
+                "a report — see runs.progress_only). Fields report-only by construction "
+                "(permission_skips, excluded_subtree_skips, requests, item_seconds, duration_s, "
+                "oversize_bytes) are undercounted by exactly those runs; see scalars.contributed_runs."
+            ),
+        },
+        "scalars": {**values, "contributed_runs": scalars["contributed_runs"]},
+        "failures": failures,
+        "skips": {
+            "oversize": {
+                "files": values.get("oversize_files", 0),
+                "bytes": values.get("oversize_bytes", 0),
+            }
+        },
+        "by_extension": by_extension,
+        "reconciliation": {
+            "seen": seen,
+            "indexed": indexed_total,
+            "accounted_for": accounted_for,
+            "unexplained": seen - accounted_for,
+            "note": (
+                "seen = new + changed + unchanged + filtered_by_age, summed across the window's runs. "
+                "accounted_for = indexed + needs_review + failed + empty_text + skipped_unsupported + "
+                "permission_skips + excluded_subtree_skips + oversize_files. indexed/needs_review read "
+                "the corpus's CURRENT state, not just this window, so a since/until narrower than the "
+                "connection's full history makes unexplained increasingly approximate rather than "
+                "exact — it is never hidden either way."
+            ),
+        },
+        "as_of": now.isoformat(),
     }
 
 

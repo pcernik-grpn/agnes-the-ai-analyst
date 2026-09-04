@@ -827,6 +827,21 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/grants/reconcile-everyone-scope": (
+        "the operator action that finishes migration 0098's deferred "
+        "scope='everyone' conversion. It HAS a CLI (`agnes admin grant "
+        "reconcile-everyone`) — the exemption is from the MCP surface "
+        "specifically, and deliberately. The conversion is guarded precisely "
+        "because it changes WHO CAN SEE WHAT: 0098 refuses it when a person "
+        "sits outside the Everyone group (they would gain everything it "
+        "holds) or a non-person sits inside it (it would lose grants it holds "
+        "today). Handing an agent a tool that flips grant scopes gives it a "
+        "lever on access control whose whole design is that a human decides, "
+        "after tidying the membership the guard named. The read half of the "
+        "question — who does an everyone-scoped grant reach — is already on "
+        "the agent surface through the ordinary grant/group tools; what is "
+        "withheld is the write"
+    ),
     "/api/admin/groups/reach": (
         "/admin/access's share picker asking how many distinct people the set "
         "of audiences it currently has ticked would reach — web UI only. Its "
@@ -1594,6 +1609,20 @@ _EXEMPT: dict[str, str] = {
         "per-scope/per-folder expected-vs-indexed document counts (Graph Search fan-out) "
         "for the completeness drawer — CLI-reachable (agnes admin sharepoint completeness) "
         "but deliberately not MCP-exposed, same reasoning as split-plan above"
+    ),
+    # "how many documents did we get, how many did we not, by file type and
+    # by reason" (2026-09-04) — read entirely from persisted run/corpus
+    # data, no Graph calls. Same class as `completeness` above: CLI-reachable
+    # (`agnes admin sharepoint breakdown`) for an operator finishing a large
+    # crawl over SSH with no browser open — the endpoint's own docstring
+    # says this is otherwise only reachable by hand-writing SQL against
+    # Postgres on the box — but deliberately not MCP-exposed: an aggregate
+    # operational diagnostic, not a bounded analyst query.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": (
+        "documents/failures/skips grouped by file extension and normalized failure reason, plus "
+        "run-level reconciliation scalars, for the extraction breakdown panel — admin display "
+        "primitive, CLI-reachable (agnes admin sharepoint breakdown) but deliberately not "
+        "MCP-exposed, same reasoning as completeness above"
     ),
     # Cooperative stop for the same card's Stop button (owner-frustration fix,
     # 2026-09-01) — an admin-only control over the SAME crawl the trigger

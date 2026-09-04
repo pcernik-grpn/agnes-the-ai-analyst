@@ -147,7 +147,14 @@
     if(n>=1e4) return (n/1e3).toFixed(0)+'k';
     if(n>=1e3) return (n/1e3).toFixed(1)+'k';
     return String(n); }
-  function esc(s){ const d=document.createElement('div'); d.textContent=(s==null?'':s); return d.innerHTML; }
+  function esc(s) {
+  /* Both quote forms, not only &, < and >: this helper may reach a
+     quoted ATTRIBUTE, where a bare `"` is an attribute break-out. Text
+     positions are unharmed — the browser renders the entities back. */
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
   async function getJSON(url){ const r=await fetch(url,{credentials:'same-origin'}); if(!r.ok) throw new Error(r.status); return r.json(); }
 
   function drawLineChart(values,color){

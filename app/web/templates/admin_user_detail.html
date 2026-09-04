@@ -403,8 +403,9 @@
         </div>
         <div class="dsec-empty" id="memberships-empty" hidden>
           <strong>Not in any group</strong>
-          Which means no data, no plugins and no memory reach this account yet.
-          Add them to a group below.
+          They still get everything shared with everyone — see the effective-access
+          read-out below. A group is what adds more on top of that.
+          Add them to one below.
         </div>
 
         {# refreshGroupDropdown() rebuilds this <select>'s options wholesale
@@ -659,7 +660,20 @@ const EFFECTIVE_API = `/api/admin/users/${encodeURIComponent(USER_ID)}/effective
 const GOOGLE_GROUP_PREFIX = {{ config.AGNES_GOOGLE_GROUP_PREFIX | tojson }};
 const GROUPS_API = "/api/admin/groups";
 
-function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+/* Escapes both quote forms, not only `&`, `<`, `>`. The `textContent` ->
+   `innerHTML` round-trip this replaced covers what a TEXT node needs, and
+   this page interpolates into quoted ATTRIBUTES too, where a bare `"` closes
+   the value early and everything after it parses as further attributes — so
+   `" onmouseover="…` injects a live handler with no `<` involved, and the
+   dashboard CSP does not block inline handlers. Text positions are unharmed:
+   the browser renders the entities back. One helper correct in both contexts
+   rather than two an author has to choose between; `tests/
+   test_admin_attribute_escaping.py` holds every page to it. */
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
 // datetime.js is loaded `defer`, so window.AgnesTime does not exist until
 // parsing finishes — but this script starts its fetches during parse. A fast
 // endpoint (the tokens list) can resolve first and would otherwise throw
@@ -1004,9 +1018,22 @@ async function loadEffectiveAccess() {
     // inspected or revoked. Read path and write path are one click apart
     // instead of on different pages.
     const viaHtml = (it.via_groups || [])
-      .map(g => `<a href="/admin/access?group=${encodeURIComponent(g.group_id)}"
-                    title="Open ${esc(g.group_name)} in Access">${
-        AgnesKindGlyph.groupGlyph()}${esc(g.group_name)}</a>`).join("");
+      .map(g => {
+        // An audience is a group OR the everyone scope, and `?group=` selects
+        // a GROUP: the scope's id is a sentinel (`src/grant_scopes.py::
+        // EVERYONE_TARGET_ID`) that would select nothing, so that row links to
+        // the Access page itself, where the everyone audience is the entry
+        // above the group list.
+        const scope = g.kind === "scope";
+        const href = scope
+          ? "/admin/access"
+          : `/admin/access?group=${encodeURIComponent(g.group_id)}`;
+        const title = scope
+          ? "Open Access — everyone gets this, through no group"
+          : `Open ${esc(g.group_name)} in Access`;
+        return `<a href="${href}" title="${title}">${
+          AgnesKindGlyph.groupGlyph()}${esc(g.group_name)}</a>`;
+      }).join("");
     const accent = KIND_ACCENT[it.resource_type];
     const kindCls = "ud-kind" + (accent ? ` ud-kind--${accent}` : "");
     html += `

@@ -139,7 +139,14 @@
     if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
     return String(n);
   }
-  function esc(s){ const d=document.createElement('div'); d.textContent=(s==null?'':s); return d.innerHTML; }
+  function esc(s) {
+  /* Both quote forms, not only &, < and >: this helper may reach a
+     quoted ATTRIBUTE, where a bare `"` is an attribute break-out. Text
+     positions are unharmed — the browser renders the entities back. */
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
   function relTime(iso){
     if(!iso) return '—';
     const sec = Math.max(0,(Date.now()-new Date(iso).getTime())/1000);

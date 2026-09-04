@@ -30,6 +30,15 @@ Error mapping is the caller's contract, implemented here once:
 - Engine 5xx / network failure = :class:`EngineFilesUnavailable` (the route
   answers 502).
 
+Two consumers share this one client. The Files-panel routes
+(``app.api.chat_session_files``) browse; the turn-end artifact harvest
+(``app.chat.artifact_harvest``, fired from ``app.chat.manager``) reads the
+very same routes through :class:`EngineFilesHandle`, an adapter shaped like
+the provider file API (``handle.files.list`` / ``.read``) the harvest
+consumes — an engine-backed session has no such handle of its own, and
+without the adapter the harvest would silently skip the one provider whose
+sandbox Agnes cannot keep alive (#2268).
+
 The listing is a bounded breadth-first walk (the engine lists one directory
 level per request): at most ``_MAX_LIST_REQUESTS`` directory fetches,
 ``_MAX_DEPTH`` levels deep, ``max_files`` file entries — past any cap the
@@ -43,12 +52,33 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import httpx
 
 from app.chat.workdir import WORKSPACE_LINK_ENTRIES
 
 logger = logging.getLogger(__name__)
+
+#: Providers whose session files live in the ENGINE's own sandbox rather than
+#: on this host. One list, shared by the file routes
+#: (``app.api.chat_session_files``) and the turn-end artifact harvest
+#: (``app.chat.manager``) — a provider added to one and not the other would
+#: mean a session whose files are browsable but never harvested (or the
+#: reverse), which is precisely the split #2268 was.
+ENGINE_SANDBOX_PROVIDERS = frozenset({"kai-agent"})
+
+
+def is_engine_sandbox(chat_config: object) -> bool:
+    """Whether this instance's chat sessions run in the engine's sandbox.
+
+    Defensive ``getattr`` on purpose (same duck-typed-double rule as the
+    provider capability flags): a config double without ``provider`` must
+    resolve to the local, no-outbound-HTTP path.
+    """
+    provider = str(getattr(chat_config, "provider", "") or "").strip().lower()
+    return provider in ENGINE_SANDBOX_PROVIDERS
+
 
 #: Same posture as the provider's turn calls (kai_engine_provider.py): the
 #: engine answers listing/download from an already-running (or auto-resumed)
@@ -323,3 +353,155 @@ async def fetch_engine_file_bytes(
     finally:
         await handle.aclose()
     return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Harvest adapter: the engine's file routes, shaped like a sandbox handle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EngineEntry:
+    """``EntryInfo``-shaped row for :class:`EngineFilesHandle`'s listing —
+    the same three fields the docker provider's shim exposes
+    (``app/chat/docker_provider.py``), because that is the shape
+    ``app.chat.artifact_harvest`` reads (``.name`` + ``.type``)."""
+
+    name: str
+    path: str
+    type: str
+
+
+def _sandbox_rel(path: str) -> str:
+    """Sandbox-ABSOLUTE path -> the workspace-RELATIVE one the engine speaks.
+
+    The harvest addresses files as ``{SANDBOX_WORKDIR}/outputs/x`` (the path
+    they have inside a native sandbox); the engine's routes take a path
+    relative to its own sandbox workspace root (``outputs/x``). This is the
+    whole translation — no traversal risk beyond what the engine already
+    enforces on its side, but a leading ``/`` would simply 404, so strip it.
+    """
+    from app.chat.provider import SANDBOX_WORKDIR
+
+    rel = path
+    if rel.startswith(SANDBOX_WORKDIR):
+        rel = rel[len(SANDBOX_WORKDIR) :]
+    return rel.lstrip("/")
+
+
+async def fetch_engine_dir(
+    *,
+    base_url: str,
+    chat_id: str,
+    token: str,
+    path: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> list[dict] | None:
+    """One directory level of the engine sandbox, unfiltered.
+
+    The sibling :func:`fetch_engine_listing` walks the whole tree and drops
+    the workspace template — right for a file BROWSER, wrong for the harvest,
+    which wants exactly the contents of one directory (``outputs/``) and
+    nothing else. ``None`` when the engine 404s (no such dir / no files
+    channel for this chat); :class:`EngineFilesUnavailable` otherwise.
+    """
+    try:
+        async with _client(base_url, token, transport) as client:
+            resp = await client.get(
+                f"/api/chat/{chat_id}/sandbox/files",
+                params={"path": path} if path else None,
+            )
+            if resp.status_code == 404:
+                return None
+            _raise_for_engine_status(resp, chat_id=chat_id, what="listing")
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise EngineFilesUnavailable("engine listing body is not JSON") from exc
+    except httpx.HTTPError as exc:
+        raise EngineFilesUnavailable(f"engine unreachable: {exc!r}") from exc
+    entries = body.get("entries") if isinstance(body, dict) else None
+    if not isinstance(entries, list):
+        raise EngineFilesUnavailable("engine listing has no entries array")
+    return [e for e in entries if isinstance(e, dict)]
+
+
+class EngineFilesHandle:
+    """The sandbox file API (``handle.files.list`` / ``.read``) over the
+    engine's HTTP file routes (#2268).
+
+    ``app.chat.artifact_harvest`` reads a session's ``outputs/`` back out of
+    a live sandbox through the provider's file API. An engine-backed session
+    has no such handle — ``KaiEngineHandle`` speaks turns, not files — so the
+    turn-end harvest would silently skip exactly the provider whose sandbox
+    is ephemeral and out of Agnes's control (both ``keepalive`` and
+    ``destroy`` are no-ops there). This adapter closes that gap with the
+    plumbing this module already ships behind the Files panel; it is not a
+    second file subsystem.
+
+    ``self.files is self``: the harvest reads ``handle.files``, and there is
+    nothing for a separate object to hold.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        chat_id: str,
+        token: str,
+        max_read_bytes: int,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._base_url = base_url
+        self._chat_id = chat_id
+        self._token = token
+        self._max_read_bytes = max_read_bytes
+        self._transport = transport
+
+    @property
+    def files(self) -> "EngineFilesHandle":
+        return self
+
+    async def list(self, path: str) -> list[EngineEntry]:
+        """Entries of one sandbox directory.
+
+        Raises rather than returning ``[]`` when the directory is absent —
+        that is how the harvest recognises "this session produced nothing"
+        (it catches, logs at debug, and returns no artifacts).
+        """
+        entries = await fetch_engine_dir(
+            base_url=self._base_url,
+            chat_id=self._chat_id,
+            token=self._token,
+            path=_sandbox_rel(path),
+            transport=self._transport,
+        )
+        if entries is None:
+            raise FileNotFoundError(path)
+        out: list[EngineEntry] = []
+        for entry in entries:
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            raw_path = entry.get("path")
+            out.append(
+                EngineEntry(
+                    name=name,
+                    path=raw_path if isinstance(raw_path, str) else name,
+                    type="DIR" if entry.get("type") == "dir" else "FILE",
+                )
+            )
+        return out
+
+    async def read(self, path: str, format: str = "bytes") -> bytes:  # noqa: A002 - mirrors the SDK kwarg name
+        data = await fetch_engine_file_bytes(
+            base_url=self._base_url,
+            chat_id=self._chat_id,
+            path=_sandbox_rel(path),
+            token=self._token,
+            max_bytes=self._max_read_bytes,
+            transport=self._transport,
+        )
+        if data is None:
+            raise FileNotFoundError(path)
+        return data

@@ -106,40 +106,177 @@ function _extPhaseCountText(run) {
   return `${_extNum(run.files_done)} files`;
 }
 
-/* The pipeline strip's Crawl cell gains a live line ONLY while there is a
-   live run to describe; otherwise it stays exactly the document count it
-   always was. */
-function _extRenderCrawlCell(connId, status) {
-  const el = document.getElementById(`ext-crawl-live-${connId}`);
-  if (!el) return;
+
+/* The head's `Run now ▾` button is server-rendered ONCE from
+   `identity.extraction_ready` dispatch bookkeeping — that verdict is
+   cadence/capability, not live run state, so it has no reason to grow its
+   own poll. But it must never stay offered while a run is already in
+   flight: the server can only ever answer that click with `409
+   extraction_already_running`. While a run exists the primary slot swaps
+   to `Stop` (and `Cancel` once stalled) instead — source-card redesign
+   §2.1's "the primary slot shows Stop while live". Renamed from
+   `_extRenderInAgnesButton` (the row it used to live in no longer exists —
+   see `data_sources_page.js::_spSettingsPanelHtml`'s `Effective
+   configuration` group for what replaced it, and the head for the new
+   button trio). */
+function _extRenderRunNowButton(connId, status) {
+  const runBtn = document.getElementById(`sp-runnow-btn-${connId}`);
+  const stopBtn = document.getElementById(`sp-stop-btn-${connId}`);
+  const cancelBtn = document.getElementById(`sp-cancel-btn-${connId}`);
+  if (!runBtn) return;
+  const ready = runBtn.dataset.extractionReady === "1";
   const run = status && status.running;
-  if (!run) { el.hidden = true; el.innerHTML = ""; return; }
-  const label = run.outcome === "stalled" ? "stalled" : (_extIsFactsPhase(run) ? "extracting facts" : "crawling");
-  el.hidden = false;
-  el.innerHTML = `${_extDot(run.outcome)}<span class="ext-sub">${_extEsc(label)} · ${_extPhaseCountText(run)}</span>`;
+  const canStop = !!run && (!status || status.can_stop !== false);
+  const canCancel = !!run && run.outcome === "stalled";
+  const st = _extS(connId);
+  runBtn.style.display = run ? "none" : "";
+  runBtn.disabled = !ready || !!run;
+  runBtn.title = run ? "An extraction is already running — see Runs below, or Stop it." : "";
+  if (stopBtn) {
+    stopBtn.style.display = canStop ? "" : "none";
+    stopBtn.disabled = !!st.stopping;
+    stopBtn.textContent = st.stopping ? "Stopping…" : "Stop";
+  }
+  if (cancelBtn) {
+    cancelBtn.style.display = canCancel ? "" : "none";
+    cancelBtn.disabled = !!st.cancelling;
+    cancelBtn.textContent = st.cancelling ? "Cancelling…" : "Cancel";
+    if (run) cancelBtn.dataset.runId = run.id;
+  }
 }
 
-/* The "In-Agnes extraction" fact row's own trigger button is server-
-   rendered ONCE from `config.extraction.last_run_at` dispatch bookkeeping —
-   that row's job is cadence/last-dispatch, not live run state, so it has no
-   reason to grow its own poll. But its one verb, "Run extraction now", must
-   never stay offered while a run is already in flight: the server can only
-   ever answer that click with `409 extraction_already_running`. Reusing the
-   SAME status this script already polls for the Run row above (rather than
-   opening a second live-state channel for one button) keeps that promise.
-   `data-extraction-ready` remembers the server's own capability gate
-   (producer configured, `sharepoint.enabled`) so a run ending restores that
-   verdict instead of blindly re-enabling a button that was never allowed to
-   begin with. */
-function _extRenderInAgnesButton(connId, status) {
-  const btn = document.getElementById(`ext-inagnes-btn-${connId}`);
-  if (!btn) return;
-  const ready = btn.dataset.extractionReady === "1";
-  const running = !!(status && status.running);
-  btn.disabled = !ready || running;
-  btn.title = running
-    ? "An extraction is already running for this connection — see the Run row above, or stop it there."
-    : "";
+/* Header live line (§2.1): `● Running · N of ≈ M files · rate files/min ·
+   about ETA left` while a run exists; the stalled explanation sentence
+   while it is not reporting; hidden otherwise. `files_per_min` and
+   `expected_documents` both ride the status payload already (the former
+   NEW this phase, reusing the fleet view's own windowed-rate computation —
+   `app/api/admin_extraction.py::_files_per_min`). */
+function _extLiveLine(connId, status) {
+  const el = document.getElementById(`sp-liveline-${connId}`);
+  if (!el) return;
+  const run = status && status.running;
+  if (!run) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  if (run.outcome === "stalled") {
+    const age = run.liveness_note || "no recent checkpoint";
+    el.hidden = false;
+    el.innerHTML = `${_extDot("stalled")}<span class="ext-sub ext-warn">Stalled — ${_extEsc(age)}. The run has not reported progress for longer than the stall threshold. Stop asks it to finish cleanly; Cancel closes it if it does not react.</span>`;
+    return;
+  }
+  // Facts-phase wording (§2.1: "Extracting facts · {done} of {total} ·
+  // about {eta} left") — distinct from the crawl phase's "Running · N of ≈
+  // M files"; `_extIsFactsPhase` reads the SAME `activity.phase` the Run
+  // row's own head line already keys off.
+  if (_extIsFactsPhase(run) && run.facts_progress) {
+    el.hidden = false;
+    el.innerHTML = `${_extDot("running")}<span class="ext-sub">Extracting facts · ${_extNum(run.facts_progress.docs_done)} of ${_extNum(run.facts_progress.docs_total)}</span>`;
+    return;
+  }
+  const rate = status.files_per_min;
+  const rateText = rate ? ` · ${_extNum(rate)} files/min` : "";
+  const expected = run.expected_documents;
+  const filesText = expected != null ? `${_extNum(run.files_done)} of ≈ ${_extNum(expected)} files` : `${_extNum(run.files_done)} files`;
+  let etaText = "";
+  if (expected != null && rate) {
+    const remaining = Math.max(expected - (run.files_done || 0), 0);
+    const eta = _extFactsEta((remaining / rate) * 60);
+    if (eta) etaText = ` · about ${eta.replace(/^~/, "")} left`;
+  }
+  el.hidden = false;
+  el.innerHTML = `${_extDot("running")}<span class="ext-sub">Running · ${filesText}${rateText}${etaText}</span>`;
+}
+
+/* Head `Not indexed` tile + Not-indexed panel (§2.1/§2.4, phase-1 reduced
+   form) — the sum of the persisted retry backlogs (`failed_items_count`/
+   `empty_items_count`), the unsupported-type count, and the last run's own
+   doomed/filtered-by-age/oversize counters. Phase 2 replaces this with the
+   dedicated `GET …/extraction/not-indexed` summary. */
+function _extNotIndexedCounts(status) {
+  const failed = status.failed_items_count || 0;
+  const empty = status.empty_items_count || 0;
+  const unsupported = status.skipped_unsupported_count || 0;
+  const last = status.last_completed || status.last_failed || status.running || {};
+  const doomed = last.skipped_doomed || 0;
+  const filteredByAge = last.filtered_by_age || 0;
+  const oversize = last.oversize_files || 0;
+  return failed + empty + unsupported + doomed + filteredByAge + oversize;
+}
+
+function _extRenderHeadTiles(connId, status) {
+  const notIndexedEl = document.getElementById(`sp-tile-notindexed-${connId}`);
+  if (notIndexedEl) notIndexedEl.textContent = _extNum(_extNotIndexedCounts(status));
+  const spentEl = document.getElementById(`sp-tile-spent-${connId}`);
+  if (spentEl) {
+    const last = status.last_completed;
+    const usage = last && last.usage;
+    let total = 0;
+    if (usage) {
+      for (const stage of Object.values(usage)) {
+        if (stage && typeof stage.estimated_cost_usd === "number") total += stage.estimated_cost_usd;
+      }
+    }
+    spentEl.textContent = total ? `$${total.toFixed(2)}` : "—";
+  }
+}
+
+/* Not indexed panel body (§2.4, phase-1 reduced form) — one line per
+   category with the count and the action that fixes it, same categories
+   `_extNotIndexedCounts` sums, plus the actions the popover/Not-indexed
+   panel already offer elsewhere (`retry_failed`, `retry-empty`). */
+function _extRenderNotIndexedPanel(connId, status) {
+  const el = document.getElementById(`sp-notindexed-body-${connId}`);
+  if (!el) return;
+  const failed = status.failed_items_count || 0;
+  const empty = status.empty_items_count || 0;
+  const unsupported = status.skipped_unsupported_count || 0;
+  const last = status.last_completed || status.last_failed || status.running || {};
+  const doomed = last.skipped_doomed || 0;
+  const filteredByAge = last.filtered_by_age || 0;
+  const oversize = last.oversize_files || 0;
+  const rows = [
+    ["Failed to convert", failed, `<button type="button" class="btn btn-sm btn-secondary" onclick="extRetryFailed('${_extEsc(connId)}')">Retry failed</button>`],
+    ["No text after conversion (scans)", empty, `<button type="button" class="btn btn-sm btn-secondary" onclick="extRetryEmpty('${_extEsc(connId)}')">Retry with OCR</button>`],
+    ["Unsupported file type", unsupported, ""],
+    ["Given up — fails every time", doomed, `<button type="button" class="btn btn-sm btn-secondary" onclick="extRetryFailed('${_extEsc(connId)}')">Force one more attempt</button>`],
+    ["Older than the since-date", filteredByAge, ""],
+    ["Over the size cap", oversize, ""],
+  ].filter(([, n]) => n > 0);
+  if (!rows.length) {
+    el.innerHTML = `<div class="ds-empty">Nothing not indexed — every attempted file is indexed.</div>`;
+    return;
+  }
+  el.innerHTML = `<ul class="sp-notindexed-list">${rows
+    .map(([label, n, action]) => `<li><span>${_extEsc(label)}</span><span class="ext-num">${_extNum(n)}</span><span>${action}</span></li>`)
+    .join("")}</ul>`;
+}
+
+/* Facts panel body (§2.5) — the standalone-pass job line and the pending-
+   documents/ETA/provider-limit line, both previously inside the Run row: a
+   facts pass is not a crawl run, and this panel is where an admin now
+   reads its state. */
+function _extRenderFactsPanel(connId, status) {
+  const el = document.getElementById(`sp-facts-body-${connId}`);
+  if (!el) return;
+  const line = (_extFactsJobLine(status.facts_job) || "") + (_extFactsPendingLine(status) || "");
+  el.innerHTML = line || `<div class="ext-sub">0 documents waiting.</div>`;
+}
+
+/* Header state chip (§2.1) — re-renders `.ds-src__health` with the FULL
+   severity-ordered ladder (`_spStateChip`, data_sources_page.js) once each
+   poll lands; the synchronous first paint only has the states computable
+   without live data. */
+function _extStateChip(connId, status) {
+  const chip = document.getElementById(`sp-chip-${connId}`);
+  if (!chip) return;
+  const fs = (typeof SOURCE_PIPELINES !== "undefined" && SOURCE_PIPELINES[connId] ? SOURCE_PIPELINES[connId].file_source : null);
+  const health = typeof _spStateChip === "function" ? _spStateChip(fs, status) : null;
+  if (health) {
+    chip.className = `ds-src__health ${health.tone}`;
+    chip.textContent = health.label;
+  }
 }
 
 /* The standalone facts pass is a JOB (`sharepoint-facts-extraction`), not
@@ -262,13 +399,15 @@ function _extRunLine(run) {
    next — the same lesson `SP_REJECTION_REASON_TEXT` above already encodes
    for rejection reasons. An unknown reason is shown VERBATIM rather than
    collapsed into a generic phrase: a slug we do not recognize is still
-   information, and hiding it would be worse than not explaining it. */
+   information, and hiding it would be worse than not explaining it.
+   Wording is the exact plain-language table from the source-card redesign
+   (§3 "Run states"). */
 const EXT_STOP_REASON_TEXT = {
-  timeout: "the run hit its time ceiling (extraction.timeout_s)",
-  throttled: "the tenant's throttling budget was exhausted (HTTP 429)",
+  timeout: "the time limit was reached",
+  throttled: "SharePoint throttled us",
   stopped: "stopped by an admin",
-  cancelled: "force-cancelled by an admin — the run did not respond to a stop request in time",
-  abandoned: "the worker running it died (crashed or was killed) and never finished — closed when the next run started",
+  cancelled: "cancelled by an admin",
+  abandoned: "the worker died",
   error: "an unexpected error",
 };
 
@@ -478,7 +617,14 @@ function _extRunRowHtml(connId, st) {
       sub += `<div class="ext-sub">A running crawl cannot be stopped from here yet — it finishes, or the worker ends it.</div>`;
     }
   } else if (last) {
-    head = `${_extDot(last.outcome)} <strong>${_extEsc(last.outcome)}</strong>${_extShardCountText(last)} · ${_extNum(last.files_done)} files`;
+    // A run that produced zero documents renders in danger tone (retro
+    // 3.8.3) — a `done` outcome with nothing indexed is not the same claim
+    // as a healthy empty run; it is usually a misconfiguration (a filter
+    // excluding everything, a scope pointed at an empty folder).
+    const zeroIndexed = last.outcome === "done" && !last.files_done;
+    const headDot = zeroIndexed ? _extDot("failed") : _extDot(last.outcome);
+    const headClass = zeroIndexed ? ' class="ext-danger"' : "";
+    head = `${headDot} <strong${headClass}>${_extEsc(last.outcome)}</strong>${_extShardCountText(last)} · ${_extNum(last.files_done)} files`;
     sub += `<div class="ext-sub">finished ${_extEsc(_extTime(last.finished_at))}`;
     if (last.duration_s != null) sub += ` · took ${_extEsc(_extDuration(last.duration_s))}`;
     sub += `</div>`;
@@ -518,77 +664,16 @@ function _extRunRowHtml(connId, st) {
     sub = `<div class="ext-sub">No extraction run has been recorded for this connection yet.</div>`;
   }
 
-  sub += _extFactsJobLine(status.facts_job);
-  sub += _extFactsPendingLine(status);
-
   if (st.error) {
     sub += `<div class="ext-sub ext-danger"><span class="ext-stale">stale</span> couldn't refresh — last read ${_extEsc(_extTime(st.lastOk))}</div>`;
   }
 
-  const total = status.runs_total || 0;
-  // Cooperative, not a hard kill — the button says "Stopping…" once clicked
-  // and stays disabled until the next poll shows the run actually gone,
-  // never a claim it ended the instant the request was sent. Mirrors the
-  // `can_stop === false` sentence above: exactly one of the two ever shows.
-  const canStopNow = !!run && (run.outcome === "running" || run.outcome === "stalled") && status.can_stop !== false;
-  const stopBtn = canStopNow
-    ? `<button type="button" class="btn btn-sm btn-danger" onclick="extStopRun('${connId}')"
-               ${st.stopping ? "disabled" : ""}>${st.stopping ? "Stopping…" : "Stop run"}</button>`
-    : "";
-
-  // Every reprocessing action an operator would otherwise need the shell
-  // for (TCRD-296): retry this connection's own failed/empty backlog, or
-  // re-run outright after a failed/interrupted attempt. `live` covers BOTH
-  // a genuinely running row and a `stalled`/job-`failed` zombie one — its
-  // idempotency key may still hold the enqueue dedup lock either way, so
-  // every button below stays disabled rather than let the server's own 409
-  // be the only thing standing between two overlapping runs.
-  const live = !!run;
-  const failedCount = status.failed_items_count || 0;
-  const emptyCount = status.empty_items_count || 0;
-  const retryFailedBtn = `<button type="button" class="btn btn-secondary" onclick="extRetryFailed('${connId}')"
-               ${live || !failedCount || st.retryingFailed ? "disabled" : ""}>${
-    st.retryingFailed ? "Retrying…" : `Retry failed (${failedCount})`
-  }</button>`;
-  const retryEmptyBtn = `<button type="button" class="btn btn-secondary" onclick="extRetryEmpty('${connId}')"
-               ${live || !emptyCount || st.retryingEmpty ? "disabled" : ""}>${
-    st.retryingEmpty ? "Retrying…" : `Retry empty (${emptyCount})`
-  }</button>`;
-  // Re-run only offers itself once there is a most-recent run to react to
-  // AND it did not finish cleanly — a `done` run has nothing to re-run
-  // FROM here (its own next scheduled/manual trigger is the ordinary path).
-  const latestKnown = run || last;
-  const canRerun = !live && !!latestKnown && (latestKnown.outcome === "failed" || latestKnown.outcome === "interrupted");
-  const rerunBtn = canRerun
-    ? `<button type="button" class="btn btn-secondary" onclick="extRerun('${connId}')"
-               ${st.rerunning ? "disabled" : ""}>${st.rerunning ? "Starting…" : "Re-run"}</button>`
-    : "";
-  // Cancel is the FORCE-close hammer, offered only once a run has already
-  // proven Stop alone won't reach it — `outcome === "stalled"` means its
-  // checkpoint is stale well past a live crawl's own cadence (see
-  // `extraction.stall_after_s` server-side), so a run merely `running`
-  // never shows this button; Stop is the right first move there.
-  const canCancelNow = !!run && run.outcome === "stalled";
-  const cancelBtn = canCancelNow
-    ? `<button type="button" class="btn btn-sm btn-danger" onclick="extCancelRun('${connId}', '${run.id}')"
-               ${st.cancelling ? "disabled" : ""}>${st.cancelling ? "Cancelling…" : "Cancel run"}</button>`
-    : "";
-
-  const actions = `
-      <div class="ext-actions">
-        ${stopBtn}
-        ${cancelBtn}
-        ${retryFailedBtn}
-        ${retryEmptyBtn}
-        ${rerunBtn}
-        <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
-                ${total ? "" : "disabled"}>Run history (${total})</button>
-        <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'completeness')"
-                title="Did we really get everything? Compares Graph Search's own document count against what's indexed.">Completeness</button>
-        <a class="btn btn-secondary" href="/admin/extraction"
-           title="Every connection's crawl and facts extraction on one screen — phase, pace, spend, and what looks stuck.">All connections</a>
-      </div>`;
-
+  // Stop/Cancel now live in the HEAD (`_extRenderRunNowButton`, swapped in
+  // for the `Run now ▾` button while a run exists); Retry failed/empty move
+  // to the Not indexed panel and the `Run now ▾` popover; Re-run folds into
+  // an ordinary `Run now ▾` click; History/Completeness/Fleet view move to
+  // the Runs panel's own toolbar (`data_sources_page.js::_spRunsPanelHtml`)
+  // — this row is left with nothing to act on directly any more.
   return `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="The built-in extraction pipeline's own run state — read from the recorded run, not from this page's clock.">Run</span>
@@ -597,10 +682,8 @@ function _extRunRowHtml(connId, st) {
         <span>${head}</span>
         ${sub}
       </span>
-      ${actions}
     </span>
-  </div>
-  ${_extConfigRowHtml(connId)}`;
+  </div>`;
 }
 
 /* The `Configuration` fact row (design §6.1): a read-out with origins, not
@@ -671,8 +754,8 @@ function _extRender(connId) {
       connId,
       false,
     );
-    _extRenderCrawlCell(connId, null);
-    _extRenderInAgnesButton(connId, null);
+    _extLiveLine(connId, null);
+    _extRenderRunNowButton(connId, null);
     _extRenderFactsButton(connId, null);
     _extRenderNextRun(connId, null);
     return;
@@ -694,10 +777,15 @@ function _extRender(connId) {
 
   block.hidden = false;
   block.innerHTML = _extRunRowHtml(connId, st);
-  _extRenderCrawlCell(connId, st.data);
-  _extRenderInAgnesButton(connId, st.data);
+  _extLiveLine(connId, st.data);
+  _extRenderRunNowButton(connId, st.data);
   _extRenderFactsButton(connId, st.data);
   _extRenderNextRun(connId, st.data);
+  _extRenderRunsCount(connId, st.data);
+  _extRenderHeadTiles(connId, st.data);
+  _extRenderNotIndexedPanel(connId, st.data);
+  _extRenderFactsPanel(connId, st.data);
+  _extStateChip(connId, st.data);
 }
 
 /* D.16 — the "Crawl schedule & filter" panel's "next run" line
@@ -710,6 +798,14 @@ function _extRenderNextRun(connId, status) {
   if (!el) return;
   const nextRunAt = status && status.next_run_at;
   el.textContent = nextRunAt ? `Next run: ${new Date(nextRunAt).toLocaleString()}.` : "Next run: not scheduled.";
+}
+
+/* Runs panel toolbar's `History (N)` (§2.3) — `runs_total` rides the SAME
+   status poll, so this needs no extra request. */
+function _extRenderRunsCount(connId, status) {
+  const el = document.getElementById(`sp-history-count-${connId}`);
+  if (!el) return;
+  el.textContent = ` (${_extNum(status.runs_total || 0)})`;
 }
 
 async function _extFetchOne(connId) {

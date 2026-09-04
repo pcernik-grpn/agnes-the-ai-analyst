@@ -82,6 +82,7 @@ _ROUTES = (
     "extraction/runs/er_whatever",
     "extraction/config",
     "extraction/completeness",
+    "extraction/breakdown",
 )
 
 
@@ -146,6 +147,13 @@ class TestDuckDbDegradesCleanly:
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="sp-run-detail")
         r = client.get(f"{BASE}/{conn_id}/extraction/runs/er_x", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_breakdown_is_typed_501(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-breakdown")
+        r = client.get(f"{BASE}/{conn_id}/extraction/breakdown", headers=_auth(token))
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
 
@@ -1058,6 +1066,121 @@ class TestRunTotalCostUsd:
         assert _run_total_cost_usd({"usage": {}}) == 0.0
 
 
+class TestFleetRowCost:
+    """`_fleet_row_cost(run, facts_ingest_usage)` — combines the crawl
+    run's own inline usage with a connection's attributable slice of the
+    `facts_ingest_runs` ledger into one honest figure (the fleet cost-truth
+    fix). Pure — no repo, no seeded app needed."""
+
+    def test_no_usage_anywhere_is_none_never_a_fabricated_zero(self):
+        from app.api.admin_extraction import _NO_FACTS_INGEST_USAGE, _fleet_row_cost
+
+        out = _fleet_row_cost(None, dict(_NO_FACTS_INGEST_USAGE))
+        assert out["estimated_cost_usd"] is None
+        assert out["cost_status"] == "no_usage"
+        assert out["cost_models"] == []
+        assert out["token_totals"] == {"input_tokens": 0, "output_tokens": 0}
+
+    def test_crawl_run_usage_alone_is_priced(self):
+        from app.api.admin_extraction import _NO_FACTS_INGEST_USAGE, _fleet_row_cost
+
+        run = {
+            "usage": {
+                "facts": {
+                    "estimated_cost_usd": 2.0,
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "model": "claude-haiku-4-5",
+                }
+            }
+        }
+        out = _fleet_row_cost(run, dict(_NO_FACTS_INGEST_USAGE))
+        assert out["estimated_cost_usd"] == 2.0
+        assert out["cost_status"] == "priced"
+        assert out["cost_models"] == ["claude-haiku-4-5"]
+        assert out["token_totals"] == {"input_tokens": 100, "output_tokens": 20}
+
+    def test_facts_ledger_usage_alone_is_priced_even_with_no_crawl_run_usage(self):
+        """The bug this fixes: a connection whose facts stage ran only
+        through the standalone `sharepoint-facts-extraction` job has an
+        EMPTY crawl-run `usage`, yet genuinely spent money."""
+        from app.api.admin_extraction import _fleet_row_cost
+
+        facts_ingest_usage = {
+            "runs_with_usage": 1,
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 5,
+            "wall_seconds": 3.0,
+            "models": ["claude-haiku-4-5"],
+            "priced_runs": 1,
+            "estimated_cost_usd": 1.23,
+        }
+        out = _fleet_row_cost(None, facts_ingest_usage)
+        assert out["estimated_cost_usd"] == 1.23
+        assert out["cost_status"] == "priced"
+        assert out["cost_models"] == ["claude-haiku-4-5"]
+        assert out["token_totals"] == {"input_tokens": 1000, "output_tokens": 200}
+
+    def test_both_sources_sum_without_double_counting(self):
+        from app.api.admin_extraction import _fleet_row_cost
+
+        run = {
+            "usage": {
+                "facts": {
+                    "estimated_cost_usd": 2.0,
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "model": "claude-haiku-4-5",
+                }
+            }
+        }
+        facts_ingest_usage = {
+            "runs_with_usage": 1,
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 5,
+            "wall_seconds": 3.0,
+            "models": ["claude-sonnet-4-6"],
+            "priced_runs": 1,
+            "estimated_cost_usd": 5.0,
+        }
+        out = _fleet_row_cost(run, facts_ingest_usage)
+        assert out["estimated_cost_usd"] == pytest.approx(7.0)
+        assert out["cost_status"] == "priced"
+        assert set(out["cost_models"]) == {"claude-haiku-4-5", "claude-sonnet-4-6"}
+        assert out["token_totals"] == {"input_tokens": 1100, "output_tokens": 220}
+
+    def test_tokens_known_but_unpriceable_ledger_usage_is_unpriced_not_zero(self):
+        """The facts ledger has runs but none could be honestly priced (no
+        single named model) and the crawl run itself has no usage — tokens
+        are a real claim, a dollar figure is not, and the two must stay
+        tellable apart."""
+        from app.api.admin_extraction import _fleet_row_cost
+
+        facts_ingest_usage = {
+            "runs_with_usage": 2,
+            "input_tokens": 1500,
+            "output_tokens": 150,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 3,
+            "wall_seconds": 1.0,
+            "models": ["some-unknown-model-9000"],
+            "priced_runs": 0,
+            "estimated_cost_usd": None,
+        }
+        out = _fleet_row_cost(None, facts_ingest_usage)
+        assert out["estimated_cost_usd"] is None
+        assert out["cost_status"] == "unpriced"
+        assert out["cost_models"] == ["some-unknown-model-9000"]
+        assert out["token_totals"] == {"input_tokens": 1500, "output_tokens": 150}
+
+
 class TestFleetFacts:
     """`_fleet_facts(run, connection_id)` — `connection_id` drives
     `facts_pending_documents`/`facts_pass_running` (TCRD-296 gap #61),
@@ -1157,6 +1280,87 @@ class TestFleetFacts:
         out_other = mod._fleet_facts(None, "conn-y")
         assert out_other["facts_pending_documents"] == 0
         assert out_other["facts_pass_running"] is False
+
+    def test_facts_ingest_usage_defaults_to_the_public_no_usage_shape_when_omitted(self, seeded_app):
+        """Pins the CLIENT-facing shape — every aggregate field, but no
+        `runs` key at all, not even an empty list (payload-size fix:
+        `runs` is server-side-only, see `_public_facts_ingest_usage`)."""
+        from app.api.admin_extraction import _fleet_facts
+
+        out = _fleet_facts(None, "conn-none")
+        usage = out["facts_ingest_usage"]
+        assert "runs" not in usage
+        assert usage == {
+            "runs_with_usage": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 0,
+            "wall_seconds": 0.0,
+            "models": [],
+            "priced_runs": 0,
+            "estimated_cost_usd": None,
+        }
+
+    def test_facts_ingest_usage_passes_through_the_callers_batched_slice(self, seeded_app):
+        """Passed in, never resolved inside `_fleet_facts` itself — the
+        caller (`fleet_extraction_runs`) resolves it ONCE for the whole
+        page via the batched repo call."""
+        from app.api.admin_extraction import _fleet_facts
+
+        ledger_entry = {
+            "runs_with_usage": 3,
+            "input_tokens": 5000,
+            "output_tokens": 900,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 40,
+            "wall_seconds": 12.0,
+            "models": ["claude-haiku-4-5"],
+            "priced_runs": 3,
+            "estimated_cost_usd": 4.5,
+            "runs": [{"id": "ir_a", "estimated_cost_usd": 1.5}],
+        }
+        out = _fleet_facts(None, "conn-ledger", facts_ingest_usage=ledger_entry)
+        assert out["facts_ingest_usage"] == {
+            "runs_with_usage": 3,
+            "input_tokens": 5000,
+            "output_tokens": 900,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 40,
+            "wall_seconds": 12.0,
+            "models": ["claude-haiku-4-5"],
+            "priced_runs": 3,
+            "estimated_cost_usd": 4.5,
+        }
+
+    def test_facts_ingest_usage_never_serializes_the_internal_runs_list(self, seeded_app):
+        """Payload-size regression pin: a caller's ledger slice carrying a
+        (potentially large — thousands of entries on a live deployment)
+        `runs` id/cost list must NEVER reach the row's own
+        `facts_ingest_usage`, only the aggregate fields it needs to
+        de-duplicate the fleet total server-side."""
+        from app.api.admin_extraction import _fleet_facts
+
+        big_runs = [{"id": f"ir_{i}", "estimated_cost_usd": 0.01} for i in range(500)]
+        ledger_entry = {
+            "runs_with_usage": 500,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "documents": 1,
+            "wall_seconds": 1.0,
+            "models": ["claude-haiku-4-5"],
+            "priced_runs": 500,
+            "estimated_cost_usd": 5.0,
+            "runs": big_runs,
+        }
+        out = _fleet_facts(None, "conn-big-ledger", facts_ingest_usage=ledger_entry)
+        assert "runs" not in out["facts_ingest_usage"]
+        assert "ir_0" not in str(out["facts_ingest_usage"])
 
 
 FLEET_URL = "/api/admin/sharepoint/extraction/runs"
@@ -1420,3 +1624,80 @@ class TestFactsJobsInFlight:
         self._enqueue("sp-other", index=0, count=2)
         self._enqueue("sp-other", index=1, count=2)
         assert _facts_jobs_in_flight("sp-mine") == []
+
+
+class TestCrawlJobInFlight:
+    """``_crawl_job_in_flight`` (source-card redesign §8, `status.crawl_job`)
+    — the crawl trigger's own mirror of ``_facts_job_in_flight``, for the
+    ``corpus-extraction`` job kind. Fills the state chip's ``Queued`` rung:
+    a job can sit queued before a worker claims it and opens the first
+    ``extraction_runs`` row, where ``running`` is still null."""
+
+    KIND = "corpus-extraction"
+
+    @staticmethod
+    def _enqueue(connection_id: str):
+        from src.repositories import jobs_repo
+
+        return jobs_repo().enqueue(
+            "corpus-extraction",
+            {"connection_id": connection_id},
+            idempotency_key=f"corpus-extraction:{connection_id}",
+        )
+
+    def test_nothing_in_flight_is_none(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+
+        assert _crawl_job_in_flight("sp-none") is None
+
+    def test_a_queued_job_is_reported_with_its_id_and_status(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+
+        job = self._enqueue("sp-queued")
+        found = _crawl_job_in_flight("sp-queued")
+        assert found is not None
+        assert found["id"] == job["id"]
+        assert found["status"] == "queued"
+        assert found["created_at"]
+
+    def test_another_connections_job_is_not_this_ones(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+
+        self._enqueue("sp-other")
+        assert _crawl_job_in_flight("sp-mine") is None
+
+    def test_a_running_job_is_reported_running_and_a_finished_one_is_gone(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+        from src.repositories import jobs_repo
+
+        job = self._enqueue("sp-running")
+        claimed = jobs_repo().claim_next(kinds=[self.KIND], worker_id="w1", lease_seconds=60)
+        assert claimed and claimed["id"] == job["id"]
+        found = _crawl_job_in_flight("sp-running")
+        assert found is not None and found["status"] == "running"
+
+        assert jobs_repo().complete(job["id"], "w1", claimed["lease_token"], result={})
+        assert _crawl_job_in_flight("sp-running") is None
+
+    def test_the_lookup_follows_the_triggers_own_key_and_kind(self, seeded_app):
+        """Same contract as `TestFactsJobInFlight::test_the_lookup_follows_
+        the_triggers_own_key_and_kind`: enqueue through the producer's OWN
+        key builder and kind constant, so a change on that side fails here
+        instead of leaving the card silently blind."""
+        from app.api.admin_extraction import _CRAWL_JOB_KIND, _crawl_job_in_flight
+        from app.api.admin_sharepoint import _extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        assert _extraction_idempotency_key("sp-contract") == f"{_CRAWL_JOB_KIND}:sp-contract"
+
+        job = jobs_repo().enqueue(
+            _CRAWL_JOB_KIND,
+            {"connection_id": "sp-contract"},
+            idempotency_key=_extraction_idempotency_key("sp-contract"),
+        )
+        found = _crawl_job_in_flight("sp-contract")
+        assert found is not None, (
+            "the status reader did not find a job enqueued with the trigger's own "
+            "idempotency key + kind — the two surfaces have drifted apart"
+        )
+        assert found["id"] == job["id"]

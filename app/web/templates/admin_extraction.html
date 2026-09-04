@@ -97,6 +97,58 @@
   .ext-shard-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .ext-shard-table th, .ext-shard-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--ds-border); }
   .ext-shard-table th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+
+  /* Extraction breakdown (2026-09-04) — "how many documents did we get, how
+     many did we not, by file type and by reason". A SEPARATE section below
+     the fleet table, its own toolbar/tiles/tables so nothing here reaches
+     into `.ext-summary`/`.ext-table` above. */
+  .extbd-section { margin-top: 34px; padding-top: 22px; border-top: 1px solid var(--ds-border); }
+  .extbd-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+  .extbd-head h2 { margin: 0; font-size: 16px; font-weight: 700; color: var(--ds-text-primary); }
+  .extbd-sub { margin: 0 0 14px; font-size: 12.5px; color: var(--ds-text-secondary); }
+
+  .extbd-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .extbd-toolbar label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ds-text-secondary); }
+  .extbd-toolbar select, .extbd-toolbar input[type="date"] {
+    font: inherit; font-size: 12.5px; padding: 5px 8px; border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-btn); background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  #extbd-conn { min-width: 220px; }
+
+  .extbd-empty { padding: 28px 16px; text-align: center; font-size: 13px; color: var(--ds-text-secondary); }
+
+  .extbd-summary { display: flex; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+  .extbd-card {
+    background: var(--ds-surface); border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-btn); padding: 12px 16px; min-width: 130px; flex: 1;
+  }
+  .extbd-card .label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ds-text-muted);
+  }
+  .extbd-card .value {
+    font-size: 20px; font-weight: 700; color: var(--ds-text-primary); margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .extbd-card .value.warn { color: var(--ds-accent-warn-ink); }
+  .extbd-card .note { font-size: 11px; color: var(--ds-text-muted); margin-top: 3px; }
+
+  .extbd-runs-note { font-size: 12px; color: var(--ds-text-secondary); margin-bottom: 18px; }
+
+  .extbd-subhead { display: flex; align-items: center; gap: 10px; margin: 22px 0 10px; }
+  .extbd-subhead h3 { margin: 0; font-size: 13.5px; font-weight: 700; color: var(--ds-text-primary); }
+
+  .extbd-truncated { margin-bottom: 10px; }
+
+  .extbd-empty-text-banner {
+    display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; padding: 10px 12px;
+    background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+    border-radius: var(--ds-radius-btn); font-size: 12.5px;
+  }
+  .extbd-empty-text-banner strong { font-size: 15px; }
+
+  .extbd-num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .extbd-sub-count { color: var(--ds-text-muted); font-size: 11px; }
 </style>
 {% endblock %}
 
@@ -141,9 +193,28 @@
     <div class="label">Stuck?</div>
     <div class="value" id="ext-stat-stuck">—</div>
   </div>
-  <div class="ext-card">
-    <div class="label">Est. cost</div>
+  {# Shared-collection double-count fix — the tile's own tooltip is set
+     dynamically from `totals.cost_note` (admin_extraction.js's
+     `renderTable`), which states plainly that this sums each row's own
+     crawl-run cost plus a run-id-de-duplicated slice of the
+     facts_ingest_runs ledger, NOT the sum of the rows' own
+     `estimated_cost_usd` figures (those are each row's full, un-split
+     attribution and would double-count a collection shared across
+     connections — see the affected rows' own "shared" badge). #}
+  <div class="ext-card" id="ext-card-cost">
+    <div class="label">Est. cost (this view, de-duplicated)</div>
     <div class="value" id="ext-stat-cost">—</div>
+  </div>
+  {# Cost-truth fix — the SAME instance-wide cumulative rollup GET
+     /api/facts/ingest-runs already exposes (`llm_usage_totals`), now also
+     carried on this page's own response. Deliberately its own, distinctly
+     labelled tile: "this view" above totals only the rows this scope is
+     currently rendering, while this one is everything the instance has
+     EVER spent on fact extraction — the two must never be read as the
+     same number. #}
+  <div class="ext-card" title="Every facts_ingest_runs LLM usage this instance has ever persisted — independent of the table's own scope/filter above.">
+    <div class="label">LLM spend (cumulative, all connections)</div>
+    <div class="value" id="ext-stat-cumulative-cost">—</div>
   </div>
 </div>
 
@@ -183,9 +254,94 @@
    functions already look up — the source card's drawer and this one render
    through the SAME code, never a second copy of it (TCRD-296 B.9). #}
 <div id="ext-fleet-completeness-shell"></div>
+
+{# Extraction breakdown (2026-09-04) — "how many documents did we get, how
+   many did we not, broken down by file type and by reason, and how much of
+   the corpus is silently empty". A SEPARATE section, fetched independently
+   of the fleet table above (`GET …/extraction/breakdown`) — see
+   extraction_breakdown.js. #}
+<section class="extbd-section" id="extbd-section" aria-labelledby="extbd-heading">
+  <div class="extbd-head">
+    <h2 id="extbd-heading">Extraction breakdown</h2>
+  </div>
+  <p class="extbd-sub">How many documents came in, how many did not, by file type and by reason — one connection at a time.</p>
+
+  <div class="extbd-toolbar" role="group" aria-label="Breakdown scope">
+    <select id="extbd-conn" aria-label="Connection">
+      <option value="">Choose a connection…</option>
+    </select>
+    <label>Since <input type="date" id="extbd-since" aria-label="Since date"></label>
+    <label>Until <input type="date" id="extbd-until" aria-label="Until date"></label>
+    <button type="button" class="btn" id="extbd-apply">Apply</button>
+  </div>
+
+  <div class="extbd-empty" id="extbd-empty">Choose a connection above to see its breakdown.</div>
+
+  <div id="extbd-body" hidden>
+    <div class="extbd-summary" id="extbd-summary"></div>
+    <p class="extbd-runs-note" id="extbd-runs-note"></p>
+
+    <div id="extbd-empty-text-banner"></div>
+
+    <div class="extbd-subhead">
+      <h3>By file type</h3>
+    </div>
+    <div class="fbar" id="extbd-ext-toolbar" role="group" aria-label="Search file types">
+      <div class="fbar__search" role="search">
+        <svg class="fbar__search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5" stroke-linecap="round"/></svg>
+        <input type="search" class="fbar__search-input" id="extbd-ext-search" placeholder="Search file types…" aria-label="Search file types">
+      </div>
+      <span class="fbar__end"><span class="fbar__count" id="extbd-ext-count"></span></span>
+    </div>
+    <div class="data-table-wrap">
+      <table class="data-table" id="extbd-ext-table">
+        <thead>
+          <tr>
+            <th>Extension</th>
+            <th>Indexed</th>
+            <th>Rejected</th>
+            <th>Processing</th>
+            <th>Pending</th>
+            <th>Needs review</th>
+            <th>Failed</th>
+            <th>Empty text</th>
+          </tr>
+        </thead>
+        <tbody id="extbd-ext-tbody"></tbody>
+      </table>
+      <div class="empty-state" id="extbd-ext-noresults" hidden>No file type matches this search.</div>
+    </div>
+
+    <div class="extbd-subhead">
+      <h3>Failures by reason</h3>
+    </div>
+    <div class="extbd-truncated" id="extbd-failures-truncated" hidden></div>
+    <div class="fbar" id="extbd-reason-toolbar" role="group" aria-label="Search failure reasons">
+      <div class="fbar__search" role="search">
+        <svg class="fbar__search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5" stroke-linecap="round"/></svg>
+        <input type="search" class="fbar__search-input" id="extbd-reason-search" placeholder="Search failure reasons…" aria-label="Search failure reasons">
+      </div>
+      <span class="fbar__end"><span class="fbar__count" id="extbd-reason-count"></span></span>
+    </div>
+    <div class="data-table-wrap">
+      <table class="data-table" id="extbd-reason-table">
+        <thead>
+          <tr>
+            <th>Reason</th>
+            <th>Count</th>
+            <th>File types</th>
+          </tr>
+        </thead>
+        <tbody id="extbd-reason-tbody"></tbody>
+      </table>
+      <div class="empty-state" id="extbd-reason-noresults" hidden>No failures match this search.</div>
+    </div>
+  </div>
+</section>
 {% endblock %}
 
 {% block scripts %}
 <script src="{{ static_url('js/admin/data_sources_extraction_observability.js') }}"></script>
 <script src="{{ static_url('js/admin/admin_extraction.js') }}" defer></script>
+<script src="{{ static_url('js/admin/extraction_breakdown.js') }}" defer></script>
 {% endblock %}

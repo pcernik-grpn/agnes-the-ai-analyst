@@ -33,7 +33,12 @@ logger = logging.getLogger(__name__)
 #: ``table_registry`` row for it would advertise a table that is not there —
 #: /catalog would list it and every query against it would fail. The id is
 #: therefore not registered at all there, and an existing row is pruned.
-PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset({"agnes_turns"})
+#: ``extraction_runs`` (Alembic ``0094_extraction_runs``) and
+#: ``facts_ingest_runs`` (Alembic ``0078_facts_ingest_runs``) are the same
+#: story — both are PG-only app-state tables added after the freeze.
+PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset(
+    {"agnes_turns", "agnes_extraction_runs", "agnes_facts_ingest_runs"}
+)
 
 #: Stable identity of the seeded package that carries the internal tables.
 #: The slug — not the name or the generated id — is what grants, tests and
@@ -41,45 +46,60 @@ PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset({"agnes_turns"})
 USAGE_PACKAGE_SLUG = "agnes-usage"
 USAGE_PACKAGE_NAME = "Agnes Usage"
 USAGE_PACKAGE_DESCRIPTION = (
-    "Your own Agnes usage data: Claude Code sessions, tool and skill "
+    "Your own Agnes usage data — Claude Code sessions, tool and skill "
     "telemetry, and the audit trail of actions performed against this "
-    "instance. Members see only their own rows; admins see everything."
+    "instance — plus, for admins, the extraction and fact-ingest pipelines' "
+    "own operational history. Members see only their own rows on the "
+    "usage tables; admins see everything, including the two admin-only "
+    "operational tables no member row ever appears on."
 )
 # The guidance fields below are what the catalog UI and any LLM (chat agent,
 # local Claude Code) read to decide WHEN and HOW to use these tables — keep
 # them accurate over decorative. Server-side only is the load-bearing fact:
 # these tables never enter `agnes pull` manifests.
 USAGE_PACKAGE_LONG_DESCRIPTION = (
-    "Self-service usage analytics over your own Agnes activity. Four tables: "
+    "Self-service usage analytics over your own Agnes activity, plus (admins "
+    "only) the extraction pipelines' own operational history. Six tables: "
     "`agnes_sessions` (one row per Claude Code or chat session — activity "
     "counters plus summed input/output/cache tokens), `agnes_turns` (one row "
     "per assistant turn with exact token usage incl. prompt cache; "
     "Postgres-backed instances only), `agnes_telemetry` (one row per "
-    "tool/skill/sub-agent/MCP event), and `agnes_audit` (server-side audit "
-    "trail of your actions). Every table is filtered to YOUR rows — admins "
-    "see everyone. All tables are server-side only: query them with "
-    '`agnes query "SELECT …"` (auto-routes to the server); they never '
-    "appear in `agnes pull` and have no local parquet. New activity is "
-    "visible within seconds of a session upload or chat turn."
+    "tool/skill/sub-agent/MCP event), `agnes_audit` (server-side audit "
+    "trail of your actions), `agnes_extraction_runs` (one row per built-in "
+    "extraction/crawl run — status, progress, LLM token usage; Postgres-"
+    "backed instances only) and `agnes_facts_ingest_runs` (one row per fact-"
+    "graph ingest batch, including the real LLM spend ledger; Postgres-"
+    "backed instances only). The first four are filtered to YOUR rows — "
+    "admins see everyone. The last two are admin/operator data, not a "
+    "per-user table: they carry no row for anyone (not even an admin's own "
+    "activity) unless the caller is an admin, because a run belongs to a "
+    "connection or a set of collections, never to a person. All six tables "
+    'are server-side only: query them with `agnes query "SELECT …"` '
+    "(auto-routes to the server); they never appear in `agnes pull` and "
+    "have no local parquet. New activity is visible within seconds of a "
+    "session upload or chat turn."
 )
 USAGE_PACKAGE_WHEN_TO_USE = [
     "Analyzing your own token spend — by day, model, session, or turn",
     "Understanding prompt-cache efficiency (cache_read vs fresh input tokens)",
     "Auditing which tools, skills and MCP servers you actually use, and which fail",
     "Reviewing your own action history on this instance (agnes_audit)",
+    "Admins: auditing an extraction run's or a fact-ingest batch's true LLM cost (agnes_extraction_runs.usage, agnes_facts_ingest_runs.llm_usage) instead of trusting one dashboard's arithmetic",
 ]
 USAGE_PACKAGE_WHEN_NOT_TO_USE = [
     "Team- or instance-wide reporting — you only see your own rows; admins use /admin/telemetry and /admin/adoption",
     "Local analysis of these tables via `agnes pull` — they are server-side only; use `agnes query` instead",
     "Reading conversation content — transcripts are admin-only; these tables hold metadata and token counts",
+    "A non-admin looking for extraction/ingest run history — agnes_extraction_runs and agnes_facts_ingest_runs return zero rows for anyone who is not an admin, regardless of this grant",
 ]
 USAGE_PACKAGE_EXAMPLE_QUESTIONS = [
     "How many tokens did I spend this week, split by model?",
     "Which of my sessions used the most output tokens this month?",
     "What share of my input tokens was served from the prompt cache?",
     "Which tools error most often in my sessions?",
+    "Admin: what did the last SharePoint extraction run actually spend on LLM tokens?",
 ]
-USAGE_PACKAGE_TAGS = ["usage", "tokens", "telemetry", "audit"]
+USAGE_PACKAGE_TAGS = ["usage", "tokens", "telemetry", "audit", "extraction", "facts"]
 
 
 def internal_table_available(table_id: str) -> bool:

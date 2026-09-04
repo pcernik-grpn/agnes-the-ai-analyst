@@ -88,6 +88,12 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "clear_semantic_draft_pending) is a Postgres-only column (semantic-"
         "phase5 wave 2, A3 PG-first ratchet) — no DuckDB implementation exists"
     ),
+    "POST /api/admin/grants/reconcile-everyone-scope": (
+        "resource_grants.reconcile_everyone_scope is Postgres-only — the frozen "
+        "DuckDB ladder has no `scope` column, so there is no half-converted "
+        "state to close there; the DuckDB sibling raises the typed "
+        "RequiresPostgresBackend (see src/repositories/resource_grants.py)"
+    ),
     "POST /api/facts/search": (
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"

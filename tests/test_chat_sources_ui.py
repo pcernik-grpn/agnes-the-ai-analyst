@@ -313,11 +313,15 @@ def test_the_prompt_asks_for_the_block_and_says_it_is_checked():
     assert "```sources" in _read(WORKSPACE_CLAUDE_MD)
     assert "table:" in md and "metric:" in md and "assumption:" in md
     assert "unverified" in md.lower()
-    assert "naming a table you did not query, or a file you did not open, is worse than naming none" in md, (
+    assert (
+        "naming a table you did not query, a term you did not look up, or a file you did not open, "
+        "is worse than naming none" in md
+    ), (
         "the claim-only-what-you-used rule has to survive in the prompt — it widened to cover "
-        "`document:` when that kind was added, it did not go away"
+        "`document:` when that kind was added and `glossary:` when that one was, it did not go away"
     )
-    assert "document:" in md, "every checkable kind has to be taught, or the model smuggles it into `assumption:`"
+    for kind in ("document:", "glossary:"):
+        assert kind in md, "every checkable kind has to be taught, or the model smuggles it into `assumption:`"
 
 
 def test_the_prompt_separates_diagrams_from_charts():
@@ -1025,4 +1029,156 @@ def test_the_hidden_list_can_actually_be_hidden():
     assert re.search(r"\.msg-assumptions-list\[hidden\] \{\s*display: none", css), (
         "without an explicit `.msg-assumptions-list[hidden] { display: none }` a later "
         "`display:` on the rule above silently re-breaks the collapse"
+    )
+
+
+# ── a glossary term is a citation, not a caveat (#2258) ────────────────────
+# The vocabulary had no word for a governed business term, so a term the
+# answer leaned on could only surface as `assumption: … | origin: definition`
+# — a citation filed as a caveat about method, which is the category error
+# the prompt already warns about for a file. These run the real server parser
+# into the real renderer: the block goes in, a chip comes out.
+
+_GLOSSARY_ANSWER = "Headcount is 412 FTE.\n\n```sources\nglossary: Full-time equivalent\n```\n"
+_GLOSSARY_CALLS = [{"tool": "Bash", "args": {"command": 'agnes glossary search "full-time equivalent"'}}]
+
+
+def _glossary_verdict(answer: str = _GLOSSARY_ANSWER, calls=None) -> dict:
+    from app.chat.sources import verdict
+
+    return verdict(answer, _GLOSSARY_CALLS if calls is None else calls).to_dict()
+
+
+def test_a_cited_term_travels_from_the_block_to_a_chip():
+    """The whole path, end to end: the server parses the `glossary:` line out
+    of the answer, checks it against the turn's tool calls, and the client
+    draws it as a chip in the SOURCES row — not among the assumptions, where
+    it used to be the only slot the vocabulary left it."""
+    v = _glossary_verdict()
+    assert [(c["kind"], c["verified"]) for c in v["claims"]] == [("glossary", True)]
+    rows = _render(v)
+    assert [_label(r) for r in rows] == ["Sources"], "a term is provenance, not a caveat"
+    (chip,) = _chips(rows[0])
+    assert chip["text"].strip() == "Full-time equivalent"
+    assert "is-ok" in chip["cls"]
+    assert chip["attrs"]["aria-label"] == "glossary Full-time equivalent, verified"
+    icons = [c for c in chip["children"] if "msg-source-icon" in c.get("cls", "")]
+    assert icons, "a term chip carries a category glyph like a table, a metric or a document"
+
+
+def test_a_term_nothing_looked_up_is_flagged_like_any_other_reference():
+    """A governed-sounding term nothing ran on is what an invented definition
+    looks like, and it counts toward the row's one summarised verdict."""
+    v = _glossary_verdict("An FTE is 40h.\n\n```sources\nglossary: Fully burdened cost\n```\n")
+    assert [c["verified"] for c in v["claims"]] == [False]
+    rows = _render(v)
+    (chip,) = _chips(rows[0])
+    assert "is-unverified" in chip["cls"]
+    assert chip["attrs"]["aria-label"].endswith(", unverified")
+    flags = [c["text"].strip() for c in rows[0]["children"] if "msg-source-flag" in c.get("cls", "")]
+    assert flags == ["1 unverified"]
+
+
+def test_an_answer_citing_only_terms_does_not_say_none_declared():
+    """The defect verbatim, in the row: a governed definition IS a declared
+    source, so the empty state must not fire above one."""
+    rows = _render(_glossary_verdict())
+    assert "none declared" not in [c["text"].strip() for c in _chips(rows[0])]
+
+
+def test_a_term_chip_opens_the_glossary_not_the_metrics_tab():
+    """The chip's destination is the glossary's OWN surface.
+
+    `#1974`'s rule is that a chip links where its ref identifies a page, and a
+    term does: `/semantic-layer?tab=all_glossary` renders `glossary_terms`
+    and filters client-side on `?q=`, the same shape the metric chip uses one
+    tab over.
+
+    Which tab is not cosmetic. The metrics tab is narrowed per caller — every
+    metric bound to a table outside the caller's Data Package stack is dropped
+    before render — while the glossary is deliberately not gated that way
+    (business vocabulary, not data). Pointing a term at `all_metrics` would
+    answer a glossary citation with a metrics-shaped, per-caller-filtered read
+    that can only ever miss the term, so the two destinations must stay
+    distinct.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _claimHref") : js.index("function renderSourcesChips")]
+    script = (
+        fn
+        + """
+process.stdout.write(JSON.stringify({
+  glossary: _claimHref({kind: 'glossary', ref: 'Full-time equivalent'}),
+  metric: _claimHref({kind: 'metric', ref: 'headcount/active'}),
+  empty: _claimHref({kind: 'glossary', ref: ''}),
+  escaped: _claimHref({kind: 'glossary', ref: 'gross & net margin?'}),
+}));
+"""
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["glossary"] == "/semantic-layer?tab=all_glossary&q=Full-time%20equivalent"
+    assert "all_metrics" not in res["glossary"], "a term must not be resolved through the metrics read"
+    assert res["metric"] == "/semantic-layer?tab=all_metrics&q=headcount%2Factive", "the metric chip is unchanged"
+    assert res["empty"] == ""
+    assert res["escaped"] == "/semantic-layer?tab=all_glossary&q=gross%20%26%20net%20margin%3F", (
+        "the ref is model output landing in a URL — encoded, never pasted"
+    )
+
+    rows = _render(_glossary_verdict())
+    (chip,) = _chips(rows[0])
+    assert chip["tag"] == "a" and "is-link" in chip["cls"]
+    assert "is-ok" in chip["cls"], "the link class must not cost the chip its verification state"
+
+
+def test_the_two_registries_the_chips_point_at_keep_their_own_read_rules():
+    """Why the destinations above may not be swapped, asserted on the rules
+    themselves rather than on prose.
+
+    `GET /api/glossary*` is any authenticated caller with no per-resource
+    narrowing; `GET /api/metrics` drops every metric whose table is outside
+    the caller's stack (#953). The day either changes, the chip that points at
+    it needs rethinking — so pin both here, next to the link they justify.
+    """
+    import inspect
+
+    from app.api.glossary import get_glossary_term, list_glossary_terms, search_glossary_terms
+    from app.api.metrics import list_metrics
+
+    for fn in (list_glossary_terms, search_glossary_terms, get_glossary_term):
+        src = inspect.getsource(fn)
+        assert "get_accessible_tables" not in src and "_first_inaccessible_table" not in src, (
+            f"{fn.__name__} now narrows per caller — the glossary chip's destination assumes it does not"
+        )
+    assert "_first_inaccessible_table" in inspect.getsource(list_metrics), (
+        "the metrics read is the FILTERED one — if that stopped being true, re-read the chip destinations"
+    )
+
+
+def test_the_prompt_offers_the_kind_and_says_a_term_is_not_an_assumption():
+    """The parser's vocabulary and the text that teaches it are one contract.
+    A kind the model is never told about is a kind it keeps smuggling into
+    `assumption:`, which is the defect — and the assumption bullet has to say
+    so outright, the way it already does for a file."""
+    md = _read(WORKSPACE_CLAUDE_MD)
+    section = md[md.index("Say where every number came from") :]
+    assert "`glossary:`" in section
+    fence = section[section.index("```sources") :]
+    fence = fence[: fence.index("```", 3)]
+    assert "glossary:" in fence, "the example the model imitates has to show the line"
+    assert "`glossary:`" in section[section.index("- `assumption:`") :], (
+        "the assumption bullet must name the term's real slot, as it already does for a document"
+    )
+    checked = re.sub(r"\s+", " ", section)
+    assert "`glossary:` and `document:` is checked against the tools you actually ran" in checked, (
+        "the model has to be told the new kind is checked, or it reads as decoration"
+    )
+    assert "not its id" in checked, (
+        "the ref has to be the TERM: the chip's destination filters the glossary tab on `?q=` "
+        "over rows indexed by term/definition/see-also — an id would open an empty list, and a "
+        "chip that lands on nothing is the dead label #1974 removed"
     )

@@ -296,6 +296,51 @@ class CorpusFilesRepository:
             out.setdefault(top_folder, {})[status or "pending"] = int(n)
         return out
 
+    def extension_status_counts(self, corpus_ids: List[str]) -> Dict[str, Dict[str, Dict[str, int]]]:
+        """``{extension: {processing_status: {count, bytes}}}`` across every
+        given corpus id, in ONE query — the extraction breakdown surface's
+        "indexed / failed / rejected / skipped, by file type" table
+        (``GET .../extraction/breakdown``).
+
+        ``extension`` is parsed from ``path`` (the last ``/``-delimited
+        segment's suffix after its last ``.``, lowercased; ``""`` when the
+        basename has no ``.`` at all, or ``path`` is NULL/blank) — NEVER
+        ``filename``/``file_type``. Both of those name the STORED artifact,
+        which for a converted document is always the markdown Agnes wrote,
+        not the source file a reader actually cares about — every row in a
+        SharePoint corpus reports ``file_type = "md"`` regardless of
+        whether the original was a ``.pdf`` or a ``.pptx``, which is
+        useless for "how many PDFs failed".
+
+        Uses the ``reverse(split_part(reverse(x), delim, 1))`` idiom twice
+        (basename off ``path``, then extension off the basename) rather
+        than a negative ``split_part`` index — DuckDB and Postgres both
+        support it identically, so this method's SQL needs no per-backend
+        branch, same as :meth:`top_folder_status_counts`.
+        """
+        if not corpus_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in corpus_ids)
+        rows = self.conn.execute(
+            "SELECT extension, processing_status, COUNT(*), COALESCE(SUM(size_bytes), 0) FROM ( "
+            "  SELECT processing_status, size_bytes, "
+            "    CASE WHEN strpos(basename, '.') > 0 "
+            "         THEN lower(reverse(split_part(reverse(basename), '.', 1))) "
+            "         ELSE '' END AS extension "
+            "  FROM ( "
+            "    SELECT processing_status, size_bytes, "
+            "      reverse(split_part(reverse(COALESCE(path, '')), '/', 1)) AS basename "
+            f"    FROM corpus_files WHERE corpus_id IN ({placeholders}) "
+            "  ) basenames "
+            ") extensions "
+            "GROUP BY extension, processing_status",
+            list(corpus_ids),
+        ).fetchall()
+        out: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for extension, status, n, size_bytes in rows:
+            out.setdefault(extension, {})[status or "pending"] = {"count": int(n), "bytes": int(size_bytes or 0)}
+        return out
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         rows = self.conn.execute(

@@ -34,6 +34,19 @@ Scope and posture:
   type FROM that map rather than from the file, and 415s everything else. An
   agent-authored ``.html`` or ``.svg`` therefore has no inline route at all —
   ``…/files/preview`` shows those as SOURCE text, never rendered.
+- **Harvested first, the sandbox second (#2268).** A deliverable used to
+  exist only inside the sandbox, so once the idle reaper paused a session
+  every file it had produced was gone and this listing answered "No files
+  here yet" for a conversation that had just built a document. The turn-end
+  harvest (``app.chat.artifact_harvest``, fired from ``app.chat.manager``)
+  now copies ``outputs/`` into the object store as ``agent_artifacts`` rows,
+  and these routes serve those rows: a harvested file is listed, downloaded
+  and previewed with no live sandbox involved at all. The sandbox is still
+  consulted and still WINS for anything it holds — it has the fresher bytes
+  and it also holds files outside ``outputs/``, which are never harvested —
+  but it is a fallback now, not the source of truth. An engine outage
+  degrades to the harvested copies instead of a 502; only a session with
+  nothing harvested still surfaces the outage.
 - **Provider-gated.** The host walk above is only correct for providers
   whose sandbox works directly on the host session dir (``docker``). Under
   ``chat.provider: kai-agent`` — the default — the agent runs in the
@@ -65,7 +78,9 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from app.auth.access import require_resource_access
+from app.chat.artifact_harvest import sanitize_filename
 from app.chat.kai_engine_files import (
+    ENGINE_SANDBOX_PROVIDERS,
     EngineFilesUnavailable,
     EngineFileTooLarge,
     fetch_engine_file_bytes,
@@ -75,6 +90,8 @@ from app.chat.kai_engine_files import (
 from app.chat.workdir import WORKSPACE_LINK_ENTRIES, _safe_email_dir
 from app.resource_types import ResourceType
 from app.utils import get_data_dir
+from src.object_store import object_store
+from src.repositories import agent_artifacts_repo
 
 logger = logging.getLogger(__name__)
 
@@ -191,8 +208,11 @@ _PREVIEW_MAX_CHARS = 20_000
 #: Providers whose sessions run in a remote engine sandbox: their files are
 #: never on this host, so the routes below must not walk the host session dir
 #: for them. Mirrors the provider-branching resolver pattern of
-#: ``app.chat.skills_catalog.marketplace_delivery``.
-_ENGINE_SANDBOX_PROVIDERS = frozenset({"kai-agent"})
+#: ``app.chat.skills_catalog.marketplace_delivery``. Defined once in
+#: ``app.chat.kai_engine_files`` and shared with the turn-end harvest, so the
+#: browse surface and the harvest surface can never disagree about which
+#: provider keeps its files in the engine.
+_ENGINE_SANDBOX_PROVIDERS = ENGINE_SANDBOX_PROVIDERS
 
 
 def _files_source(chat_config: object) -> str:
@@ -499,6 +519,135 @@ def _attachment_headers(filename: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Harvested artifacts — the copy that outlives the sandbox (#2268)
+# ---------------------------------------------------------------------------
+
+
+def _harvested_rows(chat_id: str) -> list[dict]:
+    """Every artifact harvested for this session, newest last.
+
+    Never raises: the Files panel degrading to "only what the sandbox still
+    has" is bad, but an exception here would take the whole listing down —
+    including the live half that is working fine.
+    """
+    try:
+        return agent_artifacts_repo().list_for_session(chat_id)
+    except Exception:
+        logger.exception("chat_session_files: harvested-artifact lookup failed for session %s", chat_id)
+        return []
+
+
+def _harvested_entries(chat_id: str) -> list[dict]:
+    """Harvested rows as listing entries, at the path the sandbox used.
+
+    The harvest scans exactly ``{SANDBOX_WORKDIR}/outputs`` and stores the
+    file's sanitized basename, so ``outputs/<filename>`` reconstructs the
+    session-relative path the LIVE listing reports for the same file. That is
+    what lets the two lists merge on ``path`` without ever showing a file
+    twice — and what makes a download of a listed path resolvable from either
+    side.
+    """
+    entries: list[dict] = []
+    for row in _harvested_rows(chat_id):
+        name = sanitize_filename(str(row.get("filename") or ""))
+        created = row.get("created_at")
+        entries.append(
+            {
+                "path": f"{_OUTPUTS_PREFIX}{name}",
+                "name": name,
+                "size_bytes": int(row.get("size_bytes") or 0),
+                "modified_at": created.isoformat() if hasattr(created, "isoformat") else created,
+            }
+        )
+    return entries
+
+
+def _harvested_row_for_path(chat_id: str, rel: str) -> dict | None:
+    """The harvested row a session-relative path refers to, if any.
+
+    Only ``outputs/<name>`` can match — a harvested artifact is always a flat
+    file directly under ``outputs/`` — so a nested or elsewhere path is
+    answered without touching the repo.
+    """
+    if not rel.startswith(_OUTPUTS_PREFIX):
+        return None
+    name = rel[len(_OUTPUTS_PREFIX) :]
+    if not name or "/" in name:
+        return None
+    for row in _harvested_rows(chat_id):
+        if sanitize_filename(str(row.get("filename") or "")) == name:
+            return row
+    return None
+
+
+async def _harvested_bytes(row: dict) -> bytes | None:
+    """The artifact's bytes from the object store, or ``None`` when the store
+    is unconfigured / the object is gone (a row without its blob is a
+    "missing file", never a 500)."""
+    store = object_store()
+    if store is None:
+        return None
+    try:
+        return await asyncio.to_thread(store.get_bytes, row["object_key"])
+    except Exception:
+        logger.exception("chat_session_files: object-store read failed for %s", row.get("object_key"))
+        return None
+
+
+async def _harvested_download(chat_id: str, rel: str) -> Response | None:
+    """A download response served from the harvested copy, or ``None`` when
+    there is none. Identical posture to the live paths: attachment, nosniff,
+    active content types pinned to a non-renderable one."""
+    row = _harvested_row_for_path(chat_id, rel)
+    if row is None:
+        return None
+    data = await _harvested_bytes(row)
+    if data is None:
+        return None
+    name = sanitize_filename(str(row.get("filename") or ""))
+    return Response(
+        content=data,
+        media_type=_download_media_type(name),
+        headers=_attachment_headers(name),
+    )
+
+
+async def _harvested_preview_bytes(chat_id: str, rel: str) -> bytes | None:
+    """Preview bytes from the harvested copy, honouring the same size
+    ceiling as the live paths."""
+    row = _harvested_row_for_path(chat_id, rel)
+    if row is None:
+        return None
+    if int(row.get("size_bytes") or 0) > _PREVIEW_MAX_BYTES:
+        raise _TooLargeToPreview
+    return await _harvested_bytes(row)
+
+
+def _merge_harvested(live: "SessionFilesResponse", harvested: list[dict]) -> "SessionFilesResponse":
+    """Live listing + the harvested files it does not already contain.
+
+    The live sandbox wins on collision: it has the fresher bytes for a file
+    that was rewritten after its harvest, and its entry carries the mtime the
+    harvested one cannot. Deliverables stay first (a stable sort, so each
+    group keeps the order its source produced) and the whole thing stays
+    capped at ``_MAX_LIST_FILES``.
+    """
+    if not harvested:
+        return live
+    known = {f.path for f in live.files}
+    merged = list(live.files) + [SessionFileEntry(**h) for h in harvested if h["path"] not in known]
+    merged.sort(key=lambda f: not f.path.startswith(_OUTPUTS_PREFIX))
+    truncated = live.truncated or len(merged) > _MAX_LIST_FILES
+    return SessionFilesResponse(
+        files=merged[:_MAX_LIST_FILES],
+        truncated=truncated,
+        source=live.source,
+        # Something IS here, whatever the sandbox's fate — the whole point.
+        supported=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -511,36 +660,61 @@ async def list_session_files(
 ) -> SessionFilesResponse:
     """List files in this chat session's workspace, newest-first.
 
-    Walks the session dir (including the ``.claude``/``snapshots``/… links
-    into your workspace, where skills write their deliverables), skipping
-    machine noise (``.git``, ``__pycache__``, …) and anything resolving
-    outside your own session/workspace. Returns at most 300 entries sorted
-    by modification time; ``truncated`` reports when more existed. Sessions
-    on an engine-sandbox provider (``kai-agent``) never walk the host dir —
-    see the module docstring; they report ``source="engine"``.
+    Answers from two sources, harvested first (#2268): every file this
+    session's turns wrote to ``outputs/`` was copied out of the sandbox as it
+    was produced, so it is listed whether or not the sandbox still exists.
+    The live sandbox is merged on top — it wins for a file it still holds
+    (fresher bytes, real mtime) and contributes everything outside
+    ``outputs/``, which is never harvested.
+
+    The live half walks the session dir (including the
+    ``.claude``/``snapshots``/… links into your workspace, where skills write
+    their deliverables), skipping machine noise (``.git``, ``__pycache__``,
+    …) and anything resolving outside your own session/workspace. Returns at
+    most 300 entries, deliverables first; ``truncated`` reports when more
+    existed. Sessions on an engine-sandbox provider (``kai-agent``) never
+    walk the host dir — see the module docstring; they report
+    ``source="engine"``.
     """
     user = _owned_session_or_404(request, chat_id, user)
     cfg = _chat_config(request)
+    harvested = _harvested_entries(chat_id)
     if _files_source(cfg) == "engine":
-        return await _list_engine_files(user, chat_id, cfg)
+        try:
+            live = await _list_engine_files(user, chat_id, cfg)
+        except EngineFilesUnavailable:
+            if not harvested:
+                # Nothing of our own to serve — the outage IS the answer.
+                logger.warning("chat_session_files: engine listing unavailable for session %s", chat_id, exc_info=True)
+                raise _engine_unavailable_502() from None
+            logger.warning(
+                "chat_session_files: engine listing unavailable for session %s — serving %d harvested artifact(s)",
+                chat_id,
+                len(harvested),
+                exc_info=True,
+            )
+            live = SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
+        return _merge_harvested(live, harvested)
     files, truncated = _walk_session_files(user["email"], chat_id)
-    return SessionFilesResponse(files=[SessionFileEntry(**f) for f in files], truncated=truncated)
+    host = SessionFilesResponse(files=[SessionFileEntry(**f) for f in files], truncated=truncated)
+    return _merge_harvested(host, harvested)
 
 
 async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFilesResponse:
-    """Proxy the listing from the engine's sandbox file browser."""
+    """Proxy the listing from the engine's sandbox file browser.
+
+    Raises :class:`EngineFilesUnavailable` rather than mapping it to a 502
+    here: whether an unreachable engine is fatal depends on what has been
+    harvested for this session, which only the caller knows.
+    """
     token = await _engine_token(user, chat_id)
-    try:
-        listing = await fetch_engine_listing(
-            base_url=_engine_base_url(cfg),
-            chat_id=chat_id,
-            token=token,
-            max_files=_MAX_LIST_FILES,
-            transport=_ENGINE_TRANSPORT,
-        )
-    except EngineFilesUnavailable:
-        logger.warning("chat_session_files: engine listing unavailable for session %s", chat_id, exc_info=True)
-        raise _engine_unavailable_502() from None
+    listing = await fetch_engine_listing(
+        base_url=_engine_base_url(cfg),
+        chat_id=chat_id,
+        token=token,
+        max_files=_MAX_LIST_FILES,
+        transport=_ENGINE_TRANSPORT,
+    )
     if listing is None:
         return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
     entries, truncated = listing
@@ -565,20 +739,29 @@ async def download_session_file(
     request: Request,
     path: str = Query(..., description="Session-relative file path, as returned by the listing."),
     user: dict = Depends(require_chat_access),
-) -> FileResponse:
+) -> Response:
     """Download one file from this chat session's workspace.
 
-    Always served as an attachment with ``nosniff``; HTML/SVG/XML bodies are
-    additionally pinned to ``application/octet-stream`` so a generated file
-    can never render as same-origin active content. 404 for a missing path
-    and for anything resolving outside your session dir / workspace alike.
+    Served from the live sandbox when it still has the file, and from the
+    harvested copy otherwise (#2268) — a deliverable stays downloadable long
+    after the sandbox that produced it is gone. Always an attachment with
+    ``nosniff`` either way; HTML/SVG/XML bodies are additionally pinned to
+    ``application/octet-stream`` so a generated file can never render as
+    same-origin active content. 404 for a missing path and for anything
+    resolving outside your session dir / workspace alike.
     """
     user = _owned_session_or_404(request, chat_id, user)
     rel = _validate_rel_path(path)
     cfg = _chat_config(request)
     if _files_source(cfg) == "engine":
         return await _download_engine_file(user, chat_id, rel, cfg)
-    resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    try:
+        resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    except HTTPException:
+        harvested = await _harvested_download(chat_id, rel)
+        if harvested is None:
+            raise
+        return harvested
 
     return FileResponse(
         path=str(resolved),
@@ -598,7 +781,12 @@ def _download_media_type(filename: str) -> str:
 
 async def _download_engine_file(user: dict, chat_id: str, rel: str, cfg: object) -> Response:
     """Stream one engine sandbox file through, with the exact response
-    posture of the host path (attachment + nosniff + pinned media type)."""
+    posture of the host path (attachment + nosniff + pinned media type).
+
+    Falls back to the harvested copy when the engine no longer has the file
+    (404 — the sandbox is gone) or cannot be reached at all: those are the
+    two ways a produced deliverable used to become unreachable.
+    """
     token = await _engine_token(user, chat_id)
     try:
         opened = await open_engine_download(
@@ -612,9 +800,20 @@ async def _download_engine_file(user: dict, chat_id: str, rel: str, cfg: object)
     except EngineFileTooLarge:
         raise HTTPException(status_code=413, detail="File exceeds the download size ceiling.") from None
     except EngineFilesUnavailable:
+        harvested = await _harvested_download(chat_id, rel)
+        if harvested is not None:
+            logger.warning(
+                "chat_session_files: engine download unavailable for session %s — serving the harvested copy",
+                chat_id,
+                exc_info=True,
+            )
+            return harvested
         logger.warning("chat_session_files: engine download unavailable for session %s", chat_id, exc_info=True)
         raise _engine_unavailable_502() from None
     if opened is None:
+        harvested = await _harvested_download(chat_id, rel)
+        if harvested is not None:
+            return harvested
         raise HTTPException(status_code=404, detail="file not found")
     iterator, handle = opened
     name = rel.rsplit("/", 1)[-1]
@@ -643,12 +842,13 @@ class _TooLargeToPreview(Exception):
 
 async def _preview_bytes(user: dict, chat_id: str, rel: str, cfg: object) -> bytes | None:
     """The file's bytes for preview purposes, from whichever sandbox holds
-    them. ``None`` when the path does not resolve to a readable file — the
-    same non-leaking 404 shape the download route uses."""
+    them — or from the harvested copy when neither does (#2268). ``None``
+    when the path does not resolve to a readable file anywhere: the same
+    non-leaking 404 shape the download route uses."""
     if _files_source(cfg) == "engine":
         token = await _engine_token(user, chat_id)
         try:
-            return await fetch_engine_file_bytes(
+            data = await fetch_engine_file_bytes(
                 base_url=_engine_base_url(cfg),
                 chat_id=chat_id,
                 path=rel,
@@ -659,9 +859,21 @@ async def _preview_bytes(user: dict, chat_id: str, rel: str, cfg: object) -> byt
         except EngineFileTooLarge:
             raise _TooLargeToPreview from None
         except EngineFilesUnavailable:
+            harvested = await _harvested_preview_bytes(chat_id, rel)
+            if harvested is not None:
+                return harvested
             logger.warning("chat_session_files: engine preview unavailable for session %s", chat_id, exc_info=True)
             raise _engine_unavailable_502() from None
-    resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+        if data is not None:
+            return data
+        return await _harvested_preview_bytes(chat_id, rel)
+    try:
+        resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    except HTTPException:
+        harvested = await _harvested_preview_bytes(chat_id, rel)
+        if harvested is None:
+            raise
+        return harvested
     if resolved.stat().st_size > _PREVIEW_MAX_BYTES:
         raise _TooLargeToPreview
     return await asyncio.to_thread(resolved.read_bytes)
@@ -842,6 +1054,19 @@ async def raw_session_file(
         )
 
     cfg = _chat_config(request)
+
+    async def _harvested_inline() -> Response | None:
+        """The harvested copy, drawn inline under the same closed media map
+        the live paths use — the media type still comes from
+        ``_PREVIEW_INLINE_MEDIA``, never from the stored row."""
+        row = _harvested_row_for_path(chat_id, rel)
+        if row is None:
+            return None
+        data = await _harvested_bytes(row)
+        if data is None:
+            return None
+        return Response(content=data, media_type=media, headers=_inline_headers(name))
+
     if _files_source(cfg) == "engine":
         token = await _engine_token(user, chat_id)
         try:
@@ -856,9 +1081,15 @@ async def raw_session_file(
         except EngineFileTooLarge:
             raise HTTPException(status_code=413, detail="File exceeds the download size ceiling.") from None
         except EngineFilesUnavailable:
+            harvested = await _harvested_inline()
+            if harvested is not None:
+                return harvested
             logger.warning("chat_session_files: engine raw unavailable for session %s", chat_id, exc_info=True)
             raise _engine_unavailable_502() from None
         if opened is None:
+            harvested = await _harvested_inline()
+            if harvested is not None:
+                return harvested
             raise HTTPException(status_code=404, detail="file not found")
         iterator, handle = opened
         return StreamingResponse(
@@ -868,7 +1099,13 @@ async def raw_session_file(
             background=BackgroundTask(handle.aclose),
         )
 
-    resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    try:
+        resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    except HTTPException:
+        harvested = await _harvested_inline()
+        if harvested is None:
+            raise
+        return harvested
     return FileResponse(
         path=str(resolved),
         media_type=media,

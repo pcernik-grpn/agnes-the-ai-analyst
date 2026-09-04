@@ -612,6 +612,444 @@ def test_fleet_totals_sum_across_connections(tmp_path, monkeypatch, pg_engine):
     assert body["totals"]["files_seen"] == 150
 
 
+# ---------------------------------------------------------------------------
+# Fleet cost tile — attributing `facts_ingest_runs` spend to a connection
+# (the standalone `sharepoint-facts-extraction` job's own persisted ledger,
+# distinct from the crawl run's own inline `usage` block).
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_row_cost_includes_facts_ingest_runs_attributable_spend(tmp_path, monkeypatch, pg_engine):
+    """A connection whose facts stage runs as a SEPARATE
+    `sharepoint-facts-extraction` job never touches its own `extraction_runs`
+    row's `usage` block — it spends through `facts_ingest_runs.llm_usage`
+    instead, attributed back to the connection by `corpus_ids` overlap with
+    its own scope collections. Before this fix the fleet's cost figure read
+    only the crawl run's own (empty) usage, so a connection that had
+    genuinely spent real money showed $0."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-facts-ledger-cost")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_ledger"}]}
+    )
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 3})  # facts NEVER ran inline for this run
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_ledger"],
+        caller="scheduler@system.local",
+        documents_seen=500,
+        claims_written=10,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1_000_000, "output_tokens": 200_000, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["run"]["usage"] == {}, "the crawl run itself never reported usage — this pins the bug's premise"
+    assert row["estimated_cost_usd"] is not None
+    assert row["estimated_cost_usd"] > 0
+    assert row["cost_status"] == "priced"
+    assert "claude-haiku-4-5" in row["cost_models"]
+
+
+def test_fleet_row_cost_is_none_not_a_fabricated_zero_when_nothing_is_recorded(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-no-usage-anywhere")
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 3})
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["estimated_cost_usd"] is None
+    assert row["cost_status"] == "no_usage"
+
+
+def test_fleet_row_cost_status_is_unpriced_when_facts_ledger_tokens_have_no_priceable_model(
+    tmp_path, monkeypatch, pg_engine
+):
+    """Tokens are known (the producer reported usage) but no single named
+    model means the figure cannot be honestly priced — a different claim
+    from both "priced" and "no usage at all", and the payload must say so."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-unpriceable")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_unpriced"}]}
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_unpriced"],
+        caller="scheduler@system.local",
+        documents_seen=5,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 100},  # no model named
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["estimated_cost_usd"] is None
+    assert row["cost_status"] == "unpriced"
+    assert row["token_totals"]["input_tokens"] == 1000
+
+
+def test_fleet_row_cost_sums_crawl_run_and_facts_ingest_without_double_counting(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-both-sources")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_both"}]}
+    )
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(
+        run_id,
+        status="done",
+        report={"new": 3},
+        usage={
+            "facts": {"estimated_cost_usd": 2.0, "input_tokens": 100, "output_tokens": 20, "model": "claude-haiku-4-5"}
+        },
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_both"],
+        caller="scheduler@system.local",
+        documents_seen=10,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    from src.llm_pricing import cost_usd
+
+    expected_facts_ledger_cost = cost_usd(model="claude-haiku-4-5", input_tokens=1000, output_tokens=200)
+    assert round(row["estimated_cost_usd"], 4) == round(2.0 + expected_facts_ledger_cost, 4)
+    assert row["cost_status"] == "priced"
+
+
+def test_fleet_total_de_duplicates_a_run_shared_by_two_connections_own_collections(
+    tmp_path, monkeypatch, pg_engine
+):
+    """The exact configuration the whole cost-truth fix came from: a site
+    split into siblings (`POST .../split/apply`) — or a bulk-add's shared-
+    collection option — can legitimately route more than one connection's
+    scope at the SAME collection. A `facts_ingest_runs` run touching that
+    collection is honestly attributed in FULL to both connections' own
+    rows (neither row understates what it can see), but the fleet-wide
+    TOTAL must count that run's cost exactly once, not once per connection
+    that shares it — and both rows must say, on screen, that their figure
+    is shared."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-shared-a")
+    conn_b = _connection(client, token, name="sp-shared-b")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_a, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_shared_ab"}]}
+    )
+    source_connections_repo().update(
+        conn_b, config={"scopes": [{"source_scope_id": "s2", "collection_id": "col_shared_ab"}]}
+    )
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_shared_ab"],
+        caller="scheduler@system.local",
+        documents_seen=500,
+        claims_written=10,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1_000_000, "output_tokens": 200_000, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    by_id = {r["connection_id"]: r for r in body["connections"]}
+    row_a, row_b = by_id[conn_a], by_id[conn_b]
+
+    import pytest
+
+    from src.llm_pricing import cost_usd
+
+    expected_run_cost = cost_usd(model="claude-haiku-4-5", input_tokens=1_000_000, output_tokens=200_000)
+
+    # BOTH rows show the full, un-split figure — neither understates what
+    # its own connection's collections can see.
+    assert row_a["estimated_cost_usd"] == pytest.approx(expected_run_cost, abs=1e-4)
+    assert row_b["estimated_cost_usd"] == pytest.approx(expected_run_cost, abs=1e-4)
+
+    # Both are visibly marked shared, naming the OTHER connection.
+    assert row_a["cost_shared"] is True
+    assert row_b["cost_shared"] is True
+    assert row_a["cost_shared_with"] == ["sp-shared-b"]
+    assert row_b["cost_shared_with"] == ["sp-shared-a"]
+
+    # The page total counts the shared run's cost ONCE, not twice — the
+    # double-count this fix closes.
+    assert body["totals"]["estimated_cost_usd"] == pytest.approx(expected_run_cost, abs=1e-4)
+    assert body["totals"]["cost_note"]
+
+
+def test_fleet_response_never_serializes_the_facts_ingest_runs_id_list(tmp_path, monkeypatch, pg_engine):
+    """Payload-size regression: the fleet response must carry only the
+    AGGREGATE facts-ingest figures per connection, never the underlying
+    per-run id list `llm_usage_rollup_by_corpus_ids` returns internally to
+    let the server de-duplicate the page total. `facts_ingest_runs` is
+    append-only and only grows, a single connection's own collection can
+    match a large share of it, and the fleet page polls every 5s —
+    serializing that list on every poll would ship ids the browser never
+    reads."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-many-runs")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_many"}]}
+    )
+    for _ in range(25):
+        facts_ingest_runs_repo().create(
+            corpus_ids=["col_many"],
+            caller="scheduler@system.local",
+            documents_seen=1,
+            claims_written=0,
+            claims_rejected=[],
+            deferred=[],
+            subjects_created=0,
+            subjects_deleted=0,
+            review_items=[],
+            llm_usage={"input_tokens": 100, "output_tokens": 10, "models": ["claude-haiku-4-5"]},
+        )
+
+    resp = client.get(f"{FLEET_URL}?all=1", headers=_auth(token))
+    body = resp.json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+
+    assert row["facts"]["facts_ingest_usage"]["runs_with_usage"] == 25
+    assert "runs" not in row["facts"]["facts_ingest_usage"]
+    # Belt and braces: no `ir_`-prefixed facts_ingest_runs id anywhere in
+    # the raw response body — proves the list is gone, not just renamed
+    # or nested one level deeper.
+    assert "ir_" not in resp.text
+
+
+def test_fleet_row_cost_shared_is_not_marked_when_the_shared_run_is_unpriced(tmp_path, monkeypatch, pg_engine):
+    """The shared badge is gated on the row actually showing a priced
+    dollar figure — a row whose only facts-ledger run is unpriceable (no
+    single named model) renders an em-dash for cost, and `cost_shared`
+    must stay `False` even though the SAME run is attributed to another
+    connection too, or the badge would explain a number the row does not
+    display."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-unpriced-shared-a")
+    conn_b = _connection(client, token, name="sp-unpriced-shared-b")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_a, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_unpriced_shared"}]}
+    )
+    source_connections_repo().update(
+        conn_b, config={"scopes": [{"source_scope_id": "s2", "collection_id": "col_unpriced_shared"}]}
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_unpriced_shared"],
+        caller="scheduler@system.local",
+        documents_seen=5,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 100},  # no model named — unpriceable
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    by_id = {r["connection_id"]: r for r in body["connections"]}
+    row_a, row_b = by_id[conn_a], by_id[conn_b]
+
+    for row in (row_a, row_b):
+        assert row["cost_status"] == "unpriced"
+        assert row["estimated_cost_usd"] is None
+        assert row["cost_shared"] is False
+        assert row["cost_shared_with"] == []
+
+
+def test_fleet_total_does_not_deduplicate_two_genuinely_different_runs(tmp_path, monkeypatch, pg_engine):
+    """A sibling proof for the de-duplication test above: two connections
+    with their OWN, non-overlapping collections and their OWN separate
+    ingest runs must still sum normally — de-duplication must never
+    collapse two genuinely different runs into one."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-distinct-a")
+    conn_b = _connection(client, token, name="sp-distinct-b")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_a, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_distinct_a"}]}
+    )
+    source_connections_repo().update(
+        conn_b, config={"scopes": [{"source_scope_id": "s2", "collection_id": "col_distinct_b"}]}
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_distinct_a"],
+        caller="scheduler@system.local",
+        documents_seen=10,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 100, "models": ["claude-haiku-4-5"]},
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_distinct_b"],
+        caller="scheduler@system.local",
+        documents_seen=10,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 2000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    by_id = {r["connection_id"]: r for r in body["connections"]}
+    assert by_id[conn_a]["cost_shared"] is False
+    assert by_id[conn_b]["cost_shared"] is False
+
+    import pytest
+
+    from src.llm_pricing import cost_usd
+
+    expected_total = cost_usd(model="claude-haiku-4-5", input_tokens=1000, output_tokens=100) + cost_usd(
+        model="claude-haiku-4-5", input_tokens=2000, output_tokens=200
+    )
+    assert body["totals"]["estimated_cost_usd"] == pytest.approx(expected_total, abs=1e-4)
+
+
+def test_fleet_response_carries_the_instance_wide_cumulative_llm_usage_totals(tmp_path, monkeypatch, pg_engine):
+    """The SAME cumulative rollup GET /api/facts/ingest-runs already exposes
+    (`llm_usage_totals`) must also ride on the fleet response, so the
+    summary strip can show an instance-wide total distinct from any one
+    connection's own attributed figure."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    _connection(client, token, name="sp-cumulative")
+
+    from src.repositories import facts_ingest_runs_repo
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_x"],
+        caller="scheduler@system.local",
+        documents_seen=1,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        # `llm_usage_rollup()` (the instance-wide rollup this tile reuses
+        # unchanged) prices via its own sampled rate card, which knows
+        # "claude-sonnet-4" but not the newer "claude-haiku-4-5" id the
+        # per-connection rollup's `src.llm_pricing` table carries — either
+        # is fine here since this test only pins that the CUMULATIVE tile
+        # rides on the fleet response, not which model it names.
+        llm_usage={"input_tokens": 1000, "output_tokens": 100, "models": ["claude-sonnet-4"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    assert "llm_usage_totals" in body
+    assert body["llm_usage_totals"]["runs_with_usage"] == 1
+    assert body["llm_usage_totals"]["estimated_cost_usd"] is not None
+
+
+def test_fleet_facts_ingest_cost_lookup_is_batched_not_one_query_per_connection(tmp_path, monkeypatch, pg_engine):
+    """The facts-ingest cost attribution must be ONE grouped query for the
+    whole page, never one round trip per connection — the same batching
+    discipline `children_for` already uses for shard rollups."""
+    import sqlalchemy as sa
+
+    import src.db_pg as db_pg
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    for i in range(8):
+        conn_id = _connection(client, token, name=f"sp-cost-batch-{i}")
+        source_connections_repo().update(
+            conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": f"col_batch_{i}"}]}
+        )
+        facts_ingest_runs_repo().create(
+            corpus_ids=[f"col_batch_{i}"],
+            caller="scheduler@system.local",
+            documents_seen=1,
+            claims_written=0,
+            claims_rejected=[],
+            deferred=[],
+            subjects_created=0,
+            subjects_deleted=0,
+            review_items=[],
+            llm_usage={"input_tokens": 100, "output_tokens": 10, "models": ["claude-haiku-4-5"]},
+        )
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_pg.get_engine()
+    sa.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert len(body["connections"]) == 8
+    # `llm_usage IS NOT NULL` is the distinguishing clause of the two
+    # constant-count queries this feature adds (the per-connection batched
+    # rollup, and the instance-wide cumulative one) — deliberately NOT a
+    # bare "facts_ingest_runs" substring match, which would also catch the
+    # pre-existing, unrelated per-connection `documents_done_since` calls
+    # `_facts_throughput_and_eta` already makes for the throughput/ETA line.
+    usage_queries = [s for s in statements if "llm_usage IS NOT NULL" in s]
+    assert len(usage_queries) <= 2, (
+        f"expected the facts-ingest cost lookup to be a CONSTANT number of queries "
+        f"regardless of connection count (8 connections here), got {len(usage_queries)}: {usage_queries}"
+    )
+
+
 def test_fleet_ignores_non_sharepoint_connections(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
     r = client.post(
@@ -952,6 +1390,64 @@ def test_status_reports_facts_pending_documents_and_pass_running(tmp_path, monke
     assert body["facts_pass_running"] is True
 
 
+def test_status_files_per_min_is_none_with_nothing_running(tmp_path, monkeypatch, pg_engine):
+    """`files_per_min` (source-card redesign §8) is the live line's rate —
+    absent (`null`), never `0`, when no run is currently active."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["files_per_min"] is None
+
+
+def test_status_files_per_min_is_derived_from_a_live_run(tmp_path, monkeypatch, pg_engine):
+    """A running connection's `files_per_min` reuses the exact windowed-rate
+    computation (`_files_per_min`) the fleet view's own column already
+    uses — here via the single-observation fallback (average since
+    `started_at`), the same one `TestFilesPerMin.test_falls_back_to_the_
+    since_started_average_on_first_observation` pins at the unit level."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    repo.start(connection_id=conn_id)
+    repo.checkpoint(repo.get_running(conn_id)["id"], files_seen=60, files_done=60, progress={})
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["files_per_min"] is not None
+    assert body["files_per_min"] > 0
+
+
+def test_status_crawl_job_is_null_with_nothing_queued(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["crawl_job"] is None
+
+
+def test_status_crawl_job_reports_a_queued_trigger_before_any_run_exists(tmp_path, monkeypatch, pg_engine):
+    """The state chip's `Queued` rung: a `corpus-extraction` job can sit
+    queued before a worker claims it and opens the first `extraction_runs`
+    row — `running` stays null the whole time, but `crawl_job` is not."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "corpus-extraction",
+        {"connection_id": conn_id},
+        idempotency_key=f"corpus-extraction:{conn_id}",
+    )
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["running"] is None
+    assert body["crawl_job"] is not None
+    assert body["crawl_job"]["id"] == job["id"]
+    assert body["crawl_job"]["status"] == "queued"
+
+
 def test_fleet_row_carries_facts_pending_documents_and_pass_running(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
     conn_id = _connection(client, token)
@@ -1205,3 +1701,347 @@ def test_status_reports_every_partition_job_and_throughput_eta(tmp_path, monkeyp
     assert row["facts"]["facts_passes_total"] == 2
     assert len(row["facts"]["facts_jobs"]) == 2
     assert row["facts"]["facts_docs_per_hour"] == 120.0
+
+
+# ---------------------------------------------------------------------------
+# Extraction breakdown (2026-09-04, `GET .../extraction/breakdown`) — "how
+# many documents did we get, how many did we not, by file type and by
+# reason" — read entirely from extraction_runs + corpus_files, no Graph.
+# ---------------------------------------------------------------------------
+
+
+def _breakdown(client, token, conn_id, **params):
+    return client.get(f"{BASE}/{conn_id}/extraction/breakdown", headers=_auth(token), params=params)
+
+
+def test_breakdown_requires_admin(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    r = client.get(f"{BASE}/{conn_id}/extraction/breakdown")
+    assert r.status_code == 401
+
+
+def test_breakdown_404s_for_unknown_connection(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    r = _breakdown(client, token, "conn_absent")
+    assert r.status_code == 404
+
+
+def test_breakdown_400s_on_malformed_since_and_until(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    r = _breakdown(client, token, conn_id, since="not-a-date")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "invalid_since"
+
+    r = _breakdown(client, token, conn_id, until="also-not-a-date")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "invalid_until"
+
+
+def test_breakdown_empty_connection_has_zeroed_totals_not_missing_keys(tmp_path, monkeypatch, pg_engine):
+    """A connection that never ran must still answer with the full shape —
+    zeros, not absent keys, so a caller never has to special-case "no
+    history yet"."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["runs"]["considered"] == 0
+    assert body["by_extension"] == []
+    assert body["failures"]["listed"] == 0
+    assert body["reconciliation"]["seen"] == 0
+    assert body["reconciliation"]["indexed"] == 0
+    assert body["reconciliation"]["unexplained"] == 0
+
+
+def test_breakdown_collapses_failures_sharing_a_normalized_reason(tmp_path, monkeypatch, pg_engine):
+    """The bug this endpoint exists to not reproduce: a naive `GROUP BY
+    reason` lists one row per random temp filename. 1 000 files that all
+    hit the SAME markitdown fault must collapse into ONE `by_reason` row."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    failed_items = [
+        {
+            "path": f"/docs/f{i}.xlsx",
+            "item_id": f"item{i}",
+            "drive_id": "d1",
+            "reason_type": "convert_failed",
+            "reason": f"tmp{i:06d}.xlsx: markitdown could not convert this file (ValueError)",
+            "suffix": "xlsx",
+        }
+        for i in range(50)
+    ]
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 0, "failed_items": failed_items})
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["failures"]["listed"] == 50
+    assert body["failures"]["failed"]["count"] == 50
+    assert len(body["failures"]["by_reason"]) == 1
+    row = body["failures"]["by_reason"][0]
+    assert row["count"] == 50
+    assert row["reason"] == "markitdown could not convert this file (ValueError)"
+    assert "tmp" not in row["reason"]
+    assert row["by_extension"] == {"xlsx": 50}
+    assert body["by_extension"][0]["extension"] == "xlsx"
+    assert body["by_extension"][0]["failed"] == 50
+
+
+def test_breakdown_calls_out_the_empty_text_cohort_separately(tmp_path, monkeypatch, pg_engine):
+    """`convert_empty` (converted fine, produced no text) is the biggest
+    real-world cohort and means "needs OCR", not "broken" — never folded
+    into the ordinary `failed` bucket."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    failed_items = [
+        {
+            "path": "/scans/a.pdf",
+            "item_id": "i1",
+            "drive_id": "d1",
+            "reason_type": "convert_empty",
+            "reason": "conversion succeeded but produced no extractable text",
+            "suffix": "pdf",
+        },
+        {
+            "path": "/docs/b.docx",
+            "item_id": "i2",
+            "drive_id": "d1",
+            "reason_type": "convert_failed",
+            "reason": "tmpxyz.docx: markitdown could not convert this file (BadZipFile)",
+            "suffix": "docx",
+        },
+    ]
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"failed_items": failed_items})
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["failures"]["empty_text"]["count"] == 1
+    assert body["failures"]["empty_text"]["by_extension"] == {"pdf": 1}
+    assert body["failures"]["failed"]["count"] == 1
+    assert len(body["failures"]["by_reason"]) == 1
+    assert body["failures"]["by_reason"][0]["reason_type"] == "convert_failed"
+    ext_by_key = {row["extension"]: row for row in body["by_extension"]}
+    assert ext_by_key["pdf"]["empty_text"] == 1
+    assert ext_by_key["pdf"]["failed"] == 0
+    assert ext_by_key["docx"]["failed"] == 1
+
+
+def test_breakdown_flags_truncation_and_never_invents_a_true_total(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(
+        run_id,
+        status="done",
+        report={
+            "failed_items": [
+                {"path": f"/f{i}", "reason_type": "convert_failed", "reason": "x", "suffix": "pdf"} for i in range(3)
+            ],
+            "failed_items_truncated": True,
+        },
+    )
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["failures"]["listed"] == 3
+    assert body["failures"]["truncated"] is True
+    # No `total` field pretending to know the true count beyond `listed`.
+    assert "total" not in body["failures"]
+
+
+def test_breakdown_by_extension_uses_path_not_filename_or_file_type(tmp_path, monkeypatch, pg_engine):
+    """The corpus_files trap: `filename`/`file_type` name the stored
+    markdown artifact, never the source document's real type."""
+    from src.repositories import corpus_files_repo, source_connections_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    source_connections_repo().update(conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_bd"}]})
+
+    files_repo = corpus_files_repo()
+    fid = files_repo.add(
+        corpus_id="col_bd",
+        filename="report.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=2048,
+        storage_path="/tmp/report.md",
+        path="Finance/2026/report.pdf",
+    )
+    files_repo.set_status(fid, status="indexed")
+
+    body = _breakdown(client, token, conn_id).json()
+    row = next(r for r in body["by_extension"] if r["extension"] == "pdf")
+    assert row["indexed"] == {"count": 1, "bytes": 2048}
+    assert body["reconciliation"]["indexed"] == 1
+
+
+def test_breakdown_undercounts_report_only_scalars_for_an_interrupted_run_and_says_so(tmp_path, monkeypatch, pg_engine):
+    """The other live trap: an abandoned/interrupted run has an EMPTY
+    `report` and only a `progress` checkpoint. `bytes_downloaded` (present
+    in both) must still be counted; `permission_skips` (report-only) must
+    be silently skipped for that run, not averaged in as zero."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    # A normal finished run: both a report-only field and a live field.
+    done_id = repo.start(connection_id=conn_id)
+    repo.finish(done_id, status="done", report={"bytes_downloaded": 100, "permission_skips": 4, "new": 3})
+
+    # An abandoned run: only ever checkpointed, report stays `{}` (mirrors
+    # `ExtractionRunsPgRepository.abandon_stale_running` leaving `report`
+    # untouched on a worker that never finalized).
+    interrupted_id = repo.start(connection_id=conn_id)
+    repo.checkpoint(interrupted_id, files_seen=10, files_done=10, progress={"bytes_downloaded": 400, "new": 7})
+    repo.finish(interrupted_id, status="interrupted", report={}, files_done=10)
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["runs"]["considered"] == 2
+    assert body["runs"]["with_report"] == 1
+    assert body["runs"]["progress_only"] == 1
+    # bytes_downloaded is in BOTH report and progress, so both runs count.
+    assert body["scalars"]["bytes_downloaded"] == 500
+    # permission_skips is report-only — only the finished run contributes.
+    assert body["scalars"]["permission_skips"] == 4
+    assert body["scalars"]["contributed_runs"]["permission_skips"] == 1
+    assert body["scalars"]["contributed_runs"]["bytes_downloaded"] == 2
+
+
+def test_breakdown_since_until_narrows_which_runs_are_aggregated(tmp_path, monkeypatch, pg_engine):
+    import sqlalchemy as sa
+    from datetime import datetime, timedelta, timezone
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    old_id = repo.start(connection_id=conn_id)
+    repo.finish(old_id, status="done", report={"new": 100})
+    new_id = repo.start(connection_id=conn_id)
+    repo.finish(new_id, status="done", report={"new": 5})
+
+    now = datetime.now(timezone.utc)
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(days=30), "id": old_id},
+        )
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(hours=1), "id": new_id},
+        )
+
+    body = _breakdown(client, token, conn_id, since=(now - timedelta(days=1)).isoformat()).json()
+    assert body["runs"]["considered"] == 1
+    assert body["scalars"]["new"] == 5
+
+    body_all = _breakdown(client, token, conn_id).json()
+    assert body_all["runs"]["considered"] == 2
+    assert body_all["scalars"]["new"] == 105
+
+
+def test_breakdown_includes_shard_children_not_just_the_parent(tmp_path, monkeypatch, pg_engine):
+    """A sharded site's substantive failures live on its CHILD rows, not
+    the near-empty parent (planner) row."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=1)
+    repo.checkpoint(parent_id, files_seen=5, files_done=5)
+    child_id = repo.start(connection_id=conn_id, parent_run_id=parent_id, shard_key="k1", shard_label="Shard 1")
+    repo.finish(
+        child_id,
+        status="done",
+        report={
+            "new": 5,
+            "failed_items": [{"path": "/x.pdf", "reason_type": "convert_failed", "reason": "boom", "suffix": "pdf"}],
+        },
+    )
+    repo.finish(parent_id, status="done", report={})
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["runs"]["considered"] == 2
+    assert body["failures"]["listed"] == 1
+    assert body["scalars"]["new"] == 5
+
+
+def test_breakdown_reconciliation_names_what_seen_did_not_reduce_to(tmp_path, monkeypatch, pg_engine):
+    from src.repositories import corpus_files_repo, source_connections_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    source_connections_repo().update(conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_rc"}]})
+    files_repo = corpus_files_repo()
+    fid = files_repo.add(
+        corpus_id="col_rc",
+        filename="a.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=10,
+        storage_path="/tmp/a.md",
+        path="a.pdf",
+    )
+    files_repo.set_status(fid, status="indexed")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(
+        run_id,
+        status="done",
+        report={
+            "new": 3,  # only 1 indexed below -> 2 unexplained
+            "changed": 0,
+            "unchanged": 0,
+            "filtered_by_age": 0,
+        },
+    )
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["reconciliation"]["seen"] == 3
+    assert body["reconciliation"]["indexed"] == 1
+    assert body["reconciliation"]["unexplained"] == 2
+
+
+def test_breakdown_needs_review_is_its_own_column_and_counts_as_accounted_for(tmp_path, monkeypatch, pg_engine):
+    """`needs_review` (src/ingest/runner.py — conversion succeeded but
+    chunking produced zero chunks) is a DIFFERENT "empty" signal than the
+    crawler's own `convert_empty`, one stage later in the pipeline. It must
+    show up as its own column, not vanish, and count toward `accounted_for`
+    rather than inflating `unexplained`."""
+    from src.repositories import corpus_files_repo, source_connections_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_nr"}]}
+    )
+    files_repo = corpus_files_repo()
+    fid = files_repo.add(
+        corpus_id="col_nr",
+        filename="a.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=500,
+        storage_path="/tmp/a.md",
+        path="whitespace.docx",
+    )
+    files_repo.set_status(fid, status="needs_review")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 1})
+
+    body = _breakdown(client, token, conn_id).json()
+    row = next(r for r in body["by_extension"] if r["extension"] == "docx")
+    assert row["needs_review"] == {"count": 1, "bytes": 500}
+    assert body["reconciliation"]["accounted_for"] >= 1
+    assert body["reconciliation"]["unexplained"] == 0

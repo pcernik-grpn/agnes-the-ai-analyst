@@ -319,6 +319,7 @@ claim per line, the LAST thing in the reply:
     ```sources
     table: hr_headcount
     metric: headcount/active
+    glossary: Full-time equivalent
     document: 2026_Workforce_Plan.pdf
     assumption: active employees only | origin: user | why: you asked about "the team"
     assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
@@ -326,17 +327,21 @@ claim per line, the LAST thing in the reply:
 
 - `table:` — the registry id (as `agnes catalog` gives it) of every table the
   figure was computed from. `metric:` — the canonical metric id, when you
-  adapted one. `document:` — every document or fact-graph subject the answer
-  rests on: the filename as the fact tools give it, or the subject id you
-  passed to `agnes facts claims`. Each is checked against the tools you
-  actually ran; naming a table you did not query, or a file you did not open,
-  is worse than naming none. An answer read entirely out of documents
-  declares `document:` lines and no `table:` — that is a complete answer to
-  "where did this come from", not a gap.
+  adapted one. `glossary:` — every governed business term whose definition the
+  answer leaned on, written as the glossary spells the term (`agnes glossary`),
+  not as its id. `document:` — every document
+  or fact-graph subject the answer rests on: the filename as the fact tools
+  give it, or the subject id you passed to `agnes facts claims`. Each is
+  checked against the tools you actually ran; naming a table you did not
+  query, a term you did not look up, or a file you did not open, is worse
+  than naming none. An answer read entirely out of documents declares
+  `document:` lines and no `table:` — that is a complete answer to "where did
+  this come from", not a gap.
 - `assumption:` — anything the number depends on that you chose rather than
-  read, one per line, and never a source: a file you read is a `document:`,
-  and filing it here shows the reader your evidence among your guesses.
-  Always with two more segments separated by ` | `:
+  read, one per line, and never a source: a file you read is a `document:`
+  and a term you looked up is a `glossary:`, and filing either here shows the
+  reader your evidence among your guesses. Always with two more segments
+  separated by ` | `:
   `origin:` is ONE word from `user` (the question said or implied it),
   `definition` (a metric definition, a semantic model or a document in the
   knowledge base says so), `data` (the data forced it: a missing column or

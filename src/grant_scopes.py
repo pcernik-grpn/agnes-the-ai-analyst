@@ -149,3 +149,85 @@ def carrier_group_id() -> Optional[str]:
     except Exception:  # noqa: BLE001 - a missing carrier is not a crash
         return None
     return row["id"] if row else None
+
+
+#: What an audience IS, on the wire: a group, or the scope that is not one.
+#: Sent beside the id so a reader does not have to recognise the sentinel to
+#: know which kind it is looking at.
+AUDIENCE_KIND_SCOPE = "scope"
+AUDIENCE_KIND_GROUP = "group"
+
+
+def audience_id(row: Mapping[str, Any], carrier_id: Optional[str] = None) -> str:
+    """WHO a grant row reaches, as every surface should label it.
+
+    :data:`EVERYONE_TARGET_ID` for a row that reaches every account, and the
+    group's own id otherwise. One function because two surfaces answered this
+    question and only one of them answered it right: the Access page resolved
+    the scope while the effective-access read attributed the row to the group
+    it is STORED against — the carrier — and printed its uuid as the "group"
+    a person got the thing through (#2254).
+
+    Reads through :func:`reaches_everyone`, so it answers on both backends.
+    """
+    return EVERYONE_TARGET_ID if reaches_everyone(row, carrier_id) else str(row["group_id"])
+
+
+def grants_reaching_user(user_id: str) -> list:
+    """Every grant that reaches this account, each tagged with its audience.
+
+    THE shared resolution path behind "what can this person reach, and how"
+    (#2254, #2255). Two halves, and the split is what keeps it honest:
+
+    * WHO IT REACHES is the repository's answer, never re-derived here.
+      ``list_for_groups`` already encodes each backend's own truth — Postgres
+      unions the everyone-scoped rows into whatever group set it is given,
+      including an EMPTY one, which is the account the old reader returned
+      early on; the frozen DuckDB ladder has no ``scope`` column, so there an
+      everyone-grant is a grant on the carrier group and reaches its members,
+      no more. Adding the carrier to the read to "fix" DuckDB would report
+      access that ``can_access`` on that backend denies, which is the same
+      defect as #2254 pointing the other way.
+    * WHO IT IS ATTRIBUTED TO is :func:`audience_id`, the rule
+      ``GET /api/admin/access-overview`` labels its own rows by. That is what
+      stops the carrier group's uuid being printed as the "group" a person
+      got something through.
+
+    Each returned row is the repository's row plus ``audience`` (a group id or
+    the sentinel), ``audience_kind`` and ``audience_name`` — the same three
+    facts the Access page's snapshot publishes, so the surfaces cannot answer
+    one question two ways.
+
+    Reached through the repository factory, so neither half has to know which
+    backend it is on.
+    """
+    from src.repositories import resource_grants_repo, user_group_members_repo
+
+    memberships = user_group_members_repo().list_groups_with_meta_for_user(user_id) or []
+    by_gid = {m["group_id"]: m.get("name") or m["group_id"] for m in memberships}
+    carrier = carrier_group_id()
+
+    out: list = []
+    for row in resource_grants_repo().list_for_groups(list(by_gid)):
+        if audience_id(row, carrier) == EVERYONE_TARGET_ID:
+            out.append(
+                dict(
+                    row,
+                    audience=EVERYONE_TARGET_ID,
+                    audience_kind=AUDIENCE_KIND_SCOPE,
+                    audience_name=EVERYONE_TARGET_LABEL,
+                )
+            )
+        else:
+            # Every row here came back from a group in `by_gid`, so the name
+            # always resolves — there is no id left to fall back to printing.
+            gid = row["group_id"]
+            out.append(
+                dict(
+                    row,
+                    audience=gid,
+                    audience_kind=AUDIENCE_KIND_GROUP,
+                    audience_name=by_gid[gid],
+                )
+            )
+    return out

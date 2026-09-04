@@ -1259,7 +1259,13 @@ function stripSourcesFence(markdown) {
   return out.trimEnd();
 }
 
-const _CLAIM_LABEL = { table: "table", metric: "metric", document: "document", assumption: "assumes" };
+const _CLAIM_LABEL = {
+  table: "table",
+  metric: "metric",
+  glossary: "glossary",
+  document: "document",
+  assumption: "assumes",
+};
 
 /** Where an assumption came from, as the reader sees it.
  *
@@ -1316,6 +1322,18 @@ const _ASSUMPTION_ORIGIN_UNSTATED = {
  *  asked. `assumption` is free text about the analyst's own choices, with
  *  nothing to open, so it stays a plain label.
  *
+ *  `glossary` links to the glossary tab of the same page, and WHICH tab is
+ *  not cosmetic (#2258). The two registries behind those tabs answer to
+ *  different rules: the metrics list is narrowed per caller — every metric
+ *  bound to a table outside the caller's Data Package stack is dropped before
+ *  render, matching `GET /api/metrics` — while the glossary is deliberately
+ *  not gated that way, because it is business vocabulary rather than data
+ *  (`GET /api/glossary*` serves any authenticated caller). So a term goes to
+ *  the surface that governs terms: sending it through `all_metrics` would
+ *  answer a glossary citation with a filtered metrics read that can only ever
+ *  miss it. The term itself is what the tab's `?q=` filters on, which is what
+ *  the prompt asks the agent to write on the line.
+ *
  *  `document` stays a label too, and for the opposite reason to an
  *  assumption's: there IS a page, and the ref cannot name it. Document detail
  *  is `/library/{slug}/f/{file_id}` — a collection slug and a file id, while
@@ -1332,6 +1350,7 @@ function _claimHref(claim) {
   if (!ref) return "";
   if (claim.kind === "table") return `/catalog/t/${encodeURIComponent(ref)}`;
   if (claim.kind === "metric") return `/semantic-layer?tab=all_metrics&q=${encodeURIComponent(ref)}`;
+  if (claim.kind === "glossary") return `/semantic-layer?tab=all_glossary&q=${encodeURIComponent(ref)}`;
   return "";
 }
 
@@ -1370,7 +1389,7 @@ function _bubbleHasFigure(bubble) {
 //: `VERIFIABLE_KINDS` by tests/test_chat_sources_ui.py. `assumption` has
 //: none on purpose — it is not a reference, and it wears an origin badge
 //: instead (see `_renderAssumptionChip`).
-const _CLAIM_ICON = { table: "table", metric: "chart-line", document: "file-text" };
+const _CLAIM_ICON = { table: "table", metric: "chart-line", glossary: "book-open", document: "file-text" };
 
 //: How many references the row shows before the rest fold behind "+N more".
 //: Four covers the overwhelming majority of answers outright — under it there

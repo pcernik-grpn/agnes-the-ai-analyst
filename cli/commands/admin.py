@@ -1650,6 +1650,74 @@ def grant_everyone(
     typer.echo(f"Granted {resource_type}/{resource_id} to everyone (requirement={requirement})")
 
 
+@grant_app.command("reconcile-everyone")
+def grant_reconcile_everyone(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would convert, write nothing"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable report"),
+):
+    """Finish the ``scope='everyone'`` conversion migration 0098 declined.
+
+    0098 refuses to convert rather than change who can see what: it stops when
+    a PERSON sits outside the seeded ``Everyone`` group (converting would hand
+    them everything it holds) or when a non-person sits INSIDE it (the scope
+    reaches people only, so converting would take grants away). Both refusals
+    log "a later release converts the rows once …" — this is that release, as
+    something you can re-run once the membership is tidy. Until then the
+    instance is half-converted: new grants use the scope, the pre-0098 rows
+    stay group-shaped.
+
+    Safe to run at any time. The same two guards apply here, and a blocked run
+    writes nothing and just reports which arm fired.
+
+    \b
+        agnes admin grant reconcile-everyone --dry-run
+        agnes admin grant reconcile-everyone
+
+    Postgres only: the frozen DuckDB app-state ladder has no ``scope`` column,
+    so there is no half-converted state to close and the server answers 501.
+    """
+    resp = api_post(f"/api/admin/grants/reconcile-everyone-scope?dry_run={str(dry_run).lower()}", json={})
+    if resp.status_code == 501:
+        typer.echo(
+            "This instance's app-state backend does not store grant scopes, so "
+            "there is nothing to reconcile (Postgres-only feature).",
+            err=True,
+        )
+        raise typer.Exit(0)
+    if resp.status_code != 200:
+        _fail(resp)
+    r = resp.json()
+    if json_out:
+        typer.echo(json.dumps(r, indent=2))
+        return
+
+    status = r["status"]
+    if status == "nothing_to_do":
+        typer.echo("Nothing to reconcile — no pre-0098 grants left on the Everyone group.")
+        return
+    if status == "blocked":
+        typer.echo("Blocked — nothing was written. Who can see what is unchanged.\n")
+        if r["people_outside_group"]:
+            typer.echo(
+                f"  {r['people_outside_group']} person(s) are not members of the Everyone group. "
+                "Converting would GIVE them everything it holds.\n"
+                "  Fix: add them to the group (or deactivate the accounts), then re-run."
+            )
+        if r["non_people_inside_group"]:
+            typer.echo(
+                f"  {r['non_people_inside_group']} non-person account(s) — service accounts or "
+                "seeded system identities — are members and hold its grants today.\n"
+                "  The scope reaches people only, so converting would TAKE that access away.\n"
+                "  Fix: move them to a named group of their own, then re-run."
+            )
+        raise typer.Exit(1)
+
+    if r["dry_run"]:
+        typer.echo(f"Would convert {r['would_convert']} grant(s) to scope='everyone'. Nothing written.")
+        return
+    typer.echo(f"Converted {r['converted']} grant(s) to scope='everyone'.")
+
+
 @grant_app.command("create")
 def grant_create(
     group_ref: str = typer.Argument(..., help="Group id or name"),

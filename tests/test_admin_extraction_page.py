@@ -31,6 +31,10 @@ class TestExtractionFleetPageAuth:
         assert 'id="ext-scope-active"' in body
         assert 'id="ext-scope-all"' in body
         assert 'id="ext-jobs-strip"' in body
+        # Cost-truth fix — the instance-wide cumulative LLM-spend tile,
+        # distinct from the per-page "Est. cost (this view)" one.
+        assert 'id="ext-stat-cost"' in body
+        assert 'id="ext-stat-cumulative-cost"' in body
         assert "admin_extraction.js" in body
 
         # …and the referenced asset actually serves the poll/render code,
@@ -66,23 +70,60 @@ class TestExtractionFleetPageNav:
         assert "pending" not in entry["reached_from"], entry
 
     def test_the_source_card_is_the_door(self):
-        """The off-nav record names the source card's Run row as the door;
-        the template has to actually carry it. The generic guard in
+        """The off-nav record names the source card's Runs panel as the
+        door; the template has to actually carry it. The generic guard in
         `tests/test_web_admin_nav.py` checks every off-nav page has SOME
         literal link — this pins WHICH template, so the door cannot quietly
-        migrate to a page an operator watching a crawl never opens."""
+        migrate to a page an operator watching a crawl never opens.
+
+        Source-card redesign phase 1 (2026-09-04) moved the door: the old
+        Run row's "All connections" button (drawn by the externalized
+        `data_sources_extraction_observability.js`) became the Runs panel's
+        "Fleet view" link, drawn by `data_sources_page.js::
+        _spRunsPanelHtml` — the panel-chrome half of the card, not the live
+        polling half."""
         from pathlib import Path
 
-        # The Run row is drawn by the source card's externalized script
-        # (`data_sources_extraction_observability.js`), so that is where the
-        # literal door has to live — the template only loads the script.
         tpl = Path("app/web/templates/admin_data_sources.html").read_text(encoding="utf-8")
-        assert "data_sources_extraction_observability.js" in tpl
-        script = Path("app/web/static/js/admin/data_sources_extraction_observability.js").read_text(encoding="utf-8")
+        assert "data_sources_page.js" in tpl
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
         assert 'href="/admin/extraction"' in script
-        assert "All connections" in script
+        assert "Fleet view" in script
 
     def test_visiting_the_page_lights_the_data_section(self):
         from app.web.admin_nav import resolve_active_section_key
 
         assert resolve_active_section_key("/admin/extraction") == "data"
+
+
+class TestExtractionBreakdownSection:
+    """The breakdown panel (2026-09-04) — its own toolbar/tables, fetched
+    independently of the fleet table above from
+    ``GET .../extraction/breakdown``."""
+
+    def test_page_carries_the_breakdown_section_and_its_script(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        resp = client.get("/admin/extraction", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+        assert 'id="extbd-section"' in body
+        assert 'id="extbd-conn"' in body
+        assert 'id="extbd-since"' in body
+        assert 'id="extbd-until"' in body
+        assert 'id="extbd-apply"' in body
+        assert 'id="extbd-ext-tbody"' in body
+        assert 'id="extbd-reason-tbody"' in body
+        assert "extraction_breakdown.js" in body
+
+        script = client.get("/static/js/admin/extraction_breakdown.js")
+        assert script.status_code == 200, script.text
+        assert "/extraction/breakdown" in script.text
+        assert "FilterToolbar" in script.text
+
+    def test_breakdown_section_does_not_touch_the_fleet_summary_tiles(self, seeded_app):
+        """Scope guard: the new section must not rename/duplicate the
+        sibling-owned `ext-summary` tiles or the fleet table's cost column."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        body = client.get("/admin/extraction", headers=_auth(token)).text
+        assert body.count('id="ext-summary"') == 1
+        assert body.count('id="ext-stat-cost"') == 1

@@ -571,10 +571,13 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # connection for an operator running several crawl + facts passes at
         # once. Same off-nav shape as /admin/sync — a status view an operator
         # is SENT to, not a lens they pick among Sources/Tables/Packages.
-        # The door is the "All connections" button in every SharePoint
-        # source card's Run row on /admin/data-sources — next to "Run
-        # history", because "how is THIS one doing" and "how are ALL of them
-        # doing" are the same question asked at two widths.
+        # The door is the "Fleet view" link in every SharePoint source
+        # card's Runs panel toolbar on /admin/data-sources (source-card
+        # redesign phase 1, 2026-09-04 — was "All connections" in the Run
+        # row before the card's six-panel restructure) — next to "History",
+        # because "how is THIS one doing" and "how are ALL of them doing"
+        # are the same question asked at two widths. Also reachable from
+        # the card's overflow menu ("Open fleet view").
         #
         # This entry first shipped with a "pending" door and no link
         # anywhere, which left the page reachable only by typed URL —
@@ -582,7 +585,7 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # test_web_admin_nav.py` now requires every off-nav href to be a
         # literal `href` in some template, so a promise no longer passes
         # as a door.
-        "reached_from": 'the "All connections" button in each source card\'s Run row (/admin/data-sources)',
+        "reached_from": 'the "Fleet view" link in each source card\'s Runs panel (/admin/data-sources)',
     },
     {
         "href": "/admin/semantic-layer",

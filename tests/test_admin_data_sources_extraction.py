@@ -66,7 +66,7 @@ _SIGNATURES = (
     "function _extDot(outcome) {",
     "function _extIsFactsPhase(run) {",
     "function _extPhaseCountText(run) {",
-    "function _extRenderCrawlCell(connId, status) {",
+    "function _extLiveLine(connId, status) {",
     "function _extScanOcrPausedLine(run) {",
     "function _extRunLine(run) {",
     "const EXT_STOP_REASON_TEXT = {",
@@ -82,14 +82,23 @@ _SIGNATURES = (
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
-    "function _extRenderInAgnesButton(connId, status) {",
+    "function _extRenderRunNowButton(connId, status) {",
     "function _extFactsJobLine(job) {",
     "function _extFactsPendingLine(status) {",
     "function _extFactsEta(seconds) {",
     "function _extFactsThroughputNote(status) {",
     "function _extRenderFactsButton(connId, status) {",
+    "function _extNotIndexedCounts(status) {",
+    "function _extRenderHeadTiles(connId, status) {",
+    "function _extRenderNotIndexedPanel(connId, status) {",
+    "function _extRenderFactsPanel(connId, status) {",
+    "function _spStateChip(fs, status) {",
+    "function _extStateChip(connId, status) {",
     "function _extRender(connId) {",
     "function _extRenderNextRun(connId, status) {",
+    "function _extRenderRunsCount(connId, status) {",
+    "function _spPanelHtml(title, toolbarHtml, bodyHtml) {",
+    "function _spRunsPanelHtml(row) {",
     "function _extRunsHtml(connId, body) {",
     "const EXT_ORIGIN_LABEL = {",
     "function _extConfigHtml(body) {",
@@ -102,13 +111,22 @@ def _run_js(body: str, *, state: dict | None = None) -> dict:
     fns = "\n".join(_extract_block(tpl, sig) for sig in _SIGNATURES)
     script = f"""
 const EXT_MAX_FAILURES = 3;
+const SOURCE_PIPELINES = {{}};
 {fns}
 
 const _extState = {json.dumps(state or {})};
 const _elements = {{
   "ext-block-sp1": {{ hidden: true, innerHTML: "" }},
-  "ext-crawl-live-sp1": {{ hidden: true, innerHTML: "" }},
-  "ext-inagnes-btn-sp1": {{ dataset: {{ extractionReady: "1" }}, disabled: false, title: "" }},
+  "sp-liveline-sp1": {{ hidden: true, innerHTML: "" }},
+  "sp-chip-sp1": {{ className: "", textContent: "" }},
+  "sp-tile-notindexed-sp1": {{ textContent: "" }},
+  "sp-tile-spent-sp1": {{ textContent: "" }},
+  "sp-notindexed-body-sp1": {{ innerHTML: "" }},
+  "sp-facts-body-sp1": {{ innerHTML: "" }},
+  "sp-history-count-sp1": {{ textContent: "" }},
+  "sp-runnow-btn-sp1": {{ dataset: {{ extractionReady: "1" }}, disabled: false, title: "", style: {{}} }},
+  "sp-stop-btn-sp1": {{ dataset: {{}}, disabled: false, textContent: "", style: {{}} }},
+  "sp-cancel-btn-sp1": {{ dataset: {{}}, disabled: false, textContent: "", style: {{}} }},
   "ext-facts-btn-sp1": {{ dataset: {{ factsReady: "1" }}, disabled: false, title: "" }},
 }};
 const document = {{ getElementById: (id) => _elements[id] }};
@@ -166,8 +184,11 @@ class TestCardAnchors:
     be rendered entirely by its own script with no load-order coupling."""
 
     def test_template_carries_the_three_anchors(self):
+        """The head's live line (`sp-liveline-<id>`, source-card redesign
+        §2.1) replaces the old pipeline strip's `ext-crawl-live-<id>` cell —
+        same "empty anchor the observability script fills in" contract."""
         tpl = _ds_page_source.page_source()
-        assert 'id="ext-crawl-live-${row.id}"' in tpl
+        assert 'id="sp-liveline-${row.id}"' in tpl
         assert 'id="ext-block-${row.id}" data-ext-conn="${row.id}"' in tpl
         assert 'id="ext-drawer-${row.id}"' in tpl
 
@@ -496,32 +517,37 @@ class TestRunRow:
         assert "Cancel run" not in out["html"]
 
     def test_cancel_button_shown_once_stalled(self):
+        """Cancel now lives in the HEAD, rendered by `_extRenderRunNowButton`
+        (source-card redesign §2.1) — not inside `_extRunRowHtml`'s own
+        markup any more."""
         stalled = json.loads(json.dumps(_RUNNING))
         stalled["running"]["outcome"] = "stalled"
         stalled["running"]["stale_s"] = 4200.0
         stalled["running"]["liveness_note"] = "no checkpoint for 4200s"
         out = _run_js(
-            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            """
+_extRenderRunNowButton("sp1", _extState["sp1"].data);
+console.log(JSON.stringify({
+  cancelDisplay: _elements["sp-cancel-btn-sp1"].style.display,
+  runId: _elements["sp-cancel-btn-sp1"].dataset.runId,
+}));
+""",
             state=_state(data=stalled),
         )
-        html = out["html"]
-        assert "Cancel run" in html
-        assert "extCancelRun('sp1', 'er_1')" in html
+        assert out["cancelDisplay"] == ""
+        assert out["runId"] == "er_1"
 
     def test_the_run_row_carries_the_door_to_the_fleet_dashboard(self):
         """`/admin/extraction` is off-nav (see `ADMIN_NAV_OFFNAV`): its ONLY
-        door is this row. Drawn for a live run and for a connection that
-        never ran — "how are all of them doing" is a fair question in every
+        door was this row; it now lives in the Runs panel's own toolbar
+        (`data_sources_page.js::_spRunsPanelHtml`) — drawn unconditionally,
+        so "how are all of them doing" stays a fair question in every
         state, and a door that exists only sometimes is a page that is
         sometimes unreachable."""
-        never_ran = {"running": None, "last_completed": None, "runs_total": 0, "can_stop": False}
-        for state in (_state(data=_RUNNING), _state(data=never_ran)):
-            out = _run_js(
-                'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
-                state=state,
-            )
-            assert 'href="/admin/extraction"' in out["html"]
-            assert "All connections" in out["html"]
+        out = _run_js('console.log(JSON.stringify({html: _spRunsPanelHtml({id: "sp1"})}));')
+        html = out["html"]
+        assert 'href="/admin/extraction"' in html
+        assert "Fleet view" in html
 
     def test_never_run_says_so_instead_of_showing_zeros(self):
         out = _run_js(
@@ -544,19 +570,33 @@ class TestRunRow:
         assert "couldn&#39;t refresh" in html or "couldn't refresh" in html
 
     def test_the_history_button_carries_the_true_total(self):
+        """`History (N)` — the Runs panel toolbar's own count span
+        (`sp-history-count-<id>`), filled in by the poll
+        (`_extRenderRunsCount`) since `runs_total` is live data the toolbar
+        (rendered synchronously, `_spRunsPanelHtml`) does not have yet."""
         out = _run_js(
-            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            """
+console.log(JSON.stringify({ panel: _spRunsPanelHtml({id: "sp1"}) }));
+""",
+        )
+        assert 'id="sp-history-count-sp1"' in out["panel"]
+
+        out = _run_js(
+            """
+_extRenderRunsCount("sp1", _extState["sp1"].data);
+console.log(JSON.stringify({ text: _elements["sp-history-count-sp1"].textContent }));
+""",
             state=_state(data=_RUNNING),
         )
-        assert "Run history (8)" in out["html"]
+        assert out["text"] == " (8)"
 
     def test_the_configuration_row_opens_a_read_out_never_an_editor(self):
         """The extraction block is deploy-time; a control here would be a
-        second settings surface, which is what "zero new navigation" forbids."""
-        out = _run_js(
-            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
-            state=_state(data=_RUNNING),
-        )
+        second settings surface, which is what "zero new navigation"
+        forbids. `_extConfigRowHtml` moved out of the Run row into the
+        Settings panel (`data_sources_page.js::_spSettingsPanelHtml`) but is
+        otherwise unchanged."""
+        out = _run_js('console.log(JSON.stringify({html: _extConfigRowHtml("sp1")}));')
         html = out["html"]
         assert "Configuration" in html
         assert "Read-only" in html
@@ -811,15 +851,25 @@ class TestRunRow:
 
 
 class TestRetryAndRerunButtons:
-    def _html(self, data: dict) -> str:
+    """Retry failed/empty moved into the Not indexed panel
+    (`_extRenderNotIndexedPanel`, one action button per non-zero category)
+    and the `Run now ▾` popover's own checkboxes (their counts filled in by
+    `toggleSpRunNowPopover`); "Re-run" folds into an ordinary `Run now ▾`
+    click — there is no separate Re-run control any more (source-card
+    redesign §2.3/§2.4, §4 removed-table)."""
+
+    def _not_indexed_html(self, data: dict) -> str:
         out = _run_js(
-            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            """
+_extRenderNotIndexedPanel("sp1", _extState["sp1"].data);
+console.log(JSON.stringify({ html: _elements["sp-notindexed-body-sp1"].innerHTML }));
+""",
             state=_state(data=data),
         )
         return out["html"]
 
-    def test_never_run_shows_both_retry_buttons_disabled_at_zero_and_no_rerun(self):
-        html = self._html(
+    def test_a_zero_backlog_shows_no_retry_actions(self):
+        html = self._not_indexed_html(
             {
                 "running": None,
                 "last_completed": None,
@@ -831,28 +881,12 @@ class TestRetryAndRerunButtons:
                 "skipped_unsupported_count": None,
             }
         )
-        assert "Retry failed (0)" in html
-        assert "Retry empty (0)" in html
-        assert "Re-run" not in html
-        # both retry buttons carry `disabled` — a zero backlog has nothing
-        # to retry regardless of live/idle state.
-        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
-        assert re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+        assert "extRetryFailed" not in html
+        assert "extRetryEmpty" not in html
+        assert "Nothing not indexed" in html
 
-    def test_a_live_run_disables_every_reprocessing_button_even_with_a_backlog(self):
-        """A live row's idempotency key may still hold the enqueue dedup
-        lock — the buttons must not invite a race the server would just
-        409 anyway."""
-        running = json.loads(json.dumps(_RUNNING))
-        running["failed_items_count"] = 5
-        running["empty_items_count"] = 2
-        html = self._html(running)
-        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
-        assert re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
-        assert "Re-run" not in html  # `live` — there is nothing to "re-run FROM", it's already running
-
-    def test_a_backlog_with_no_live_run_enables_both_retry_buttons_with_their_count(self):
-        html = self._html(
+    def test_a_backlog_with_no_live_run_offers_its_retry_actions_with_the_count(self):
+        html = self._not_indexed_html(
             {
                 "running": None,
                 "last_completed": {
@@ -870,122 +904,16 @@ class TestRetryAndRerunButtons:
                 "skipped_unsupported_count": None,
             }
         )
-        assert "Retry failed (3)" in html
-        assert "Retry empty (9)" in html
-        assert not re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
-        assert not re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
-        # a clean `done` last run has nothing to re-run FROM
-        assert "Re-run" not in html
+        assert "3" in html
+        assert "9" in html
+        assert "extRetryFailed('sp1')" in html
+        assert "extRetryEmpty('sp1')" in html
 
-    def test_a_failed_last_run_offers_rerun_and_it_is_not_disabled(self):
-        failed_last = {
-            "running": None,
-            "last_completed": None,
-            "last_failed": {
-                "id": "er_9",
-                "outcome": "failed",
-                "finished_at": "2026-09-02T10:00:00+00:00",
-                "files_done": 40,
-                "error": "lease expired after max attempts",
-                "usage": {},
-            },
-            "runs_total": 2,
-            "can_stop": False,
-            "failed_items_count": 0,
-            "empty_items_count": 0,
-            "skipped_unsupported_count": None,
-        }
-        html = self._html(failed_last)
-        assert "Re-run" in html
-        assert re.search(r"onclick=\"extRerun\('sp1'\)\"\s+>Re-run", html) or "Re-run</button>" in html
-        assert not re.search(r"onclick=\"extRerun\('sp1'\)\"\s+disabled", html)
-
-    def test_an_interrupted_last_run_also_offers_rerun(self):
-        interrupted_last = {
-            "running": None,
-            "last_completed": {
-                "id": "er_int",
-                "outcome": "interrupted",
-                "finished_at": "2026-09-02T10:00:00+00:00",
-                "files_done": 40,
-                "usage": {},
-            },
-            "last_failed": None,
-            "runs_total": 1,
-            "can_stop": False,
-            "failed_items_count": 0,
-            "empty_items_count": 0,
-            "skipped_unsupported_count": None,
-        }
-        html = self._html(interrupted_last)
-        assert "Re-run" in html
-
-    def test_a_clean_done_last_run_never_offers_rerun(self):
-        clean_last = {
-            "running": None,
-            "last_completed": {
-                "id": "er_ok",
-                "outcome": "done",
-                "finished_at": "2026-09-02T10:00:00+00:00",
-                "files_done": 40,
-                "usage": {},
-            },
-            "last_failed": None,
-            "runs_total": 1,
-            "can_stop": False,
-            "failed_items_count": 0,
-            "empty_items_count": 0,
-            "skipped_unsupported_count": None,
-        }
-        html = self._html(clean_last)
-        assert "Re-run" not in html
-
-    def test_a_pending_retry_click_locks_its_own_button_with_a_progress_label(self):
-        out = _run_js(
-            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
-            state=_state(
-                data={
-                    "running": None,
-                    "last_completed": None,
-                    "last_failed": None,
-                    "runs_total": 0,
-                    "can_stop": False,
-                    "failed_items_count": 4,
-                    "empty_items_count": 0,
-                    "skipped_unsupported_count": None,
-                },
-                retryingFailed=True,
-            ),
-        )
-        html = out["html"]
-        assert "Retrying…" in html
-        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
-
-    def test_a_pending_rerun_click_locks_the_button_with_a_progress_label(self):
-        failed_last = {
-            "running": None,
-            "last_completed": None,
-            "last_failed": {
-                "id": "er_9",
-                "outcome": "failed",
-                "finished_at": "2026-09-02T10:00:00+00:00",
-                "files_done": 40,
-                "error": "boom",
-                "usage": {},
-            },
-            "runs_total": 1,
-            "can_stop": False,
-            "failed_items_count": 0,
-            "empty_items_count": 0,
-            "skipped_unsupported_count": None,
-        }
-        out = _run_js(
-            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
-            state=_state(data=failed_last, rerunning=True),
-        )
-        html = out["html"]
-        assert "Starting…" in html
-        assert re.search(r"onclick=\"extRerun\('sp1'\)\"\s+disabled", html)
+    # The `Run now ▾` popover's own retry-count prefill
+    # (`toggleSpRunNowPopover`, data_sources_page.js) is a page.js DOM-wiring
+    # concern — pinned in `tests/test_admin_data_sources_page.py`, which
+    # already mocks the fuller DOM surface (`data-disclose`, `setSourceOpen`)
+    # that function needs.
 
 
 class TestDegradation:
@@ -1008,23 +936,25 @@ class TestDegradation:
         assert "Couldn&#39;t read the extraction run state" in html or "Couldn't read" in html
         assert "extRetry(&#39;sp1&#39;)" in html or "extRetry('sp1')" in html
 
-    def test_the_crawl_cell_stays_the_document_count_when_nothing_runs(self):
+    def test_the_live_line_stays_hidden_when_nothing_runs(self):
+        """`_extLiveLine` replaces `_extRenderCrawlCell` — the head's live
+        line (`sp-liveline-<id>`), not the old pipeline strip's crawl cell."""
         out = _run_js(
-            '_extRenderCrawlCell("sp1", {running: null});'
-            'console.log(JSON.stringify({hidden: _elements["ext-crawl-live-sp1"].hidden,'
-            ' html: _elements["ext-crawl-live-sp1"].innerHTML}));'
+            '_extLiveLine("sp1", {running: null});'
+            'console.log(JSON.stringify({hidden: _elements["sp-liveline-sp1"].hidden,'
+            ' html: _elements["sp-liveline-sp1"].innerHTML}));'
         )
         assert out["hidden"] is True
         assert out["html"] == ""
 
-    def test_the_crawl_cell_goes_live_only_while_a_run_is_live(self):
+    def test_the_live_line_shows_only_while_a_run_is_live(self):
         out = _run_js(
-            f"_extRenderCrawlCell('sp1', {json.dumps(_RUNNING)});"
-            'console.log(JSON.stringify({hidden: _elements["ext-crawl-live-sp1"].hidden,'
-            ' html: _elements["ext-crawl-live-sp1"].innerHTML}));'
+            f"_extLiveLine('sp1', {json.dumps(_RUNNING)});"
+            'console.log(JSON.stringify({hidden: _elements["sp-liveline-sp1"].hidden,'
+            ' html: _elements["sp-liveline-sp1"].innerHTML}));'
         )
         assert out["hidden"] is False
-        assert "crawling" in out["html"]
+        assert "Running" in out["html"]
         assert "812 files" in out["html"]
 
 
@@ -1060,13 +990,14 @@ class TestFactsPhaseRendering:
         assert "812 files processed" not in html
 
     def test_the_pipeline_strip_cell_also_reflects_the_facts_phase(self):
+        """`_extLiveLine` replaces `_extRenderCrawlCell` — the head's live
+        line, not the old pipeline strip's crawl cell."""
         out = _run_js(
-            f"_extRenderCrawlCell('sp1', {json.dumps(_FACTS_RUNNING)});"
-            'console.log(JSON.stringify({html: _elements["ext-crawl-live-sp1"].innerHTML}));'
+            f"_extLiveLine('sp1', {json.dumps(_FACTS_RUNNING)});"
+            'console.log(JSON.stringify({html: _elements["sp-liveline-sp1"].innerHTML}));'
         )
         html = out["html"]
-        assert "extracting facts" in html
-        assert "documents" in html
+        assert "Extracting facts" in html
         assert "files" not in html
 
     def test_a_stalled_facts_run_still_says_stalled_first(self):
@@ -1188,7 +1119,7 @@ class TestRunsDrawer:
             "total": 1,
         }
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
-        assert "stopped early — the run hit its time ceiling" in html
+        assert "stopped early — the time limit was reached" in html
         # The reason line and the resume line are INDEPENDENT: this fixture
         # pins a server that did not vouch for resumability, and the drawer
         # must then stay silent about it even though the reason is one that
@@ -1214,7 +1145,7 @@ class TestRunsDrawer:
             "total": 1,
         }
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
-        assert "stopped early — the run hit its time ceiling" in html
+        assert "stopped early — the time limit was reached" in html
         assert "the next run resumes from where it stopped" in html
 
     def test_a_crash_never_gets_the_resume_reassurance(self):
@@ -1258,7 +1189,7 @@ class TestRunsDrawer:
             "total": 1,
         }
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
-        assert "throttling budget was exhausted" in html
+        assert "SharePoint throttled us" in html
         assert "the next run resumes from where it stopped" in html
 
     def test_an_unknown_stop_reason_is_shown_verbatim_never_hidden(self):
@@ -1800,16 +1731,23 @@ class TestFactsPassSurfacesOnTheCard:
         "as_of": "2026-09-02T10:00:00+00:00",
     }
 
+    def _facts_panel_html(self, data: dict) -> str:
+        out = _run_js(
+            "_extRenderFactsPanel('sp1', _extState.sp1.data);"
+            'console.log(JSON.stringify({ html: _elements["sp-facts-body-sp1"].innerHTML }));',
+            state=_state(data=data),
+        )
+        return out["html"]
+
     def test_a_queued_facts_pass_is_named_in_the_run_row(self):
+        """The standalone-pass job line moved into the Facts panel
+        (`_extRenderFactsPanel`, source-card redesign §2.5) — a facts pass
+        is not a crawl run, so it no longer rides `_extRunRowHtml`."""
         data = {
             **self._IDLE,
             "facts_job": {"id": "job-9", "status": "queued", "created_at": "2026-09-02T09:58:00+00:00"},
         }
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        html = out["html"]
+        html = self._facts_panel_html(data)
         assert "facts pass" in html.lower()
         assert "queued" in html
         assert "job-9" in html
@@ -1824,22 +1762,15 @@ class TestFactsPassSurfacesOnTheCard:
                 "started_at": "2026-09-02T09:59:00+00:00",
             },
         }
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        html = out["html"]
+        html = self._facts_panel_html(data)
         assert "facts pass" in html.lower()
         assert "running" in html
         assert "queued" not in html
 
     def test_no_facts_pass_draws_no_facts_line(self):
         data = {**self._IDLE, "facts_job": None}
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        assert "facts pass" not in out["html"].lower()
+        html = self._facts_panel_html(data)
+        assert "facts pass" not in html.lower()
 
     def test_the_button_is_disabled_while_a_pass_is_in_flight_and_restored_after(self):
         body = """
@@ -1869,9 +1800,11 @@ class TestFactsPendingLine:
     """TCRD-296 gap #61: a pass that stopped on its own time budget with
     documents still pending used to leave nothing visible once the crawl
     that triggered it was long over. `facts_pending_documents`/
-    `facts_pass_running` on the status payload drive one extra line in the
-    Run row, distinct from `_extFactsJobLine` (which only ever shows a
-    SPECIFIC job's id/status)."""
+    `facts_pass_running` on the status payload drive one extra line, now in
+    the Facts panel (`_extRenderFactsPanel`, source-card redesign §2.5) —
+    not the Run row, since this is a facts fact, not a crawl one — distinct
+    from `_extFactsJobLine` (which only ever shows a SPECIFIC job's
+    id/status)."""
 
     _IDLE = {
         "connection_id": "sp1",
@@ -1883,43 +1816,37 @@ class TestFactsPendingLine:
         "as_of": "2026-09-02T10:00:00+00:00",
     }
 
-    def test_a_pending_backlog_with_a_pass_running_says_continuing(self):
-        data = {**self._IDLE, "facts_pending_documents": 42, "facts_pass_running": True}
+    def _facts_panel_html(self, data: dict) -> str:
         out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            "_extRenderFactsPanel('sp1', _extState.sp1.data);"
+            'console.log(JSON.stringify({ html: _elements["sp-facts-body-sp1"].innerHTML }));',
             state=_state(data=data),
         )
-        html = out["html"]
+        return out["html"]
+
+    def test_a_pending_backlog_with_a_pass_running_says_continuing(self):
+        data = {**self._IDLE, "facts_pending_documents": 42, "facts_pass_running": True}
+        html = self._facts_panel_html(data)
         assert "42 documents pending facts extraction" in html
         assert "continuing" in html
         assert "not running" not in html
 
     def test_a_pending_backlog_with_nothing_running_says_not_running(self):
         data = {**self._IDLE, "facts_pending_documents": 7, "facts_pass_running": False}
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        html = out["html"]
+        html = self._facts_panel_html(data)
         assert "7 documents pending facts extraction" in html
         assert "not running" in html
 
     def test_zero_pending_says_nothing(self):
         data = {**self._IDLE, "facts_pending_documents": 0, "facts_pass_running": False}
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        assert "pending facts extraction" not in out["html"]
+        html = self._facts_panel_html(data)
+        assert "pending facts extraction" not in html
 
     def test_a_status_payload_with_no_field_at_all_says_nothing(self):
         """Older code paths / a payload that never set the field — never a
         false "0 pending"."""
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=self._IDLE),
-        )
-        assert "pending facts extraction" not in out["html"]
+        html = self._facts_panel_html(self._IDLE)
+        assert "pending facts extraction" not in html
 
     def test_an_active_provider_limit_condition_wins_over_the_pending_line(self):
         """TCRD-296 synthesis F.25 — an operator seeing a backlog needs to
@@ -1932,11 +1859,7 @@ class TestFactsPendingLine:
             "facts_pass_running": False,
             "provider_limit": {"provider": "anthropic", "reason": "workspace_limit"},
         }
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        html = out["html"]
+        html = self._facts_panel_html(data)
         assert "paused: provider limit" in html
         assert "anthropic" in html
         assert "pending facts extraction" not in html
@@ -1948,12 +1871,9 @@ class TestFactsPendingLine:
             "facts_pass_running": False,
             "provider_limit": None,
         }
-        out = _run_js(
-            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
-            state=_state(data=data),
-        )
-        assert "paused: provider limit" not in out["html"]
-        assert "7 documents pending facts extraction" in out["html"]
+        html = self._facts_panel_html(data)
+        assert "paused: provider limit" not in html
+        assert "7 documents pending facts extraction" in html
 
 
 # --------------------------------------------------------------------------

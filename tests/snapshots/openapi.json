@@ -4877,6 +4877,18 @@
             "description": "Drop this connection's persisted deltaLinks and item-failure queue before running, so every drive re-enumerates from scratch (already-ingested files are not re-downloaded \u2014 cTags are kept). The supported recovery path for a connection whose delta cursor ran past documents it never actually ingested. On a sharded site this clears every shard's own state row too, and the next trigger re-plans the whole site from scratch.",
             "title": "Resync"
           },
+          "retry_empty": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Re-queue this connection's `convert_empty` backlog for conversion \u2014 the same replay `POST \u2026/extraction/retry-empty` triggers, offered here so one popover submission can combine it with the other options above instead of firing a second request. A document that converted fine but carried no text (a scan with no text layer, most commonly) is otherwise a dead end: Graph's delta feed never re-offers an unchanged item, so the ordinary incremental walk would skip it forever even after scan OCR starts being able to read it \u2014 see `connectors.sharepoint.crawler._retry_empty_items`. On a sharded site each shard replays its OWN `convert_empty` backlog, same as `retry_failed`. The standalone `POST \u2026/extraction/retry-empty` route is unchanged and still works on its own.",
+            "title": "Retry Empty"
+          },
           "retry_failed": {
             "anyOf": [
               {
@@ -4901,7 +4913,7 @@
                 "type": "null"
               }
             ],
-            "description": "Re-run ONLY these 1-based shard indices from this connection's last persisted shard plan, instead of an ordinary trigger \u2014 the supported way to retry a shard that failed without re-planning or re-crawling the whole site (design \u00a74.4, replaces the retired manual-split 're-run one clone' escape hatch). Opens a fresh parent run covering only the named shards. Every other field above (except `resync`/`force_reprocess`/`retry_failed`, which still fan out to the re-run shards) is ignored when this is set. 404 `no_shard_plan` when the connection has never sharded; 400 `unknown_shard_index` for an index the last plan doesn't have.",
+            "description": "Re-run ONLY these 1-based shard indices from this connection's last persisted shard plan, instead of an ordinary trigger \u2014 the supported way to retry a shard that failed without re-planning or re-crawling the whole site (design \u00a74.4, replaces the retired manual-split 're-run one clone' escape hatch). Opens a fresh parent run covering only the named shards. Every other field above (except `resync`/`force_reprocess`/`retry_failed`/`retry_empty`, which still fan out to the re-run shards) is ignored when this is set. 404 `no_shard_plan` when the connection has never sharded; 400 `unknown_shard_index` for an index the last plan doesn't have.",
             "title": "Shards"
           },
           "timeout_s": {
@@ -21998,6 +22010,70 @@
         ]
       }
     },
+    "/api/admin/grants/reconcile-everyone-scope": {
+      "post": {
+        "description": "Finish the ``scope='everyone'`` conversion migration 0098 declined.\n\n0098's step 3 is guarded in two directions and refuses rather than change\nwho can see what: a PERSON outside the seeded ``Everyone`` group would gain\neverything it holds, and a non-person INSIDE it would lose grants it holds\ntoday (the scope reaches people only, #2256). Both refusals log \"a later\nrelease converts the rows once \u2026\" \u2014 and nothing implemented that release,\nso an instance that tripped a guard stayed half-converted permanently: new\nwrites use the column, the pre-0098 rows stay group-shaped, and the\nrevision is stamped and never runs again.\n\nThis is that release, as an operation an admin can re-run after tidying the\nmembership the guard named. It applies the SAME two guards (pinned against\nthe migration by ``tests/db_pg/test_everyone_scope_reconcile.py``) and\nwrites nothing when either fires, so calling it on a still-inconsistent\ninstance is safe and merely reports.\n\nPostgres-only: the frozen DuckDB ladder has no ``scope`` column, so there\nis no half-converted state to close there. The repository raises the typed\n``RequiresPostgresBackend`` and the app-wide handler renders a ``501``.",
+        "operationId": "reconcile_everyone_scope_api_admin_grants_reconcile_everyone_scope_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dry Run",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Everyone Scope",
+        "tags": [
+          "access"
+        ]
+      }
+    },
     "/api/admin/grants/{grant_id}": {
       "delete": {
         "operationId": "delete_grant_api_admin_grants__grant_id__delete",
@@ -34102,7 +34178,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extract": {
       "post": {
-        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched \u2014 plus ``resync``, the\nsupported alternative to hand-editing the crawl state file on the data\ndisk when a connection's delta cursor ran past documents it never\ningested (see ``connectors.sharepoint.crawler._apply_resync``), and\n``force_reprocess``, the stronger \"re-process everything\" control that\nadditionally ignores cTags so already-unchanged documents are\nre-downloaded and re-ingested too, and ``retry_failed``, the targeted\nalternative to ``resync`` that gives every item this connection's own\nfailure queue already knows about \u2014 including ones already given up on\n\u2014 one more chance (see\n``connectors.sharepoint.crawler._retry_failed_items``'s\n``include_given_up``) \u2014 never persisted beyond this one run.\n\n2026-09-03 auto-parallel-crawl design: on a site large enough to\nauto-shard (``extraction.crawler.shard_target_docs``, PG-only), a\n``corpus-extraction`` job is a short PLANNER \u2014 it packs the site into\nshards, opens a parent run, enqueues one ``corpus-extraction-shard``\nchild per shard and returns; ``resync``/``force_reprocess``/\n``retry_failed`` fan out unchanged to every child, and ``timeout_s``\nbounds each child independently, not the run as a whole. ``options.\nshards`` (a list of 1-based indices) skips planning entirely and\nre-runs only the named shards from the connection's LAST persisted\nplan \u2014 the supported replacement for the retired manual-split \"re-run\none clone\" escape hatch \u2014 see :func:`_trigger_shard_rerun`.\n\nEvery option here is per-run, not a setting: an absent key falls back to\nwhatever is currently configured (or, for the booleans, to \"off\"), and\nnothing in this endpoint ever writes an option's value anywhere an\nadmin could re-read it as the new default.\n\nWhen ``retry_failed`` is set, the response also carries ``queued_count``\n\u2014 the size of this connection's persisted ``failed_items`` backlog at\nthe moment this call reads it, before the job is enqueued \u2014 mirroring\n:func:`retry_empty_extraction`'s ``queued_count``: the source card's\n\"Retry failed (N)\" button reads the SAME number off the status poll,\nand the toast after clicking it should say the same thing the button\nalready promised, not a different count read moments later.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\nThen, whenever a TOP-LEVEL ``extraction_runs`` row is still ``running``\nfor this connection \u2014 an inline crawl, or a sharded site's parent still\nwaiting on its children (see :func:`_extraction_run_already_in_flight`)\n\u2014 ``409 extraction_already_running`` naming that run's id; on a\nDuckDB-backed instance this check is a no-op and the ORIGINAL guard\nbelow is what fires instead.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running`` \u2014 this is what still\ncatches two near-simultaneous triggers on a DuckDB-backed instance (or\nthe brief window before a sharded site's parent row exists yet).",
+        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched \u2014 plus ``resync``, the\nsupported alternative to hand-editing the crawl state file on the data\ndisk when a connection's delta cursor ran past documents it never\ningested (see ``connectors.sharepoint.crawler._apply_resync``), and\n``force_reprocess``, the stronger \"re-process everything\" control that\nadditionally ignores cTags so already-unchanged documents are\nre-downloaded and re-ingested too, ``retry_failed``, the targeted\nalternative to ``resync`` that gives every item this connection's own\nfailure queue already knows about \u2014 including ones already given up on\n\u2014 one more chance (see\n``connectors.sharepoint.crawler._retry_failed_items``'s\n``include_given_up``), and ``retry_empty``, the SAME replay\n``POST \u2026/extraction/retry-empty`` triggers, offered here so the\n``Run now`` popover (source-card redesign \u00a72.3) can combine it with the\nother options in one submission \u2014 never persisted beyond this one run.\n\n2026-09-03 auto-parallel-crawl design: on a site large enough to\nauto-shard (``extraction.crawler.shard_target_docs``, PG-only), a\n``corpus-extraction`` job is a short PLANNER \u2014 it packs the site into\nshards, opens a parent run, enqueues one ``corpus-extraction-shard``\nchild per shard and returns; ``resync``/``force_reprocess``/\n``retry_failed``/``retry_empty`` fan out unchanged to every child, and\n``timeout_s`` bounds each child independently, not the run as a whole.\n``options.shards`` (a list of 1-based indices) skips planning entirely\nand re-runs only the named shards from the connection's LAST persisted\nplan \u2014 the supported replacement for the retired manual-split \"re-run\none clone\" escape hatch \u2014 see :func:`_trigger_shard_rerun`.\n\nEvery option here is per-run, not a setting: an absent key falls back to\nwhatever is currently configured (or, for the booleans, to \"off\"), and\nnothing in this endpoint ever writes an option's value anywhere an\nadmin could re-read it as the new default.\n\nWhen ``retry_failed`` and/or ``retry_empty`` is set, the response also\ncarries ``queued_count`` \u2014 the combined size of this connection's\npersisted ``failed_items``/``empty_items`` backlogs at the moment this\ncall reads them, before the job is enqueued \u2014 mirroring\n:func:`retry_empty_extraction`'s own ``queued_count``: the source\ncard's \"Retry failed (N)\" / \"Retry empty (N)\" popover options read the\nSAME numbers off the status poll, and the toast after clicking Start\nshould say the same thing the popover already promised, not a\ndifferent count read moments later.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\nThen, whenever a TOP-LEVEL ``extraction_runs`` row is still ``running``\nfor this connection \u2014 an inline crawl, or a sharded site's parent still\nwaiting on its children (see :func:`_extraction_run_already_in_flight`)\n\u2014 ``409 extraction_already_running`` naming that run's id; on a\nDuckDB-backed instance this check is a no-op and the ORIGINAL guard\nbelow is what fires instead.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running`` \u2014 this is what still\ncatches two near-simultaneous triggers on a DuckDB-backed instance (or\nthe brief window before a sharded site's parent row exists yet).",
         "operationId": "trigger_extraction_api_admin_sharepoint_connections__connection_id__extract_post",
         "parameters": [
           {
@@ -34175,6 +34251,105 @@
           }
         },
         "summary": "Trigger Extraction",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": {
+      "get": {
+        "description": "\"How many documents did we get, how many did we not, broken down by\nfile type and by reason, and how much of the corpus is silently empty\"\n(2026-09-04) \u2014 read entirely from what the crawl and the corpus already\npersisted (``extraction_runs``/``corpus_files``), no Graph calls, unlike\nA6 completeness above.\n\n``since``/``until`` scope which RUNS contribute to ``scalars``/\n``failures``/``skips`` (default: every run on record for this\nconnection \u2014 the \"everywhere\" default the rest of Agnes's read surfaces\nuse, per the command-UX scope model \u2014 capped defensively at 500 runs,\nnewest first, by :meth:`ExtractionRunsPgRepository.list_full_for_\nconnection`). ``by_extension``'s ``indexed``/``rejected``/\n``processing``/``pending`` counts are UNSCOPED by design \u2014 they read\nthe corpus's current state, not just what this window's runs touched \u2014\nso narrowing the window makes ``reconciliation.unexplained`` an\nincreasingly approximate figure; see its own ``note``.\n\nEvery run selected \u2014 PARENT (planner) rows AND shard children alike,\nunlike the fleet/history endpoints above which show only parents \u2014 so a\nsharded site's real per-shard failures are counted once each rather\nthan folded into (or missing from) a near-empty parent report.\n\n``400 invalid_since``/``invalid_until`` for a malformed bound (mirrors\n``_validate_min_modified``'s own posture). ``404`` for an unknown or\nnon-SharePoint connection id.\n\nPG-only, same as every other route in this module: both\n``extraction_runs`` and ``corpus_files`` resolve through their own\n``*_repo()`` factory, so a DuckDB-backed instance gets the typed\n``501`` from whichever resolves first via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.",
+        "operationId": "extraction_breakdown_api_admin_sharepoint_connections__connection_id__extraction_breakdown_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only runs started on/after this ISO date/datetime",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only runs started on/after this ISO date/datetime",
+              "title": "Since"
+            }
+          },
+          {
+            "description": "Only runs started before this ISO date/datetime",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only runs started before this ISO date/datetime",
+              "title": "Until"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Extraction Breakdown",
         "tags": [
           "admin"
         ]
@@ -34690,7 +34865,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/status": {
       "get": {
-        "description": "A1 \u2014 the source card's live crawl cell and `Run` row.\n\n``running`` is the newest un-finalized run WITH its liveness derived\n(see :func:`_derived_outcome`); ``last_completed`` is the newest run\nthat actually ended. Both may be null, and null is rendered as \"never\nrun\", never as zeros.\n\n``as_of`` is this response's own read time \u2014 distinct from each run's\n``checkpoint_at``, which is when its numbers were last true. The card\nprints the run's, not this one, wherever it shows a counter.\n\n``next_run_at`` (D.16) is when this connection's own crawl cadence\n(``config.extraction.crawl.schedule`` \u2014 off / follow-the-instance-\ncadence / its own interval) next fires the scheduled sweep, best-effort\nand DISPLAY ONLY (:func:`_crawl_schedule_next_run_at`) \u2014 ``None`` when\nthis connection is ``off`` or the instance-wide sweep has no cadence\nconfigured at all.\n\n``facts_job`` is the queued/running standalone facts pass for this\nconnection (:func:`_facts_job_in_flight`) or ``null`` \u2014 a job, never a\nrun: it is what lets the card say \"a facts pass is running\" and lock\nits own \"Extract facts now\" button while one is, since that pass never\nappears in ``running``/``last_completed``.\n\n``last_failed`` is the newest run whose OWNING JOB the worker itself\nmarked ``failed`` (``app/worker/runtime.py``'s\n``_finalize_extraction_run_for_job`` \u2014 2026-09 incident: an\nattempts-exhausted `corpus-extraction` job must still be visible here,\neven though :meth:`ExtractionRunsPgRepository.last_completed` itself\ndeliberately excludes a ``failed`` row). Only populated when nothing is\ncurrently ``running`` AND it postdates ``last_completed`` \u2014 an old\nfailure from long before the run that actually finished last must\nnever eclipse it.\n\n``failed_items_count``/``empty_items_count`` are the SIZE of this\nconnection's persisted ``failed_items``/``empty_items`` backlogs\n(``connectors.sharepoint.crawler.load_state``), read with\n:meth:`SharepointStatePgRepository.backlog_counts` \u2014 a cheap\n``jsonb_object_keys`` count, never a decode of the (potentially huge)\npayload on this polled-every-few-seconds path. They are what the\nsource card's \"Retry failed (N)\"/\"Retry empty (N)\" buttons show as\n``N``, and are ``0`` (never ``null``) for a connection that has never\ncrawled \u2014 an honest \"nothing to retry\", not a missing signal.\n``skipped_unsupported_count`` is NOT a persisted backlog (no retry\nmechanism replays it \u2014 see ``CrawlStats.skipped_unsupported``'s\ndocstring), so it is read off whichever of ``running``/``last_failed``/\n``last_completed`` above is most recent, in that order, and is ``null``\nwhen none of the three exist.",
+        "description": "A1 \u2014 the source card's live crawl cell and `Run` row.\n\n``running`` is the newest un-finalized run WITH its liveness derived\n(see :func:`_derived_outcome`); ``last_completed`` is the newest run\nthat actually ended. Both may be null, and null is rendered as \"never\nrun\", never as zeros.\n\n``as_of`` is this response's own read time \u2014 distinct from each run's\n``checkpoint_at``, which is when its numbers were last true. The card\nprints the run's, not this one, wherever it shows a counter.\n\n``next_run_at`` (D.16) is when this connection's own crawl cadence\n(``config.extraction.crawl.schedule`` \u2014 off / follow-the-instance-\ncadence / its own interval) next fires the scheduled sweep, best-effort\nand DISPLAY ONLY (:func:`_crawl_schedule_next_run_at`) \u2014 ``None`` when\nthis connection is ``off`` or the instance-wide sweep has no cadence\nconfigured at all.\n\n``facts_job`` is the queued/running standalone facts pass for this\nconnection (:func:`_facts_job_in_flight`) or ``null`` \u2014 a job, never a\nrun: it is what lets the card say \"a facts pass is running\" and lock\nits own \"Extract facts now\" button while one is, since that pass never\nappears in ``running``/``last_completed``.\n\n``last_failed`` is the newest run whose OWNING JOB the worker itself\nmarked ``failed`` (``app/worker/runtime.py``'s\n``_finalize_extraction_run_for_job`` \u2014 2026-09 incident: an\nattempts-exhausted `corpus-extraction` job must still be visible here,\neven though :meth:`ExtractionRunsPgRepository.last_completed` itself\ndeliberately excludes a ``failed`` row). Only populated when nothing is\ncurrently ``running`` AND it postdates ``last_completed`` \u2014 an old\nfailure from long before the run that actually finished last must\nnever eclipse it.\n\n``failed_items_count``/``empty_items_count`` are the SIZE of this\nconnection's persisted ``failed_items``/``empty_items`` backlogs\n(``connectors.sharepoint.crawler.load_state``), read with\n:meth:`SharepointStatePgRepository.backlog_counts` \u2014 a cheap\n``jsonb_object_keys`` count, never a decode of the (potentially huge)\npayload on this polled-every-few-seconds path. They are what the\nsource card's \"Retry failed (N)\"/\"Retry empty (N)\" buttons show as\n``N``, and are ``0`` (never ``null``) for a connection that has never\ncrawled \u2014 an honest \"nothing to retry\", not a missing signal.\n``skipped_unsupported_count`` is NOT a persisted backlog (no retry\nmechanism replays it \u2014 see ``CrawlStats.skipped_unsupported``'s\ndocstring), so it is read off whichever of ``running``/``last_failed``/\n``last_completed`` above is most recent, in that order, and is ``null``\nwhen none of the three exist.\n\n``files_per_min`` is :func:`_files_per_min` over ``running`` (``null``\nwhen nothing is running or the rate is not yet computable) \u2014 the source\ncard's live line (source-card redesign \u00a72.1) reads this rather than\ndividing absolute counters itself, the same windowed-rate computation\nthe fleet view's own ``files_per_min`` column already uses.\n\n``crawl_job`` is the queued/running ``corpus-extraction`` job for this\nconnection (:func:`_crawl_job_in_flight`) or ``null`` \u2014 mirrors\n``facts_job`` above, for the crawl trigger's own job kind. Fills the\nwindow between a trigger enqueueing a job and a worker claiming it and\nopening the first ``extraction_runs`` row, where ``running`` is still\n``null`` but the connection is not truly idle \u2014 the state chip's\n``Queued`` rung.",
         "operationId": "extraction_status_api_admin_sharepoint_connections__connection_id__extraction_status_get",
         "parameters": [
           {
@@ -36485,7 +36660,7 @@
     },
     "/api/admin/sharepoint/extraction/runs": {
       "get": {
-        "description": "One row per SharePoint connection \u2014 the fleet dashboard for an\noperator running several crawls at once: is it on pace, is anything\nstuck, what is it costing.\n\nDefault scope (and ``?active=1``) is connections with a run CURRENTLY\n``running`` \u2014 an idle connection has nothing to say about \"on pace\" and\nits absence here is the honest answer, not an omission. ``?all=1``\nbroadens to every SharePoint connection, each with its own latest run\n(``null`` if it has never run) \u2014 ``all`` wins if both are passed.\n\nEach row's ``run`` reuses :func:`_run_out` \u2014 the SAME projection the\nper-connection status/history endpoints render, so a fleet row and a\nsource card can never disagree about one run \u2014 plus two fleet-only\nadditions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck``\n(``True`` exactly when that same ``run.outcome`` is ``\"stalled\"`` \u2014 ONE\nrule, read twice, so the fleet's \"Stuck?\" badge and the per-run outcome\nword can never disagree; before 2026-09-03 this used its own, tighter,\nindependent threshold, which could show a calm \"running\" badge right\nnext to a red \"Stuck?\" tag on the same row). ``facts`` is the facts\nstage's own numbers, read off the same row (:func:`_fleet_facts`).\n``failed_items_count``/``empty_items_count`` are the SAME persisted-\nbacklog counts ``extraction/status`` carries (:meth:`SharepointStatePg\nRepository.backlog_counts`) \u2014 what the table's own \"Retry failed (N)\"/\n\"Retry empty (N)\" buttons show, one cheap query per row. A ``stalled``\nrow (or one still merely ``running``) can also be force-cancelled \u2014 see\n``POST \u2026/extraction/runs/{run_id}/cancel`` below.\n\nA SHARDED site's row is its PARENT run (2026-09-03 auto-parallel-crawl\ndesign \u00a74.7) \u2014 a child never appears as its own fleet row\n(``list_latest_for_connections`` already filters ``parent_run_id IS\nNULL``). ``run.mode == \"sharded\"`` names it; ``run.shards_total``/\n``run.shards_done`` come straight off the parent row, and\n``run.shards[]``/``run.expected_documents``/``run.seen_documents`` are\nfilled in from a SINGLE batched :meth:`ExtractionRunsPgRepository.\nchildren_for` call across every parent this page is about to render\n(never one round trip per sharded connection) \u2014 see\n:func:`_rollup_children`.\n\nPG-only, same as every other route in this module: ``extraction_runs``\nis a post-A3 table, so a DuckDB-backed instance gets the typed ``501``\nfrom ``extraction_runs_repo()`` via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.\n\n``jobs`` is ``{kind: {queued, running}}`` for :data:`_EXTRACTION_JOB_KINDS`\n\u2014 the extraction pipeline's own worker lanes \u2014 read in ONE grouped query\noff the (backend-agnostic) jobs table via\n:meth:`JobsPgRepository.counts_by_kind`, independent of ``active``/\n``all``: lane starvation (a growing ``queued`` count with ``running``\nstuck at 0 \u2014 every worker slot busy elsewhere, or none configured for\nthis lane) is exactly the fact an operator scanning ONLY the active\nscope would otherwise never see, since a starved connection's job has\nno ``extraction_runs`` row yet to show up as a table row at all.\n\n``next_run_at`` (D.16) on each row is the same best-effort \"when next\nswept\" hint the crawl-config PATCH response and ``extraction/status``\ncarry (:func:`_crawl_schedule_next_run_at`) \u2014 pure computation, no extra\nquery per row.\n\nPlain ``def`` (not ``async def``, zero ``await``s below): blocking,\nsynchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread\npool rather than the single event loop (Tier-1 convention,\n``tests/test_event_loop_offload_guard.py``).",
+        "description": "One row per SharePoint connection \u2014 the fleet dashboard for an\noperator running several crawls at once: is it on pace, is anything\nstuck, what is it costing.\n\nDefault scope (and ``?active=1``) is connections with a run CURRENTLY\n``running`` \u2014 an idle connection has nothing to say about \"on pace\" and\nits absence here is the honest answer, not an omission. ``?all=1``\nbroadens to every SharePoint connection, each with its own latest run\n(``null`` if it has never run) \u2014 ``all`` wins if both are passed.\n\nEach row's ``run`` reuses :func:`_run_out` \u2014 the SAME projection the\nper-connection status/history endpoints render, so a fleet row and a\nsource card can never disagree about one run \u2014 plus two fleet-only\nadditions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck``\n(``True`` exactly when that same ``run.outcome`` is ``\"stalled\"`` \u2014 ONE\nrule, read twice, so the fleet's \"Stuck?\" badge and the per-run outcome\nword can never disagree; before 2026-09-03 this used its own, tighter,\nindependent threshold, which could show a calm \"running\" badge right\nnext to a red \"Stuck?\" tag on the same row). ``facts`` is the facts\nstage's own numbers, read off the same row (:func:`_fleet_facts`).\n``failed_items_count``/``empty_items_count`` are the SAME persisted-\nbacklog counts ``extraction/status`` carries (:meth:`SharepointStatePg\nRepository.backlog_counts`) \u2014 what the table's own \"Retry failed (N)\"/\n\"Retry empty (N)\" buttons show, one cheap query per row. A ``stalled``\nrow (or one still merely ``running``) can also be force-cancelled \u2014 see\n``POST \u2026/extraction/runs/{run_id}/cancel`` below.\n\nA SHARDED site's row is its PARENT run (2026-09-03 auto-parallel-crawl\ndesign \u00a74.7) \u2014 a child never appears as its own fleet row\n(``list_latest_for_connections`` already filters ``parent_run_id IS\nNULL``). ``run.mode == \"sharded\"`` names it; ``run.shards_total``/\n``run.shards_done`` come straight off the parent row, and\n``run.shards[]``/``run.expected_documents``/``run.seen_documents`` are\nfilled in from a SINGLE batched :meth:`ExtractionRunsPgRepository.\nchildren_for` call across every parent this page is about to render\n(never one round trip per sharded connection) \u2014 see\n:func:`_rollup_children`.\n\nPG-only, same as every other route in this module: ``extraction_runs``\nis a post-A3 table, so a DuckDB-backed instance gets the typed ``501``\nfrom ``extraction_runs_repo()`` via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.\n\n``jobs`` is ``{kind: {queued, running}}`` for :data:`_EXTRACTION_JOB_KINDS`\n\u2014 the extraction pipeline's own worker lanes \u2014 read in ONE grouped query\noff the (backend-agnostic) jobs table via\n:meth:`JobsPgRepository.counts_by_kind`, independent of ``active``/\n``all``: lane starvation (a growing ``queued`` count with ``running``\nstuck at 0 \u2014 every worker slot busy elsewhere, or none configured for\nthis lane) is exactly the fact an operator scanning ONLY the active\nscope would otherwise never see, since a starved connection's job has\nno ``extraction_runs`` row yet to show up as a table row at all.\n\n``next_run_at`` (D.16) on each row is the same best-effort \"when next\nswept\" hint the crawl-config PATCH response and ``extraction/status``\ncarry (:func:`_crawl_schedule_next_run_at`) \u2014 pure computation, no extra\nquery per row.\n\n``estimated_cost_usd``/``cost_status``/``cost_models``/``token_totals``\non each row (cost-truth fix) come from :func:`_fleet_row_cost`, which\ncombines the crawl run's own inline usage with this connection's\nattributable slice of ``facts_ingest_runs`` \u2014 the SEPARATE ledger a\nstandalone ``sharepoint-facts-extraction`` job writes to instead of the\ncrawl's own row. That per-connection slice is resolved by ONE batched\ncall, :meth:`~src.repositories.facts_ingest_runs_pg\n.FactsIngestRunsPgRepository.llm_usage_rollup_by_corpus_ids`, across\nevery connection this page is about to render \u2014 never one round trip\nper row, same discipline as ``children_for`` above \u2014 keyed by each\nconnection's own scope collections\n(``connectors.sharepoint.facts_extraction.collection_ids_for``, the\nSAME resolution ``_facts_throughput_and_eta`` already uses for its own\nper-connection throughput signal). Each row's OWN figure is a full,\nun-split attribution: a bulk-add's shared-collection option or a\ncollection consolidation can legitimately route more than one\nconnection at the SAME collection (``app/api/admin_sharepoint.py::\n_collection_still_referenced``), and a run touching that collection\ncounts in full toward every connection that can see it \u2014 ``cost_shared``/\n``cost_shared_with`` name when that is happening for a row, rather than\nleaving it implicit (see :func:`_fleet_row_cost`'s docstring for why a\nproportional split was rejected in favor of full attribution plus this\nmarker). ``cost_shared`` is gated on the row's own ``cost_status`` being\n``\"priced\"`` \u2014 a ``\"no_usage\"``/``\"unpriced\"`` row already renders an\nem-dash, and a \"shared\" badge next to no dollar figure at all would\nexplain a number the row does not show.\n\n``totals.estimated_cost_usd`` is NOT the sum of the rows' own\n``estimated_cost_usd`` \u2014 that would count a shared collection's run\nonce per connection that can see it. It is each row's own crawl-run\ncost (never shared \u2014 one ``extraction_runs`` row belongs to exactly one\nconnection) plus the ``facts_ingest_runs`` ledger cost, de-duplicated\nby run id ONCE across every connection this page renders\n(``run_owner_connections``/``unique_facts_run_cost_by_id``, built from\nthe SAME batched lookup, no second query). ``totals.cost_note`` states\nthis in the response itself, not only here. A row whose own status is\n``\"no_usage\"``/``\"unpriced\"`` contributes nothing to either half, same\n\"coverage, not a lie\" reasoning :meth:`llm_usage_rollup` documents.\n\n``llm_usage_totals`` (top-level, cost-truth fix) is the SAME\ninstance-wide cumulative rollup ``GET /api/facts/ingest-runs`` already\nreturns (:meth:`FactsIngestRunsPgRepository.llm_usage_rollup`) \u2014 every\n``facts_ingest_runs`` row this instance has EVER persisted, not scoped\nto the connections rendered on this page. Distinct on purpose from\n``totals`` (this page's own per-page aggregate): an operator must be\nable to tell \"what this page shows\" from \"everything this instance has\never spent on fact extraction\" \u2014 the summary strip renders it as its\nown, clearly-labelled tile.\n\nPlain ``def`` (not ``async def``, zero ``await``s below): blocking,\nsynchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread\npool rather than the single event loop (Tier-1 convention,\n``tests/test_event_loop_offload_guard.py``).",
         "operationId": "fleet_extraction_runs_api_admin_sharepoint_extraction_runs_get",
         "parameters": [
           {
@@ -42435,7 +42610,7 @@
     },
     "/api/chat/sessions/{chat_id}/files": {
       "get": {
-        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. Sessions\non an engine-sandbox provider (``kai-agent``) never walk the host dir \u2014\nsee the module docstring; they report ``source=\"engine\"``.",
+        "description": "List files in this chat session's workspace, newest-first.\n\nAnswers from two sources, harvested first (#2268): every file this\nsession's turns wrote to ``outputs/`` was copied out of the sandbox as it\nwas produced, so it is listed whether or not the sandbox still exists.\nThe live sandbox is merged on top \u2014 it wins for a file it still holds\n(fresher bytes, real mtime) and contributes everything outside\n``outputs/``, which is never harvested.\n\nThe live half walks the session dir (including the\n``.claude``/``snapshots``/\u2026 links into your workspace, where skills write\ntheir deliverables), skipping machine noise (``.git``, ``__pycache__``,\n\u2026) and anything resolving outside your own session/workspace. Returns at\nmost 300 entries, deliverables first; ``truncated`` reports when more\nexisted. Sessions on an engine-sandbox provider (``kai-agent``) never\nwalk the host dir \u2014 see the module docstring; they report\n``source=\"engine\"``.",
         "operationId": "list_session_files_api_chat_sessions__chat_id__files_get",
         "parameters": [
           {
@@ -42500,7 +42675,7 @@
     },
     "/api/chat/sessions/{chat_id}/files/download": {
       "get": {
-        "description": "Download one file from this chat session's workspace.\n\nAlways served as an attachment with ``nosniff``; HTML/SVG/XML bodies are\nadditionally pinned to ``application/octet-stream`` so a generated file\ncan never render as same-origin active content. 404 for a missing path\nand for anything resolving outside your session dir / workspace alike.",
+        "description": "Download one file from this chat session's workspace.\n\nServed from the live sandbox when it still has the file, and from the\nharvested copy otherwise (#2268) \u2014 a deliverable stays downloadable long\nafter the sandbox that produced it is gone. Always an attachment with\n``nosniff`` either way; HTML/SVG/XML bodies are additionally pinned to\n``application/octet-stream`` so a generated file can never render as\nsame-origin active content. 404 for a missing path and for anything\nresolving outside your session dir / workspace alike.",
         "operationId": "download_session_file_api_chat_sessions__chat_id__files_download_get",
         "parameters": [
           {
