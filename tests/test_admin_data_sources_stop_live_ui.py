@@ -95,6 +95,7 @@ _SIGNATURES = (
     "function _extStateChip(connId, status) {",
     "function _extRender(connId) {",
     "function _extRenderNextRun(connId, status) {",
+    "function _extRenderRunsCount(connId, status) {",
 )
 
 # The network-touching functions, pulled in only for the tests that click
@@ -118,6 +119,7 @@ const _elements = {
   "sp-tile-spent-sp1": { textContent: "" },
   "sp-notindexed-body-sp1": { innerHTML: "" },
   "sp-facts-body-sp1": { innerHTML: "" },
+  "sp-history-count-sp1": { textContent: "" },
   "sp-runnow-btn-sp1": { dataset: { extractionReady: "1" }, disabled: false, title: "", style: {} },
   "sp-stop-btn-sp1": { dataset: {}, disabled: false, textContent: "", style: {} },
   "sp-cancel-btn-sp1": { dataset: {}, disabled: false, textContent: "", style: {} },

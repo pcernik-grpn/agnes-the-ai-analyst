@@ -452,7 +452,14 @@ def test_identity_row_counts_matched_groups_and_ungranted_collections(tmp_path, 
 
     fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
     # CORPUS_A is granted (1 group), CORPUS_B is not — fail-closed, counted.
-    assert fs["identity"] == {"groups_matched": 1, "collections_no_group": 1, "collections_total": 2}
+    # `group_names` (source-card redesign §8) names the matched group(s) —
+    # what the head's `Shared with` tile reads without a second fetch.
+    assert fs["identity"] == {
+        "groups_matched": 1,
+        "collections_no_group": 1,
+        "collections_total": 2,
+        "group_names": ["sp-group"],
+    }
 
 
 def test_anonymization_distinguishes_requested_declared_and_pending(tmp_path, monkeypatch, pg_engine):
