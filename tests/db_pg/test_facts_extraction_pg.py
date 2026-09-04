@@ -1018,7 +1018,18 @@ def test_a_cache_served_reply_ships_claims_under_the_serving_documents_own_doc_i
         "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
     }
     extractor = StubExtractor([_stream(node)])
-    report = _run(extractor)
+    # concurrency=1 is load-bearing, not tidiness. The pass extracts
+    # documents in parallel (`extraction.facts.concurrency`, default 3) and
+    # there is no in-flight guard on the content hash, so at the default two
+    # documents sharing one hash can BOTH be dispatched before either has
+    # written its cache row — a legitimate miss that costs a second model
+    # call. This test's subject is what a cache HIT does to the replayed
+    # reply's doc_id, so the hit has to be a precondition rather than a
+    # scheduling coincidence; measured at the default it failed 1 run in 12.
+    # (An in-flight guard would make the parallel case hit too. That is an
+    # efficiency feature this pass does not have and this test should not be
+    # the place it gets asserted into existence.)
+    report = _run(extractor, concurrency=1)
 
     assert report["docs_extracted"] == 2
     assert len(extractor.seen) == 1, "the cache hit must still cost zero model calls"
