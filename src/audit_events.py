@@ -89,6 +89,11 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.preview": AuditEvent(
         "access_policy.preview", "read", "An admin previewed a table access policy's effect."
     ),
+    "access_policy.preview_groups": AuditEvent(
+        "access_policy.preview_groups",
+        "read",
+        "An admin previewed a table access policy's effect across every group.",
+    ),
     "attachment.download": AuditEvent("attachment.download", "read", "A chat attachment was downloaded."),
     "catalog.list": AuditEvent("catalog.list", "read", "The table/dataset catalog was listed."),
     "catalog.sample": AuditEvent("catalog.sample", "read", "A table sample was fetched via the catalog."),
@@ -648,6 +653,14 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.compile": AuditEvent(
         "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
     ),
+    # `PUT /api/admin/registry/{id}` writes its generic `update_table` row
+    # too; these two name the policy change itself, so "every access-policy
+    # change in the last N days" is a direct `action_prefix=access_policy.`
+    # query rather than a grep through `update_table` params.
+    "access_policy.set": AuditEvent(
+        "access_policy.set", "mutation", "An admin attached or edited a table access policy."
+    ),
+    "access_policy.clear": AuditEvent("access_policy.clear", "mutation", "An admin cleared a table's access policy."),
     "data_source.bigquery_connection_test": AuditEvent(
         "data_source.bigquery_connection_test",
         "read",
@@ -1358,6 +1371,24 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed what the anonymizer would redact in a pasted sample "
         "(length and counts recorded; the sample text itself is never stored).",
+    ),
+    # -- RBAC-reviewer finding on #1979: two policy-editor reads were
+    # declared `exempt:ui_support` despite returning content, the same class
+    # `access_policy.preview` / `access_policy.preview_groups` above are
+    # audited for. `GET .../policy/revisions` returns the full historical
+    # `policy_sql` body of every saved revision; `GET .../policy/columns`
+    # returns profiler-derived `samples` (real row values, cf.
+    # `catalog.sample`). Reclassified to real, cataloged reads — see
+    # `src/audit_posture.py` READ_POSTURE for the route mapping.
+    "access_policy.revisions_view": AuditEvent(
+        "access_policy.revisions_view",
+        "read",
+        "An admin read a table access policy's saved revision history.",
+    ),
+    "access_policy.columns_view": AuditEvent(
+        "access_policy.columns_view",
+        "read",
+        "An admin read a table's schema + sample values for the no-SQL policy builder.",
     ),
 }
 

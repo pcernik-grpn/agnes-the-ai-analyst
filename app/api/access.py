@@ -1421,7 +1421,13 @@ def _table_policy_diagnosis(row: dict, principal: dict) -> dict:
     if not policy_sql:
         return {"applies": False, "rows_visible": None, "reason": "ok", "note": None}
 
-    from src.access_policy import PolicyError, PolicyIdentityUnresolvable, PolicyMappingEmpty, policied_relation
+    from src.access_policy import (
+        PolicyError,
+        PolicyIdentityUnresolvable,
+        PolicyMappingEmpty,
+        policied_relation,
+        raise_if_policy_mapping_empty,
+    )
 
     table_id = row["id"]
     try:
@@ -1434,9 +1440,14 @@ def _table_policy_diagnosis(row: dict, principal: dict) -> dict:
     # §15.1 — an empty (or never-synced) policy_mapping dependency only
     # matters for a persona actually reading THROUGH the policy; the admin
     # bypass (§12) reads unfiltered, so it is irrelevant to what they see.
+    # The protected table is named to the shared helper so its policy's own
+    # mandatory ``FROM <itself>`` is not read as an empty mapping dependency
+    # when this table is ALSO marked ``policy_mapping=True`` and merely has
+    # no rows yet -- that is an ``empty_slice``, not a broken mapping
+    # (#1979, review follow-up).
     if relation.policied:
         try:
-            _raise_if_policy_mapping_empty(policy_sql)
+            raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=row.get("name"))
         except PolicyMappingEmpty as exc:
             return {"applies": True, "rows_visible": None, "reason": "mapping_empty", "note": str(exc)}
 
@@ -1484,46 +1495,6 @@ def _policy_error_diagnosis(table_id: str, *, stage: str) -> dict:
         "reason": "policy_error",
         "note": f"access policy for table {table_id!r} failed to {stage}",
     }
-
-
-def _raise_if_policy_mapping_empty(policy_sql: str) -> None:
-    """§15.1 — fail closed with a NAMED reason when a ``policy_mapping``
-    table this policy body references currently has zero (or never-synced)
-    rows, rather than let a broken upstream sync read as "you legitimately
-    have no data" via a bare zero count.
-
-    Cheap by design: reads ``sync_state`` — the row count already recorded
-    by the last successful sync — rather than a live ``COUNT(*)`` against
-    every mapping dependency. This runs for every policied+accessible table
-    on every effective-access call, and "the last sync landed empty (or
-    never ran)" is exactly what ``sync_state`` already tracks (and gives
-    ``last_sync`` for free, per §16's "must say" column).
-    """
-    import sqlglot
-    from sqlglot import exp
-
-    from src.access_policy import PolicyMappingEmpty
-    from src.repositories import sync_state_repo, table_registry_repo
-
-    try:
-        statement = sqlglot.parse_one(policy_sql, read="duckdb")
-    except Exception:
-        # policied_relation() already parsed this SQL successfully to reach
-        # this point (or raised PolicyError, handled by the caller before
-        # this runs) — defensive no-op only, never a NEW failure mode.
-        return
-    referenced_names = {t.name for t in statement.find_all(exp.Table) if t.name}
-    if not referenced_names:
-        return
-
-    mapping_rows = [
-        r for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name") in referenced_names
-    ]
-    for mapping_row in mapping_rows:
-        state = sync_state_repo().get_table_state(mapping_row["id"])
-        rows = state.get("rows") if state else None
-        if not rows:
-            raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)
 
 
 def _count_through_relation(relation) -> int:

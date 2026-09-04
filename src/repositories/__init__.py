@@ -167,6 +167,8 @@ __all__ = [
     "facts_prompt_repo",
     # Built-in extraction run observability (2026-08-31 design §7.1)
     "extraction_runs_repo",
+    # Table access-policy revision history (#1979)
+    "access_policy_revisions_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
     "user_external_identities_repo",
@@ -586,6 +588,14 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     # cannot grow a mutable progress column); `job_id` joins the two.
     "extraction_runs": {
         PG: ("src.repositories.extraction_runs_pg", "ExtractionRunsPgRepository"),
+    },
+    # Table access-policy revision history (#1979 K1-sweep finding 1) —
+    # PG-only, A3 ratchet: no DuckDB backend. Deliberately NOT audit_log:
+    # `audit_log.params` redacts `access_policy_sql`, so the trail records
+    # that a policy changed but never what it was, and "restore this
+    # version" needs the body.
+    "access_policy_revisions": {
+        PG: ("src.repositories.access_policy_revisions_pg", "AccessPolicyRevisionsPgRepository"),
     },
     # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
     # DuckDB backend. The singleton runtime config for the `sso` provider
@@ -1044,6 +1054,15 @@ def extraction_runs_repo() -> Any:
     last N runs' outcomes. PG-only — raises ``RequiresPostgresBackend`` on a
     DuckDB-backed instance."""
     return _build("extraction_runs")
+
+
+def access_policy_revisions_repo() -> Any:
+    """Saved states of a table's access policy (#1979) — what the history
+    panel lists and what "restore this version" prefills the editor from.
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance, which every caller treats as "no revision history here" (the
+    modal falls back to the audit-derived, read-only history)."""
+    return _build("access_policy_revisions")
 
 
 def sso_config_repo() -> Any:

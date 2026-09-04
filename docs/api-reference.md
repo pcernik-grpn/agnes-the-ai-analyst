@@ -78,8 +78,10 @@ are the unit of curation and user-facing discovery.
 | `PATCH` | `/api/admin/registry/{table_id}/docs` | see §3.5 | Update **extended LLM-facing docs** (grain, gotchas, …) |
 | `DELETE` | `/api/admin/registry/{table_id}` | — | Unregister |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview` | see §3.7 | Preview a stored or candidate access policy as a chosen persona |
+| `POST` | `/api/admin/registry/{table_id}/policy/preview-groups` | see §3.7 | Preview a stored or candidate access policy across every real group in one call |
 | `GET` | `/api/admin/registry/{table_id}/policy/columns` | — | No-SQL policy builder: real column schema + sample values (see §3.8) |
 | `POST` | `/api/admin/registry/{table_id}/policy/compile` | see §3.8 | No-SQL policy builder: structured spec → validated SQL (never persisted) |
+| `GET` | `/api/admin/registry/{table_id}/policy/revisions` | — | Saved states of a table's access policy, newest first (see §3.9) |
 | `GET` | `/api/admin/metadata/{table_id}` | — | Get per-column metadata (see §3.6) |
 | `POST` | `/api/admin/metadata/{table_id}` | see §3.6 | Save per-column metadata |
 | `POST` | `/api/admin/metadata/{table_id}/push` | — | Push saved column metadata downstream (no body) |
@@ -253,6 +255,15 @@ attached/replaced/cleared via `PUT /api/admin/registry/{table_id}` (`access_poli
 Every call is recorded to the audit log (`access_policy.preview`) — it shows one admin
 another person's data slice.
 
+These four policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
+`.../policy/columns`, `.../policy/revisions`) need an admin credential whose data-read
+**surface** is `all` — a browser session, a regular PAT, or `agnes init --as-admin`.
+A `surface='stack'` PAT (the `agnes init` default, filtered like an analyst everywhere
+else) gets `403` with a detail naming the fix: they return real table content with no
+per-table grant check and no policy rewrite behind them, so the admin gate is the only
+thing standing between the caller and unpolicied data. `.../policy/compile` is
+deliberately not narrowed — it persists nothing and returns only generated SQL.
+
 | Field | Type | Notes |
 |---|---|---|
 | `sql` | string, optional | A candidate policy body to preview before saving. Omit to preview the table's **currently stored** `access_policy_sql`. Validated the same way a `PUT` would validate it. |
@@ -282,6 +293,35 @@ to the raw sample's window (e.g. it names the table with a schema qualifier) and
 sample is not provably the whole table — in that case the two lists must **not** be
 diffed row-by-row, only read on their own.
 
+Both `.../policy/preview` and `.../policy/preview-groups` below carry a `mapping_warning`
+field (`null` unless a referenced `policy_mapping` table is empty or has never synced),
+mirroring the `mapping_empty` reason `GET /api/me/effective-access` already reports for
+the same condition — a suspiciously-low `rows_visible` in the preview explains itself
+instead of reading as "you legitimately have no data."
+
+#### `POST /api/admin/registry/{table_id}/policy/preview-groups`
+
+Runs the same preview once per **real** `user_groups` row and reports `rows_visible`/
+`rows_total` for each in a single call — a `CASE`-on-`$user_groups` policy with a missing
+or wrong `ELSE` branch shows up as an unexpected group seeing the whole table, without
+manually re-running `.../policy/preview` once per group.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sql` | string, optional | Same meaning as `.../policy/preview` — omit to preview the stored policy. |
+
+```bash
+curl -s -X POST \
+  "https://{your-instance}/api/admin/registry/orders_daily/policy/preview-groups" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+# {"rows_total": 4200,
+#  "groups": [{"group": "Finance", "rows_visible": 1200, "error": null},
+#             {"group": "Everyone", "rows_visible": 0, "error": null}],
+#  "mapping_warning": null}
+```
+
 ### 3.8 No-SQL policy builder — `GET .../policy/columns`, `POST .../policy/compile`
 
 Lets an admin author a policy by picking columns and masks instead of writing SQL by
@@ -293,8 +333,18 @@ never has to know the table's structure up front:
 curl -s "https://{your-instance}/api/admin/registry/orders_daily/policy/columns" \
   -H "Authorization: Bearer $PAT"
 # {"columns": [{"name": "email", "type": "VARCHAR", "samples": ["a@x.com"], "distinct": 42, "pii": true}, ...],
-#  "mapping_tables": ["cost_centers"], "eligible": true}
+#  "mapping_tables": ["cost_centers"], "eligible": true,
+#  "schema_available": true, "columns_error": null}
 ```
+
+The schema comes from the same lookup `GET /api/v2/schema/{table_id}` (`agnes schema`)
+uses — BigQuery's own INFORMATION_SCHEMA for a remote BQ row, Unity Catalog for a remote
+Databricks row, the table's own parquet otherwise — so a `query_mode='remote'` table that
+has never synced locally still lists its columns. When the lookup itself fails,
+`columns` is empty, `schema_available` is `false` and `columns_error` carries a
+caller-facing reason, so "this table has never synced" is distinguishable from "this
+table has no columns". `.../policy/compile` shares the same source and refuses with
+`422 policy_builder_schema_unavailable` rather than compile against an empty column list.
 
 `eligible` mirrors the distribution interlock (§3.7's PUT gate): a policy can only be
 attached to a `query_mode='remote'` or `server_only=true` table — the builder shows
@@ -367,7 +417,47 @@ as `access_policy_sql` (plus the mandatory `access_policy_note`).
 Both builder routes are admin-only and, like `.../policy/preview`, available regardless
 of `access_policies.enabled`: they neither read nor write a stored policy. That flag
 gates attaching one (`PUT` with a non-null `access_policy_sql`) and applying one on a
-read.
+read. `.../policy/columns` returns real profiler sample values, so it additionally
+requires the full (`all`) credential surface described in §3.7; `.../policy/compile`
+does not.
+
+### 3.9 Access-policy history — `GET /api/admin/registry/{table_id}/policy/revisions`
+
+Every policy write through `PUT /api/admin/registry/{table_id}` (attach, edit, clear)
+appends a revision. This lists them newest first — who saved what, when, and the full
+SQL body — which is what the policy editor's history panel renders and what its
+**Restore** button prefills the editor from.
+
+The audit trail cannot answer this question: `audit_log.params` redacts
+`access_policy_sql` (content never enters the trail), so an audit row records *that* a
+policy changed and by whom, never what it was.
+
+Because every listed revision carries a full historical policy body, this route requires
+the full (`all`) credential surface described in §3.7.
+
+```bash
+curl -s "https://{your-instance}/api/admin/registry/orders_daily/policy/revisions?limit=10" \
+  -H "Authorization: Bearer $PAT"
+# {"table_id": "orders_daily", "count": 12, "limit": 10, "revisions": [
+#   {"id": "apr_1a2b...", "saved_at": "2026-09-01T09:12:03+00:00", "saved_by": "admin@example.com",
+#    "policy_sql": "SELECT ...", "policy_note": "regional scoping", "policy_mapping": false,
+#    "cleared": false}, ...]}
+```
+
+`limit` is 1–50 (default 10); `count` is the untruncated total, so a truncated list can
+say so. `cleared: true` marks the revision that REMOVED the policy — `policy_sql` is
+`null` there, and the revision before it is the body a restore would put back.
+
+**There is no restore endpoint, by design.** Restoring means re-submitting a revision's
+`policy_sql` + `policy_note` through the ordinary `PUT /api/admin/registry/{table_id}`,
+so it is re-validated exactly like a fresh save (distribution interlock, mandatory note,
+static validation, live probe) and can be refused — e.g. a policy saved while the table
+was `server_only=true` will not reattach itself to a table that has since become
+distributable.
+
+Requires the Postgres app-state backend (`access_policy_revisions` is a Postgres-only
+table); a DuckDB-backed instance answers `501 requires_postgres_backend` and the editor
+falls back to a read-only history derived from the audit trail.
 
 ---
 
@@ -757,8 +847,10 @@ checks against.
 - /api/admin/registry/{table_id}
 - /api/admin/registry/{table_id}/docs
 - /api/admin/registry/{table_id}/policy/preview
+- /api/admin/registry/{table_id}/policy/preview-groups
 - /api/admin/registry/{table_id}/policy/columns
 - /api/admin/registry/{table_id}/policy/compile
+- /api/admin/registry/{table_id}/policy/revisions
 
 ### `/api/admin/register-table` — Table registration
 

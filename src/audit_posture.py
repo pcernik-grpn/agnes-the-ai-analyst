@@ -77,6 +77,7 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/registry/rebuild": "rebuild_registry",
     "POST /api/admin/registry/{table_id}/policy/compile": "access_policy.compile",
     "POST /api/admin/registry/{table_id}/policy/preview": "access_policy.preview",
+    "POST /api/admin/registry/{table_id}/policy/preview-groups": "access_policy.preview_groups",
     "POST /api/admin/run-audit-prune": "run_audit_prune",
     # Landed on `integration` in parallel with this wave.
     "POST /api/admin/upgrade-freeze": "upgrade_freeze.set",
@@ -734,7 +735,21 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin --
     "GET /api/admin/discover-tables": "table_registry.discover_preview",
     "GET /api/admin/registry": "exempt:ui_support",
-    "GET /api/admin/registry/{table_id}/policy/columns": "exempt:ui_support",
+    # RBAC-reviewer finding on #1979 (was `exempt:ui_support`): the response
+    # carries profiler-derived `samples` — real row values, potentially PII
+    # (the endpoint even has a `pii` flag per column) — the same class of
+    # content `GET /api/v2/sample/{table_id}` is audited for as
+    # `catalog.sample`. The handler writes its own row (`log_safe`), never
+    # the sample VALUES themselves — see `app/api/admin.py::
+    # policy_builder_columns`.
+    "GET /api/admin/registry/{table_id}/policy/columns": "access_policy.columns_view",
+    # RBAC-reviewer finding on #1979 (was `exempt:ui_support`): each listed
+    # revision carries the full historical `policy_sql` body — the same
+    # content `POST .../policy/preview` / `.../preview-groups` are already
+    # audited for. The handler writes its own row (`log_safe`), never the
+    # SQL bodies themselves — see `app/api/admin.py::
+    # list_access_policy_revisions`.
+    "GET /api/admin/registry/{table_id}/policy/revisions": "access_policy.revisions_view",
     "GET /api/admin/server-config": "server_config.read",
     "GET /api/admin/server-config/overlay": "server_config.read",
     # Same fold the /admin/data-sources template inlines at render time, for

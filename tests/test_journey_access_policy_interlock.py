@@ -600,6 +600,265 @@ class TestTwoPoliciedRowsStayUnwindable:
 
 
 @pytest.mark.journey
+class TestUnpinnedConnectionIdIsWildcard:
+    """S5 physical-twin gap (issue #1979): an omitted/blank ``connection_id``
+    on either side of the twin check must mean "any connection of that
+    source type", not a literal ``""`` that fails to intersect a pinned
+    ``connection_id``. Reviewer MonikaFeigler's live repro on a
+    single-connection instance: register a policied ``order`` row pinned to
+    a real ``connection_id``, then register a SECOND row over the same
+    bucket/table with ``connection_id`` omitted -- the omitted value used to
+    compare unequal to the pin and sail past the check entirely."""
+
+    def _connection(self, conn_id: str = "conn-a") -> str:
+        from src.repositories import source_connections_repo
+
+        source_connections_repo().create(
+            id=conn_id,
+            name=conn_id,
+            source_type="keboola",
+            config={"stack_url": f"https://{conn_id}.keboola.com"},
+        )
+        return conn_id
+
+    def test_monika_repro_unpinned_twin_next_to_pinned_policied_row_is_rejected_at_register(
+        self, seeded_app, monkeypatch
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection()
+
+        policied_id = _register(
+            c,
+            token,
+            name="order",
+            server_only=True,
+            bucket="in.c-main",
+            source_table="order",
+            connection_id=conn_id,
+        )
+        attach = c.put(
+            f"/api/admin/registry/{policied_id}",
+            json={
+                "access_policy_sql": _policy_sql("order"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+
+        # Step 1 of the repro: a second row over the same bucket/table with
+        # `connection_id` OMITTED. Must now be rejected -- before this fix,
+        # signal `(keboola, "", bucket, table)` did not intersect
+        # `(keboola, <uuid>, bucket, table)` and this landed with 201.
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "order_twin",
+                "source_type": "keboola",
+                "query_mode": "local",
+                "bucket": "in.c-main",
+                "source_table": "order",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+        # Tells the admin how to disambiguate if this really is a different
+        # connection reusing the same bucket/table label.
+        assert "connection_id" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("order_twin") is None
+
+    def test_monika_repro_step2_pinning_the_twin_to_the_same_connection_stays_rejected(self, seeded_app, monkeypatch):
+        """Step 2 of the repro, unchanged by this fix: a row that already
+        exists unpinned (inserted directly, bypassing the register-time
+        check, to reach the shape a live instance had before the fix) is
+        still rejected when PUT pins it to the SAME connection as the
+        policied row."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection()
+
+        policied_id = _register(
+            c,
+            token,
+            name="order2",
+            server_only=True,
+            bucket="in.c-main",
+            source_table="order2",
+            connection_id=conn_id,
+        )
+        assert (
+            c.put(
+                f"/api/admin/registry/{policied_id}",
+                json={"access_policy_sql": _policy_sql("order2"), "access_policy_note": "pii masking"},
+                headers=_auth(token),
+            ).status_code
+            == 200
+        )
+
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="order2_twin",
+                name="order2_twin",
+                source_type="keboola",
+                query_mode="local",
+                bucket="in.c-main",
+                source_table="order2",
+            )
+        finally:
+            conn.close()
+
+        resp = c.put(
+            "/api/admin/registry/order2_twin",
+            json={"connection_id": conn_id},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+
+    def test_pinned_twin_next_to_unpinned_policied_row_is_rejected_at_register(self, seeded_app, monkeypatch):
+        """The mirror direction: the POLICIED row is unpinned and the new
+        row PINS a connection over the same bucket/table."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection("conn-b")
+
+        policied_id = _register(
+            c,
+            token,
+            name="unpinned_orig",
+            server_only=True,
+            bucket="in.c-main",
+            source_table="invoices3",
+        )
+        attach = c.put(
+            f"/api/admin/registry/{policied_id}",
+            json={
+                "access_policy_sql": _policy_sql("unpinned_orig"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "pinned_twin",
+                "source_type": "keboola",
+                "query_mode": "local",
+                "bucket": "in.c-main",
+                "source_table": "invoices3",
+                "connection_id": conn_id,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+
+    def test_attaching_a_policy_while_an_unpinned_twin_exists_is_rejected(self, seeded_app, monkeypatch):
+        """The ATTACH-direction interlock must also honor the wildcard: the
+        row about to be policied is PINNED to a connection, and the
+        existing unpolicied twin is unpinned."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection("conn-c")
+
+        # Registered while unpinned and unpolicied -- legitimate at that
+        # moment, two unpolicied rows sharing a source is not a leak.
+        twin_id = _register(
+            c,
+            token,
+            name="unpinned_twin",
+            bucket="in.c-main",
+            source_table="shipments3",
+        )
+        # Registered pinned, also unpolicied yet -- also legitimate, both
+        # rows are still unpolicied at this point.
+        pinned_id = _register(
+            c,
+            token,
+            name="pinned_orig",
+            server_only=True,
+            bucket="in.c-main",
+            source_table="shipments3",
+            connection_id=conn_id,
+        )
+
+        attach = c.put(
+            f"/api/admin/registry/{pinned_id}",
+            json={
+                "access_policy_sql": _policy_sql("pinned_orig"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        assert attach.status_code == 422, attach.text
+        assert "access_policy_physical_source_conflict" in attach.text
+        assert twin_id in attach.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get(pinned_id)["access_policy_sql"] is None
+
+    def test_different_pinned_connections_over_same_bucket_table_do_not_conflict(self, seeded_app, monkeypatch):
+        """Two rows that both PIN different, real connection_ids over the
+        same bucket/table are genuinely different projects -- the wildcard
+        rule must not treat them as twins."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_a = self._connection("conn-d1")
+        conn_b = self._connection("conn-d2")
+
+        policied_id = _register(
+            c,
+            token,
+            name="proj_a_orders",
+            server_only=True,
+            bucket="in.c-main",
+            source_table="orders_shared_label",
+            connection_id=conn_a,
+        )
+        attach = c.put(
+            f"/api/admin/registry/{policied_id}",
+            json={
+                "access_policy_sql": _policy_sql("proj_a_orders"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "proj_b_orders",
+                "source_type": "keboola",
+                "query_mode": "local",
+                "bucket": "in.c-main",
+                "source_table": "orders_shared_label",
+                "connection_id": conn_b,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+
+
 class TestClearAndDistributeInOnePut:
     """The safety valve the interlock must NOT swallow: clearing the policy
     and making the table distributable again in ONE request.

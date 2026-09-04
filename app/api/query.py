@@ -9,7 +9,8 @@ import os
 import re
 import threading
 import time
-from typing import Optional
+from datetime import UTC, datetime
+from typing import Any, Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -42,10 +43,13 @@ from connectors.internal.access import (
 from src.access_policy import (
     PolicyError,
     PolicyIdentityUnresolvable,
+    PolicyMappingEmpty,
     PolicyNameCollision,
     assert_policied_reads_unique,
     assert_unique_output_columns,
+    find_registry_row,
     policied_relation,
+    raise_if_policy_mapping_empty,
     rewrite_sql,
     row_scope_payload,
 )
@@ -1675,6 +1679,77 @@ def _assert_select_only(sql_lower: str) -> None:
         raise HTTPException(status_code=400, detail="Query must start with SELECT or WITH")
 
 
+def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
+    """S3 (RLS review, #1979): refuse a live read through a policy whose
+    ``policy_mapping`` dependency is empty or never synced, rather than let
+    it silently return `row_count: 0` for everyone -- indistinguishable
+    from "you legitimately have no data" (docs/table-access-policies.md
+    v1 limitation #3 / §15.1).
+
+    ``policied_table_ids`` is `rewrite_sql`'s own output: it already
+    excludes the admin-bypass case (`relation.policied is False` never
+    lands in that list, see `rewrite_sql`'s own filtering), so this
+    function does not need to re-check the admin bypass itself -- an
+    unrestricted admin never joins the mapping table in the first place,
+    exactly mirroring `_table_policy_diagnosis`'s own
+    `if relation.policied:` gate on this same check (§15.1's admin-bypass
+    note).
+
+    Delegates the actual "is the mapping table empty" question to
+    ``src.access_policy.raise_if_policy_mapping_empty`` -- the SAME
+    function ``GET /api/me/effective-access``
+    (`app/api/access.py::_table_policy_diagnosis`) calls for its
+    ``reason: mapping_empty`` diagnosis, so the two surfaces can never
+    disagree about which tables trip this check. The protected table is
+    named to that helper (``table_id=``) so its policy's own mandatory
+    ``FROM <itself>`` is not mistaken for an empty mapping dependency when
+    the table is ALSO marked ``policy_mapping=True`` and simply has no rows
+    yet (#1979, review follow-up).
+    """
+    if not policied_table_ids:
+        return
+    repo = table_registry_repo()
+    for table_id in policied_table_ids:
+        row = repo.get(table_id)
+        policy_sql = row.get("access_policy_sql") if row else None
+        if not policy_sql:
+            continue
+        try:
+            raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=(row or {}).get("name"))
+        except PolicyMappingEmpty as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "reason": "policy_mapping_empty",
+                    "table": table_id,
+                    "mapping_table": exc.mapping_table,
+                    "note": str(exc),
+                    "last_sync": _jsonable_last_sync(exc.last_sync),
+                },
+            )
+
+
+def _jsonable_last_sync(last_sync: Any) -> str | None:
+    """Serialize ``PolicyMappingEmpty.last_sync`` for an ``HTTPException``
+    detail (PR #2023 review, finding 2).
+
+    ``fastapi.exception_handlers.http_exception_handler`` builds a plain
+    Starlette ``JSONResponse`` from ``exc.detail`` -- unlike a
+    ``response_model`` return value, it never runs through
+    ``jsonable_encoder``, so a raw ``datetime`` here would blow up
+    ``json.dumps`` inside the response instead of reaching the caller as
+    the structured error this whole check exists to produce. Naive inputs
+    are assumed UTC (DuckDB's ``SET GLOBAL TimeZone='UTC'`` pin, see
+    ``app/serialization.py``), matching how every other datetime this app
+    returns is labeled.
+    """
+    if not isinstance(last_sync, datetime):
+        return last_sync
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=UTC)
+    return last_sync.isoformat()
+
+
 @router.post("", response_model=QueryResponse)
 def execute_query(
     request: QueryRequest,
@@ -1836,6 +1911,15 @@ def execute_query(
             # failing policy's error can quote literal values from the
             # policy body.
             raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+
+        # S3 (RLS review, #1979): an empty/never-synced `policy_mapping`
+        # dependency (§15.1) must fail closed with a NAMED reason, not a
+        # silent, indistinguishable-from-legitimate empty result. Placed
+        # right after `policied_table_ids` is known and before ANY engine
+        # (local DuckDB, Databricks, BigQuery push-down/policied-direct)
+        # executes anything, so the check covers every branch below rather
+        # than needing to be duplicated per engine.
+        _assert_no_empty_policy_mapping(policied_table_ids)
 
         # ---- Which remote engine, if any, runs this statement -------------
         # `None` for an all-local query and for BigQuery, which keeps its own
@@ -3070,14 +3154,18 @@ def _databricks_remote_plan(sql: str, sql_lower: str, sys_conn, user, allowed):
 class _PolicyResolutionFailed(Exception):
     """A policy resolver failed for a reason that is NOT "unregistered name".
 
-    Deliberately not a ``PolicyError`` subclass. ``rewrite_sql``'s resolution
-    loop swallows ``PolicyError`` on purpose — that exception doubles as the
-    registry's "no such table" signal, and swallowing it is what keeps every
-    query naming a CTE or an ``information_schema`` view working. But an
-    engine-side failure (a transpile error, a pattern-metacharacter group name,
-    a parameter-binding failure) raises the SAME type, and being swallowed
-    there makes a policied table look unpolicied. This type is invisible to
-    that ``except``, so a genuine resolution failure propagates instead.
+    Deliberately not a ``PolicyError`` subclass, and belt-and-braces since
+    #1979: ``rewrite_sql``'s resolution loop now swallows only
+    ``PolicyUnknownTable`` (the registry's "no such table" signal, and what
+    keeps every query naming a CTE or an ``information_schema`` view
+    working), so a plain ``PolicyError`` from ``policied_relation`` already
+    propagates on its own. What is still ONLY expressible with this type is a
+    failure raised by the engine-specific wrapping these resolvers do AROUND
+    ``policied_relation`` — a Databricks parameter-binding or native-rewrite
+    error — which has no ``PolicyUnknownTable``/``PolicyError`` split of its
+    own and, raised as the base type, would land in the swallowed arm of any
+    future ``except`` that widens again. Being swallowed there makes a
+    policied table look unpolicied, i.e. serves it unfiltered.
     """
 
     def __init__(self, table_id: str) -> None:
@@ -3086,15 +3174,25 @@ class _PolicyResolutionFailed(Exception):
 
 
 def _table_is_registered(name_or_id: str) -> bool:
-    """Does the registry know this name? Distinguishes the two things
-    ``policied_relation`` reports with the same ``PolicyError``: an unknown
-    name (a CTE, an ``information_schema`` view — must stay swallowed) from a
-    genuine resolution failure on a table that does exist."""
-    repo = table_registry_repo()
-    if repo.get(name_or_id):
+    """Does the registry know this name? Distinguishes an unknown name (a CTE,
+    an ``information_schema`` view — must stay swallowed) from a genuine
+    resolution failure on a table that does exist.
+
+    ``policied_relation`` now answers that itself (``PolicyUnknownTable`` vs.
+    ``PolicyError``, #1979); this stays as the resolvers' own second opinion,
+    because they wrap that call in engine-specific work whose failures are not
+    typed that way.
+
+    Resolves through the SAME ``find_registry_row`` the policy resolver uses,
+    so the two can never disagree about whether a name is registered — an
+    exact-equality lookup here would have called an upper-cased reference to
+    a policied table "unknown" and let its resolution failure stay swallowed
+    (#1979, security review). Ambiguous case-variant rows ARE registered, and
+    fail closed downstream."""
+    try:
+        return find_registry_row(name_or_id) is not None
+    except PolicyError:
         return True
-    getter = getattr(repo, "get_by_name", None)
-    return bool(getter(name_or_id)) if getter else False
 
 
 def _assert_policy_substitution_complete(expected_ids, actual_ids) -> None:
@@ -3104,13 +3202,16 @@ def _assert_policy_substitution_complete(expected_ids, actual_ids) -> None:
     Both remote arms run ``rewrite_sql`` twice: once with the default DuckDB
     resolver to decide whether a policy is in play at all, then again with an
     engine resolver that transpiles and binds. Only the second can fail on
-    engine-specific work, and its failure mode is silent: ``rewrite_sql``
-    swallows ``PolicyError`` from ``resolve``, so the table drops out of
-    ``policied_table_ids``, the substitution never happens, and what executes
-    is the caller's own unfiltered statement — returned with a 200.
+    engine-specific work, and its failure mode used to be silent:
+    ``rewrite_sql`` swallowed every ``PolicyError`` from ``resolve``, so the
+    table dropped out of ``policied_table_ids``, the substitution never
+    happened, and what executed was the caller's own unfiltered statement —
+    returned with a 200. That hole is closed at the source now (#1979: only
+    ``PolicyUnknownTable`` is swallowed).
 
-    That is the worst shape a policy bug can take, so it gets a positive
-    invariant rather than trust in the failure paths: compare the two passes
+    That is the worst shape a policy bug can take, so it keeps a positive
+    invariant rather than trusting the failure paths — including any future
+    resolver that loses a table without raising at all: compare the two passes
     and deny on any table the second one lost.
     """
     actual = set(actual_ids or [])
@@ -3244,12 +3345,14 @@ def _databricks_policy_resolver(*, name_lookups, default_catalog: str):
         try:
             relation = policied_relation(table_id, principal, dialect="databricks")
         except PolicyError as exc:
-            # `policied_relation` raises PolicyError for BOTH "no such
-            # registered table" (which must stay swallowed, or every CTE name
-            # breaks) and genuine resolution failures — a Databricks transpile
-            # error, a group name carrying a LIKE metacharacter. Only the
-            # second kind can happen after the DuckDB pass already resolved
-            # this name successfully, so re-raise as the non-swallowed type.
+            # "No such registered table" must stay swallowed (or every CTE
+            # name breaks); a genuine resolution failure — a Databricks
+            # transpile error, a policy body that no longer parses — must not.
+            # `policied_relation` distinguishes the two by type since #1979,
+            # so this is now a second opinion rather than the only one: only
+            # the second kind can happen after the DuckDB pass already
+            # resolved this name successfully, so re-raise it as the type no
+            # `except PolicyError` anywhere can absorb.
             if _table_is_registered(table_id):
                 raise _PolicyResolutionFailed(exc.table_id) from exc
             raise
@@ -3258,8 +3361,11 @@ def _databricks_policy_resolver(*, name_lookups, default_catalog: str):
         try:
             body_sql, parameters = bind_policy_parameters(relation.relation_sql, relation.params)
         except DatabricksPolicyBindingError as exc:
-            # NOT PolicyError: `rewrite_sql` swallows that, which would drop
-            # the policy and execute the caller's unfiltered statement.
+            # NOT PolicyError: this is engine-side work AROUND the resolver,
+            # so it carries no unknown-vs-refused type split of its own — the
+            # non-swallowable type is what keeps a binding failure from
+            # dropping the policy and executing the caller's unfiltered
+            # statement.
             raise _PolicyResolutionFailed(relation.table_id) from exc
         try:
             # `_body_lookups` and not the caller-derived `name_lookups`: the
@@ -3979,10 +4085,12 @@ def _execute_policied_remote_bq(
     bq_sql, policy_params, policied_table_ids = _bq_policied_execution_sql(
         sql, principal, bq, name_lookups=name_lookups
     )
-    # The BigQuery transpile happens inside that second `rewrite_sql`, and its
-    # PolicyError is swallowed by the resolution loop — so a policy that fails
-    # to transpile drops out silently and `bq_sql` becomes the caller's own
-    # unfiltered statement. Same invariant as the Databricks arm.
+    # The BigQuery transpile happens inside that second `rewrite_sql`. Its
+    # PolicyError propagates now (#1979 — the resolution loop swallows only
+    # `PolicyUnknownTable`), but the positive invariant stays: any way a table
+    # drops out of `policied_table_ids` between the two passes leaves `bq_sql`
+    # as the caller's own unfiltered statement. Same invariant as the
+    # Databricks arm.
     _assert_policy_substitution_complete(expected_ids, policied_table_ids)
     if outer_limit is not None:
         bq_sql = f"SELECT * FROM ({bq_sql}) AS _bqq_policy_outer LIMIT {outer_limit}"
