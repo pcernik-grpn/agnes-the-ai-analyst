@@ -149,7 +149,7 @@ _CREDENTIAL_SCOPE = "kai_session"
 #: NATIVE chat sandbox's `mcp` ticket can no longer reach `/api/kai/mcp` —
 #: which is what made that route reachable from sessions it was never designed
 #: for in the first place. Both halves found by Devin Review on this PR.
-_EGRESS_SCOPES: Dict[str, str] = {"llm": "llm", "mcp": "kai_mcp"}
+_EGRESS_SCOPES: Dict[str, str] = {"llm": "llm", "mcp": "kai_mcp", "otlp": "kai_otlp"}
 
 
 def _secret() -> str:
@@ -194,6 +194,24 @@ def _broker_mcp_enabled() -> bool:
     from app.instance_config import feature_enabled
 
     return feature_enabled("kai", "broker_mcp_enabled", env_var="KAI_BROKER_MCP_ENABLED", default=False)
+
+
+def _broker_otlp_enabled() -> bool:
+    """Whether this instance issues the ``kai_otlp`` ticket scope.
+
+    Not a switch of its own: the scope exists exactly when the instance's own
+    OTLP export is configured (``OTEL_EXPORTER_OTLP_ENDPOINT``), because
+    ``POST /api/broker/otlp/v1/{signal}`` forwards to that very collector with
+    that very credential — a ticket for a route that would answer 503 is
+    worse than no ticket. The engine side is the mirror image: the sandbox
+    only initializes OTel when its host declares an ``otlp`` upstream
+    (``HOST_BROKER_OTLP_URL``), and an ACTIVE scope with no ticket fails every
+    turn before the prompt is sent, which is why the URL must never reach an
+    engine ahead of the app version carrying the route.
+    """
+    from src.observability.otel import endpoint_configured
+
+    return endpoint_configured()
 
 
 def _b64url(raw: bytes) -> str:
@@ -273,7 +291,7 @@ def _create_session_and_credential(user_email: str) -> tuple[str, str, int]:
     The converse — an engine turn stripping a live native sandbox's egress
     tickets — was real while both sides minted the same broker scopes, and is
     now closed by construction rather than by policy: a turn touches
-    `{llm, kai_mcp}` (`_EGRESS_SCOPES` values) and a native web-chat sandbox
+    `{llm, kai_mcp, kai_otlp}` (`_EGRESS_SCOPES` values) and a native web-chat sandbox
     holds `{main, mcp, data_apps}` (`app/chat/manager.py`). The sets are
     disjoint with the tool switch on or off, so the engine's *rotation*
     (`revoke_session_scopes`, scope-limited) cannot reach a native ticket.
@@ -558,6 +576,8 @@ async def issue_kai_tickets(
     scopes = dict(_EGRESS_SCOPES)
     if not _broker_mcp_enabled():
         scopes.pop("mcp", None)
+    if not _broker_otlp_enabled():
+        scopes.pop("otlp", None)
     response.headers.update(_NO_STORE)
     return await asyncio.to_thread(_rotate_egress_tickets, row["session_id"], scopes)
 
@@ -1023,6 +1043,7 @@ def _is_workspace_junk(arcname: str) -> bool:
     """
     parts = arcname.split("/")
     return bool(_WORKSPACE_EXCLUDED_DIR_NAMES.intersection(parts)) or arcname.endswith(_WORKSPACE_EXCLUDED_SUFFIX)
+
 
 #: Hard ceiling mirroring the engine's own (100 MiB, wire and extracted). The
 #: bundled template is ~160 KiB, so this only fires if an operator's override

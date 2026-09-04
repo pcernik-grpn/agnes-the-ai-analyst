@@ -2139,3 +2139,25 @@ def test_workspace_omits_python_bytecode_artifacts(seeded_app, kai_env):
         assert ".claude/hooks/pre_tool_use.py" in names
     finally:
         stray.unlink(missing_ok=True)
+
+
+def test_otlp_ticket_is_issued_exactly_when_the_instance_exports_otlp(seeded_app, kai_env, monkeypatch):
+    """The ``otlp`` ticket exists for one route — ``/api/broker/otlp/v1/{signal}``,
+    which forwards to the collector the instance's own export points at. No
+    configured export, no ticket: an ``otlp`` scope the relay would arm
+    against a route answering 503 is worse than the key being absent (the
+    engine treats every non-``llm`` key as optional)."""
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    payload = seeded_app["client"].post("/api/kai/tickets", headers={"Authorization": f"Bearer {credential}"}).json()
+    assert "otlp" not in payload
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/base")
+    payload = seeded_app["client"].post("/api/kai/tickets", headers={"Authorization": f"Bearer {credential}"}).json()
+    assert isinstance(payload.get("otlp"), str) and payload["otlp"]
+    # The minted ticket authenticates the otlp broker route and nothing else.
+    from src.repositories import ticket_repo
+
+    row = ticket_repo().resolve(payload["otlp"])
+    assert row is not None and row["scope"] == "kai_otlp"
