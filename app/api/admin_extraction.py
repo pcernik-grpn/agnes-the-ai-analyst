@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -2647,6 +2648,429 @@ async def extraction_completeness(
         "cached": was_cached,
         "provisional": _completeness_crawl_running(connection_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Extraction breakdown (2026-09-04) — "how many documents did we get, how
+# many did we not, broken down by file type and by reason" — the answer an
+# operator finishing a large crawl cannot get from any other screen today,
+# only by hand-writing SQL against Postgres on the box. A SEPARATE surface
+# from A6 completeness above: completeness answers "does the corpus match
+# what Graph Search says exists" (an external reference count); this
+# answers "of what the crawl itself touched, what became of it" — entirely
+# from data the crawl and the corpus already persisted, no Graph calls.
+# ---------------------------------------------------------------------------
+
+#: Field names :func:`_run_out` already normalizes per run as ``live =
+#: report or progress`` (present in BOTH a finished run's report and a
+#: live/abandoned run's progress checkpoint) — reused here rather than
+#: re-deriving the same report-or-progress pick a second time.
+_BREAKDOWN_LIVE_FIELDS: Tuple[str, ...] = (
+    "new",
+    "changed",
+    "unchanged",
+    "renamed",
+    "deleted",
+    "bytes_downloaded",
+    "http_429",
+    "throttle_wait_s",
+    "filtered_by_age",
+    "age_unknown",
+    "skipped_unsupported",
+    "skipped_doomed",
+    "oversize_files",
+)
+
+#: Scalars ``_progress_snapshot`` (``connectors/sharepoint/crawler.py``)
+#: never carries — only a run that finished long enough to call
+#: ``CrawlStats.report()`` has them. An "abandoned" run (worker killed
+#: outright, closed by ``ExtractionRunsPgRepository.abandon_stale_
+#: running`` with whatever ``report`` it already had — see this module's
+#: own docstring on the interrupted-run trap) contributes NOTHING to these,
+#: never a lowball number silently averaged in. Read straight off
+#: ``report`` (not through ``_run_out``, which does not expose them).
+_BREAKDOWN_REPORT_ONLY_FIELDS: Tuple[str, ...] = (
+    "permission_skips",
+    "excluded_subtree_skips",
+    "requests",
+    "item_seconds",
+    "duration_s",
+)
+
+#: The one ``reason_type`` this surface calls out separately from every
+#: other convert-stage failure: the document converted fine and produced no
+#: extractable text (``CrawlStats.note_failed_item``'s ``convert_empty``
+#: call site, reason text always exactly "conversion succeeded but produced
+#: no extractable text") — usually a scanned PDF that needs OCR, not a
+#: broken pipeline, and typically the single largest cohort in
+#: ``failed_items``.
+_EMPTY_TEXT_REASON_TYPE = "convert_empty"
+
+#: Every item that reaches the download/convert stage is fetched to a local
+#: temp file first (``tempfile.mkstemp()``, default ``"tmp"`` prefix —
+#: ``connectors/sharepoint/crawler.py``'s ``download_to_temp``), and a
+#: convert-stage exception's message is built as ``f"{filename}: {message}"``
+#: (``ConversionError.__init__``, ``src/ingest/convert.py``) where
+#: ``filename`` is that temp file's own basename — so 1 444 files that all
+#: hit the SAME underlying fault ("markitdown could not convert this file")
+#: read as 1 444 DIFFERENT reason strings under a naive ``GROUP BY reason``,
+#: one per random temp filename. This strips exactly that prefix so they
+#: collapse back into one row. Bounded quantifiers only (no nested/unbounded
+#: repetition) — linear-time over tenant-controlled text, per the security
+#: playbook; a reason with no such prefix (most non-``ConversionError``
+#: faults, e.g. a bare timeout message) passes through unchanged, since
+#: those already read the same across files with no per-file noise to strip.
+_TMP_FILENAME_PREFIX_RE = re.compile(r"^tmp[\w\-]{1,64}\.[\w]{1,12}:\s*")
+
+
+def _normalize_failure_reason(reason: str) -> str:
+    """A ``failed_items[].reason`` string, with a leading local-temp-filename
+    prefix stripped (see :data:`_TMP_FILENAME_PREFIX_RE`) so every file that
+    hit the same underlying fault groups under the same row."""
+    reason = (reason or "").strip()
+    if not reason:
+        return "(no reason recorded)"
+    stripped = _TMP_FILENAME_PREFIX_RE.sub("", reason, count=1).strip()
+    return stripped or reason
+
+
+def _extension_of_suffix(suffix: Any) -> str:
+    """``failed_items``/``skips`` items carry their OWN ``suffix`` (set by
+    the crawler at note-time, already the real extension, lowercased,
+    ``Path(name).suffix.lower()`` — never a stored-artifact type like
+    ``corpus_files.file_type``, which is always ``"md"`` for a converted
+    document). Normalized to match :meth:`CorpusFilesRepository.
+    extension_status_counts`'s own convention: lowercase, no leading dot,
+    ``""`` when absent — so the two sources bucket under the same key."""
+    return str(suffix or "").lower().lstrip(".")
+
+
+def _parse_window_bound(value: Optional[str], *, param: str) -> Optional[datetime]:
+    """A ``since``/``until`` query param — ``None`` when absent, else a
+    tz-aware ``datetime``. ``400 invalid_{param}`` on anything
+    ``datetime.fromisoformat`` rejects (accepts both a bare ``YYYY-MM-DD``
+    and a full ISO timestamp) — the same "never build a filter from an
+    unchecked value, name which param" posture ``_validate_min_modified``
+    (``app/api/admin_sharepoint.py``) already uses for its own date filter.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"error": f"invalid_{param}"}) from None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _breakdown_scalars(runs: List[Dict[str, Any]], *, now: datetime) -> Dict[str, Any]:
+    """The run-level reconciliation scalars, summed across every run in the
+    window — the raw material for "seen reconciles to indexed with nothing
+    unexplained in between".
+
+    Each :data:`_BREAKDOWN_LIVE_FIELDS` key is read through :func:`_run_out`
+    (the SAME ``live = report or progress`` pick the status/history/fleet
+    endpoints already use — reused, not re-derived) so a value present on
+    either a finished run's report OR a still-checkpointing run's progress
+    counts; :data:`_BREAKDOWN_REPORT_ONLY_FIELDS` are read straight off
+    ``report`` and are simply absent from a run that never got one — see
+    both data structures' own docstrings for why the split matters (the
+    task's own live-fleet trap: an 82-of-96-interrupted connection's
+    ``bytes_downloaded`` undercounts by ~3x if only ``report`` is read).
+    ``contributed_runs`` names, per key, how many of the window's runs
+    actually had a value to add — the honest complement to a bare sum: a
+    ``permission_skips`` total built from 14 of 96 runs is a different claim
+    than one built from all 96, and this is what lets a caller tell them
+    apart instead of reading one indistinguishable number.
+    """
+    totals: Dict[str, float] = {}
+    contributed: Dict[str, int] = {}
+    runs_with_report = 0
+    runs_progress_only = 0
+
+    def _add(key: str, value: Any) -> None:
+        if value is None:
+            return
+        totals[key] = totals.get(key, 0.0) + float(value)
+        contributed[key] = contributed.get(key, 0) + 1
+
+    for run in runs:
+        report = run.get("report") or {}
+        if report:
+            runs_with_report += 1
+        else:
+            runs_progress_only += 1
+        out = _run_out(run, now=now)
+        for key in _BREAKDOWN_LIVE_FIELDS:
+            _add(key, out.get(key))
+        for key in _BREAKDOWN_REPORT_ONLY_FIELDS:
+            _add(key, report.get(key))
+        _add("concurrency_downshifts", (report.get("concurrency") or {}).get("downshifts"))
+        _add("oversize_bytes", (report.get("skipped_oversize") or {}).get("bytes"))
+
+    # Every summed field here is an integer count/byte/request tally except
+    # `throttle_wait_s`/`item_seconds`/`duration_s`, which are seconds —
+    # rounding those to 1 decimal keeps sub-second precision without a
+    # trailing float artifact (`12.300000000000001`) on the wire.
+    seconds_keys = {"throttle_wait_s", "item_seconds", "duration_s"}
+    values = {k: (round(v, 1) if k in seconds_keys else int(v)) for k, v in totals.items()}
+    return {
+        "runs_considered": len(runs),
+        "runs_with_report": runs_with_report,
+        "runs_progress_only": runs_progress_only,
+        "values": values,
+        "contributed_runs": contributed,
+    }
+
+
+def _breakdown_failures(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """``report.failed_items`` across every run in the window, split into
+    the "converted fine, produced no text" cohort
+    (:data:`_EMPTY_TEXT_REASON_TYPE`) and everything else, the latter
+    grouped by NORMALIZED reason (:func:`_normalize_failure_reason`) —
+    without this, 1 444 files failing the SAME markitdown fault would list
+    as 1 444 one-row reasons, exactly the naive-``GROUP BY`` bug this
+    endpoint exists to not reproduce.
+
+    ``listed`` is the number of itemized failures actually available across
+    every contributing run's own (5000-item-capped) ``failed_items`` list —
+    NOT a true total: a run's ``failed_items_truncated`` flag says it hit
+    its own cap, but the crawl does not persist how many MORE there were
+    past it, so this can only ever be a lower bound when ``truncated`` is
+    true, never a number this endpoint invents. A run with an empty
+    ``report`` (progress-only — see :func:`_breakdown_scalars`) contributes
+    no items here at all, since ``failed_items`` is never in ``progress``
+    either — this cohort is understated by exactly the same runs that
+    undercount every other report-only figure.
+    """
+    empty_text_count = 0
+    empty_text_by_ext: Dict[str, int] = {}
+    failed_by_ext: Dict[str, int] = {}
+    reasons: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    listed = 0
+    truncated = False
+
+    for run in runs:
+        report = run.get("report") or {}
+        items = report.get("failed_items") or []
+        if report.get("failed_items_truncated"):
+            truncated = True
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            listed += 1
+            ext = _extension_of_suffix(item.get("suffix"))
+            reason_type = str(item.get("reason_type") or "unknown")
+            if reason_type == _EMPTY_TEXT_REASON_TYPE:
+                empty_text_count += 1
+                empty_text_by_ext[ext] = empty_text_by_ext.get(ext, 0) + 1
+                continue
+            failed_by_ext[ext] = failed_by_ext.get(ext, 0) + 1
+            normalized = _normalize_failure_reason(str(item.get("reason") or ""))
+            key = (reason_type, normalized)
+            bucket = reasons.setdefault(
+                key, {"reason_type": reason_type, "reason": normalized, "count": 0, "by_extension": {}}
+            )
+            bucket["count"] += 1
+            bucket["by_extension"][ext] = bucket["by_extension"].get(ext, 0) + 1
+
+    by_reason = sorted(reasons.values(), key=lambda r: -r["count"])
+    return {
+        "empty_text": {
+            "count": empty_text_count,
+            "by_extension": empty_text_by_ext,
+            "note": "conversion succeeded but produced no extractable text — usually needs OCR, not a broken pipeline",
+        },
+        "failed": {
+            # `listed` counts every item this loop visited (both cohorts);
+            # subtracting the empty-text share leaves the real-failure one
+            # without a second pass over every run's `failed_items`.
+            "count": listed - empty_text_count,
+            "by_extension": failed_by_ext,
+        },
+        "by_reason": by_reason,
+        "listed": listed,
+        "truncated": truncated,
+    }
+
+
+def _breakdown_by_extension(
+    corpus_counts: Dict[str, Dict[str, Dict[str, int]]],
+    *,
+    failed_by_ext: Dict[str, int],
+    empty_text_by_ext: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """One row per file extension — ``corpus_files.path``-derived (via
+    :meth:`CorpusFilesRepository.extension_status_counts`, NEVER
+    ``filename``/``file_type`` — see that method's own docstring for the
+    trap) merged with the failure counts from :func:`_breakdown_failures`,
+    keyed the same way (:func:`_extension_of_suffix`).
+
+    ``indexed``/``rejected``/``processing``/``pending``/``needs_review``
+    reflect the corpus's CURRENT state — every file ever landed for this
+    connection, not scoped to the run window — while ``failed``/
+    ``empty_text`` are windowed (only the runs the caller selected). The two
+    are DIFFERENT populations by construction whenever a window narrower
+    than "every run" is requested; see the response's own
+    ``reconciliation.note``. ``needs_review`` (``src/ingest/runner.py``) is
+    a DIFFERENT "produced no text" signal from ``empty_text`` above — it
+    fires when conversion succeeded and chunking still yielded zero chunks
+    (e.g. all-whitespace content), one stage later in the pipeline than the
+    crawler's own ``convert_empty`` — kept as its own column rather than
+    merged into either sibling.
+    """
+    _EMPTY_STATUS = {"count": 0, "bytes": 0}
+    extensions = set(corpus_counts) | set(failed_by_ext) | set(empty_text_by_ext)
+    rows: List[Dict[str, Any]] = []
+    for ext in extensions:
+        statuses = corpus_counts.get(ext, {})
+        rows.append(
+            {
+                "extension": ext or "(none)",
+                "indexed": statuses.get("indexed", _EMPTY_STATUS),
+                "rejected": statuses.get("rejected", _EMPTY_STATUS),
+                "processing": statuses.get("processing", _EMPTY_STATUS),
+                "pending": statuses.get("pending", _EMPTY_STATUS),
+                "needs_review": statuses.get("needs_review", _EMPTY_STATUS),
+                "failed": failed_by_ext.get(ext, 0),
+                "empty_text": empty_text_by_ext.get(ext, 0),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            -(
+                r["indexed"]["count"]
+                + r["rejected"]["count"]
+                + r["processing"]["count"]
+                + r["pending"]["count"]
+                + r["needs_review"]["count"]
+                + r["failed"]
+                + r["empty_text"]
+            )
+        )
+    )
+    return rows
+
+
+@router.get("/connections/{connection_id}/extraction/breakdown")
+def extraction_breakdown(
+    connection_id: str,
+    since: Optional[str] = Query(None, description="Only runs started on/after this ISO date/datetime"),
+    until: Optional[str] = Query(None, description="Only runs started before this ISO date/datetime"),
+    _user: dict = Depends(require_admin),
+):
+    """ "How many documents did we get, how many did we not, broken down by
+    file type and by reason, and how much of the corpus is silently empty"
+    (2026-09-04) — read entirely from what the crawl and the corpus already
+    persisted (``extraction_runs``/``corpus_files``), no Graph calls, unlike
+    A6 completeness above.
+
+    ``since``/``until`` scope which RUNS contribute to ``scalars``/
+    ``failures``/``skips`` (default: every run on record for this
+    connection — the "everywhere" default the rest of Agnes's read surfaces
+    use, per the command-UX scope model — capped defensively at 500 runs,
+    newest first, by :meth:`ExtractionRunsPgRepository.list_full_for_
+    connection`). ``by_extension``'s ``indexed``/``rejected``/
+    ``processing``/``pending`` counts are UNSCOPED by design — they read
+    the corpus's current state, not just what this window's runs touched —
+    so narrowing the window makes ``reconciliation.unexplained`` an
+    increasingly approximate figure; see its own ``note``.
+
+    Every run selected — PARENT (planner) rows AND shard children alike,
+    unlike the fleet/history endpoints above which show only parents — so a
+    sharded site's real per-shard failures are counted once each rather
+    than folded into (or missing from) a near-empty parent report.
+
+    ``400 invalid_since``/``invalid_until`` for a malformed bound (mirrors
+    ``_validate_min_modified``'s own posture). ``404`` for an unknown or
+    non-SharePoint connection id.
+
+    PG-only, same as every other route in this module: both
+    ``extraction_runs`` and ``corpus_files`` resolve through their own
+    ``*_repo()`` factory, so a DuckDB-backed instance gets the typed
+    ``501`` from whichever resolves first via the app-wide handler in
+    ``app/main.py`` — nothing here needs its own DuckDB fallback.
+    """
+    connection = _sharepoint_connection_or_404(connection_id)
+    since_dt = _parse_window_bound(since, param="since")
+    until_dt = _parse_window_bound(until, param="until")
+
+    from connectors.sharepoint.facts_extraction import collection_ids_for
+    from src.repositories import corpus_files_repo, extraction_runs_repo
+
+    now = datetime.now(timezone.utc)
+    runs = extraction_runs_repo().list_full_for_connection(connection_id, since=since_dt, until=until_dt)
+
+    scalars = _breakdown_scalars(runs, now=now)
+    failures = _breakdown_failures(runs)
+
+    corpus_ids = collection_ids_for(connection)
+    corpus_counts = corpus_files_repo().extension_status_counts(corpus_ids) if corpus_ids else {}
+    by_extension = _breakdown_by_extension(
+        corpus_counts,
+        failed_by_ext=failures["failed"]["by_extension"],
+        empty_text_by_ext=failures["empty_text"]["by_extension"],
+    )
+
+    indexed_total = sum(row["indexed"]["count"] for row in by_extension)
+    needs_review_total = sum(row["needs_review"]["count"] for row in by_extension)
+    values = scalars["values"]
+    seen = (
+        values.get("new", 0) + values.get("changed", 0) + values.get("unchanged", 0) + values.get("filtered_by_age", 0)
+    )
+    accounted_for = (
+        indexed_total
+        + needs_review_total
+        + failures["failed"]["count"]
+        + failures["empty_text"]["count"]
+        + values.get("skipped_unsupported", 0)
+        + values.get("permission_skips", 0)
+        + values.get("excluded_subtree_skips", 0)
+        + values.get("oversize_files", 0)
+    )
+
+    return {
+        "connection_id": connection_id,
+        "window": {
+            "since": since_dt.isoformat() if since_dt else None,
+            "until": until_dt.isoformat() if until_dt else None,
+        },
+        "runs": {
+            "considered": scalars["runs_considered"],
+            "with_report": scalars["runs_with_report"],
+            "progress_only": scalars["runs_progress_only"],
+            "note": (
+                "counters below use each run's REPORT when it finished normally, and its live "
+                "PROGRESS checkpoint otherwise (an interrupted run whose worker died before writing "
+                "a report — see runs.progress_only). Fields report-only by construction "
+                "(permission_skips, excluded_subtree_skips, requests, item_seconds, duration_s, "
+                "oversize_bytes) are undercounted by exactly those runs; see scalars.contributed_runs."
+            ),
+        },
+        "scalars": {**values, "contributed_runs": scalars["contributed_runs"]},
+        "failures": failures,
+        "skips": {
+            "oversize": {
+                "files": values.get("oversize_files", 0),
+                "bytes": values.get("oversize_bytes", 0),
+            }
+        },
+        "by_extension": by_extension,
+        "reconciliation": {
+            "seen": seen,
+            "indexed": indexed_total,
+            "accounted_for": accounted_for,
+            "unexplained": seen - accounted_for,
+            "note": (
+                "seen = new + changed + unchanged + filtered_by_age, summed across the window's runs. "
+                "accounted_for = indexed + needs_review + failed + empty_text + skipped_unsupported + "
+                "permission_skips + excluded_subtree_skips + oversize_files. indexed/needs_review read "
+                "the corpus's CURRENT state, not just this window, so a since/until narrower than the "
+                "connection's full history makes unexplained increasingly approximate rather than "
+                "exact — it is never hidden either way."
+            ),
+        },
+        "as_of": now.isoformat(),
     }
 
 

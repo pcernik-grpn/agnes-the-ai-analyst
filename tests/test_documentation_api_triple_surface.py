@@ -1522,6 +1522,16 @@ _EXEMPT: dict[str, str] = {
         "for the completeness drawer — CLI-reachable (agnes admin sharepoint completeness) "
         "but deliberately not MCP-exposed, same reasoning as split-plan above"
     ),
+    # "how many documents did we get, how many did we not, by file type and
+    # by reason" (2026-09-04) — read entirely from persisted run/corpus
+    # data, no Graph calls. Same class as `extraction/config` above: an
+    # admin display primitive over this connection's own data, no analyst
+    # CLI/MCP analogue.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": (
+        "documents/failures/skips grouped by file extension and normalized failure reason, plus "
+        "run-level reconciliation scalars, for the extraction breakdown panel — admin display "
+        "primitive, no analyst CLI/MCP analogue"
+    ),
     # Cooperative stop for the same card's Stop button (owner-frustration fix,
     # 2026-09-01) — an admin-only control over the SAME crawl the trigger
     # above starts, no analyst CLI/MCP analogue.

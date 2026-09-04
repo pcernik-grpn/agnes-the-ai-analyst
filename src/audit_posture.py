@@ -897,6 +897,14 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
         "sharepoint_connection.completeness_read"
     ),
+    # "How many documents did we get, how many did we not, by file type and
+    # by reason" (2026-09-04) — aggregated counts by extension and by
+    # NORMALIZED failure reason, plus run-level scalars. Unlike A3's
+    # `extraction/runs/{run_id}` (itself only `exempt:ui_support`), this
+    # never carries a `path`/`item_id`/`drive_id` at all — only extensions,
+    # reason strings and counts — so it sits at the same "run counters, no
+    # document content" class A1-A3 already exempt.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": "exempt:ui_support",
     # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
     # is active) — one row per connection of the SAME run counters A1
     # already exempts, plus a derived rate and a derived "stuck" flag. Same

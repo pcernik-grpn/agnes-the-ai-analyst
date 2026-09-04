@@ -33715,6 +33715,105 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": {
+      "get": {
+        "description": "\"How many documents did we get, how many did we not, broken down by\nfile type and by reason, and how much of the corpus is silently empty\"\n(2026-09-04) \u2014 read entirely from what the crawl and the corpus already\npersisted (``extraction_runs``/``corpus_files``), no Graph calls, unlike\nA6 completeness above.\n\n``since``/``until`` scope which RUNS contribute to ``scalars``/\n``failures``/``skips`` (default: every run on record for this\nconnection \u2014 the \"everywhere\" default the rest of Agnes's read surfaces\nuse, per the command-UX scope model \u2014 capped defensively at 500 runs,\nnewest first, by :meth:`ExtractionRunsPgRepository.list_full_for_\nconnection`). ``by_extension``'s ``indexed``/``rejected``/\n``processing``/``pending`` counts are UNSCOPED by design \u2014 they read\nthe corpus's current state, not just what this window's runs touched \u2014\nso narrowing the window makes ``reconciliation.unexplained`` an\nincreasingly approximate figure; see its own ``note``.\n\nEvery run selected \u2014 PARENT (planner) rows AND shard children alike,\nunlike the fleet/history endpoints above which show only parents \u2014 so a\nsharded site's real per-shard failures are counted once each rather\nthan folded into (or missing from) a near-empty parent report.\n\n``400 invalid_since``/``invalid_until`` for a malformed bound (mirrors\n``_validate_min_modified``'s own posture). ``404`` for an unknown or\nnon-SharePoint connection id.\n\nPG-only, same as every other route in this module: both\n``extraction_runs`` and ``corpus_files`` resolve through their own\n``*_repo()`` factory, so a DuckDB-backed instance gets the typed\n``501`` from whichever resolves first via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.",
+        "operationId": "extraction_breakdown_api_admin_sharepoint_connections__connection_id__extraction_breakdown_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only runs started on/after this ISO date/datetime",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only runs started on/after this ISO date/datetime",
+              "title": "Since"
+            }
+          },
+          {
+            "description": "Only runs started before this ISO date/datetime",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only runs started before this ISO date/datetime",
+              "title": "Until"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Extraction Breakdown",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/completeness": {
       "get": {
         "description": "A6 \u2014 \"did we really get everything?\": one row per confirmed scope,\nplus (only for a connection with exactly one whole-drive scope) one row\nper top-level folder under it, plus a totals row.\n\n``min_modified`` defaults to the connection's OWN resolved crawl cutoff\n(:func:`connectors.sharepoint.crawler.resolve_min_modified` \u2014 same\n``{value, source}`` shape ``\u2026/extraction/config`` returns) so \"expected\"\ncounts exactly the population the last crawl would have attempted, not\nan unfiltered superset; an explicit query param overrides it\n(``source: \"query\"``). ``400 invalid_min_modified`` for a malformed\noverride, same validation ``\u2026/split-plan`` runs on the identical key.\n\nCached per ``(connection_id, resolved min_modified)`` for\n:data:`_COMPLETENESS_CACHE_TTL_S` \u2014 the response's own ``cached`` field\nsays whether this answer was reused. ``refresh=true`` bypasses the\ncache and recomputes.\n\n``provisional: true`` when a ``corpus-extraction`` job is currently\nqueued/running for this connection \u2014 the numbers are still returned\n(a stale-but-labeled answer beats none), just flagged as a snapshot\nmid-crawl rather than a settled one.\n\nRead-only: no crawl state is written, no corpus row is touched. ``404``\nfor an unknown/non-SharePoint connection id; the same ``409``/``502``\n``\u2026/split-plan`` raises when this connection's certificate is\nunresolved or Graph itself rejects the token exchange.",

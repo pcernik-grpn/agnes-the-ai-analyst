@@ -299,6 +299,34 @@ class CorpusFilesPgRepository:
             out.setdefault(top_folder, {})[status or "pending"] = int(n)
         return out
 
+    def extension_status_counts(self, corpus_ids: List[str]) -> Dict[str, Dict[str, Dict[str, int]]]:
+        """Mirrors the DuckDB sibling — see its docstring."""
+        if not corpus_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT extension, processing_status, COUNT(*) AS n, "
+                    "  COALESCE(SUM(size_bytes), 0) AS bytes FROM ( "
+                    "  SELECT processing_status, size_bytes, "
+                    "    CASE WHEN strpos(basename, '.') > 0 "
+                    "         THEN lower(reverse(split_part(reverse(basename), '.', 1))) "
+                    "         ELSE '' END AS extension "
+                    "  FROM ( "
+                    "    SELECT processing_status, size_bytes, "
+                    "      reverse(split_part(reverse(COALESCE(path, '')), '/', 1)) AS basename "
+                    "    FROM corpus_files WHERE corpus_id = ANY(:ids) "
+                    "  ) basenames "
+                    ") extensions "
+                    "GROUP BY extension, processing_status"
+                ),
+                {"ids": list(corpus_ids)},
+            ).all()
+        out: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for extension, status, n, size_bytes in rows:
+            out.setdefault(extension, {})[status or "pending"] = {"count": int(n), "bytes": int(size_bytes or 0)}
+        return out
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         with self._engine.connect() as conn:

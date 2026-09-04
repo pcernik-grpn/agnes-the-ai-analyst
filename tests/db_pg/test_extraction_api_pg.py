@@ -1205,3 +1205,347 @@ def test_status_reports_every_partition_job_and_throughput_eta(tmp_path, monkeyp
     assert row["facts"]["facts_passes_total"] == 2
     assert len(row["facts"]["facts_jobs"]) == 2
     assert row["facts"]["facts_docs_per_hour"] == 120.0
+
+
+# ---------------------------------------------------------------------------
+# Extraction breakdown (2026-09-04, `GET .../extraction/breakdown`) — "how
+# many documents did we get, how many did we not, by file type and by
+# reason" — read entirely from extraction_runs + corpus_files, no Graph.
+# ---------------------------------------------------------------------------
+
+
+def _breakdown(client, token, conn_id, **params):
+    return client.get(f"{BASE}/{conn_id}/extraction/breakdown", headers=_auth(token), params=params)
+
+
+def test_breakdown_requires_admin(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    r = client.get(f"{BASE}/{conn_id}/extraction/breakdown")
+    assert r.status_code == 401
+
+
+def test_breakdown_404s_for_unknown_connection(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    r = _breakdown(client, token, "conn_absent")
+    assert r.status_code == 404
+
+
+def test_breakdown_400s_on_malformed_since_and_until(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    r = _breakdown(client, token, conn_id, since="not-a-date")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "invalid_since"
+
+    r = _breakdown(client, token, conn_id, until="also-not-a-date")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "invalid_until"
+
+
+def test_breakdown_empty_connection_has_zeroed_totals_not_missing_keys(tmp_path, monkeypatch, pg_engine):
+    """A connection that never ran must still answer with the full shape —
+    zeros, not absent keys, so a caller never has to special-case "no
+    history yet"."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["runs"]["considered"] == 0
+    assert body["by_extension"] == []
+    assert body["failures"]["listed"] == 0
+    assert body["reconciliation"]["seen"] == 0
+    assert body["reconciliation"]["indexed"] == 0
+    assert body["reconciliation"]["unexplained"] == 0
+
+
+def test_breakdown_collapses_failures_sharing_a_normalized_reason(tmp_path, monkeypatch, pg_engine):
+    """The bug this endpoint exists to not reproduce: a naive `GROUP BY
+    reason` lists one row per random temp filename. 1 000 files that all
+    hit the SAME markitdown fault must collapse into ONE `by_reason` row."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    failed_items = [
+        {
+            "path": f"/docs/f{i}.xlsx",
+            "item_id": f"item{i}",
+            "drive_id": "d1",
+            "reason_type": "convert_failed",
+            "reason": f"tmp{i:06d}.xlsx: markitdown could not convert this file (ValueError)",
+            "suffix": "xlsx",
+        }
+        for i in range(50)
+    ]
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 0, "failed_items": failed_items})
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["failures"]["listed"] == 50
+    assert body["failures"]["failed"]["count"] == 50
+    assert len(body["failures"]["by_reason"]) == 1
+    row = body["failures"]["by_reason"][0]
+    assert row["count"] == 50
+    assert row["reason"] == "markitdown could not convert this file (ValueError)"
+    assert "tmp" not in row["reason"]
+    assert row["by_extension"] == {"xlsx": 50}
+    assert body["by_extension"][0]["extension"] == "xlsx"
+    assert body["by_extension"][0]["failed"] == 50
+
+
+def test_breakdown_calls_out_the_empty_text_cohort_separately(tmp_path, monkeypatch, pg_engine):
+    """`convert_empty` (converted fine, produced no text) is the biggest
+    real-world cohort and means "needs OCR", not "broken" — never folded
+    into the ordinary `failed` bucket."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    failed_items = [
+        {
+            "path": "/scans/a.pdf",
+            "item_id": "i1",
+            "drive_id": "d1",
+            "reason_type": "convert_empty",
+            "reason": "conversion succeeded but produced no extractable text",
+            "suffix": "pdf",
+        },
+        {
+            "path": "/docs/b.docx",
+            "item_id": "i2",
+            "drive_id": "d1",
+            "reason_type": "convert_failed",
+            "reason": "tmpxyz.docx: markitdown could not convert this file (BadZipFile)",
+            "suffix": "docx",
+        },
+    ]
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"failed_items": failed_items})
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["failures"]["empty_text"]["count"] == 1
+    assert body["failures"]["empty_text"]["by_extension"] == {"pdf": 1}
+    assert body["failures"]["failed"]["count"] == 1
+    assert len(body["failures"]["by_reason"]) == 1
+    assert body["failures"]["by_reason"][0]["reason_type"] == "convert_failed"
+    ext_by_key = {row["extension"]: row for row in body["by_extension"]}
+    assert ext_by_key["pdf"]["empty_text"] == 1
+    assert ext_by_key["pdf"]["failed"] == 0
+    assert ext_by_key["docx"]["failed"] == 1
+
+
+def test_breakdown_flags_truncation_and_never_invents_a_true_total(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(
+        run_id,
+        status="done",
+        report={
+            "failed_items": [
+                {"path": f"/f{i}", "reason_type": "convert_failed", "reason": "x", "suffix": "pdf"} for i in range(3)
+            ],
+            "failed_items_truncated": True,
+        },
+    )
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["failures"]["listed"] == 3
+    assert body["failures"]["truncated"] is True
+    # No `total` field pretending to know the true count beyond `listed`.
+    assert "total" not in body["failures"]
+
+
+def test_breakdown_by_extension_uses_path_not_filename_or_file_type(tmp_path, monkeypatch, pg_engine):
+    """The corpus_files trap: `filename`/`file_type` name the stored
+    markdown artifact, never the source document's real type."""
+    from src.repositories import corpus_files_repo, source_connections_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    source_connections_repo().update(conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_bd"}]})
+
+    files_repo = corpus_files_repo()
+    fid = files_repo.add(
+        corpus_id="col_bd",
+        filename="report.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=2048,
+        storage_path="/tmp/report.md",
+        path="Finance/2026/report.pdf",
+    )
+    files_repo.set_status(fid, status="indexed")
+
+    body = _breakdown(client, token, conn_id).json()
+    row = next(r for r in body["by_extension"] if r["extension"] == "pdf")
+    assert row["indexed"] == {"count": 1, "bytes": 2048}
+    assert body["reconciliation"]["indexed"] == 1
+
+
+def test_breakdown_undercounts_report_only_scalars_for_an_interrupted_run_and_says_so(tmp_path, monkeypatch, pg_engine):
+    """The other live trap: an abandoned/interrupted run has an EMPTY
+    `report` and only a `progress` checkpoint. `bytes_downloaded` (present
+    in both) must still be counted; `permission_skips` (report-only) must
+    be silently skipped for that run, not averaged in as zero."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    # A normal finished run: both a report-only field and a live field.
+    done_id = repo.start(connection_id=conn_id)
+    repo.finish(done_id, status="done", report={"bytes_downloaded": 100, "permission_skips": 4, "new": 3})
+
+    # An abandoned run: only ever checkpointed, report stays `{}` (mirrors
+    # `ExtractionRunsPgRepository.abandon_stale_running` leaving `report`
+    # untouched on a worker that never finalized).
+    interrupted_id = repo.start(connection_id=conn_id)
+    repo.checkpoint(interrupted_id, files_seen=10, files_done=10, progress={"bytes_downloaded": 400, "new": 7})
+    repo.finish(interrupted_id, status="interrupted", report={}, files_done=10)
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["runs"]["considered"] == 2
+    assert body["runs"]["with_report"] == 1
+    assert body["runs"]["progress_only"] == 1
+    # bytes_downloaded is in BOTH report and progress, so both runs count.
+    assert body["scalars"]["bytes_downloaded"] == 500
+    # permission_skips is report-only — only the finished run contributes.
+    assert body["scalars"]["permission_skips"] == 4
+    assert body["scalars"]["contributed_runs"]["permission_skips"] == 1
+    assert body["scalars"]["contributed_runs"]["bytes_downloaded"] == 2
+
+
+def test_breakdown_since_until_narrows_which_runs_are_aggregated(tmp_path, monkeypatch, pg_engine):
+    import sqlalchemy as sa
+    from datetime import datetime, timedelta, timezone
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    old_id = repo.start(connection_id=conn_id)
+    repo.finish(old_id, status="done", report={"new": 100})
+    new_id = repo.start(connection_id=conn_id)
+    repo.finish(new_id, status="done", report={"new": 5})
+
+    now = datetime.now(timezone.utc)
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(days=30), "id": old_id},
+        )
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(hours=1), "id": new_id},
+        )
+
+    body = _breakdown(client, token, conn_id, since=(now - timedelta(days=1)).isoformat()).json()
+    assert body["runs"]["considered"] == 1
+    assert body["scalars"]["new"] == 5
+
+    body_all = _breakdown(client, token, conn_id).json()
+    assert body_all["runs"]["considered"] == 2
+    assert body_all["scalars"]["new"] == 105
+
+
+def test_breakdown_includes_shard_children_not_just_the_parent(tmp_path, monkeypatch, pg_engine):
+    """A sharded site's substantive failures live on its CHILD rows, not
+    the near-empty parent (planner) row."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=1)
+    repo.checkpoint(parent_id, files_seen=5, files_done=5)
+    child_id = repo.start(connection_id=conn_id, parent_run_id=parent_id, shard_key="k1", shard_label="Shard 1")
+    repo.finish(
+        child_id,
+        status="done",
+        report={
+            "new": 5,
+            "failed_items": [{"path": "/x.pdf", "reason_type": "convert_failed", "reason": "boom", "suffix": "pdf"}],
+        },
+    )
+    repo.finish(parent_id, status="done", report={})
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["runs"]["considered"] == 2
+    assert body["failures"]["listed"] == 1
+    assert body["scalars"]["new"] == 5
+
+
+def test_breakdown_reconciliation_names_what_seen_did_not_reduce_to(tmp_path, monkeypatch, pg_engine):
+    from src.repositories import corpus_files_repo, source_connections_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    source_connections_repo().update(conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_rc"}]})
+    files_repo = corpus_files_repo()
+    fid = files_repo.add(
+        corpus_id="col_rc",
+        filename="a.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=10,
+        storage_path="/tmp/a.md",
+        path="a.pdf",
+    )
+    files_repo.set_status(fid, status="indexed")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(
+        run_id,
+        status="done",
+        report={
+            "new": 3,  # only 1 indexed below -> 2 unexplained
+            "changed": 0,
+            "unchanged": 0,
+            "filtered_by_age": 0,
+        },
+    )
+
+    body = _breakdown(client, token, conn_id).json()
+    assert body["reconciliation"]["seen"] == 3
+    assert body["reconciliation"]["indexed"] == 1
+    assert body["reconciliation"]["unexplained"] == 2
+
+
+def test_breakdown_needs_review_is_its_own_column_and_counts_as_accounted_for(tmp_path, monkeypatch, pg_engine):
+    """`needs_review` (src/ingest/runner.py — conversion succeeded but
+    chunking produced zero chunks) is a DIFFERENT "empty" signal than the
+    crawler's own `convert_empty`, one stage later in the pipeline. It must
+    show up as its own column, not vanish, and count toward `accounted_for`
+    rather than inflating `unexplained`."""
+    from src.repositories import corpus_files_repo, source_connections_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_nr"}]}
+    )
+    files_repo = corpus_files_repo()
+    fid = files_repo.add(
+        corpus_id="col_nr",
+        filename="a.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=500,
+        storage_path="/tmp/a.md",
+        path="whitespace.docx",
+    )
+    files_repo.set_status(fid, status="needs_review")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 1})
+
+    body = _breakdown(client, token, conn_id).json()
+    row = next(r for r in body["by_extension"] if r["extension"] == "docx")
+    assert row["needs_review"] == {"count": 1, "bytes": 500}
+    assert body["reconciliation"]["accounted_for"] >= 1
+    assert body["reconciliation"]["unexplained"] == 0

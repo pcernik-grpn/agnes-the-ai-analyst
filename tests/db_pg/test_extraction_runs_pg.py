@@ -339,6 +339,96 @@ def test_count_for_connection_is_the_total_not_the_page(pg_engine, monkeypatch):
     assert repo.count_for_connection("conn_nothing") == 0
 
 
+def test_list_full_for_connection_keeps_failed_items_unlike_list_for_connection(pg_engine, monkeypatch):
+    """The breakdown surface's whole reason for existing: `list_for_connection`
+    strips `report.failed_items`/`skipped_items` for the history drawer, but
+    the breakdown needs exactly those itemized lists to group by reason."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = repo.start(connection_id="conn_a")
+    report = {
+        "new": 3,
+        "failed_items": [{"path": "/f0", "reason": "x", "suffix": "pdf", "reason_type": "convert_failed"}],
+    }
+    repo.finish(run_id, status="done", report=report, files_seen=4, files_done=4)
+
+    rows = repo.list_full_for_connection("conn_a")
+    assert len(rows) == 1
+    assert len(rows[0]["report"]["failed_items"]) == 1
+
+
+def test_list_full_for_connection_includes_shard_children(pg_engine, monkeypatch):
+    """Unlike `list_for_connection` (`parent_run_id IS NULL` only), the
+    breakdown reader needs a sharded site's CHILD rows too — that is where
+    the substantive per-shard `failed_items`/`skips` actually live."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent_id = repo.start(connection_id="conn_a", shards_total=2)
+    child_id = repo.start(connection_id="conn_a", parent_run_id=parent_id, shard_key="k1", shard_label="Shard 1")
+
+    ids = {r["id"] for r in repo.list_full_for_connection("conn_a")}
+    assert ids == {parent_id, child_id}
+
+
+def test_list_full_for_connection_scoped_to_connection(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    a = repo.start(connection_id="conn_a")
+    repo.start(connection_id="conn_b")
+
+    rows = repo.list_full_for_connection("conn_a")
+    assert [r["id"] for r in rows] == [a]
+
+
+def test_list_full_for_connection_filters_by_since_until(pg_engine, monkeypatch):
+    import sqlalchemy as sa
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    old_id = repo.start(connection_id="conn_a")
+    new_id = repo.start(connection_id="conn_a")
+    now = datetime.now(timezone.utc)
+    with repo._engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(days=10), "id": old_id},
+        )
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(hours=1), "id": new_id},
+        )
+
+    rows = repo.list_full_for_connection("conn_a", since=now - timedelta(days=1))
+    assert [r["id"] for r in rows] == [new_id]
+
+    rows = repo.list_full_for_connection("conn_a", until=now - timedelta(days=1))
+    assert [r["id"] for r in rows] == [old_id]
+
+
+def test_list_full_for_connection_newest_first(pg_engine, monkeypatch):
+    import sqlalchemy as sa
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    first = repo.start(connection_id="conn_a")
+    second = repo.start(connection_id="conn_a")
+    now = datetime.now(timezone.utc)
+    with repo._engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(hours=2), "id": first},
+        )
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET started_at = :ts WHERE id = :id"),
+            {"ts": now - timedelta(hours=1), "id": second},
+        )
+
+    rows = repo.list_full_for_connection("conn_a")
+    assert [r["id"] for r in rows] == [second, first]
+
+
+def test_list_full_for_connection_respects_limit(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    for _ in range(5):
+        repo.start(connection_id="conn_a")
+    assert len(repo.list_full_for_connection("conn_a", limit=2)) == 2
+
+
 def test_cap_skips_reports_listed_and_total_separately():
     """Only oversize skips keep a path; a run that refused 27 documents and
     can name 20 of them must say exactly that."""

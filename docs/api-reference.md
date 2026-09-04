@@ -2002,6 +2002,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
 - /api/admin/sharepoint/connections/{connection_id}/extraction/completeness
+- /api/admin/sharepoint/connections/{connection_id}/extraction/breakdown
 - /api/admin/sharepoint/extraction/runs/{run_id}/cancel
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
@@ -2339,6 +2340,69 @@ to count against, so no token is ever requested). Audited as
 [--min-modified <date>] [--refresh] [--json]`, rows sorted by `gap`
 descending. Deliberately not MCP-exposed — an admin/ops display primitive
 over live Graph data, same reasoning as `…/split-plan`.
+
+`GET …/extraction/breakdown` (2026-09-04) answers a different question than
+completeness above: not "does the corpus match what Graph Search says
+exists", but "of what the crawl itself touched, what became of it" — read
+entirely from `extraction_runs`/`corpus_files`, no Graph calls. `since`/
+`until` (`400 invalid_since`/`invalid_until` on a malformed bound) scope
+which runs contribute; the default is every run on record for this
+connection, capped defensively at 500, newest first — every PARENT (planner)
+row and every shard CHILD alike, so a sharded site's real per-shard failures
+count once each rather than folding into (or missing from) a near-empty
+parent report.
+
+`by_extension` groups `corpus_files` rows by the extension parsed from
+`path` — **never `filename`/`file_type`**, which for a converted document
+always name the stored markdown artifact ("md" regardless of whether the
+source was a `.pdf` or a `.pptx`) — into `indexed`/`rejected`/`processing`/
+`pending`/`needs_review` counts and byte totals, merged with per-extension
+`failed`/`empty_text` counts from `failures` below. `needs_review`
+(`src/ingest/runner.py`) is a DIFFERENT "produced no text" signal than
+`empty_text` — conversion succeeded and CHUNKING still yielded zero chunks,
+one stage later in the pipeline than the crawler's own `convert_empty`.
+This is the corpus's CURRENT state, unscoped by `since`/`until` by design;
+narrowing the window only narrows which runs' failure/skip/scalar counters
+are aggregated, so `reconciliation.unexplained` becomes an increasingly
+approximate figure the narrower the window gets (never hidden either way —
+see its own `note`).
+
+`failures` groups `report.failed_items` by NORMALIZED reason: every item's
+`reason` has its leading local-temp-filename prefix stripped (crawl items
+download to a `tempfile.mkstemp()` path before conversion, and a convert
+failure's message is `"{temp_filename}: {message}"`, so one underlying fault
+across a thousand files would otherwise list as a thousand one-row reasons)
+before grouping, and the `convert_empty` cohort — "conversion succeeded but
+produced no extractable text", usually a scanned document that needs OCR,
+not a broken pipeline — is called out separately from every other failure
+rather than folded in with it. `listed` is a lower bound, never a fabricated
+total, when `truncated` is true (a contributing run's own `failed_items`
+list hit its 5000-item cap; the crawl does not persist how many more there
+were past it).
+
+`scalars` sums the run-level counters (`new`/`changed`/`unchanged`/
+`filtered_by_age`/`permission_skips`/`excluded_subtree_skips`/
+`bytes_downloaded`/`http_429`/`requests`/... ) across the window, reading
+each run's REPORT when it finished normally and its live PROGRESS checkpoint
+otherwise — the trap this exists to avoid: an interrupted run (worker killed
+before writing a report) has an empty `report` and only `progress`, and a
+few fields (`permission_skips`, `excluded_subtree_skips`, `requests`,
+`item_seconds`, `duration_s`, oversize bytes) exist ONLY in a finished run's
+report, so they undercount by exactly however many runs in the window never
+got one — `runs.progress_only` and `scalars.contributed_runs` say by how
+much, rather than a silent average. `reconciliation` reads `seen = new +
+changed + unchanged + filtered_by_age` against `accounted_for = indexed +
+needs_review + failed + empty_text + skipped_unsupported +
+permission_skips + excluded_subtree_skips + oversize_files`, and reports
+`unexplained` as their difference — positive, negative, or zero, never
+suppressed.
+
+`404` for an unknown/non-SharePoint connection. Exempt (`ui_support`),
+same disclosure class as A2/A3 above: unlike `extraction/runs/{run_id}`,
+this never carries a `path`/`item_id`/`drive_id` at all, only extensions,
+normalized reason strings and counts. Deliberately not MCP-exposed — an
+admin display primitive, no analyst CLI/MCP analogue, same reasoning as
+`…/extraction/config`.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

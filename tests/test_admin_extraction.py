@@ -82,6 +82,7 @@ _ROUTES = (
     "extraction/runs/er_whatever",
     "extraction/config",
     "extraction/completeness",
+    "extraction/breakdown",
 )
 
 
@@ -146,6 +147,13 @@ class TestDuckDbDegradesCleanly:
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="sp-run-detail")
         r = client.get(f"{BASE}/{conn_id}/extraction/runs/er_x", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_breakdown_is_typed_501(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-breakdown")
+        r = client.get(f"{BASE}/{conn_id}/extraction/breakdown", headers=_auth(token))
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
 
