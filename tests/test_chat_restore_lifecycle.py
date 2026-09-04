@@ -767,32 +767,45 @@ class TestReattachShowsThatSomethingIsRunning:
             "function handleFrame(frame) {",
         )
         assert "turnInFlight = !!(t && t.turn_in_flight);" in body
-        paint = body[body.index("if (turnInFlight) {") :]
-        assert "showThinkingPlaceholder();" in paint
-        assert "_reattachPlaceholder = true;" in paint
-        assert "cancelBtn.hidden = false" in paint
+        # #2156 moved the paint behind one state writer, and made it
+        # unconditional in both directions: attaching to a conversation whose
+        # turn has finished must also take DOWN a Stop button left over from
+        # the conversation being switched away from.
+        paint = body[body.index("_reattachGuessedTurn = !!turnInFlight;") :]
+        assert "setTurnInFlight(!!turnInFlight, { immediate: true });" in paint
         # Painted BEFORE the socket is opened — that wait is the dead window.
-        assert body.index("if (turnInFlight) {") < body.index("ws = new WebSocket(")
+        assert body.index("_reattachGuessedTurn = !!turnInFlight;") < body.index("ws = new WebSocket(")
 
     def test_ready_frame_reconciles_a_stale_guess(self):
         js = _chat_js()
         body = _slice(js, '    case "ready":', '    case "token":')
-        assert "if (_reattachPlaceholder && frame.turn_in_flight === false) {" in body
-        assert "clearThinkingPlaceholder();" in body
-        assert 'frame.turn_in_flight === true && !thinkingEl' in body
+        assert "if (_reattachGuessedTurn && frame.turn_in_flight === false) {" in body
+        assert "setTurnInFlight(false);" in body
+        # Reads the TURN state, not the placeholder: since #2156 the
+        # placeholder comes and goes many times inside one live turn, so
+        # `!thinkingEl` would re-arm a turn that is already running.
+        assert "frame.turn_in_flight === true && !_turnInFlight" in body
 
-    def test_only_a_reattach_placeholder_is_taken_down_by_ready(self):
-        """A submit's own placeholder must survive a ``ready`` that arrives
-        before the server has even received the message."""
+    def test_only_a_reattachs_turn_is_taken_down_by_ready(self):
+        """A submit's own turn must survive a ``ready`` that arrives before
+        the server has even received the message."""
         js = _chat_js()
         submit = _slice(js, "async function submitUserMessage(text) {", "/** Resize the composer textarea")
-        # The submit disclaims the flag right where it paints its own spinner.
-        show = submit.index("showThinkingPlaceholder();")
-        assert submit.index("_reattachPlaceholder = false;", show) - show < 200
-        # And the one choke point that removes a placeholder always drops it,
-        # so no terminal frame can leave a stale claim behind.
+        # The submit disclaims the flag right where it starts its own turn.
+        start = submit.index("setTurnInFlight(true, { immediate: true });")
+        assert start - submit.index("_reattachGuessedTurn = false;") < 200
+        # The claim is dropped when the TURN stops, not when the placeholder
+        # is removed. That reset used to live in `clearThinkingPlaceholder`,
+        # and #2156 is what made it wrong: the placeholder now comes and goes
+        # on every token and every tool call inside one live turn, so dropping
+        # the claim on any of those would let a late `ready` frame call off a
+        # turn a reattach legitimately owns.
+        setter = _slice(js, "function setTurnInFlight(on, { immediate = false } = {}) {", "//: How long the transcript")
+        assert "if (!_turnInFlight) _reattachGuessedTurn = false;" in setter
         clear = _slice(js, "function clearThinkingPlaceholder() {", "// Streaming state")
-        assert "_reattachPlaceholder = false;" in clear
+        assert "_reattachGuessedTurn" not in clear, (
+            "removing the placeholder must not disclaim the turn (#2156)"
+        )
 
     def test_a_stale_placeholder_cannot_survive_a_transcript_reload(self):
         """``innerHTML = ''`` detaches the node but used to leave the pointer
