@@ -91,6 +91,15 @@ def repo(request, tmp_path, pg_engine, monkeypatch):
         yield repo
 
 
+@pytest.fixture
+def pg_repo(pg_engine, monkeypatch):
+    """PG-only variant of ``repo`` — for ``search_candidates`` behavior that
+    is Postgres-specific (``ts_rank_cd`` ranking; the DuckDB sibling doesn't
+    rank at all, see its docstring), like the ranking-cap tests below."""
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    return repo
+
+
 # ---------------------------------------------------------------------------
 # contract tests
 # ---------------------------------------------------------------------------
@@ -494,3 +503,40 @@ def test_search_candidates_and_search_by_filename_never_return_a_stored_embeddin
 
     # The pruned row's id still resolves to its stored vector in phase 2.
     assert len(repo.list_embeddings_for_ids([body[0]["id"]])[body[0]["id"]]) == 384
+
+
+# ---------------------------------------------------------------------------
+# search_candidates ranking-cap fix (TCRD-296 gap #69, PG-only — the
+# DuckDB sibling has no ``ts_rank_cd`` ranking to bound, see its docstring)
+# ---------------------------------------------------------------------------
+
+
+def test_search_candidates_ranks_by_relevance_when_matches_are_under_the_cap(pg_repo):
+    """Below ``rank_cap`` the inner subquery's own LIMIT never trims
+    anything, so ranking is unaffected by the fix: a chunk repeating the
+    query term more often still ranks first."""
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "contract"}])
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "contract contract contract"}])
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 2, "text": "a contract mentioned once"}])
+
+    rows = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+    assert len(rows) == 3
+    assert rows[0]["text"] == "contract contract contract"
+
+
+def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_rank_cap(pg_repo, monkeypatch):
+    """Correctness under cap: with more matching rows than ``rank_cap``,
+    the query still returns exactly ``limit`` rows — never a crash, never
+    a short result. The module constants are monkeypatched down so the
+    test doesn't need to insert 20 000+ rows to exercise the branch."""
+    import src.repositories.corpus_chunks_pg as corpus_chunks_pg_module
+
+    monkeypatch.setattr(corpus_chunks_pg_module, "_RANK_CANDIDATE_FLOOR", 5)
+    monkeypatch.setattr(corpus_chunks_pg_module, "_RANK_CANDIDATE_MULTIPLIER", 1)
+
+    for i in range(20):
+        pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"contract text {i}"}])
+
+    rows = pg_repo.search_candidates([CORPUS_ID], "contract", limit=3)
+    assert len(rows) == 3
+    assert all("contract" in r["text"] for r in rows)
