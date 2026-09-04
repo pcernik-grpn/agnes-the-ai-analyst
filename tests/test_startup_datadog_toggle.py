@@ -94,6 +94,10 @@ BASE_VARS: dict = {
     "kai_agent_cpus": "1.0",
     "kai_agent_pg_mem_limit": "1g",
     "kai_agent_broker_mcp_enabled": False,
+    "otlp_endpoint": "",
+    "otlp_headers_secret": "",
+    "otlp_capture_content": "0",
+    "deployment_env": "agnes-test",
     "kai_agent_image": "",
     "kai_agent_jwt_secret": "",
     "kai_agent_e2b_key_secret": "",
@@ -280,8 +284,7 @@ def test_the_fleet_installer_unit_is_masked_before_the_agent_can_start(on: str):
     mask = on.index(mask_cmd)
     apt = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
     assert mask < apt, (
-        "mask before the package install: its postinst starts the agent, which "
-        "is what pulls the installer unit in"
+        "mask before the package install: its postinst starts the agent, which is what pulls the installer unit in"
     )
 
     # `systemctl mask` is not used on purpose: it can refuse a unit whose file
