@@ -508,6 +508,21 @@ resource "google_project_iam_member" "vm_log_writer" {
   member  = "serviceAccount:${google_service_account.vm.email}"
 }
 
+# The Ops Agent the logging feature installs runs a second sub-agent, an
+# OpenTelemetry collector, which cannot be switched off — only emptied. With
+# no receivers on its metrics pipeline (files/ops-agent-config.yaml) it still
+# exports the agent's own agent.googleapis.com/agent/* self-metrics, and
+# without this role every export cycle fails and floods the serial console
+# with monitoring.timeSeries.create PermissionDenied. The role therefore buys
+# silence, not ingestion: the host metrics Cloud Monitoring would charge for
+# are off in the config, because enable_datadog is what collects those.
+resource "google_project_iam_member" "vm_metric_writer" {
+  count   = var.enable_gcp_logging ? 1 : 0
+  project = var.gcp_project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.vm.email}"
+}
+
 # --- Network ---
 
 # Web firewall: 80/443 for Caddy (TLS), 8000 only when TLS is disabled (direct HTTP).
