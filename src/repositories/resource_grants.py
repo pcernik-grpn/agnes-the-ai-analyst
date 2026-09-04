@@ -475,3 +475,22 @@ class ResourceGrantsRepository:
         del resource_type
         raise RequiresPostgresBackend("resource_grants.scope")
 
+
+    def reconcile_everyone_scope(self, *, dry_run: bool = False) -> dict:
+        """Postgres-only, and not merely unimplemented here.
+
+        The reconciler finishes what `0098_everyone_becomes_a_scope` declined
+        to convert (see the Postgres sibling). There is nothing for it to do on
+        this backend: the frozen DuckDB app-state ladder has no `scope` column
+        at all, so an everyone-grant is stored as an ordinary grant on the
+        carrier group and there is no half-converted state to close.
+
+        Raising the typed error rather than returning an empty report is the
+        honest answer — a caller asking "did the conversion complete?" would
+        read `nothing_to_do` as "yes", when in fact the question does not apply
+        here. The app-wide handler turns this into a clean `501`, and the CLI
+        prints the feature name.
+        """
+        from src.repository_errors import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("everyone-scope grant reconciliation")

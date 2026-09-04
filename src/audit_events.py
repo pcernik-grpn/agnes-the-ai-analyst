@@ -667,6 +667,13 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin dry-ran the register-table validation without registering anything.",
     ),
+    "resource_grant.everyone_scope_reconciled": AuditEvent(
+        "resource_grant.everyone_scope_reconciled",
+        "mutation",
+        "An admin ran the everyone-scope reconciler that finishes migration 0098's "
+        "deferred conversion (recorded on a blocked or no-op run too, since "
+        "'the conversion still cannot complete' is the trail an operator works from).",
+    ),
     "access_policy.compile": AuditEvent(
         "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
     ),

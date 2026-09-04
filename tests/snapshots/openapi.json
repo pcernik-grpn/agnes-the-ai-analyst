@@ -22010,6 +22010,70 @@
         ]
       }
     },
+    "/api/admin/grants/reconcile-everyone-scope": {
+      "post": {
+        "description": "Finish the ``scope='everyone'`` conversion migration 0098 declined.\n\n0098's step 3 is guarded in two directions and refuses rather than change\nwho can see what: a PERSON outside the seeded ``Everyone`` group would gain\neverything it holds, and a non-person INSIDE it would lose grants it holds\ntoday (the scope reaches people only, #2256). Both refusals log \"a later\nrelease converts the rows once \u2026\" \u2014 and nothing implemented that release,\nso an instance that tripped a guard stayed half-converted permanently: new\nwrites use the column, the pre-0098 rows stay group-shaped, and the\nrevision is stamped and never runs again.\n\nThis is that release, as an operation an admin can re-run after tidying the\nmembership the guard named. It applies the SAME two guards (pinned against\nthe migration by ``tests/db_pg/test_everyone_scope_reconcile.py``) and\nwrites nothing when either fires, so calling it on a still-inconsistent\ninstance is safe and merely reports.\n\nPostgres-only: the frozen DuckDB ladder has no ``scope`` column, so there\nis no half-converted state to close there. The repository raises the typed\n``RequiresPostgresBackend`` and the app-wide handler renders a ``501``.",
+        "operationId": "reconcile_everyone_scope_api_admin_grants_reconcile_everyone_scope_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dry Run",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Everyone Scope",
+        "tags": [
+          "access"
+        ]
+      }
+    },
     "/api/admin/grants/{grant_id}": {
       "delete": {
         "operationId": "delete_grant_api_admin_grants__grant_id__delete",
