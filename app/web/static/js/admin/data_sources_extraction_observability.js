@@ -179,6 +179,7 @@ function _extRunLine(run) {
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
   if (run.changed != null) bits.push(`${_extNum(run.changed)} changed`);
   if (run.unchanged != null) bits.push(`${_extNum(run.unchanged)} unchanged`);
+  if (run.renamed) bits.push(`${_extNum(run.renamed)} renamed`);
   if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
   // `extraction.crawl.min_modified` age filter — so an operator can tell
   // mid-run whether the cutoff is doing anything, not only after the run
@@ -610,6 +611,7 @@ function _extRender(connId) {
     _extRenderCrawlCell(connId, null);
     _extRenderInAgnesButton(connId, null);
     _extRenderFactsButton(connId, null);
+    _extRenderNextRun(connId, null);
     return;
   }
 
@@ -632,6 +634,19 @@ function _extRender(connId) {
   _extRenderCrawlCell(connId, st.data);
   _extRenderInAgnesButton(connId, st.data);
   _extRenderFactsButton(connId, st.data);
+  _extRenderNextRun(connId, st.data);
+}
+
+/* D.16 — the "Crawl schedule & filter" panel's "next run" line
+   (`ds-sp-crawlschedule-nextrun-<connId>`, `data_sources_page.js::
+   _extRenderCrawlFilter`), refreshed on the SAME poll that already fetches
+   `extraction/status` (`_extFetchOne` below) — no extra request. A no-op
+   when the panel isn't in the DOM yet (a card not yet expanded/rendered). */
+function _extRenderNextRun(connId, status) {
+  const el = document.getElementById(`ds-sp-crawlschedule-nextrun-${connId}`);
+  if (!el) return;
+  const nextRunAt = status && status.next_run_at;
+  el.textContent = nextRunAt ? `Next run: ${new Date(nextRunAt).toLocaleString()}.` : "Next run: not scheduled.";
 }
 
 async function _extFetchOne(connId) {

@@ -119,15 +119,22 @@ class FakeIngestor:
 
     instances: List["FakeIngestor"] = []
     _collection_of: Dict[str, str] = {}
+    #: stable_id -> (collection_id, path, filename) as last recorded by
+    #: `ingest()` — what `rename()` compares an "already unchanged" item's
+    #: CURRENT path/filename against, mirroring the real `_Ingestor.rename`'s
+    #: read of the persisted `corpus_files` row.
+    _location_of: Dict[str, tuple] = {}
 
     @classmethod
     def reset(cls) -> None:
         cls.instances.clear()
         cls._collection_of.clear()
+        cls._location_of.clear()
 
     def __init__(self) -> None:
         self.ingested: List[Dict[str, Any]] = []
         self.deleted: List[str] = []
+        self.renamed: List[Dict[str, Any]] = []
         FakeIngestor.instances.append(self)
 
     def ingest(
@@ -152,13 +159,30 @@ class FakeIngestor:
         )
         was_new = stable_id not in FakeIngestor._collection_of
         FakeIngestor._collection_of[stable_id] = collection_id
+        FakeIngestor._location_of[stable_id] = (collection_id, path, filename)
         return f"file-{len(FakeIngestor._collection_of)}", was_new
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
         if FakeIngestor._collection_of.get(stable_id) != collection_id:
             return False
         del FakeIngestor._collection_of[stable_id]
+        FakeIngestor._location_of.pop(stable_id, None)
         self.deleted.append(stable_id)
+        return True
+
+    def rename(self, *, collection_id: str, stable_id: str, path: str, filename: str) -> bool:
+        """Stands in for the real ``_Ingestor.rename`` — same contract:
+        False when nothing is resolved yet or the stored location already
+        matches, True (and the stored location updated) otherwise."""
+        current = FakeIngestor._location_of.get(stable_id)
+        if current is None or current[0] != collection_id:
+            return False
+        if current[1] == path and current[2] == filename:
+            return False
+        FakeIngestor._location_of[stable_id] = (collection_id, path, filename)
+        self.renamed.append(
+            {"collection_id": collection_id, "stable_id": stable_id, "path": path, "filename": filename}
+        )
         return True
 
 
@@ -513,6 +537,76 @@ class TestResume:
         assert second["new"] == 0 and second["changed"] == 0
         assert FakeIngestor.instances[-1].ingested == []
         assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+
+    def test_a_renamed_item_with_unchanged_ctag_updates_the_path_without_downloading(self, crawl_env, monkeypatch):
+        """D.18: a rename/move keeps Graph's cTag stable, so the item still
+        counts as `already` — but its `name`/`parentReference.path` no
+        longer match the stored `corpus_files` row. The crawl must update
+        the row's path in place, count it as `renamed` (not `unchanged`),
+        and never re-download/re-convert/re-ingest it."""
+        item = {"name": "brief.docx", "parent_path": "/drives/b!drive1/root:/Reports"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(name=item["name"], parent_path=item["parent_path"])],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        connection = _connection([_drive_scope()])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+
+        # Same cTag (unchanged content), but moved to a new folder AND
+        # renamed — both `name` and `parentReference.path` differ.
+        item["name"] = "brief-renamed.docx"
+        item["parent_path"] = "/drives/b!drive1/root:/Reports/Archive"
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 1
+        assert second["unchanged"] == 0
+        assert second["new"] == 0 and second["changed"] == 0
+        # Never re-downloaded, converted, or re-ingested.
+        assert FakeIngestor.instances[-1].ingested == []
+        assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+        # `filename` is the SAME `<stem>.md` shape a fresh ingest would have
+        # stored (see `_prepare_document`'s "ok" branch) — never the raw
+        # source extension.
+        assert FakeIngestor.instances[-1].renamed == [
+            {
+                "collection_id": "col1",
+                "stable_id": "graph:item1",
+                "path": "Reports/Archive/brief-renamed.docx",
+                "filename": "brief-renamed.md",
+            }
+        ]
+
+    def test_an_unrenamed_item_with_unchanged_ctag_writes_nothing(self, crawl_env, monkeypatch):
+        """The counterpart to the rename test above: an item whose cTag AND
+        path/name are both unchanged must stay a plain `unchanged` — no
+        rename write, no download."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        connection = _connection([_drive_scope()])
+        _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 0
+        assert second["unchanged"] == 1
+        assert FakeIngestor.instances[-1].renamed == []
 
     def test_a_changed_ctag_re_ingests_the_same_stable_id(self, crawl_env, monkeypatch):
         ctag = {"value": "ctag-1"}
@@ -1314,6 +1408,56 @@ class TestAnonymizeFailClosed:
             "REDACTED[Client Files]/REDACTED[Northwind Deal]/REDACTED[Northwind Logistics Merger Brief].docx"
         )
         assert row["filename"] == "REDACTED[Northwind Logistics Merger Brief].md"
+
+    def test_a_renamed_item_on_an_anonymized_scope_updates_the_redacted_path_too(self, crawl_env, monkeypatch):
+        """D.18's rename gate runs `_anonymize_identity` on an anonymize-
+        marked scope's unchanged item — same deterministic stub as the test
+        above, so a real rename (new raw name/path) produces a DIFFERENT
+        redacted identity, proving the gate re-derives it rather than
+        reusing whatever was stored the first time (which would leave the
+        OLD redacted path stale, defeating the whole point of D.18 on an
+        anonymized scope)."""
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+        item = {"name": "brief.docx", "parent_path": "/drives/b!drive1/root:/Reports"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(name=item["name"], parent_path=item["parent_path"])],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        connection = _connection([_drive_scope(anonymize=True)])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+        first_row = FakeIngestor.instances[-1].ingested[0]
+        assert first_row["path"] == "REDACTED[Reports]/REDACTED[brief].docx"
+
+        item["name"] = "brief-renamed.docx"
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 1
+        assert second["unchanged"] == 0
+        assert FakeIngestor.instances[-1].ingested == []  # no re-download/re-convert/re-ingest
+        assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+        assert FakeIngestor.instances[-1].renamed == [
+            {
+                "collection_id": "col1",
+                "stable_id": "graph:item1",
+                "path": "REDACTED[Reports]/REDACTED[brief-renamed].docx",
+                "filename": "REDACTED[brief-renamed].md",
+            }
+        ]
 
     def test_an_anonymized_scope_leaks_no_fragment_of_the_real_name_through_the_real_anonymizer(
         self, crawl_env, monkeypatch
@@ -3284,6 +3428,56 @@ class TestResolveMinModified:
     def test_a_blank_connection_override_is_unfiltered(self):
         connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": ""}}}}
         assert crawler.resolve_min_modified(connection) == (None, "none")
+
+
+class TestIsValidCrawlSchedule:
+    """``crawler.is_valid_crawl_schedule`` — D.16's per-connection sweep
+    cadence, sharing its grammar with ``src.scheduler.is_valid_schedule``
+    (the SAME syntax ``extraction.schedule`` uses instance-wide) plus the
+    two sentinels ``off``/``instance``."""
+
+    @pytest.mark.parametrize(
+        "value",
+        ["off", "instance", "every 15m", "every 6h", "daily 03:00", "daily 07:00,13:00", "cron 0 3 * * *"],
+    )
+    def test_accepts_the_sentinels_and_every_scheduler_grammar_form(self, value):
+        assert crawler.is_valid_crawl_schedule(value) is True
+
+    @pytest.mark.parametrize("value", [None, "", "  ", "sometimes", "every 6 hours", "daily 25:00", "OFF"])
+    def test_rejects_anything_else(self, value):
+        assert crawler.is_valid_crawl_schedule(value) is False
+
+
+class TestResolveCrawlSchedule:
+    """``crawler.resolve_crawl_schedule`` — unlike ``resolve_min_modified``
+    this ALWAYS resolves to something usable: absent/invalid falls back to
+    ``CRAWL_SCHEDULE_INSTANCE``, the "follow the instance-wide sweep" default,
+    never to "no schedule at all"."""
+
+    def test_no_connection_follows_the_instance_default(self):
+        assert crawler.resolve_crawl_schedule(None) == ("instance", "default")
+
+    def test_a_connection_that_sets_nothing_follows_the_instance_default(self):
+        connection = {"id": "conn1", "config": {}}
+        assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+
+    def test_a_connection_override_off_is_honored(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "off"}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("off", "connection")
+
+    def test_a_connection_override_interval_is_honored(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "every 6h"}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("every 6h", "connection")
+
+    def test_an_invalid_connection_override_falls_back_to_instance_default_and_is_logged(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "sometimes"}}}}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+        assert "schedule" in caplog.text
+
+    def test_a_blank_connection_override_follows_the_instance_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": ""}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
 
 
 class TestMinModifiedFilter:

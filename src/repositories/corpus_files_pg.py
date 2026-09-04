@@ -397,3 +397,14 @@ class CorpusFilesPgRepository:
                     "id": file_id,
                 },
             )
+
+    def update_path(self, file_id: str, *, path: Optional[str], filename: str) -> None:
+        """Postgres twin of the DuckDB ``update_path`` — see its docstring."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE corpus_files SET filename = :filename, path = :path, "
+                    "    updated_at = CURRENT_TIMESTAMP WHERE id = :id"
+                ),
+                {"filename": filename, "path": path, "id": file_id},
+            )

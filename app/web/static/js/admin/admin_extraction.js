@@ -60,6 +60,16 @@ function fmtRate(rate) {
   return rate == null ? "—" : rate.toFixed(1);
 }
 
+// D.16 — `row.next_run_at` (`app/api/admin_extraction.py::
+// _crawl_schedule_next_run_at`, best-effort display only): `null` means
+// this connection is `off`, OR the instance-wide sweep itself has no
+// cadence configured at all (the instance switch is what turns the sweep
+// on — see that function's own docstring). Either way "not scheduled" is
+// the honest read, not a blank cell.
+function fmtNextRun(iso) {
+  return iso ? new Date(iso).toLocaleString() : "not scheduled";
+}
+
 function fmtCost(usd) {
   return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
 }
@@ -222,7 +232,7 @@ function renderShardDisclosureRow(row) {
   tr.className = "ext-shard-disclosure";
   tr.hidden = true;
   tr.innerHTML = `
-    <td colspan="11">
+    <td colspan="12">
       <table class="data-table ext-shard-table">
         <thead>
           <tr><th>Shard</th><th>Outcome</th><th>Files done/seen</th><th>Expected</th><th>Checkpoint</th><th>Error</th></tr>
@@ -265,6 +275,7 @@ function renderRow(row) {
     <td class="ext-num">${tokenTotals(usage)}</td>
     <td class="ext-num">${fmtCost(cost)}</td>
     <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
+    <td class="ext-sub">${fmtNextRun(row.next_run_at)}</td>
     <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
     <td>${actionsCell(row)}</td>
     <td><button type="button" class="btn btn-sm btn-secondary" onclick="openFleetCompleteness('${row.connection_id}')">Completeness</button></td>
@@ -330,7 +341,7 @@ function renderTable(body) {
     const msg = extScope === "active"
       ? "No SharePoint connection currently has a run in progress."
       : "No SharePoint connections are registered.";
-    tbody.innerHTML = `<tr><td colspan="11" class="ext-blank">${msg}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="ext-blank">${msg}</td></tr>`;
   } else {
     tbody.innerHTML = "";
     for (const row of rows) {

@@ -281,6 +281,29 @@ def test_config_answers_on_postgres_too(tmp_path, monkeypatch, pg_engine):
     assert any(row["key"] == "extraction.timeout_s" for row in body["effective"])
 
 
+def test_status_next_run_at_is_none_by_default(tmp_path, monkeypatch, pg_engine):
+    """D.16: with no per-connection override AND no instance-wide
+    ``extraction.schedule`` configured (this test env's default), the
+    sweep never runs at all — an honest ``None``, not a guess."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["next_run_at"] is None
+
+
+def test_status_next_run_at_is_present_once_a_connection_sets_its_own_interval(tmp_path, monkeypatch, pg_engine):
+    """A connection's own cadence (D.16) does not need the instance-wide
+    switch to compute a next-run estimate — only to actually be picked up
+    by a live sweep."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+    client.patch(f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "every 6h"}, headers=_auth(token))
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["next_run_at"] is not None
+
+
 # ---------------------------------------------------------------------------
 # Fleet view (`GET /api/admin/sharepoint/extraction/runs`, 2026-09-02) — one
 # row per SharePoint connection, for an operator running several crawls at
@@ -401,6 +424,22 @@ def test_fleet_row_carries_the_age_filter_counters_from_the_same_run(tmp_path, m
     row = body["connections"][0]
     assert row["run"]["filtered_by_age"] == 40
     assert row["run"]["age_unknown"] == 3
+
+
+def test_fleet_row_carries_next_run_at(tmp_path, monkeypatch, pg_engine):
+    """D.16 — same best-effort ``next_run_at`` hint the crawl-config PATCH
+    response and ``extraction/status`` carry, on every fleet row (``?all=1``
+    so an idle, never-run connection is included)."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    off_conn = _connection(client, token, name="sp-fleet-schedule-off")
+    interval_conn = _connection(client, token, name="sp-fleet-schedule-interval")
+    client.patch(f"{BASE}/{off_conn}/extraction/crawl-config", json={"schedule": "off"}, headers=_auth(token))
+    client.patch(f"{BASE}/{interval_conn}/extraction/crawl-config", json={"schedule": "every 6h"}, headers=_auth(token))
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    rows = {row["connection_id"]: row for row in body["connections"]}
+    assert rows[off_conn]["next_run_at"] is None
+    assert rows[interval_conn]["next_run_at"] is not None
 
 
 def test_fleet_row_flags_a_stuck_run_past_the_stall_threshold(tmp_path, monkeypatch, pg_engine):
