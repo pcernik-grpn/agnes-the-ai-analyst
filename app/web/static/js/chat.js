@@ -194,8 +194,9 @@ let _initialRestorePromise = null;
  *  pre-conversation hero — "Ask Agnes anything" — with the `?session=` param
  *  already stripped from the URL by `openSession`. That is indistinguishable
  *  from being dropped into a new chat, and it is what the reporter saw. So:
- *  the hero comes down synchronously here, the status line says what is
- *  happening, and the fetches start now instead of after the sidebar.
+ *  the hero comes down synchronously here and the fetches start now instead
+ *  of after the sidebar. No status line for the wait itself — connecting is
+ *  not an event the reader has to be told about.
  *
  *  The session id is deliberately NOT consumed: `_hadInitialSession` (the
  *  `?agent=` race guard) is captured later in boot and must still see it. */
@@ -204,7 +205,6 @@ function _restoreInitialSessionEarly() {
   // A deep link names a conversation that exists — never show the
   // pre-conversation dashboard for it, not even for one frame.
   hideCapabilities();
-  setStatus("Restoring conversation…", "info");
   _initialRestorePromise = openSession(_initialSessionId, undefined, { restoring: true }).catch((err) => {
     console.error("chat: deep-link restore failed", err);
   });
@@ -251,15 +251,90 @@ function _resyncOpenSessionMeta() {
 // handshake) does NOT mean the server-side ``ChatManager.attach`` has finished
 // spawning the runner and populated ``live[chat_id]`` — that takes ~5 s for
 // sandbox creation. If we send ``user_msg`` during that window the server
-// raises ``SessionNotFound``, closes the WS with 4404, and the user sees
-// "Disconnected — click the conversation again to resume." with no idea why.
-// All ``user_msg`` sends now ``await`` this promise first.
+// raises ``SessionNotFound`` and closes the WS with 4404, with the turn the
+// user just sent silently lost. All ``user_msg`` sends now ``await`` this
+// promise first.
 let serverReadyPromise = null;
 let resolveServerReady = null;
 function resetServerReady() {
   serverReadyPromise = new Promise((r) => { resolveServerReady = r; });
 }
 resetServerReady();
+
+// --- background reconnect ----------------------------------------
+// A dropped socket is OUR problem, not the reader's: while the sandbox is
+// alive, losing the stream and getting it back is backend bookkeeping and must
+// be invisible. So a close of the live socket re-opens the same conversation
+// on its own — ``openSession`` re-mints a per-conversation ticket — silently,
+// and only a recovery that ran out of attempts says anything.
+//
+// Mirrors keboola/ui's kai-chat reconnect (``packages/kai-chat/src/
+// useStreamReconnect.ts`` + ``constants.ts``, rendered by
+// ``apps/kbc-ui/.../SheetChatContent.tsx``): three attempts, exponential
+// ``2^n × 1000 ms``, nothing shown while a retry is pending (that host passes
+// ``errorMessage: isReconnecting ? null : …`` — the error is suppressed
+// outright, there is no "reconnecting…" copy), the error surfacing only once
+// the budget is spent, and the counter resetting on a turn that COMPLETED
+// rather than on one that merely started — a network bad enough to burn the
+// budget stops retrying behind the user's back.
+const WS_RECONNECT_MAX_ATTEMPTS = 3;
+// The one line a connection failure earns: what the reader can do, not what
+// broke. Sockets, tickets and runners are not their vocabulary.
+const WS_RECONNECT_FAILED_COPY =
+  "Could not get back to this conversation. Send your message again, or reload the page.";
+// The server's own rejections (``app/api/chat.py``): a fresh socket would be
+// refused the same way, so these skip the retries and surface immediately.
+// 4503 (coordination unavailable) is deliberately NOT here — that one is
+// transient infrastructure, the case retrying exists for.
+const WS_CLOSE_REJECTED = new Set([4401, 4403, 4404]);
+let _wsReconnectAttempts = 0;
+let _wsReconnectTimer = null;
+
+/** Drop a pending retry and restore the budget. This is the manual escape
+ *  hatch from a spent budget — the user sending a message is the gesture
+ *  kai-chat's ``resetReconnect`` button is. */
+function _resetWsReconnect() {
+  if (_wsReconnectTimer !== null) {
+    clearTimeout(_wsReconnectTimer);
+    _wsReconnectTimer = null;
+  }
+  _wsReconnectAttempts = 0;
+}
+
+/** Re-open ``chatId`` after an unexpected drop — silently — or, with the
+ *  budget spent, tell the reader what to do about it. */
+function _scheduleWsReconnect(chatId) {
+  if (_wsReconnectAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
+    setStatus(WS_RECONNECT_FAILED_COPY, "error");
+    return;
+  }
+  const delay = 2 ** _wsReconnectAttempts * 1000;
+  _wsReconnectAttempts++;
+  if (_wsReconnectTimer !== null) clearTimeout(_wsReconnectTimer);
+  _wsReconnectTimer = setTimeout(async () => {
+    _wsReconnectTimer = null;
+    // Both checks mean the drop already resolved itself: the reader moved to
+    // another conversation (or out of one), or a submit's ``ensureWsReady``
+    // beat this timer to the reconnect.
+    if (currentChatId !== chatId) return;
+    if (ws && ws.readyState === 1) return;
+    try {
+      // Minted HERE, and handed to ``openSession`` through the override it
+      // already takes, so a failed mint is one more silent attempt instead of
+      // the reader-facing resume-failure block: that block is the right answer
+      // when THEY asked to open the conversation, not for a recovery they
+      // never saw start. A server coming back up usually refuses the first
+      // ticket and serves the second.
+      const t = await api(`/api/chat/sessions/${chatId}/ticket`, { method: "POST" });
+      if (currentChatId !== chatId) return;
+      await openSession(chatId, t.ws_url);
+    } catch (err) {
+      console.error("chat: background reconnect attempt failed", err);
+      // One more attempt if the budget allows; the line above if it does not.
+      _scheduleWsReconnect(chatId);
+    }
+  }, delay);
+}
 
 // --- capability empty-state panel ---------------------------------
 // Populated from a server-embedded JSON blob
@@ -2577,6 +2652,11 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // open as a fresh conversation re-showed the empty-state hero one tick
   // after the first message replaced it.
   const _switchingSession = currentChatId !== chatId;
+  // The retry budget belongs to a conversation, the way kai-chat's lives in
+  // one chat instance's hook state: a different conversation starts fresh,
+  // and a reconnect of THIS one (currentChatId already equals chatId) keeps
+  // spending the budget it is on.
+  if (_switchingSession) _resetWsReconnect();
   currentChatId = chatId;
   markActiveSidebar(chatId);
   // The session-files drawer keeps per-conversation state — the count badge,
@@ -2638,8 +2718,8 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
     _renderRestoreFailure(hydrated.error);
     return;
   }
-  // The restore got its transcript — drop the "Restoring conversation…" line.
-  // (The in-flight-turn branch below sets its own, truer line.)
+  // The restore got its transcript — nothing about the load is worth a line
+  // any more, so make sure none is left over from before it.
   if (restoring) setStatus("");
 
   // Mint a fresh WS ticket for THIS chat_id (unless caller already has one).
@@ -2669,11 +2749,12 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   }
   // Paint the working state BEFORE the socket: attaching can take seconds
   // (a paused sandbox has to resume), and for that whole window a reload
-  // mid-answer used to show no spinner, no Stop button and no status — the
-  // silence that invited the second reload behind the duplicated questions
-  // in #1973. The replayed turn frames land in this same bubble.
+  // mid-answer used to show no spinner and no Stop button — the silence that
+  // invited the second reload behind the duplicated questions in #1973. The
+  // spinner is the signal, and it is about the ANSWER, not the socket: the
+  // reattach itself gets no status line. The replayed turn frames land in
+  // this same bubble.
   if (turnInFlight) {
-    setStatus("Reattaching to the answer in progress…", "info");
     showThinkingPlaceholder();
     _reattachPlaceholder = true;
     const cancelBtn = $("cancel-btn");
@@ -2693,29 +2774,47 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   resetServerReady();
-  // Show a "Resuming session…" status immediately after the TCP handshake and
-  // before the ready frame arrives. For a fresh spawn this reads as a brief
-  // connecting state; for a paused session (~1–2 s resume) it tells the user
-  // something is happening. The ready frame handler clears it — connected is
-  // the normal state and gets no pill.
-  // Not while reattaching to a live answer — "Reattaching to the answer in
-  // progress…" is the truer line and it is already up (#1973).
-  if (!turnInFlight) setStatus("Resuming session…", "info");
+  // No "Resuming session…" line, and no pill of any kind for the connect: a
+  // fresh spawn, a paused sandbox resuming (~1–2 s) and a reconnect after a
+  // drop are all the same thing to the reader — the answer is coming. The
+  // status bar is for what they can act on. Cleared rather than left as-is so
+  // a line from the state being left cannot linger.
+  // Not while reattaching to a live answer: the spinner and Stop button
+  // painted above are that turn's signal and must not be disturbed (#1973).
+  if (!turnInFlight) setStatus("");
   if (openGen !== _openGeneration) return;   // last check before claiming `ws`
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
-  ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
-  ws.onclose = () => {
-    // No pill on a close. The line here used to read "Disconnected — click
-    // the conversation again to resume.", which fired on EVERY socket close
-    // and instructed the reader to do something that does not exist: there
-    // is no per-conversation reconnect endpoint, and the next message
-    // re-opens the session by itself via ensureWsReady. The genuinely
-    // actionable failures keep their own copy (_renderResumeFailure, the
-    // runner-not-ready paths) — this one only added noise.
-    setStatus("");
+  // THIS socket, captured for the handlers below: `ws` is a module global that
+  // the next open — or any deliberate close — reassigns out from under them.
+  const sock = ws;
+  sock.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
+  sock.onclose = (ev) => {
+    // Only the socket that is STILL the current one may act here. `close()`
+    // fires its event a task later, so every deliberate drop — openSession
+    // switching conversations, _renderRestoreFailure, deleteChat,
+    // startNewChatFromGesture's catch — runs this handler after the caller
+    // has already set its own status and possibly armed a replacement
+    // socket. A superseded socket acting then would erase that caller's
+    // error line, re-arm serverReadyPromise behind a live socket (so the next
+    // submit waits out its 30 s timeout for a `ready` frame that already
+    // arrived), and reconnect a conversation nobody is looking at.
+    if (ws !== sock) return;
     // Re-arm so the next openSession starts with an unresolved promise;
     // resolveServerReady is replaced fresh in resetServerReady().
     resetServerReady();
+    // A rejection is not a dropped connection — a new socket would be turned
+    // away identically, so skip the retries and say so now.
+    if (WS_CLOSE_REJECTED.has(ev.code)) {
+      setStatus(WS_RECONNECT_FAILED_COPY, "error");
+      return;
+    }
+    // Everything below is connection state, which the reader is not asked to
+    // care about: clear the line rather than leave stale text behind.
+    setStatus("");
+    // A clean 1000 is this page or the server ending the stream on purpose.
+    // Nothing to recover, nothing to say.
+    if (ev.code === 1000) return;
+    _scheduleWsReconnect(chatId);
   };
 }
 
@@ -2752,11 +2851,11 @@ function handleFrame(frame) {
   switch (frame.type) {
     case "ready":
     case "runner_ready":
-      // Connected is the NORMAL state — showing a permanent "Connected."
-      // pill told the user about infrastructure they never asked about
-      // (and reconnection is automatic anyway). Clear the transient
-      // "Resuming session…" line instead; the status surfaces only when
-      // something is wrong (warn/error) or in progress (info).
+      // Connected is the NORMAL state, and so is having reconnected — the
+      // permanent "Connected." pill, the "Disconnected" one and the transient
+      // "Resuming session…" line all told the reader about infrastructure
+      // they never asked about. Clear whatever is up instead; the status
+      // surfaces only when there is something for them to do about it.
       setStatus("");
       // #1973: the attach's own verdict on whether a turn is running. The
       // ticket's flag is a pre-socket guess (and is always false on a replica
@@ -2841,6 +2940,12 @@ function handleFrame(frame) {
       break;
     }
     case "assistant_message":
+      // A turn that COMPLETED proves the connection, so the next drop starts
+      // with a full retry budget again. Deliberately not the `ready` frame: a
+      // socket that merely opened proves nothing, and refilling on it would
+      // let a flapping connection retry forever (kai-chat resets on the same
+      // completed-turn signal, for the same reason).
+      _wsReconnectAttempts = 0;
       finalizeAssistantMessage(frame);
       break;
     case "session_renamed":
@@ -6226,7 +6331,12 @@ async function submitUserMessage(text) {
   //    must not leave the card hanging over the input they just used.
   onboardingNoteComposerSubmitted();
 
-  // 2. Make sure we have an open WS. For a brand-new chat this calls
+  // 2. Make sure we have an open WS. Sending is the gesture that says "I am
+  //    still here, try again" — it refills the reconnect budget the way
+  //    kai-chat's Retry button does, so a conversation that gave up in the
+  //    background gets its automatic recovery back the moment the reader
+  //    reaches for it.
+  //    For a brand-new chat this calls
   //    newChat() -> openSession(), and openSession wipes
   //    ``#chat-messages`` ``innerHTML`` on entry — so we deliberately
   //    DO NOT render the user bubble or the thinking placeholder yet,
@@ -6235,6 +6345,7 @@ async function submitUserMessage(text) {
   //    hide it again after ensureWsReady so that side effect doesn't
   //    undo step 1.
   try {
+    _resetWsReconnect();
     await ensureWsReady();
     hideCapabilities();
     // Re-asserted for exactly the reason hideCapabilities() is, one line up.
