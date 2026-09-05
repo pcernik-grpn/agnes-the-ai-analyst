@@ -479,4 +479,4 @@ dev-dependencies = [
 override-dependencies = ["urllib3>=2.7.0"]
 
 [tool.agnes]
-released_changelog_sha256 = "fd200897f731a5eda59739e86ff02818f15aa8b4e17b7fb012d288356e6aec06"
+released_changelog_sha256 = "6ffe0844771c8425b00a80596073c232b3cd808c8a150424504dd414954b73f1"
