@@ -1,6 +1,6 @@
 [project]
 name = "agnes-the-ai-analyst"
-version = "0.100.0"
+version = "0.101.0"
 description = "Agnes — self-hosted AI harness for organizations: governed data access, agents as an API, skills marketplace, corporate memory, hosted data apps, and agent surfaces (web chat, Slack, MCP, CLI)"
 requires-python = ">=3.11,<3.14"
 license = {file = "LICENSE"}
@@ -479,4 +479,4 @@ dev-dependencies = [
 override-dependencies = ["urllib3>=2.7.0"]
 
 [tool.agnes]
-released_changelog_sha256 = "6ffe0844771c8425b00a80596073c232b3cd808c8a150424504dd414954b73f1"
+released_changelog_sha256 = "3ad86930f2c3c264fcebfff3790608a59401ba0eb83e10a5c16d3428ef19b687"
