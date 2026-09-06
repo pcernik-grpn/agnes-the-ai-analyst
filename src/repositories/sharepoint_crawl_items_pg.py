@@ -27,11 +27,15 @@ the seam checks ``use_pg()`` itself rather than ever letting
 from __future__ import annotations
 
 import json
+import random
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+
+from src.db_transient import is_transient_db_error
 
 #: The three per-file collections this table splits out of the hot blob,
 #: and the column each lives in — shared by :meth:`get_all` and
@@ -42,6 +46,51 @@ _FIELD_COLUMNS: Dict[str, str] = {
     "failed_items": "failed_entry",
     "empty_items": "empty_entry",
 }
+
+
+#: Bounded retry for a transient deadlock/serialization failure on the
+#: per-checkpoint upsert below (SQLSTATE ``40P01``/``40001`` via
+#: :func:`src.db_transient.is_transient_db_error`) — see :meth:`
+#: SharepointCrawlItemsPgRepository.apply_delta`'s docstring for the
+#: production incident (concurrent shard children upserting overlapping
+#: rows in opposite order). Deterministic row ordering (below) removes the
+#: lock-cycle almost entirely; this is the belt to that ordering's braces
+#: for whatever narrow window survives it — never the only measure, since
+#: retrying an UNORDERED batch would just burn work forever. Short and
+#: local (milliseconds, not the seconds an HTTP/ingest retry uses):
+#: a deadlock resolves the instant the OTHER transaction's abort releases
+#: its locks, which is already true by the time this call gets to retry.
+_DEADLOCK_RETRY_ATTEMPTS = 4
+_DEADLOCK_RETRY_BASE_S = 0.05
+_DEADLOCK_RETRY_MAX_S = 0.5
+
+
+def _deadlock_retry_sleep(seconds: float) -> None:
+    """The retry loop's only wall-clock wait, behind one seam — a test can
+    monkeypatch this to assert the retry COUNT without spending the time."""
+    time.sleep(seconds)
+
+
+def _sorted_touched_stable_ids(deltas: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Every ``stable_id`` this checkpoint's ``removed``/``set`` entries
+    name, across ALL THREE fields, in one GLOBAL ascending order —
+    independent of the order the caller built each field's dict/list in,
+    and independent of which field(s) a given id happens to be touched
+    through.
+
+    This is what closes the deadlock: two concurrent writers with
+    overlapping rows must acquire those rows' locks in the SAME relative
+    sequence no matter how their own batches were ordered, and no matter
+    whether writer A touches a shared id via ``ctags`` while writer B
+    touches the SAME id via ``failed_items`` — sorting each field
+    independently would not catch that cross-field case, only sorting the
+    UNION does.
+    """
+    touched: set = set()
+    for delta in deltas.values():
+        touched.update(delta.get("removed") or ())
+        touched.update((delta.get("set") or {}).keys())
+    return sorted(touched)
 
 
 def _now() -> datetime:
@@ -141,12 +190,48 @@ class SharepointCrawlItemsPgRepository:
         row lands, or none does — the same atomicity the old single-blob
         write gave, now scoped to this checkpoint's own delta rather than
         the whole connection.
+
+        Row-level writes (the ``removed``/``set`` entries, as opposed to
+        the whole-collection ``reset`` above) are applied in ONE global
+        ascending ``stable_id`` order (:func:`_sorted_touched_stable_ids`),
+        never in the caller's own dict/set iteration order. A live
+        instance running many parallel SharePoint crawl shards hit a
+        Postgres deadlock here (``DeadlockDetected`` on this very INSERT ..
+        ON CONFLICT) because two shard children can legitimately touch the
+        same ``(connection_id, kind, stable_id)`` row when their scopes
+        overlap, and the batches were previously applied in whatever order
+        each process's own ``dict``/``set`` happened to iterate — which,
+        for a ``set`` of string keys, differs across processes because of
+        Python's per-process hash randomization. Two transactions taking
+        the SAME two rows' locks in opposite order is a textbook deadlock
+        cycle; a shared, deterministic order removes the cycle by
+        construction. :data:`_DEADLOCK_RETRY_ATTEMPTS` covers whatever
+        narrow window still slips through (e.g. a third overlapping writer
+        landing mid-transaction) — belt, not the only fix.
         """
+        deltas = {"ctags": ctags, "failed_items": failed, "empty_items": empty}
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._apply_delta_once(connection_id, kind, deltas)
+                return
+            except Exception as exc:  # noqa: BLE001 — reclassified immediately below
+                if attempt >= _DEADLOCK_RETRY_ATTEMPTS or not is_transient_db_error(exc):
+                    raise
+                wait = min(_DEADLOCK_RETRY_BASE_S * (2 ** (attempt - 1)), _DEADLOCK_RETRY_MAX_S)
+                wait += random.uniform(0, _DEADLOCK_RETRY_BASE_S)
+                _deadlock_retry_sleep(wait)
+
+    def _apply_delta_once(self, connection_id: str, kind: str, deltas: Dict[str, Dict[str, Any]]) -> None:
+        """One attempt at :meth:`apply_delta` — a single transaction, no
+        retry. Split out so the retry loop above can re-run exactly this
+        (idempotent: re-applying the same deltas from scratch after an
+        aborted attempt lands the same final state)."""
         with self._engine.begin() as conn:
             now = _now()
             for field, column in _FIELD_COLUMNS.items():
-                delta = ctags if field == "ctags" else failed if field == "failed_items" else empty
-                if delta.get("reset"):
+                if deltas[field].get("reset"):
                     conn.execute(
                         sa.text(
                             f"UPDATE sharepoint_crawl_items SET {column} = NULL, updated_at = :now "
@@ -154,26 +239,30 @@ class SharepointCrawlItemsPgRepository:
                         ),
                         {"cid": connection_id, "kind": kind, "now": now},
                     )
-                for stable_id in delta.get("removed") or ():
-                    conn.execute(
-                        sa.text(
-                            f"UPDATE sharepoint_crawl_items SET {column} = NULL, updated_at = :now "
-                            "WHERE connection_id = :cid AND kind = :kind AND stable_id = :sid"
-                        ),
-                        {"cid": connection_id, "kind": kind, "sid": stable_id, "now": now},
-                    )
-                set_entries: Dict[str, Any] = delta.get("set") or {}
-                if not set_entries:
-                    continue
-                value_expr = ":value" if field == "ctags" else "CAST(:value AS JSONB)"
-                for stable_id, value in set_entries.items():
-                    param_value = value if field == "ctags" else json.dumps(value)
-                    conn.execute(
-                        sa.text(
-                            f"INSERT INTO sharepoint_crawl_items (connection_id, kind, stable_id, {column}, updated_at) "
-                            f"VALUES (:cid, :kind, :sid, {value_expr}, :now) "
-                            "ON CONFLICT (connection_id, kind, stable_id) DO UPDATE SET "
-                            f"  {column} = EXCLUDED.{column}, updated_at = EXCLUDED.updated_at"
-                        ),
-                        {"cid": connection_id, "kind": kind, "sid": stable_id, "value": param_value, "now": now},
-                    )
+            for stable_id in _sorted_touched_stable_ids(deltas):
+                for field, column in _FIELD_COLUMNS.items():
+                    delta = deltas[field]
+                    removed: Iterable[str] = delta.get("removed") or ()
+                    set_entries: Dict[str, Any] = delta.get("set") or {}
+                    if stable_id in set_entries:
+                        value = set_entries[stable_id]
+                        value_expr = ":value" if field == "ctags" else "CAST(:value AS JSONB)"
+                        param_value = value if field == "ctags" else json.dumps(value)
+                        conn.execute(
+                            sa.text(
+                                f"INSERT INTO sharepoint_crawl_items "
+                                f"(connection_id, kind, stable_id, {column}, updated_at) "
+                                f"VALUES (:cid, :kind, :sid, {value_expr}, :now) "
+                                "ON CONFLICT (connection_id, kind, stable_id) DO UPDATE SET "
+                                f"  {column} = EXCLUDED.{column}, updated_at = EXCLUDED.updated_at"
+                            ),
+                            {"cid": connection_id, "kind": kind, "sid": stable_id, "value": param_value, "now": now},
+                        )
+                    elif stable_id in removed:
+                        conn.execute(
+                            sa.text(
+                                f"UPDATE sharepoint_crawl_items SET {column} = NULL, updated_at = :now "
+                                "WHERE connection_id = :cid AND kind = :kind AND stable_id = :sid"
+                            ),
+                            {"cid": connection_id, "kind": kind, "sid": stable_id, "now": now},
+                        )
