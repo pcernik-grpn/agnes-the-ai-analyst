@@ -7346,23 +7346,47 @@ def _known_folder_counts(scopes: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, in
     return known_totals, known_folder_counts
 
 
+def _predates_remainder_scope_fix(shard: Dict[str, Any]) -> bool:
+    """True when a persisted ``shard_defs`` entry has the exact shape a
+    PRE-2026-09-06 ``shard_plan.plan_shards`` produced for a FOLDER scope's
+    remainder: ``root_item_id=None`` (the whole drive) instead of the
+    scope's own root (finding: "the remainder shard must be scoped to the
+    same subtree its scope covers, never to the drive root"). A genuine
+    WHOLE-DRIVE scope's remainder legitimately has ``root_item_id=None``
+    too — this only flags the combination that is never legitimate: a
+    ``kind=="folder"`` scope's own remainder pointing at the drive root."""
+    if shard.get("label") != "remainder":
+        return False
+    if _scope_kind(str(shard.get("scope_id") or "")) != "folder":
+        return False
+    return any(t.get("root_item_id") is None for t in shard.get("targets") or ())
+
+
 def _reusable_shard_plan(connection_id: str, scopes: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The connection's LAST persisted shard plan, if it is still valid to
-    reuse for THIS trigger (2026-09-04 finding #65 item 2) — present, and
-    built from the SAME scope set. Returns the persisted entry VERBATIM
-    (``{"shards", "scope_set_hash", "signal", "min_modified", ...}`` — see
-    :func:`_enqueue_shard_plan`'s own persisted shape) so the caller can
-    re-persist the SAME fingerprint after reusing it, letting a THIRD,
-    FOURTH, ... trigger keep reusing it too — or ``None`` (build a fresh
-    plan). The caller is responsible for the OTHER two invalidation
+    reuse for THIS trigger (2026-09-04 finding #65 item 2) — present, built
+    from the SAME scope set, and not STALE (2026-09-06 finding: a plan a
+    PRE-remainder-scope-fix worker already persisted for a folder scope —
+    its own remainder scoped to the drive root — must never be served back
+    verbatim just because the fix shipped after it was written;
+    ``scope_set_hash`` alone cannot tell the two apart, since the scope set
+    itself never changed across the deploy). Returns the persisted entry
+    VERBATIM (``{"shards", "scope_set_hash", "signal", "min_modified",
+    ...}`` — see :func:`_enqueue_shard_plan`'s own persisted shape) so the
+    caller can re-persist the SAME fingerprint after reusing it, letting a
+    THIRD, FOURTH, ... trigger keep reusing it too — or ``None`` (build a
+    fresh plan). The caller is responsible for the OTHER two invalidation
     triggers (``resync`` — handled by :func:`_apply_resync` dropping the
     persisted plan outright before this is ever consulted — and
     ``force_replan``, which skips calling this at all)."""
     state = load_state(connection_id)
     persisted = state.get("shard_plan") or {}
-    if not persisted.get("shards"):
+    shards = persisted.get("shards")
+    if not shards:
         return None
     if persisted.get("scope_set_hash") != _scope_set_hash(scopes):
+        return None
+    if any(_predates_remainder_scope_fix(shard) for shard in shards):
         return None
     return dict(persisted)
 

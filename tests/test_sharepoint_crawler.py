@@ -8388,6 +8388,111 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
         assert remainder_root_by_scope["01FOLDERID"] == "01FOLDERID"
 
 
+class TestStalePersistedPlanNeverReusedAcrossTheRemainderScopeFix(TestShardScopeAttribution):
+    """2026-09-06 finding — PR #2319 fixed HOW a plan is COMPUTED
+    (``shard_plan.plan_shards``/``compute_shard_plan``: a folder scope's
+    remainder now inherits its own ``root_item_id`` instead of the drive
+    root) but never touched HOW a plan is REUSED. ``_reusable_shard_plan``'s
+    only validity check is ``scope_set_hash`` — a plan a PRE-fix worker
+    already persisted for this exact connection (remainder
+    ``root_item_id=None`` for a folder scope) is served back VERBATIM on
+    every later trigger, with NO new Graph calls, for as long as the scope
+    set itself never changes. Observed live: a 388-folder-scope connection
+    sharing one drive, already planned once before the fix shipped, kept
+    enqueueing 388 whole-drive-root remainders AFTER the fixed code was
+    deployed, because the deploy never invalidated what was already on
+    disk — the compute path is correct in isolation (see
+    ``tests/test_sharepoint_shard_plan.py``), but the cache in front of it
+    was never told the old shape was no longer trustworthy."""
+
+    def test_a_plan_persisted_with_a_folder_scopes_remainder_at_the_drive_root_is_not_reused(
+        self, crawl_env, monkeypatch
+    ):
+        runs, jobs, store = self._install_env(monkeypatch, target_docs=100)
+        seen = _install_graph(monkeypatch, self._multi_folder_handler(folder_scope_root_item_id="01FOLDERID"))
+        scope = _drive_scope(source_scope_id="01FOLDERID", drive_id="b!drive1", display_path="Corp / Documents / HR")
+        connection = _connection([scope])
+
+        # Seed EXACTLY the shape a pre-2026-09-06 `plan_shards` persisted:
+        # this folder scope's own remainder scoped to the whole drive
+        # (`root_item_id=None`) — the production incident's own 388/388
+        # split, reproduced here for a single scope.
+        stale_shards = [
+            {
+                "scope_id": "01FOLDERID",
+                "label": "part 1/1",
+                "signal": "child_count",
+                "targets": [
+                    {
+                        "drive_id": "b!drive1",
+                        "root_item_id": "f0",
+                        "state_key": "b!drive1:f0",
+                        "path": "Folder0",
+                        "signal": "child_count",
+                    }
+                ],
+                "exclude_prefixes": [],
+                "expected": 300,
+            },
+            {
+                "scope_id": "01FOLDERID",
+                "label": "remainder",
+                "signal": "none",
+                "targets": [
+                    {
+                        "drive_id": "b!drive1",
+                        "root_item_id": None,
+                        "state_key": "b!drive1",
+                        "path": "",
+                        "signal": "none",
+                    }
+                ],
+                "exclude_prefixes": ["Folder0"],
+                "expected": 0,
+            },
+        ]
+        state = crawler.load_state(connection["id"])
+        state["shard_plan"] = {
+            "parent_run_id": "prior-run-before-the-fix",
+            "shards_total": len(stale_shards),
+            "planned_at": "2026-09-01T00:00:00+00:00",
+            "scope_set_hash": crawler._scope_set_hash([scope]),
+            "signal": "child_count",
+            "min_modified": None,
+            "shards": stale_shards,
+        }
+        crawler.save_state(connection["id"], state)
+
+        report = _run(connection, monkeypatch)
+
+        assert report["mode"] == "sharded"
+        # The stale plan must NOT be served verbatim — a fresh plan is
+        # computed, which means new Graph calls happen.
+        assert len(seen) > 0, "a stale pre-fix plan was reused verbatim instead of being recomputed"
+        remainder = next(
+            j["payload_json"]["shard"] for j in jobs.enqueued if j["payload_json"]["shard"]["label"] == "remainder"
+        )
+        assert remainder["targets"][0]["root_item_id"] == "01FOLDERID"
+
+    def test_a_stale_whole_drive_remainder_for_a_genuine_whole_drive_scope_is_still_reused(
+        self, crawl_env, monkeypatch
+    ):
+        """No regression on the legitimate case: a WHOLE-DRIVE scope's own
+        persisted remainder correctly has ``root_item_id=None`` — that is
+        not staleness, and must still be reused (no new Graph calls)."""
+        runs, jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        first = _run(_connection([_drive_scope()]), monkeypatch)
+        assert first["mode"] == "sharded"
+        graph_calls_after_first = len(seen)
+
+        second = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert second["mode"] == "sharded"
+        assert len(seen) == graph_calls_after_first, "a legitimate whole-drive remainder must still be reused"
+
+
 class TestShardPlanPreview(TestAutoParallelCrawlPlanner):
     """``connectors.sharepoint.crawler.preview_shard_plan`` — the read-only
     computation behind ``GET …/connections/{id}/shard-plan`` (2026-09-03
