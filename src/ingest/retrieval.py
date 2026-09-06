@@ -522,10 +522,16 @@ def _rank_by_filename(
 #: question. A lower bar looked cheaper but broke the case the pass exists
 #: for: a two-word question ("quarterly report") is half-covered by any
 #: passage containing either word, and the file named after both would never
-#: be considered. The cost argument does not survive contact with the line
-#: above it either — `search()` has already loaded every chunk row of every
-#: corpus in scope, next to which one file listing per corpus is a rounding
-#: error. (Devin Review on #1267, arguing both directions across two rounds.)
+#: be considered. This ceiling therefore rarely short-circuits in practice —
+#: ANY query with more than one content word whose best passage covers less
+#: than all of them (the ordinary case a search box sees) still runs the
+#: pass, which used to mean paying for a full corpus file listing on nearly
+#: every real query (measured: ~4s fixed cost on a ~285k-file collection,
+#: independent of term frequency or `k`). Fixed by scoping the pass's own
+#: cost to the bounded candidate pool instead of widening this ceiling —
+#: see `_load_pool_names` below. (Devin Review on #1267, arguing both
+#: directions across two rounds; cost fixed 2026-09 rather than by loosening
+#: the trigger, which would have traded retrieval quality for speed.)
 _NAME_PASS_BODY_CEILING = 1.0
 
 
@@ -575,12 +581,14 @@ def apply_filename_fallback(
     best_body_cover = max((_cover(ch.get("text", "")) for ch in chunks), default=0.0)
     if best_body_cover >= _NAME_PASS_BODY_CEILING:
         # Some passage already explains the WHOLE question — no name can beat
-        # that, so neither the pass nor the file listing `prepare` loads is
-        # needed. A partially-explained question DOES pay for the listing, and
-        # that is the deliberate side of the trade: the two-word case is the
-        # one the feature exists for, and one listing per collection is a
-        # rounding error next to the chunk rows already loaded above.
-        # (Devin Review on #1267, arguing both directions across rounds.)
+        # that, so neither the pass nor whatever `prepare` loads is needed.
+        # A partially-explained question DOES pay for `prepare` — that is the
+        # deliberate side of the trade, the two-word case is the one the
+        # feature exists for — but `prepare` itself is now scoped to the
+        # bounded candidate pool (see `_load_pool_names`), not the whole
+        # corpus, so paying for it no longer means an O(files in the
+        # collection) cost. (Devin Review on #1267, arguing both directions
+        # across rounds; cost fixed 2026-09.)
         return top, confidence, set()
     if prepare is not None:
         prepare()
@@ -757,24 +765,31 @@ def search_with_meta(
     fallback_pool = body_chunks + [ch for ch in name_chunks if ch.get("id") not in seen_ids]
 
     # Resolve filenames for citations, one file at a time and cached — a
-    # normal search cites at most `k` of them. The bulk listing below is
-    # loaded ONLY when the name pass actually runs, so an ordinary search
-    # never pays for every collection's file list. (Devin Review on #1267,
-    # both halves: the per-file loop was an N+1 for the name pass, and
-    # loading everything up front was a tax on the searches that do not need
-    # it.)
+    # normal search cites at most `k` of them. The name pass (when it runs —
+    # see `_NAME_PASS_BODY_CEILING`'s docstring: this is most real queries,
+    # not a rare edge case) needs a filename for every candidate in
+    # `fallback_pool` to score it, and used to get those via
+    # `list_for_corpus`, one full listing per corpus in scope — O(files in
+    # the collection), a measured ~4s fixed tax on a ~285k-file collection on
+    # nearly every query. `_load_pool_names` instead bulk-fetches by id
+    # (`CorpusFilesRepository.filenames_for_ids`) for exactly
+    # `fallback_pool`'s file ids — O(candidates), bounded by the same
+    # candidate cap as the rest of this function, regardless of collection
+    # size. (Devin Review on #1267 established the per-file-loop-vs-bulk-load
+    # trade-off this replaces; the whole-corpus listing chosen there turned
+    # out to be the wrong side of it at scale — fixed 2026-09.)
     cf_repo = corpus_files_repo()
     name_cache: Dict[str, Optional[str]] = {}
     names_bulk_loaded = False
 
-    def _load_all_names() -> None:
+    def _load_pool_names() -> None:
         nonlocal names_bulk_loaded
         if names_bulk_loaded:
             return
         names_bulk_loaded = True
-        for cid in corpus_ids:
-            for row in cf_repo.list_for_corpus(cid):
-                name_cache.setdefault(row.get("id"), row.get("filename"))
+        pool_ids = {ch.get("file_id") for ch in fallback_pool} - set(name_cache)
+        if pool_ids:
+            name_cache.update(cf_repo.filenames_for_ids(list(pool_ids)))
 
     def _filename(file_id: str) -> Optional[str]:
         if file_id not in name_cache:
@@ -784,10 +799,11 @@ def search_with_meta(
 
     # Names are only consulted when they beat the body — see
     # `apply_filename_fallback`, which the offline reader shares. Runs over
-    # `fallback_pool` (body candidates + filename candidates), never over an
+    # `fallback_pool` (body candidates + filename candidates), and
+    # `_load_pool_names` resolves names for exactly that pool — never an
     # unbounded full corpus listing.
     top, confidence, filename_ids = apply_filename_fallback(
-        fallback_pool, query, _filename, top, confidence, k=k, prepare=_load_all_names
+        fallback_pool, query, _filename, top, confidence, k=k, prepare=_load_pool_names
     )
 
     results: List[Dict[str, Any]] = []

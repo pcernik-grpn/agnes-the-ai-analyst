@@ -386,6 +386,92 @@ class TestTheTriggerSurvivesAnOrdinarySentence:
         assert calls == [], f"the bulk listing ran anyway: {calls}"
 
 
+class TestTheNamePassCostsCandidatesNotCollectionSize:
+    """Live finding (2026-09): the previous fix above only covers the case
+    where some passage explains the WHOLE question — the ceiling this module
+    documents as rarely tripping in practice. Any ordinary multi-word query
+    whose best passage covers LESS than all of it (the common case — see
+    `_NAME_PASS_BODY_CEILING`'s docstring) still ran the name pass, which
+    used to resolve citation filenames by ``list_for_corpus``-ing every file
+    row of every corpus in scope: O(files in the collection), a measured
+    ~4s fixed tax on a ~285k-file collection on nearly every query,
+    independent of term frequency, ``limit``, or ``lexical_only``. Filenames
+    for the (already bounded) candidate pool must cost O(candidates)
+    instead — a bulk fetch by id, never a whole-corpus listing.
+    """
+
+    def _seed_large_corpus(self, slug: str, n_unrelated: int, target_filename: str, target_text: str) -> str:
+        from src.repositories import corpus_chunks_repo, corpus_files_repo, file_corpora_repo
+
+        cid = file_corpora_repo().create(name=slug, slug=slug, description=None, created_by="u")
+        for i in range(n_unrelated):
+            fid = corpus_files_repo().add(
+                corpus_id=cid,
+                filename=f"unrelated-{i}.txt",
+                sha256=f"u{i}",
+                file_type="txt",
+                size_bytes=1,
+                storage_path="/x",
+            )
+            corpus_chunks_repo().add_many(
+                [{"corpus_id": cid, "file_id": fid, "ordinal": 0, "text": "filler content nobody searches for"}]
+            )
+        target = corpus_files_repo().add(
+            corpus_id=cid,
+            filename=target_filename,
+            sha256="target",
+            file_type=target_filename.rsplit(".", 1)[-1],
+            size_bytes=1,
+            storage_path="/y",
+        )
+        corpus_chunks_repo().add_many([{"corpus_id": cid, "file_id": target, "ordinal": 0, "text": target_text}])
+        return cid
+
+    def test_a_partially_covered_query_never_lists_the_whole_corpus(self, e2e_env):
+        """Fails before the fix: a 3-word query whose only matching passage
+        covers just 2 of the 3 words trips the name pass, which used to list
+        every one of the corpus's (here, 200) unrelated files to resolve a
+        single citation filename."""
+        from unittest.mock import patch
+
+        from src.ingest import retrieval as retrieval_mod
+        from src.repositories import corpus_files_repo
+
+        cid = self._seed_large_corpus("np-cost-partial", 200, "quarterly-report.md", "the report covers margin trends")
+
+        real_repo = corpus_files_repo()
+
+        class _Spy:
+            def list_for_corpus(self, corpus_id, **kw):
+                raise AssertionError("resolving a handful of citation filenames must not list the whole corpus")
+
+            def get(self, file_id):
+                return real_repo.get(file_id)
+
+            def filenames_for_ids(self, file_ids):
+                return real_repo.filenames_for_ids(file_ids)
+
+        with patch.object(retrieval_mod, "corpus_files_repo", lambda: _Spy()):
+            res = retrieval_mod.search([cid], "quarterly report margin", k=5)
+
+        assert res, "precondition: the query must actually match something"
+
+    def test_a_name_led_win_is_unchanged_by_collection_size(self, e2e_env):
+        """Behaviour-preserving: the SAME name-led win the small-corpus test
+        (`TestFillerWordsDoNotDecideWhichFileWins`) proves must still happen
+        once the corpus has hundreds of unrelated files — the fix changes
+        the COST of resolving names, never which file wins."""
+        from src.ingest.retrieval import search
+
+        target = self._seed_large_corpus("np-cost-namewin", 200, "quarterly-report.md", "alpha bravo")
+
+        res = search([target], "what is in quarterly-report.md", k=5)
+
+        assert res, "the question that motivated the whole fallback found nothing"
+        assert res[0]["filename"] == "quarterly-report.md"
+        assert res[0]["matched_on"] == "filename"
+
+
 class TestFillerWordsDoNotDecideWhichFileWins:
     """Devin Review on #1267: the shortlist and the filter disagreed.
 

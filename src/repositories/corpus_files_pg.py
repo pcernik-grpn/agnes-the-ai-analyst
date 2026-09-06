@@ -263,6 +263,18 @@ class CorpusFilesPgRepository:
             )
         return [self._decode_row(dict(r)) for r in rows]
 
+    def filenames_for_ids(self, file_ids: List[str]) -> Dict[str, Optional[str]]:
+        """Mirrors the DuckDB sibling — see its docstring for why this
+        exists (the whole-corpus-listing cost it replaces)."""
+        if not file_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT id, filename FROM corpus_files WHERE id = ANY(:ids)"),
+                {"ids": list(file_ids)},
+            ).all()
+        return {r[0]: r[1] for r in rows}
+
     def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
         """``{corpus_id: {processing_status: count}}`` for exactly the given
         corpus ids, in ONE query. Mirrors the DuckDB sibling — see its

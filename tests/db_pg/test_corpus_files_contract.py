@@ -1121,3 +1121,37 @@ def test_count_for_corpus_zero_when_no_match(repo):
     _seed_ordered(repo, 2)
     assert repo.count_for_corpus(CORPUS_ID, q="no-such-substring-anywhere") == 0
     assert repo.count_for_corpus("col_nonexistent") == 0
+
+
+# ---------------------------------------------------------------------------
+# filenames_for_ids — bulk-by-ids citation lookup (retrieval cost fix, 2026-09)
+# ---------------------------------------------------------------------------
+
+
+def test_filenames_for_ids_returns_only_the_requested_ids(repo):
+    a = repo.add(corpus_id=CORPUS_ID, filename="alpha.md", sha256="a", file_type="md", size_bytes=1, storage_path="/a")
+    b = repo.add(corpus_id=CORPUS_ID, filename="beta.md", sha256="b", file_type="md", size_bytes=1, storage_path="/b")
+    repo.add(corpus_id=CORPUS_ID, filename="gamma.md", sha256="c", file_type="md", size_bytes=1, storage_path="/c")
+
+    result = repo.filenames_for_ids([a, b])
+
+    assert result == {a: "alpha.md", b: "beta.md"}
+
+
+def test_filenames_for_ids_tolerates_unknown_ids(repo):
+    a = repo.add(corpus_id=CORPUS_ID, filename="known.md", sha256="a", file_type="md", size_bytes=1, storage_path="/a")
+
+    result = repo.filenames_for_ids([a, "cf_does_not_exist"])
+
+    # A requested id with no matching row is simply absent — never an error,
+    # never a placeholder entry.
+    assert result == {a: "known.md"}
+
+
+def test_filenames_for_ids_empty_input_returns_empty_dict(repo):
+    repo.add(corpus_id=CORPUS_ID, filename="a.md", sha256="a", file_type="md", size_bytes=1, storage_path="/a")
+    assert repo.filenames_for_ids([]) == {}
+
+
+def test_filenames_for_ids_all_unknown_returns_empty_dict(repo):
+    assert repo.filenames_for_ids(["cf_nope1", "cf_nope2"]) == {}

@@ -244,6 +244,32 @@ class CorpusFilesRepository:
         ).fetchall()
         return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
 
+    def filenames_for_ids(self, file_ids: List[str]) -> Dict[str, Optional[str]]:
+        """``{file_id: filename}`` for exactly the given ids, in ONE query.
+
+        The bulk-by-ids counterpart to :meth:`get`, for a caller that needs
+        many filenames at once (retrieval's citation resolution — see
+        ``src.ingest.retrieval.search_with_meta``'s filename-fallback
+        prepare pass): before this existed, resolving a handful of citation
+        filenames meant ``list_for_corpus``-ing every file row of every
+        corpus in scope, an O(files in the collection) cost that on a
+        collection with hundreds of thousands of files paid several seconds
+        on EVERY query whose best-matching passage did not cover the whole
+        question — the common case for any query with more than one content
+        word. This is O(candidates) instead: exactly the ids the caller
+        already has in hand. A requested id with no matching row is simply
+        absent from the result — same "requested but not found is just
+        absent" contract as :meth:`status_counts_for_corpora`.
+        """
+        if not file_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in file_ids)
+        rows = self.conn.execute(
+            f"SELECT id, filename FROM corpus_files WHERE id IN ({placeholders})",
+            list(file_ids),
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
         """``{corpus_id: {processing_status: count}}`` for exactly the given
         corpus ids, in ONE query.
