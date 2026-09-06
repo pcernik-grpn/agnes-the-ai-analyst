@@ -8190,13 +8190,29 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
     to avoid on a large site."""
 
     def _multi_folder_handler(
-        self, *, num_folders: int = 6, per_folder: int = 300, site_total: int = 5000, drive: str = "b!drive1"
+        self,
+        *,
+        num_folders: int = 6,
+        per_folder: int = 300,
+        site_total: int = 5000,
+        drive: str = "b!drive1",
+        folder_scope_root_item_id: Optional[str] = None,
     ) -> Callable[[httpx.Request], httpx.Response]:
         """Like the base class's own ``_handler`` but with enough folders
         (and enough documents per folder) that ``target_docs=100`` packs
         MULTIPLE non-empty folder shards, not just one — the shape that
         exposes the bug (a single packed shard's own key coincidentally
-        never mattered before, since only the remainder needed to survive)."""
+        never mattered before, since only the remainder needed to survive).
+
+        ``folder_scope_root_item_id`` (2026-09-06 remainder-scope fix): when
+        a FOLDER scope is under test, its own top-level listing goes
+        through ``/items/{root_item_id}/children`` — the SAME 2026-09-06
+        fix that also makes THAT the request whose response actually
+        decides its plan (never ``/root/children``, the drive's own). Given
+        here, that endpoint returns the identical ``folders`` fixture, so a
+        folder scope's own subtree is exercised the same way the drive
+        root's is. Any OTHER ``/items/.../children`` call (folding a still-
+        over-target packed folder one level deeper) still returns empty."""
         folders = [
             {
                 "id": f"f{i}",
@@ -8220,6 +8236,8 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
                     return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": site_total}]}]})
                 return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 5}]}]})
             if path.endswith("/root/children") and f"/drives/{drive}/" in path:
+                return httpx.Response(200, json={"value": folders})
+            if folder_scope_root_item_id and path.endswith(f"/items/{folder_scope_root_item_id}/children"):
                 return httpx.Response(200, json={"value": folders})
             if "/items/" in path and path.endswith("/children"):
                 # A still-over-target folder gets folded one level deeper —
@@ -8249,14 +8267,17 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
         assert all(j["payload_json"]["shard"]["scope_id"] == "b!drive1" for j in jobs.enqueued)
 
     def test_a_folder_scope_that_splits_enqueues_shards_instead_of_falling_back_inline(self, crawl_env, monkeypatch):
-        """The same for a FOLDER scope: before the fix its own remainder
-        shard also failed to match (derived key is the bare ``drive_id``,
-        the scope's own key is ``drive_id:root_item_id``), so EVERY shard
-        was dropped and the run fell back to a fully inline, single-worker
-        crawl (``mode == "builtin"``, reason ``"plan produced no non-empty
-        shard"``)."""
+        """The same for a FOLDER scope: before the 2026-09-05 fix its own
+        remainder shard also failed to match (derived key is the bare
+        ``drive_id``, the scope's own key is ``drive_id:root_item_id``), so
+        EVERY shard was dropped and the run fell back to a fully inline,
+        single-worker crawl (``mode == "builtin"``, reason ``"plan produced
+        no non-empty shard"``). This also exercises the 2026-09-06 fix: the
+        folder scope's own listing goes through ``/items/01FOLDERID/
+        children`` (never ``/root/children``, the DRIVE's), so its remainder
+        below is scoped to the folder, never the drive root."""
         runs, jobs, _store = self._install_env(monkeypatch, target_docs=100)
-        _install_graph(monkeypatch, self._multi_folder_handler())
+        _install_graph(monkeypatch, self._multi_folder_handler(folder_scope_root_item_id="01FOLDERID"))
         scope = _drive_scope(source_scope_id="01FOLDERID", drive_id="b!drive1", display_path="Corp / Documents / HR")
 
         report = _run(_connection([scope]), monkeypatch)
@@ -8266,6 +8287,13 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
         assert len(jobs.enqueued) == report["shards_total"]
         assert all(j["payload_json"]["shard"]["scope_id"] == "01FOLDERID" for j in jobs.enqueued)
         assert not any(f.get("report", {}).get("mode") == "inline (planner fallback)" for f in runs.finished)
+
+        # 2026-09-06 remainder-scope fix: the folder scope's own remainder
+        # is bounded to its own folder, never the whole drive.
+        remainder = next(
+            j["payload_json"]["shard"] for j in jobs.enqueued if j["payload_json"]["shard"]["label"] == "remainder"
+        )
+        assert remainder["targets"][0]["root_item_id"] == "01FOLDERID"
 
     def test_a_drive_that_stays_whole_gets_its_single_shard_while_a_sibling_drive_splits(self, crawl_env, monkeypatch):
         """No regression: within a real sharded run, a drive small enough
@@ -8301,21 +8329,27 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
 
     def test_two_scopes_sharing_one_drive_never_cross_attribute_a_shard(self, crawl_env, monkeypatch):
         """A whole-drive scope and a folder scope on the SAME physical
-        drive: ``compute_shard_plan`` is unaware of scopes and returns the
-        identical (cached) per-drive plan for both targets that share it.
-        Every shard must still land under its OWN confirmed scope — never
-        the other one's, and never silently dropped.
+        drive. 2026-09-05 fix's own concern: every shard must still land
+        under its OWN confirmed scope — never the other one's, and never
+        silently dropped.
 
-        Before the fix: the folder scope's own shards ALWAYS mismatched
-        (dropped), the whole-drive scope's remainder shard matched TWICE
-        (once per target sharing the drive) so it was double-enqueued, and
-        the folder scope never got any coverage at all — a wrong,
-        silently-swapped ``scope_id`` is worse than the old inline
-        fallback, since it decides the crawled files' ``min_modified``
-        filter and permission zone.
+        2026-09-06 fix's own concern, added here rather than as a separate
+        test since it is the SAME two-scopes-one-drive shape: each scope's
+        plan is now computed independently, scoped to ITS OWN
+        ``root_item_id`` — ``compute_shard_plan`` no longer reuses one
+        drive-wide plan verbatim across every scope that happens to share
+        the drive. This fixture gives the folder scope's own listing
+        (``/items/01FOLDERID/children``) the identical folder set the
+        drive root's listing has, so the two scopes coincidentally still
+        produce the SAME shard count — but for a structurally different
+        reason than before: not because they share one plan, but because
+        each independently sees an equally-splittable subtree. The
+        assertion that actually matters is the last one: neither scope's
+        remainder ever points at the OTHER's root, and the folder scope's
+        remainder is never the whole drive.
         """
         _runs, jobs, _store = self._install_env(monkeypatch, target_docs=100)
-        _install_graph(monkeypatch, self._multi_folder_handler())
+        _install_graph(monkeypatch, self._multi_folder_handler(folder_scope_root_item_id="01FOLDERID"))
         whole_drive = _drive_scope()
         folder = _drive_scope(
             source_scope_id="01FOLDERID",
@@ -8328,19 +8362,30 @@ class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
 
         assert report["mode"] == "sharded"
         by_scope: Dict[str, int] = {}
+        remainder_root_by_scope: Dict[str, Any] = {}
         for j in jobs.enqueued:
-            sid = j["payload_json"]["shard"]["scope_id"]
+            shard = j["payload_json"]["shard"]
+            sid = shard["scope_id"]
             assert sid in ("b!drive1", "01FOLDERID"), f"shard attributed to an unconfirmed scope {sid!r}"
             by_scope[sid] = by_scope.get(sid, 0) + 1
+            if shard["label"] == "remainder":
+                remainder_root_by_scope[sid] = shard["targets"][0]["root_item_id"]
 
-        # Before the fix the folder scope got ZERO shards (every one of
-        # its own targets' derived keys mismatched) — this is the
-        # assertion that actually catches the regression.
+        # Before the 2026-09-05 fix the folder scope got ZERO shards (every
+        # one of its own targets' derived keys mismatched) — this is the
+        # assertion that actually catches THAT regression.
         assert by_scope.get("01FOLDERID", 0) > 0
-        # The two scopes cover the identical physical drive, so they must
-        # get the SAME shard count — never merged, never lost, never
-        # doubled onto just one of the two.
+        # Both subtrees split the same way here (fixture, not a schema
+        # requirement) — never merged, never lost, never doubled onto just
+        # one of the two.
         assert by_scope["b!drive1"] == by_scope["01FOLDERID"]
+
+        # 2026-09-06 fix: the whole-drive scope's remainder covers the
+        # drive root; the folder scope's remainder covers ONLY its own
+        # folder — never the drive root, and never the OTHER scope's own
+        # root either.
+        assert remainder_root_by_scope["b!drive1"] is None
+        assert remainder_root_by_scope["01FOLDERID"] == "01FOLDERID"
 
 
 class TestShardPlanPreview(TestAutoParallelCrawlPlanner):

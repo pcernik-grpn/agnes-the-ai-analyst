@@ -119,6 +119,27 @@ def _dominant_signal(signals: Sequence[str]) -> str:
     return max(signals, key=lambda s: _SIGNAL_RANK.get(s, len(_SIGNAL_RANK)))
 
 
+def _state_key(drive_id: str, root_item_id: Optional[str]) -> str:
+    """Same formula as ``connectors.sharepoint.crawler.DriveTarget.
+    state_key`` — duplicated here rather than imported (``crawler`` imports
+    FROM this module; importing back would cycle)."""
+    return f"{drive_id}:{root_item_id}" if root_item_id else drive_id
+
+
+def _join_path(prefix: str, name: str) -> str:
+    """``prefix`` (a target's own drive-relative root path — ``""`` for a
+    whole-drive target) joined onto ``name`` (a path already computed
+    relative to THAT root). This is what makes a FOLDER-scoped target's
+    ``exclude_prefixes`` land as the SAME full drive-relative path
+    ``connectors.sharepoint.crawler._drive_relative_path`` computes for the
+    same item at crawl time — without it, a folder scope's own packed
+    child names (e.g. ``"Contracts"``) would never match the drive-relative
+    paths (``"HR/Contracts/..."``) the remainder's item-level exclusion
+    check actually sees, and the remainder would silently re-walk its own
+    already-packed siblings on every first enumeration."""
+    return f"{prefix}/{name}" if prefix else name
+
+
 class _PlanBudget:
     """Shared wall-clock ceiling for every Graph Search call ONE
     :func:`compute_shard_plan` invocation makes (finding #65) — Pass 1's
@@ -200,21 +221,35 @@ def plan_shards(
     max_shards: int = 32,
     force_shard_count: Optional[int] = None,
     balance: bool = True,
+    root_item_id: Optional[str] = None,
+    root_path: str = "",
 ) -> Dict[str, Any]:
     """Pack pre-resolved, pre-counted crawl units into ``K`` shards plus one
     remainder shard.
 
-    Each ``unit``: ``{"path": <drive-relative path>, "item_id": <Graph item
-    id>, "documents": <int>, "signal": <str, optional>}`` — one crawl
-    target's worth of work, already at the granularity it will be crawled at
-    (a top-level folder, or one of its children when
-    :func:`compute_shard_plan` folded it one level deeper). This function
-    does not care which. ``signal`` (one of :data:`SIGNAL_KNOWN`/
-    :data:`SIGNAL_CHILD_COUNT`/:data:`SIGNAL_SEARCH`/:data:`SIGNAL_NONE`,
-    default :data:`SIGNAL_NONE` when absent) rides through onto each packed
-    shard's own targets and rolls up into the shard's ``signal`` — the
-    WORST (least certain) signal among the shard's own units (finding #65
-    item 1: "record signal per shard in the plan").
+    ``root_item_id``/``root_path`` (2026-09-06 finding — "the remainder
+    shard must be scoped to the same subtree its scope covers, never to the
+    drive root"): identify the SUBTREE this whole call is packing —
+    ``None``/``""`` (the default) for a whole-DRIVE scope, or a folder
+    scope's own root item id and its drive-relative path (e.g. ``"HR"``)
+    when :func:`compute_shard_plan` is packing one confirmed FOLDER scope's
+    own children, never the drive it happens to live on. Every unit's own
+    ``item_id`` still becomes ITS OWN packed target's ``root_item_id``
+    (a specific child, unaffected) — ``root_item_id``/``root_path`` matter
+    only for the WHOLE-SUBTREE targets this function itself manufactures:
+    the empty-``units`` shard and the remainder.
+
+    Each ``unit``: ``{"path": <path relative to root_item_id>, "item_id":
+    <Graph item id>, "documents": <int>, "signal": <str, optional>}`` — one
+    crawl target's worth of work, already at the granularity it will be
+    crawled at (a top-level folder under ``root_item_id``, or one of its
+    children when :func:`compute_shard_plan` folded it one level deeper).
+    This function does not care which. ``signal`` (one of
+    :data:`SIGNAL_KNOWN`/:data:`SIGNAL_CHILD_COUNT`/:data:`SIGNAL_SEARCH`/
+    :data:`SIGNAL_NONE`, default :data:`SIGNAL_NONE` when absent) rides
+    through onto each packed shard's own targets and rolls up into the
+    shard's ``signal`` — the WORST (least certain) signal among the shard's
+    own units (finding #65 item 1: "record signal per shard in the plan").
 
     ``K = min(ceil(total_documents / target_docs), max_shards)``, at least
     1, UNLESS ``force_shard_count`` overrides it (the "no counting signal"
@@ -227,31 +262,37 @@ def plan_shards(
     Returns ``{"drive_id", "shards": [...], "expected_total": int}``. Every
     shard but the last is ``{"index", "label", "signal", "targets": [{
     "drive_id", "root_item_id", "state_key", "path", "signal"}], "expected":
-    <summed documents>}`` — one target per unit in that group. The LAST
-    shard is always the REMAINDER: a single whole-drive target
-    (``root_item_id=None``, ``state_key=drive_id``) with ``exclude_prefixes``
-    set to every packed unit's own path, so it covers loose root files and
+    <summed documents>}`` — one target per unit in that group, each unit's
+    own ``path`` joined onto ``root_path`` so it reads as a full
+    drive-relative path even for a folder-scoped call. The LAST shard is
+    always the REMAINDER: a single target scoped to ``root_item_id``
+    (``state_key = drive_id`` for a whole-drive call, ``f"{drive_id}:
+    {root_item_id}"`` for a folder scope's own remainder — never the drive
+    root when the scope itself is not the whole drive) with
+    ``exclude_prefixes`` set to every packed unit's own (``root_path``-
+    joined) path, so it covers loose files directly under the scope and
     anything created after planning without re-crawling what the other
-    shards already own (design §4.1 point 3). Its ``expected`` is always
-    ``0`` and its ``signal`` is :data:`SIGNAL_NONE` — a remainder's true
-    count is whatever a full drive enumeration finds beyond the packed
+    shards already own (design §4.1 point 3, generalized from "drive" to
+    "the subtree this call packs"). Its ``expected`` is always ``0`` and
+    its ``signal`` is :data:`SIGNAL_NONE` — a remainder's true count is
+    whatever a full enumeration of its own subtree finds beyond the packed
     folders, which this function has no way to know in advance.
 
     No I/O, no randomness — safe to call twice on the same input and diff
     the results (a preview endpoint's whole reason to exist).
 
     ``units`` EMPTY is its own case, not "zero packed shards plus a
-    remainder": a drive with nothing to split by (its own total already at
-    or under ``target_docs``, or a flat listing with no top-level folders)
-    still gets exactly ONE shard — the whole drive, unsplit — never an
+    remainder": a subtree with nothing to split by (its own total already
+    at or under ``target_docs``, or a flat listing with no subfolders)
+    still gets exactly ONE shard — the whole subtree, unsplit — never an
     empty packed shard sitting next to a remainder that duplicates it.
     """
     if not units:
-        whole_drive_target = {
+        whole_target = {
             "drive_id": drive_id,
-            "root_item_id": None,
-            "state_key": drive_id,
-            "path": "",
+            "root_item_id": root_item_id,
+            "state_key": _state_key(drive_id, root_item_id),
+            "path": root_path,
             "signal": SIGNAL_NONE,
         }
         return {
@@ -261,7 +302,7 @@ def plan_shards(
                     "index": 1,
                     "label": "whole drive",
                     "signal": SIGNAL_NONE,
-                    "targets": [whole_drive_target],
+                    "targets": [whole_target],
                     "expected": 0,
                 }
             ],
@@ -291,8 +332,8 @@ def plan_shards(
             {
                 "drive_id": drive_id,
                 "root_item_id": unit["item_id"],
-                "state_key": f"{drive_id}:{unit['item_id']}",
-                "path": unit["path"],
+                "state_key": _state_key(drive_id, unit["item_id"]),
+                "path": _join_path(root_path, unit["path"]),
                 "signal": unit.get("signal") or SIGNAL_NONE,
             }
             for unit in group["folders"]
@@ -307,7 +348,7 @@ def plan_shards(
             }
         )
 
-    exclude_prefixes = sorted({str(u["path"]) for u in units})
+    exclude_prefixes = sorted({_join_path(root_path, str(u["path"])) for u in units})
     shards.append(
         {
             "index": k + 1,
@@ -316,9 +357,9 @@ def plan_shards(
             "targets": [
                 {
                     "drive_id": drive_id,
-                    "root_item_id": None,
-                    "state_key": drive_id,
-                    "path": "",
+                    "root_item_id": root_item_id,
+                    "state_key": _state_key(drive_id, root_item_id),
+                    "path": root_path,
                     "signal": SIGNAL_NONE,
                 }
             ],
@@ -536,44 +577,80 @@ async def compute_shard_plan(
     "0 = never shard" contract (design §4.8) applies at this layer too, not
     only in the caller that decides whether to invoke this function at all.
 
-    Two passes (design §4.1 points 2-3), BOTH memoized by ``drive_id``
-    (finding #65 item 1/2: a connection with many targets sharing one drive
-    — the incident's own shape — used to repeat every Graph call once per
-    TARGET instead of once per unique drive):
+    Two passes (design §4.1 points 2-3):
 
     1. One :func:`connectors.sharepoint.graph_client.search_document_count`
-       per UNIQUE drive ROOT (skipped entirely when ``known_totals`` already
-       names that drive, and skipped once the shared search ``budget`` is
-       spent — an unresolved drive is treated as "total unknown", never
-       assumed small). If EVERY drive answered (none had an unreadable root
-       ``webUrl`` and none hit the budget) and their SUM is at or under
-       ``target_docs``, the whole site stays inline — ``{"drives": [],
-       "inline_state_keys": [every target's state_key], ...}`` — the same
-       "byte-for-byte today's crawl" path the caller takes for DuckDB / the
-       knob at 0.
-    2. Otherwise every UNIQUE drive gets its own :func:`plan_shards` result,
-       reused for every target that shares it: a drive whose OWN total is
-       at or under ``target_docs`` gets exactly ONE shard (the whole drive,
-       unsplit — :func:`plan_shards`'s empty-units case); an over-target
-       drive (or one whose total could not be read at all) is listed,
-       counted (known -> childCount -> Search, see
+       per UNIQUE DRIVE root (memoized by ``drive_id`` — finding #65 item
+       1/2: a connection with many targets sharing one drive, the
+       incident's own shape, must not repeat this once per target),
+       skipped entirely when ``known_totals`` already names that drive, and
+       skipped once the shared search ``budget`` is spent (an unresolved
+       drive is treated as "total unknown", never assumed small). If EVERY
+       drive answered (none had an unreadable root ``webUrl`` and none hit
+       the budget) and their SUM is at or under ``target_docs``, the whole
+       site stays inline — ``{"drives": [], "inline_state_keys": [every
+       target's state_key], ...}`` — the same "byte-for-byte today's crawl"
+       path the caller takes for DuckDB / the knob at 0. This pass answers
+       a SITE-level question ("is there enough content anywhere to bother
+       sharding at all"), so deduping by the physical drive — coarser than
+       a target's own subtree — is deliberate and safe: it can only ever
+       UNDER-estimate how much sharding is needed, never drop coverage.
+    2. Otherwise every UNIQUE TARGET (memoized by ``target.state_key`` —
+       2026-09-06 finding: a connection with many FOLDER-scoped targets
+       sharing one drive must get one plan PER TARGET's own subtree, never
+       one plan per drive reused verbatim across every scope that happens
+       to live on it) gets its own :func:`plan_shards` result: a target
+       whose drive-wide total is at or under ``target_docs`` gets exactly
+       ONE shard (the whole SUBTREE, unsplit — :func:`plan_shards`'s
+       empty-units case, scoped to ``target.root_item_id``); an over-target
+       target is listed — under ``target.root_item_id`` when set, the
+       drive root otherwise — counted (known -> childCount -> Search, see
        :func:`_count_top_level_folders`), folded and packed as described in
-       the module docstring.
+       the module docstring. Two targets that are BYTE-IDENTICAL (same
+       ``drive_id`` AND same ``root_item_id`` — the dedup case finding #65
+       actually fixed, e.g. two confirmed scopes that resolve to the exact
+       same whole drive) still share one computed plan; two targets that
+       merely share a ``drive_id`` but cover DIFFERENT subtrees (a
+       whole-drive scope and a folder scope on it, or two sibling folder
+       scopes) never do — each is listed and packed under its OWN root, so
+       its own remainder can never wander into a sibling's subtree, let
+       alone the whole drive.
 
     Returns ``{"drives": [<one plan_shards() result per TARGET, in
-    ``targets`` order — duplicated verbatim across every target sharing a
-    drive>], "inline_state_keys": [<every target's state_key, ONLY when the
-    whole site stayed inline>], "signal": <the WORST signal observed across
-    every drive, or "none">}`` — ``drives`` and a non-empty
-    ``inline_state_keys`` are mutually exclusive: either the whole site is
-    inline, or every target has its own plan (never a per-drive mix of the
-    two, which would leave an "inline" drive uncrawled by anything the
+    ``targets`` order — identical only for two targets sharing the same
+    ``state_key``>], "inline_state_keys": [<every target's state_key, ONLY
+    when the whole site stayed inline>], "signal": <the WORST signal
+    observed across every target, or "none">}`` — ``drives`` and a
+    non-empty ``inline_state_keys`` are mutually exclusive: either the
+    whole site is inline, or every target has its own plan (never a mix of
+    the two, which would leave an "inline" target uncrawled by anything the
     parent enqueues). If, once every pass above is done, NO signal was ever
-    resolved (every drive/folder stayed :data:`SIGNAL_NONE`) AND the search
-    ``budget`` was exhausted getting there, :class:`PlanningBudgetExhausted`
+    resolved (every target/folder stayed :data:`SIGNAL_NONE`) AND the
+    search ``budget`` was exhausted getting there, :class:`PlanningBudgetExhausted`
     is raised instead — the caller (``connectors.sharepoint.crawler.
     _plan_or_run_inline``) falls back to the inline crawl rather than
     enqueue a plan balanced on nothing but a 429 storm (finding #65 item 4).
+
+    **Nested scopes on one drive** (a folder scope's own root lies inside
+    ANOTHER confirmed scope's subtree — e.g. a whole-drive scope plus a
+    folder scope for one of its subfolders, or two nested folder scopes):
+    this function does NOT try to detect or special-case the nesting. Each
+    target's plan is built independently, scoped only to ITS OWN
+    ``root_item_id`` — so the outer scope's own packed/remainder shards
+    will still enumerate (via Graph delta, at crawl time) into the inner
+    scope's subtree too, exactly as the INLINE (unsharded) crawl already
+    does today. What has always prevented double-INGESTION of that overlap
+    is a DIFFERENT, pre-existing mechanism: a nested zone's own
+    ``excluded_subtrees`` entry on the OUTER scope (populated by ACL sync
+    when the nested zone was carved out as its own confirmed scope),
+    applied at item-processing time
+    (``connectors.sharepoint.crawler._excluded_path_prefixes`` /
+    ``_process_item``) — unchanged by sharding, and untouched by this
+    function. The shard planner's own job is narrower and unrelated: keep
+    a SINGLE scope's own packed/remainder targets from wandering OUTSIDE
+    that scope's subtree (the drive-root leak this finding fixes), not
+    resolve overlaps BETWEEN scopes — that has always been, and remains,
+    ``excluded_subtrees``'s job.
 
     ``clock`` is a TEST SEAM only (same idiom as ``connectors.sharepoint.
     crawler._Deadline``'s own ``clock`` parameter) — production never passes
@@ -628,46 +705,76 @@ async def compute_shard_plan(
             signal = _dominant_signal(list(drive_total_signal.values()))
             return {"drives": [], "inline_state_keys": [t.state_key for t in targets], "signal": signal}
 
-    # Pass 2 — the site needs sharding; every UNIQUE drive gets its own
-    # plan, computed once and reused for every target that shares it.
+    # Pass 2 — the site needs sharding; every UNIQUE TARGET (its own
+    # subtree — `drive_id` AND `root_item_id`, never `drive_id` alone; see
+    # the docstring's 2026-09-06 finding) gets its own plan, computed once
+    # and reused only for a target sharing the exact same state_key.
     drive_plan_cache: Dict[str, Dict[str, Any]] = {}
     drive_signal_cache: Dict[str, str] = {}
     drive_plans: List[Dict[str, Any]] = []
 
     for target in targets:
         drive_id = target.drive_id
-        cached = drive_plan_cache.get(drive_id)
+        root_item_id = target.root_item_id
+        root_path = getattr(target, "root_path", "") or ""
+        cache_key = target.state_key
+        cached = drive_plan_cache.get(cache_key)
         if cached is not None:
             drive_plans.append(cached)
-            if drive_signal_cache[drive_id] != SIGNAL_NONE:
+            if drive_signal_cache[cache_key] != SIGNAL_NONE:
                 any_signal_found = True
             continue
 
+        # This target's own subtree can never hold MORE than its whole
+        # drive — the drive-wide total from Pass 1 is a safe (if
+        # conservative for a folder scope) upper bound: if the WHOLE drive
+        # fits under target_docs, this target's own subtree certainly does
+        # too, and no listing call is needed to know it.
         drive_total = drive_totals.get(drive_id)
         if drive_total is not None and drive_total <= target_docs:
-            # Small enough on its OWN — one whole-drive shard, no folder
-            # split, no extra listing call.
-            plan = plan_shards([], drive_id=drive_id, target_docs=target_docs, max_shards=max_shards)
+            # Small enough on its OWN — one whole-subtree shard, scoped to
+            # THIS target's own root (never the drive root for a folder
+            # scope), no folder split, no extra listing call.
+            plan = plan_shards(
+                [],
+                drive_id=drive_id,
+                target_docs=target_docs,
+                max_shards=max_shards,
+                root_item_id=root_item_id,
+                root_path=root_path,
+            )
             plan["loose_root_files"] = []
             plan["signal"] = drive_total_signal.get(drive_id, SIGNAL_NONE)
-            drive_plan_cache[drive_id] = plan
-            drive_signal_cache[drive_id] = plan["signal"]
+            drive_plan_cache[cache_key] = plan
+            drive_signal_cache[cache_key] = plan["signal"]
             drive_plans.append(plan)
             if plan["signal"] != SIGNAL_NONE:
                 any_signal_found = True
             continue
 
-        children = await graph_client.list_root_children_with_url(token, drive_id)
+        children = (
+            await graph_client.list_item_children_with_url(token, drive_id, root_item_id)
+            if root_item_id
+            else await graph_client.list_root_children_with_url(token, drive_id)
+        )
         folder_items = [c for c in children if c.get("is_folder")]
         loose_root_files = [c["name"] for c in children if not c.get("is_folder")]
         if not folder_items:
             # Nothing to shard by — a flat listing of loose files only;
-            # still one whole-drive shard, same as the "small enough" case.
-            plan = plan_shards([], drive_id=drive_id, target_docs=target_docs, max_shards=max_shards)
+            # still one whole-subtree shard, same as the "small enough"
+            # case, scoped to THIS target's own root.
+            plan = plan_shards(
+                [],
+                drive_id=drive_id,
+                target_docs=target_docs,
+                max_shards=max_shards,
+                root_item_id=root_item_id,
+                root_path=root_path,
+            )
             plan["loose_root_files"] = loose_root_files
             plan["signal"] = SIGNAL_NONE
-            drive_plan_cache[drive_id] = plan
-            drive_signal_cache[drive_id] = SIGNAL_NONE
+            drive_plan_cache[cache_key] = plan
+            drive_signal_cache[cache_key] = SIGNAL_NONE
             drive_plans.append(plan)
             continue
 
@@ -704,11 +811,13 @@ async def compute_shard_plan(
             max_shards=max_shards,
             force_shard_count=force_shard_count,
             balance=balance,
+            root_item_id=root_item_id,
+            root_path=root_path,
         )
         plan["loose_root_files"] = loose_root_files
         plan["signal"] = signal
-        drive_plan_cache[drive_id] = plan
-        drive_signal_cache[drive_id] = signal
+        drive_plan_cache[cache_key] = plan
+        drive_signal_cache[cache_key] = signal
         drive_plans.append(plan)
         if signal != SIGNAL_NONE:
             any_signal_found = True

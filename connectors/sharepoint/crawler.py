@@ -110,7 +110,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from connectors.sharepoint import graph_client
-from connectors.sharepoint.acl_sync import active_zone_rows
+from connectors.sharepoint.acl_sync import active_zone_rows, scope_rel_root
 from connectors.sharepoint.graph_client import GRAPH_BASE, SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from connectors.sharepoint.shard_plan import SIGNAL_NONE, PlanningBudgetExhausted, compute_shard_plan
@@ -2515,6 +2515,17 @@ class DriveTarget:
     drive_name: Optional[str]
     #: ``None`` for a whole drive; a folder item id for a folder scope.
     root_item_id: Optional[str] = None
+    #: This target's own drive-relative path prefix — ``""`` when
+    #: ``root_item_id`` is ``None`` (the target IS the drive root), else
+    #: the folder scope's own path (``acl_sync.scope_rel_root``'s output).
+    #: Consumed only by the shard planner (``connectors.sharepoint.
+    #: shard_plan.compute_shard_plan``), to build a folder-scoped
+    #: remainder's ``exclude_prefixes`` as full drive-relative paths — the
+    #: same shape ``_drive_relative_path`` computes for an item at crawl
+    #: time — instead of paths relative to this target's own root, which
+    #: would silently fail to match and let the remainder re-walk its own
+    #: already-packed siblings.
+    root_path: str = ""
 
     @property
     def state_key(self) -> str:
@@ -2551,7 +2562,14 @@ async def _drive_targets(transport: GraphTransport, scope: Dict[str, Any]) -> Li
             # persisted drive_id is a wizard gap, reported per-scope rather
             # than crashing the connection's whole run.
             raise CrawlError(f"folder scope {source_scope_id!r} has no drive_id on its scope row")
-        return [DriveTarget(drive_id=str(drive_id), drive_name=scope.get("display_path"), root_item_id=source_scope_id)]
+        return [
+            DriveTarget(
+                drive_id=str(drive_id),
+                drive_name=scope.get("display_path"),
+                root_item_id=source_scope_id,
+                root_path=scope_rel_root(scope.get("display_path") or ""),
+            )
+        ]
 
     body = await transport.get_json(f"{GRAPH_BASE}/sites/{source_scope_id}/drives?$select=id,name")
     return [

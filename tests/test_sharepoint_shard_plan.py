@@ -46,9 +46,10 @@ class _FakeAuth:
 
 
 class _FakeTarget:
-    def __init__(self, drive_id: str, root_item_id: Optional[str] = None) -> None:
+    def __init__(self, drive_id: str, root_item_id: Optional[str] = None, root_path: str = "") -> None:
         self.drive_id = drive_id
         self.root_item_id = root_item_id
+        self.root_path = root_path
 
     @property
     def state_key(self) -> str:
@@ -134,6 +135,59 @@ class TestPlanShardsPure:
         assert plan["shards"][0]["targets"] == [
             {"drive_id": "drv1", "root_item_id": None, "state_key": "drv1", "path": "", "signal": "none"}
         ]
+
+
+class TestPlanShardsFolderScopeRemainder:
+    """2026-09-06 regression: a FOLDER scope's remainder must inherit that
+    scope's own ``root_item_id`` — never the drive root — unless the scope
+    genuinely IS the whole drive. Observed live: a 388-folder-scope
+    connection sharing one drive produced 776 shards whose remainder
+    targets ALL carried ``root_item_id=None`` (the whole drive), so every
+    one of them independently re-walked the entire ~458k-item site."""
+
+    def test_remainder_inherits_root_item_id_and_path_for_a_folder_scope(self):
+        units = _units(("A", 100), ("B", 200))
+        plan = shard_plan.plan_shards(units, drive_id="drv1", target_docs=150, root_item_id="folder1", root_path="HR")
+
+        remainder = plan["shards"][-1]
+        # The regression itself: NOT root_item_id=None (the drive root).
+        assert remainder["targets"] == [
+            {"drive_id": "drv1", "root_item_id": "folder1", "state_key": "drv1:folder1", "path": "HR", "signal": "none"}
+        ]
+        # exclude_prefixes must be FULL drive-relative paths (joined with
+        # root_path) — a bare "A"/"B" would never match the drive-relative
+        # path `_drive_relative_path` computes for an item under "HR" at
+        # crawl time, and the remainder would silently re-walk its own
+        # already-packed siblings.
+        assert remainder["exclude_prefixes"] == ["HR/A", "HR/B"]
+
+    def test_packed_targets_also_carry_the_full_drive_relative_path(self):
+        units = _units(("A", 100), ("B", 200))
+        plan = shard_plan.plan_shards(units, drive_id="drv1", target_docs=150, root_item_id="folder1", root_path="HR")
+        packed_paths = sorted(t["path"] for s in plan["shards"][:-1] for t in s["targets"])
+        assert packed_paths == ["HR/A", "HR/B"]
+
+    def test_empty_units_whole_scope_shard_inherits_root_item_id_for_a_folder_scope(self):
+        """The 'nothing to split by' case (plan_shards's own empty-units
+        branch) must ALSO stay scoped to the folder, not fall back to the
+        drive root."""
+        plan = shard_plan.plan_shards([], drive_id="drv1", target_docs=100, root_item_id="folder1", root_path="HR")
+
+        assert plan["shards"][0]["targets"] == [
+            {"drive_id": "drv1", "root_item_id": "folder1", "state_key": "drv1:folder1", "path": "HR", "signal": "none"}
+        ]
+
+    def test_a_scope_that_genuinely_is_the_whole_drive_still_gets_a_whole_drive_remainder(self):
+        """No regression on the legitimate case: root_item_id/root_path
+        default to the drive root, exactly as before this fix."""
+        units = _units(("A", 100), ("B", 200))
+        plan = shard_plan.plan_shards(units, drive_id="drv1", target_docs=150)
+
+        remainder = plan["shards"][-1]
+        assert remainder["targets"] == [
+            {"drive_id": "drv1", "root_item_id": None, "state_key": "drv1", "path": "", "signal": "none"}
+        ]
+        assert remainder["exclude_prefixes"] == ["A", "B"]
 
 
 # ---------------------------------------------------------------------------
@@ -680,3 +734,235 @@ class TestSearchBudget:
         # `finish()` call still reports the completed tally.
         assert calls, "on_progress must fire at least once (the final tally)"
         assert calls[-1] == (2, 2)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-06 — the LIVE incident: a connection with several hundred FOLDER
+# scopes all confirmed on ONE physical drive. Before this fix,
+# `compute_shard_plan` memoized its per-target plan by bare `drive_id`, so
+# every folder-scoped target after the first got a byte-identical copy of a
+# plan built by listing the DRIVE ROOT — and that plan's remainder always
+# carried `root_item_id=None` (the whole drive). Observed live: 388 confirmed
+# scopes -> 776 shards, every one of the ~388 "remainder" shards independently
+# re-walking the entire ~458k-item site (18 running children each already at
+# 113k-140k `files_seen`, 21 minutes in, 0/776 shards done).
+# ---------------------------------------------------------------------------
+
+
+def _items_children_handler(
+    *,
+    drive: str = "drv1",
+    site_total: int,
+    children_by_root: Dict[str, List[Dict[str, Any]]],
+    root_children: Optional[List[Dict[str, Any]]] = None,
+    folder_totals: Optional[Dict[str, int]] = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """A Graph mock that can answer a DIFFERENT top-level listing per
+    ``/items/{root_item_id}/children`` call — the shape a connection with
+    many FOLDER-scoped targets sharing one drive actually needs (each
+    scope's own listing must come from ITS OWN root, never the drive root).
+    ``root_children`` (optional) additionally serves ``/root/children`` —
+    only a WHOLE-DRIVE target (``root_item_id=None``) ever calls that."""
+    root_children = root_children if root_children is not None else []
+    folder_totals = folder_totals or {}
+
+    def _listing(items: List[Dict[str, Any]], url_prefix: str) -> httpx.Response:
+        value = [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "folder": {"childCount": item.get("child_count", 0)},
+                "webUrl": f"{url_prefix}/{item['name']}",
+            }
+            for item in items
+        ]
+        return httpx.Response(200, json={"value": value})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/root") and request.method == "GET":
+            return httpx.Response(200, json={"webUrl": f"https://x/{drive}/root"})
+        if path.endswith("/search/query"):
+            body = json.loads(request.content.decode())
+            query = body["requests"][0]["query"]["queryString"]
+            if f'"https://x/{drive}/root"' in query:
+                return _search_response(site_total)
+            for name, total in folder_totals.items():
+                if f"/{name}" in query:
+                    return _search_response(total)
+            return _search_response(0)
+        if path.endswith("/root/children"):
+            return _listing(root_children, f"https://x/{drive}/root")
+        if "/items/" in path and path.endswith("/children"):
+            item_id = path.split("/items/")[1].split("/")[0]
+            return _listing(children_by_root.get(item_id, []), f"https://x/{drive}/{item_id}")
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+
+    return handler
+
+
+class TestComputeShardPlanFolderScopeRemainder:
+    """The regression at the ``compute_shard_plan`` (Graph) layer, not just
+    the pure ``plan_shards`` layer above — proves the LISTING call itself is
+    scoped correctly, not only the shape ``plan_shards`` would produce if
+    fed the right inputs."""
+
+    def test_a_folder_scope_that_splits_lists_its_own_children_and_its_remainder_is_scoped_to_it(self, monkeypatch):
+        handler = _items_children_handler(
+            site_total=1000,
+            children_by_root={"folderHR": [{"id": "c1", "name": "Contracts"}, {"id": "c2", "name": "Invoices"}]},
+            folder_totals={"Contracts": 600, "Invoices": 400},
+        )
+        seen = _install_transport(monkeypatch, handler)
+        target = _FakeTarget("drv1", root_item_id="folderHR", root_path="HR")
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, [target], target_docs=100))
+
+        drive_plan = plan["drives"][0]
+        remainder = drive_plan["shards"][-1]
+        # The regression itself: the remainder is scoped to the SCOPE's own
+        # folder, never the drive root.
+        assert remainder["targets"][0]["root_item_id"] == "folderHR"
+        assert remainder["targets"][0]["state_key"] == "drv1:folderHR"
+        assert remainder["exclude_prefixes"] == ["HR/Contracts", "HR/Invoices"]
+        # The listing call itself must have gone through the SCOPE's own
+        # item, never `/root/children` (the drive's).
+        assert any("/items/folderHR/children" in url for url in seen)
+        assert not any(url.endswith("/root/children") for url in seen)
+
+
+class TestComputeShardPlanMultiScopeOneDrive:
+    def test_many_folder_scopes_on_one_drive_each_get_a_remainder_scoped_to_their_own_folder(self, monkeypatch):
+        """The union of every scope's own shard targets covers each scope
+        once — no scope's shard walks another scope's subtree, and NONE of
+        them silently expands to the whole drive."""
+        handler = _items_children_handler(
+            site_total=5000,
+            children_by_root={
+                f"folder{i}": [{"id": f"folder{i}-child", "name": "Sub", "child_count": 900}] for i in range(5)
+            },
+        )
+        _install_transport(monkeypatch, handler)
+        targets = [_FakeTarget("drv1", root_item_id=f"folder{i}", root_path=f"Dept{i}") for i in range(5)]
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, targets, target_docs=100))
+
+        assert len(plan["drives"]) == 5
+        for i, drive_plan in enumerate(plan["drives"]):
+            remainder = drive_plan["shards"][-1]
+            assert remainder["targets"][0]["root_item_id"] == f"folder{i}"
+            assert remainder["targets"][0]["state_key"] == f"drv1:folder{i}"
+            # Never another scope's own root, and never the drive root.
+            for other in range(5):
+                if other != i:
+                    assert remainder["targets"][0]["root_item_id"] != f"folder{other}"
+            # This scope's own packed unit came from ITS OWN listing only.
+            packed_ids = [t["root_item_id"] for s in drive_plan["shards"][:-1] for t in s["targets"]]
+            assert packed_ids == [f"folder{i}-child"]
+
+    def test_a_whole_drive_scope_still_gets_a_whole_drive_remainder_alongside_folder_scopes(self, monkeypatch):
+        """No regression on the legitimate case, even mixed in with folder
+        scopes sharing the same physical drive."""
+        handler = _items_children_handler(
+            site_total=5000,
+            root_children=[{"id": "top1", "name": "TopLevel", "child_count": 900}],
+            children_by_root={"folderHR": [{"id": "hr-child", "name": "Sub", "child_count": 900}]},
+        )
+        _install_transport(monkeypatch, handler)
+        whole_drive = _FakeTarget("drv1")
+        folder = _FakeTarget("drv1", root_item_id="folderHR", root_path="HR")
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, [whole_drive, folder], target_docs=100))
+
+        by_state_key = {t.state_key: d for t, d in zip([whole_drive, folder], plan["drives"])}
+        assert by_state_key["drv1"]["shards"][-1]["targets"][0]["root_item_id"] is None
+        assert by_state_key["drv1:folderHR"]["shards"][-1]["targets"][0]["root_item_id"] == "folderHR"
+
+    def test_nested_folder_scopes_on_one_drive_are_each_bounded_to_their_own_root(self, monkeypatch):
+        """Design decision (2026-09-06, see ``compute_shard_plan``'s own
+        docstring): the shard planner does NOT detect or special-case
+        nested scopes. A folder scope ("Contracts") whose root happens to
+        be a child folder INSIDE another confirmed scope's own subtree
+        ("HR") still gets its own, fully independent plan, scoped only to
+        ITS OWN root. The outer scope's own listing is free to enumerate
+        the SAME child ("Contracts") as one of its own units — deduplicating
+        that overlap at INGEST time is `excluded_subtrees`'s job (ACL sync),
+        not this function's; this function's own job is only to keep each
+        scope's OWN targets from wandering OUTSIDE that scope's subtree."""
+        handler = _items_children_handler(
+            site_total=5000,
+            children_by_root={
+                # "HR" scope's own top-level listing — "Contracts" is a
+                # child of HR AND is itself another confirmed scope's root.
+                "folderHR": [
+                    # Under target_docs on its own — the outer scope's own
+                    # listing has no reason to fold into it, so it packs as
+                    # a plain leaf unit even though it is ALSO another
+                    # scope's own confirmed root elsewhere.
+                    {"id": "folderContracts", "name": "Contracts", "child_count": 50},
+                    {"id": "hr-other", "name": "Payroll", "child_count": 900},
+                ],
+                # "Contracts" scope's OWN listing — computed independently.
+                "folderContracts": [{"id": "contracts-child", "name": "Signed", "child_count": 900}],
+            },
+        )
+        _install_transport(monkeypatch, handler)
+        outer = _FakeTarget("drv1", root_item_id="folderHR", root_path="HR")
+        inner = _FakeTarget("drv1", root_item_id="folderContracts", root_path="HR/Contracts")
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, [outer, inner], target_docs=100))
+
+        outer_plan, inner_plan = plan["drives"]
+        # The outer scope's own plan is free to pack "Contracts" as one of
+        # its own units — this function never excludes it.
+        outer_packed_ids = [t["root_item_id"] for s in outer_plan["shards"][:-1] for t in s["targets"]]
+        assert "folderContracts" in outer_packed_ids
+        # The inner scope's plan is entirely independent — scoped to its
+        # OWN root, never the outer scope's.
+        assert inner_plan["shards"][-1]["targets"][0]["root_item_id"] == "folderContracts"
+        inner_packed_ids = [t["root_item_id"] for s in inner_plan["shards"][:-1] for t in s["targets"]]
+        assert inner_packed_ids == ["contracts-child"]
+
+    def test_shard_counts_stay_sane_n_scopes_never_produce_n_whole_drive_walks(self, monkeypatch):
+        """The pre-fix bug was sharpest in the "small enough on its own"
+        Pass-2 shortcut (no folder listing at all, ``plan_shards([], ...)``
+        called unconditionally without ``root_item_id``): a small drive
+        with SEVERAL folder scopes confirmed on it — alongside an unrelated
+        big drive that is what actually forces the SITE as a whole to
+        shard — must give each of those folder scopes its own bounded,
+        independent shard, never N copies of a whole-DRIVE walk."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/root") and request.method == "GET":
+                if "drv-small" in path:
+                    return httpx.Response(200, json={"webUrl": "https://x/drv-small/root"})
+                return httpx.Response(200, json={"webUrl": "https://x/drv-big/root"})
+            if path.endswith("/search/query"):
+                body = json.loads(request.content.decode())
+                query = body["requests"][0]["query"]["queryString"]
+                if "drv-small/root" in query:
+                    return _search_response(10)
+                if "drv-big/root" in query:
+                    return _search_response(1000)
+                return _search_response(50)  # drv-big's own folder "A"
+            if path.endswith("/root/children"):
+                return httpx.Response(
+                    200,
+                    json={"value": [{"id": "f1", "name": "A", "folder": {"childCount": 5}, "webUrl": "https://x/A"}]},
+                )
+            raise AssertionError(f"unexpected request: {path}")
+
+        _install_transport(monkeypatch, handler)
+        small_targets = [_FakeTarget("drv-small", root_item_id=f"folder{i}", root_path=f"Dept{i}") for i in range(5)]
+        big = _FakeTarget("drv-big")
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, small_targets + [big], target_docs=100))
+
+        assert len(plan["drives"]) == 6
+        small_plans = plan["drives"][:5]
+        whole_drive_walks = [d for d in small_plans if d["shards"][0]["targets"][0]["root_item_id"] is None]
+        assert whole_drive_walks == [], "no small-drive folder scope's plan may fall back to a whole-drive walk"
+        for i, drive_plan in enumerate(small_plans):
+            assert len(drive_plan["shards"]) == 1
+            assert drive_plan["shards"][0]["targets"][0]["root_item_id"] == f"folder{i}"
