@@ -15,6 +15,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **A long-running background job no longer pins the database-wide vacuum horizon for its entire runtime.** `seed_lease()`, `rebuild_lease()`, and `knowledge_packaging_lease()` in `src/db_pg.py` each acquire a session-scoped Postgres advisory lock but never committed the connection that took it — under SQLAlchemy 2.x "commit as you go" that left the connection `idle in transaction` for the whole guarded operation, pinning `backend_xmin` and blocking autovacuum ANYWHERE in the database from reclaiming any row version created after the lease was taken, regardless of per-table tuning. Measured on a live instance: a `knowledge-packaging` job held its lease for 6.7 hours idle in transaction while one heavily-updated table's TOAST accumulated 8.9M dead tuples / 52 GB against 2 MB of live heap data, with autovacuum running every ~5 minutes and reclaiming nothing. Each lease now commits immediately after acquiring the lock — the lock itself is session-scoped, not transaction-scoped, so mutual exclusion is unaffected; only the pinned snapshot goes away.
 
 ### Removed
 

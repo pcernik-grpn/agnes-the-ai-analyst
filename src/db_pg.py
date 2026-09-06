@@ -834,6 +834,18 @@ def seed_lease() -> Iterator[None]:
     No-op on the DuckDB backend — Task 2's startup guard already
     restricts DuckDB app-state to a single process, so there is nothing
     to serialize.
+
+    ``pg_advisory_lock``/``pg_advisory_unlock`` are *session*-scoped, not
+    transaction-scoped — the lock lives as long as the connection, not the
+    transaction wrapping the call that took it. So each is followed by an
+    explicit ``commit()``: under SQLAlchemy 2.x "commit as you go" the first
+    ``execute()`` on a fresh connection auto-begins a transaction, and
+    without the commit that transaction (and the snapshot it pins via
+    ``pg_stat_activity.backend_xmin``) would stay open for the entire
+    guarded block — blocking autovacuum database-wide from reclaiming any
+    row version created while the lease was held, no matter how long that
+    is. The mutual exclusion itself is unaffected: the lock is not released
+    by the commit, only the transaction is.
     """
     if not _lease_use_pg():
         yield
@@ -841,10 +853,12 @@ def seed_lease() -> Iterator[None]:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(sa.text("SELECT pg_advisory_lock(:key)"), {"key": _SEED_LEASE_ID})
+        conn.commit()
         try:
             yield
         finally:
             conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _SEED_LEASE_ID})
+            conn.commit()
 
 
 #: Session-scoped PG advisory lock id for the orchestrator rebuild critical
@@ -878,6 +892,18 @@ def rebuild_lease() -> Iterator[None]:
     No-op on the DuckDB backend — DuckDB app-state deployments are
     single-process (Task 2's startup guard), so there is no second
     process to serialize against.
+
+    ``pg_advisory_lock``/``pg_advisory_unlock`` are *session*-scoped, not
+    transaction-scoped — the lock lives as long as the connection, not the
+    transaction wrapping the call that took it. So each is followed by an
+    explicit ``commit()``: under SQLAlchemy 2.x "commit as you go" the first
+    ``execute()`` on a fresh connection auto-begins a transaction, and
+    without the commit that transaction (and the snapshot it pins via
+    ``pg_stat_activity.backend_xmin``) would stay open for the entire
+    guarded rebuild — blocking autovacuum database-wide from reclaiming any
+    row version created while the lease was held. Mutual exclusion is
+    unaffected: the lock is not released by the commit, only the
+    transaction is.
     """
     if not _lease_use_pg():
         yield
@@ -885,10 +911,12 @@ def rebuild_lease() -> Iterator[None]:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(sa.text("SELECT pg_advisory_lock(:key)"), {"key": _REBUILD_LEASE_ID})
+        conn.commit()
         try:
             yield
         finally:
             conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _REBUILD_LEASE_ID})
+            conn.commit()
 
 
 #: Session-scoped PG advisory lock id for the knowledge-packaging worker job
@@ -920,6 +948,18 @@ def knowledge_packaging_lease() -> Iterator[bool]:
     should skip, not wait). No-op (always yields ``True``) on the DuckDB
     backend — DuckDB app-state deployments are single-process already
     (Task 2's startup guard), so there is no second process to race.
+
+    ``pg_try_advisory_lock``/``pg_advisory_unlock`` are *session*-scoped,
+    not transaction-scoped — the lock lives as long as the connection, not
+    the transaction wrapping the call that took it. So the acquisition is
+    followed by an explicit ``commit()``: under SQLAlchemy 2.x "commit as
+    you go" the first ``execute()`` on a fresh connection auto-begins a
+    transaction, and without the commit that transaction (and the snapshot
+    it pins via ``pg_stat_activity.backend_xmin``) would stay open for the
+    entire packaging run — hours, in practice — blocking autovacuum
+    database-wide from reclaiming any row version created while the lease
+    was held. Mutual exclusion is unaffected: the lock is not released by
+    the commit, only the transaction is.
     """
     if not _lease_use_pg():
         yield True
@@ -929,8 +969,10 @@ def knowledge_packaging_lease() -> Iterator[bool]:
         acquired = bool(
             conn.execute(sa.text("SELECT pg_try_advisory_lock(:key)"), {"key": _KNOWLEDGE_PACKAGING_LEASE_ID}).scalar()
         )
+        conn.commit()
         try:
             yield acquired
         finally:
             if acquired:
                 conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _KNOWLEDGE_PACKAGING_LEASE_ID})
+                conn.commit()
