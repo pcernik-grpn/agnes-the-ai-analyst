@@ -1868,8 +1868,10 @@ call after a partial failure converges: folds every involved scope
 collection into the target collection (delegated wholesale to
 `SharePointCollectionConsolidationPgRepository.consolidate` — not
 reimplemented); unions every sibling's crawl/facts state
-(`sharepoint_connection_state`: `delta_links`/`ctags`/`failed_items`/
-`empty_items` for `kind='crawl'`, `docs` for `kind='facts'`) onto the
+(`sharepoint_connection_state`: `delta_links` for `kind='crawl'`, `docs`
+for `kind='facts'`, plus `ctags`/`failed_items`/`empty_items` — split into
+the per-file `sharepoint_crawl_items` table since migration
+`0110_sharepoint_crawl_items`, transparently to this merge) onto the
 target's own — disjoint keys are simply carried over, a genuine collision
 keeps the target's own `delta_links`/`ctags` entry (no per-entry freshness
 signal exists for either) or the newer entry by timestamp for
@@ -2530,7 +2532,11 @@ the scope/folder's `web_url` — the SAME mechanism `…/split-plan` uses, never
 a delta walk. `indexed`/`rejected` come from `corpus_files.processing_status`
 in the scope's own collection. `failed`/`empty`/`skipped_unsupported`/
 `oversize` come from the persisted crawl state
-(`sharepoint_connection_state(kind="crawl")`) — exact for a single-scope
+(`connectors.sharepoint.crawler.load_state` — `ctags`/`failed_items`/
+`empty_items` live in the per-file `sharepoint_crawl_items` table since
+migration `0110_sharepoint_crawl_items`; `load_state` is what reconciles
+that with `sharepoint_connection_state(kind="crawl")`'s own
+`delta_links`/`last_run`) — exact for a single-scope
 connection, best-effort attributed for a multi-scope one (a "site" scope
 spanning several drives cannot resolve a single `expected` count at all,
 and reads `status: "unknown"` rather than a misleading 0). `gap = expected -

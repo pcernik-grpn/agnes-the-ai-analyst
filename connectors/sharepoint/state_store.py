@@ -51,6 +51,8 @@ __all__ = [
     "FactsPassLocked",  # noqa: F822 — lazily resolved via __getattr__ below
     "StateStoreError",
     "any_facts_pass_running",
+    "crawl_items_apply",
+    "crawl_items_get",
     "delete",
     "facts_pass_lock",
     "file_state_path",
@@ -197,6 +199,90 @@ def put(kind: str, connection_id: str, payload: Dict[str, Any]) -> None:
         _write_file(kind, connection_id, payload)
         return
     _pg_repo().put(connection_id, kind, payload)
+
+
+def _crawl_items_repo() -> Any:
+    from src.repositories import sharepoint_crawl_items_repo
+
+    return sharepoint_crawl_items_repo()
+
+
+#: The three per-file crawl collections this seam can split out of the hot
+#: ``put``/``get`` blob on Postgres — shared with
+#: ``connectors.sharepoint.crawler`` so the two modules can never disagree
+#: on the field names either side reads/writes.
+CRAWL_ITEM_FIELDS: Tuple[str, ...] = ("ctags", "failed_items", "empty_items")
+
+
+def crawl_items_get(
+    kind: str, connection_id: str, *, legacy: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """The per-FILE ``{"ctags", "failed_items", "empty_items"}`` maps for
+    ``(connection_id, kind)`` — Postgres only, read from
+    ``sharepoint_crawl_items`` (migration ``0110_sharepoint_crawl_items``;
+    see that migration's docstring for the TOAST/dead-tuple incident this
+    split fixes). Returns ``None`` on the DuckDB fallback: these three
+    collections stay embedded in the whole ``get``/``put`` payload there,
+    unchanged — the caller (``connectors.sharepoint.crawler.load_state``)
+    keeps its own pre-split behaviour for that backend.
+
+    ``legacy`` (optional): a connection touched for the first time after
+    this split shipped may still carry its pre-split copies embedded in the
+    hot blob's own payload (a crawl mid-flight when this change deployed).
+    When the item table has NOTHING yet for this ``(connection_id, kind)``
+    AND ``legacy`` is non-empty, it is imported once — the same "old shape
+    -> new shape, exactly once" pattern :func:`get`'s own module docstring
+    already uses for the file -> Postgres-row move.
+    """
+    from src.repositories import use_pg
+
+    if not use_pg():
+        return None
+    repo = _crawl_items_repo()
+    items = repo.get_all(connection_id, kind)
+    if legacy and any(legacy.get(field) for field in CRAWL_ITEM_FIELDS) and not any(items.values()):
+        repo.apply_delta(
+            connection_id,
+            kind,
+            ctags={"set": legacy.get("ctags") or {}, "removed": (), "reset": False},
+            failed={"set": legacy.get("failed_items") or {}, "removed": (), "reset": False},
+            empty={"set": legacy.get("empty_items") or {}, "removed": (), "reset": False},
+        )
+        items = repo.get_all(connection_id, kind)
+        logger.info(
+            "sharepoint state: imported legacy embedded ctags/failed_items/empty_items for "
+            "connection %s kind %s into the per-item table",
+            connection_id,
+            kind,
+        )
+    return items
+
+
+def crawl_items_apply(kind: str, connection_id: str, deltas: Dict[str, Dict[str, Any]]) -> bool:
+    """Apply one checkpoint's ``ctags``/``failed_items``/``empty_items``
+    deltas (``connectors.sharepoint.crawler._drain_item_deltas`` — each
+    shaped ``{"set": {...}, "removed": [...], "reset": bool}``).
+
+    Returns whether THIS backend keeps the three collections out of the hot
+    blob at all: ``True`` on Postgres (even when ``deltas`` is a total
+    no-op — nothing to flush this call, but the split still applies, so the
+    caller must still exclude these fields from what it hands to
+    :func:`put`), ``False`` on the DuckDB fallback (nothing written; the
+    caller keeps them embedded in the very same payload, unchanged).
+    """
+    from src.repositories import use_pg
+
+    if not use_pg():
+        return False
+    if any(deltas[field]["reset"] or deltas[field]["set"] or deltas[field]["removed"] for field in CRAWL_ITEM_FIELDS):
+        _crawl_items_repo().apply_delta(
+            connection_id,
+            kind,
+            ctags=deltas["ctags"],
+            failed=deltas["failed_items"],
+            empty=deltas["empty_items"],
+        )
+    return True
 
 
 def delete(kind: str, connection_id: str) -> None:

@@ -737,6 +737,98 @@ def _crawl_state_kind(shard_key: Optional[str] = None) -> str:
     return "crawl" if shard_key is None else f"crawl:{shard_key}"
 
 
+#: ``ctags``/``failed_items``/``empty_items`` — the per-FILE collections
+#: split OUT of the connection's hot ``sharepoint_connection_state`` row on
+#: Postgres (migration ``0110_sharepoint_crawl_items``): a connection with a
+#: few hundred thousand documents grew these three maps to tens of
+#: megabytes combined, and every checkpoint rewrote that whole payload —
+#: Postgres always produces a brand-new toasted value for a changed
+#: ``jsonb`` column, even via ``jsonb_set`` targeting one key, so every
+#: checkpoint orphaned the PREVIOUS copy's TOAST chunks (measured on a live
+#: instance: ~21,900 dead tuples/minute, ~60 GB/day of table growth while a
+#: crawl runs — reclaimed for reuse by autovacuum but never returned to the
+#: OS). See :func:`load_state`/:func:`save_state` for the split, and
+#: :class:`_TrackedDict`/:func:`_drain_item_deltas` for how a checkpoint
+#: flushes only what actually changed.
+_ITEM_TABLE_FIELDS: Tuple[str, ...] = ("ctags", "failed_items", "empty_items")
+
+
+class _TrackedDict(dict):
+    """A plain ``dict`` that also tracks which keys were set/removed since
+    the last :meth:`drain_dirty` call — what lets :func:`save_state` flush
+    only THIS checkpoint's changes into the per-item Postgres table
+    (:data:`_ITEM_TABLE_FIELDS`) instead of rewriting the whole map.
+
+    Every existing ``ctags[stable_id] = ...`` / ``failed_items.pop(sid,
+    None)`` call site in this module keeps working completely unmodified —
+    this is API-identical to a plain dict for every operation those sites
+    use (``[]=``, ``.pop``, ``.get``, ``.items``, ``.values``, ``in``,
+    ``len``).
+
+    Mirrors ``connectors.sharepoint.facts_extraction._PartitionDocsLedger``
+    (same problem, same shape) — kept as its own small class rather than a
+    shared import: the two live in different modules for a reason (this
+    module's own "a corrupt facts pass must never cost the crawl its
+    deltaLinks" isolation argument), and neither should reach into the
+    other's internals for something this small.
+    """
+
+    def __init__(self, initial: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(initial or {})
+        self._dirty_set: set = set()
+        self._dirty_removed: set = set()
+
+    def __setitem__(self, key: str, value: Any) -> None:  # noqa: D105
+        super().__setitem__(key, value)
+        self._dirty_set.add(key)
+        self._dirty_removed.discard(key)
+
+    def pop(self, key: str, *default: Any) -> Any:  # noqa: D102
+        had_key = key in self
+        result = super().pop(key, *default)
+        if had_key:
+            self._dirty_removed.add(key)
+            self._dirty_set.discard(key)
+        return result
+
+    def drain_dirty(self) -> Tuple[Dict[str, Any], List[str]]:
+        """Every key set/removed since the last drain — ``(set_entries,
+        removed)`` — and clears the tracking."""
+        set_entries = {key: self[key] for key in self._dirty_set if key in self}
+        removed = sorted(self._dirty_removed)
+        self._dirty_set.clear()
+        self._dirty_removed.clear()
+        return set_entries, removed
+
+
+def _drain_item_deltas(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Snapshot what changed in ``ctags``/``failed_items``/``empty_items``
+    since the last :func:`save_state` call — always returns all three
+    fields, each ``{"set": {...}, "removed": [...], "reset": bool}``.
+
+    ``reset`` is true when the caller reassigned the whole key to a plain
+    ``dict`` rather than mutating a :class:`_TrackedDict` in place — the
+    resync (``state["failed_items"] = {}``) and sharded-finalize
+    (``state["ctags"] = {}``) call sites. The per-item store must then WIPE
+    this field's column for every row of ``(connection_id, kind)`` before
+    applying ``set`` — which, for every current reset call site, is always
+    empty; the general case replays whatever the plain dict actually held,
+    so a future caller that reassigns to a non-empty dict is handled the
+    same way as "wipe, then set this as the new complete state".
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    for field_name in _ITEM_TABLE_FIELDS:
+        value = state.get(field_name)
+        if isinstance(value, _TrackedDict):
+            set_entries, removed = value.drain_dirty()
+            result[field_name] = {"set": set_entries, "removed": removed, "reset": False}
+        elif isinstance(value, dict):
+            result[field_name] = {"set": dict(value), "removed": [], "reset": True}
+        else:
+            result[field_name] = {"set": {}, "removed": [], "reset": False}
+    return result
+
+
 def load_state(connection_id: str, shard_key: Optional[str] = None) -> Dict[str, Any]:
     """Read this connection's crawl state, tolerating a torn/absent file or
     a never-before-seen connection.
@@ -749,28 +841,50 @@ def load_state(connection_id: str, shard_key: Optional[str] = None) -> Dict[str,
     reads a SHARD's own per-delta-unit row instead of the connection-level
     one — see :func:`_crawl_state_kind`. ``None`` (every caller before
     sharding existed) is today's connection-wide row, unchanged.
-    """
-    from connectors.sharepoint.state_store import get as _state_get
 
-    state: Dict[str, Any] = _state_get(_crawl_state_kind(shard_key), connection_id) or {}
+    ``ctags``/``failed_items``/``empty_items`` (:data:`_ITEM_TABLE_FIELDS`)
+    are popped off whatever the hot blob returned and either restored
+    as-is (DuckDB fallback — they never left the blob) or replaced by
+    fresh :class:`_TrackedDict`\\ s loaded from the per-item Postgres table,
+    migrating a still-embedded legacy copy the first time this
+    ``(connection_id, kind)`` is touched after the split (see
+    ``connectors.sharepoint.state_store.crawl_items_get``). Shapes,
+    unchanged by the split:
+
+    * ``ctags``: ``stable_id -> cTag`` — the delta-detection cursor.
+    * ``failed_items``: ``stable_id -> {state_key, path, item, attempts,
+      ..., given_up}`` — see the module docstring's "a per-item failure
+      never advances past itself" and :func:`_note_retry` /
+      :func:`_retry_failed_items`.
+    * ``empty_items``: ``stable_id -> {state_key, path, item,
+      first_seen_at, last_seen_at}`` — every item this connection has seen
+      convert to ``convert_empty`` (converted fine, no text at all — the
+      scan-OCR candidate population). NOT replayed by the ordinary per-run
+      backlog (:func:`_retry_failed_items`): re-running an empty document
+      changes nothing while scan OCR is off, so every ordinary crawl would
+      otherwise pay to re-walk the whole backlog for no reason. Replayed
+      only by an explicit admin ``retry_empty`` run
+      (:func:`_retry_empty_items`) — e.g. once an operator turns
+      ``extraction.scan_ocr.enabled`` on and wants the existing backlog
+      reconsidered. See :func:`_note_empty` for the same
+      :data:`_FAILED_ITEMS_CAP` bound ``failed_items`` observes.
+    """
+    from connectors.sharepoint import state_store
+
+    kind = _crawl_state_kind(shard_key)
+    state: Dict[str, Any] = state_store.get(kind, connection_id) or {}
     state.setdefault("delta_links", {})
-    state.setdefault("ctags", {})
-    #: ``stable_id -> {state_key, path, item, attempts, ..., given_up}`` —
-    #: see the module docstring's "a per-item failure never advances past
-    #: itself" and :func:`_note_retry` / :func:`_retry_failed_items`.
-    state.setdefault("failed_items", {})
-    #: ``stable_id -> {state_key, path, item, first_seen_at, last_seen_at}``
-    #: — every item this connection has seen convert to ``convert_empty``
-    #: (converted fine, no text at all — the scan-OCR candidate population).
-    #: NOT replayed by the ordinary per-run backlog (:func:`_retry_failed_
-    #: items`): re-running an empty document changes nothing while scan OCR
-    #: is off, so every ordinary crawl would otherwise pay to re-walk the
-    #: whole backlog for no reason. Replayed only by an explicit admin
-    #: ``retry_empty`` run (:func:`_retry_empty_items`) — e.g. once an
-    #: operator turns ``extraction.scan_ocr.enabled`` on and wants the
-    #: existing backlog reconsidered. See :func:`_note_empty` for the same
-    #: :data:`_FAILED_ITEMS_CAP` bound `failed_items` observes.
-    state.setdefault("empty_items", {})
+
+    legacy = {field_name: state.pop(field_name, None) or {} for field_name in _ITEM_TABLE_FIELDS}
+    items = state_store.crawl_items_get(kind, connection_id, legacy=legacy)
+    if items is None:
+        # DuckDB fallback — unchanged: these three collections travel
+        # inside the very same payload `state_store.get` just returned.
+        for field_name in _ITEM_TABLE_FIELDS:
+            state[field_name] = legacy[field_name]
+    else:
+        for field_name in _ITEM_TABLE_FIELDS:
+            state[field_name] = _TrackedDict(items.get(field_name) or {})
     return state
 
 
@@ -780,17 +894,36 @@ def save_state(connection_id: str, state: Dict[str, Any], shard_key: Optional[st
 
     Serialized on :data:`_state_lock`: one writer at a time, and never
     concurrent with an in-page cTag write (which takes the same lock), so
-    what lands is always a whole, self-consistent snapshot.
+    what lands is always a self-consistent snapshot.
 
     ``shard_key`` — see :func:`load_state`'s docstring; the write-side half
     of the same seam. A shard child's own ``save_for`` closure (Task 4)
     passes its target's ``state_key`` here so its checkpoint never lands in
     the connection-level row.
-    """
-    from connectors.sharepoint.state_store import put as _state_put
 
+    On Postgres, :data:`_ITEM_TABLE_FIELDS` are flushed to the per-item
+    table FIRST (its own transaction, committed) and excluded from the hot
+    blob written second — the same "cTags on disk before the deltaLink
+    advances" ordering the module docstring's page-boundary comment already
+    relies on, now spanning two statements instead of one: a crash between
+    them leaves the per-item table ahead of the hot blob, so a resumed
+    crawl at worst RE-VERIFIES (never skips) this checkpoint's own files,
+    exactly the safe direction the original single-write invariant gave.
+    On the DuckDB fallback the three fields are restored into the hot blob
+    exactly as before — a single atomic file replace, unchanged.
+    """
+    from connectors.sharepoint import state_store
+
+    kind = _crawl_state_kind(shard_key)
     with _state_lock:
-        _state_put(_crawl_state_kind(shard_key), connection_id, state)
+        deltas = _drain_item_deltas(state)
+        pg_owns_items = state_store.crawl_items_apply(kind, connection_id, deltas)
+        hot = {k: v for k, v in state.items() if k not in _ITEM_TABLE_FIELDS}
+        if not pg_owns_items:
+            for field_name in _ITEM_TABLE_FIELDS:
+                if field_name in state:
+                    hot[field_name] = state[field_name]
+        state_store.put(kind, connection_id, hot)
 
 
 # --------------------------------------------------------------------------

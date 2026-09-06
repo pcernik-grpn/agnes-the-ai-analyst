@@ -161,3 +161,4 @@
 0097_resource_grants_scope
 0098_everyone_becomes_a_scope
 0109_merge_access_stack
+0110_sharepoint_crawl_items

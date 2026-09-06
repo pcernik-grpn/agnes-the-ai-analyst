@@ -204,6 +204,8 @@ __all__ = [
     "memory_detection_runs_repo",
     # SharePoint crawl/facts per-connection state — Postgres-only
     "sharepoint_state_repo",
+    # SharePoint crawl per-file state (ctag/failed_items/empty_items) — Postgres-only
+    "sharepoint_crawl_items_repo",
     # Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B) — Postgres-only
     "facts_llm_cache_repo",
     # SharePoint collection consolidation — Postgres-only
@@ -724,6 +726,15 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "sharepoint_state": {
         PG: ("src.repositories.sharepoint_state_pg", "SharepointStatePgRepository"),
     },
+    # SharePoint crawl per-file state (ctag/failed_items/empty_items) —
+    # POSTGRES-ONLY, A3 ratchet: split out of "sharepoint_state" above to
+    # stop a checkpoint rewriting the whole connection's ctags map (see
+    # migration 0110_sharepoint_crawl_items). Same "never resolved on a
+    # DuckDB-backed instance" posture: the caller
+    # (``connectors.sharepoint.state_store``) checks ``use_pg()`` itself.
+    "sharepoint_crawl_items": {
+        PG: ("src.repositories.sharepoint_crawl_items_pg", "SharepointCrawlItemsPgRepository"),
+    },
     "facts_llm_cache": {
         PG: ("src.repositories.facts_llm_cache_pg", "FactsLlmCachePgRepository"),
     },
@@ -1224,6 +1235,15 @@ def memory_detection_runs_repo() -> Any:
 # a crawl in flight on a DuckDB-backed instance.
 def sharepoint_state_repo() -> Any:
     return _build("sharepoint_state")
+
+
+# SharePoint crawl per-FILE state (ctag/failed_items/empty_items, split out
+# of sharepoint_state's own payload — TOAST/dead-tuple amplification fix,
+# 2026-09-05) — POSTGRES-ONLY, same posture as sharepoint_state_repo above:
+# connectors.sharepoint.state_store checks use_pg() itself before ever
+# calling this factory.
+def sharepoint_crawl_items_repo() -> Any:
+    return _build("sharepoint_crawl_items")
 
 
 # Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B)

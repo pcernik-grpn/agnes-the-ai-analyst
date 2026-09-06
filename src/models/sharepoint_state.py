@@ -55,6 +55,7 @@ pre-existing JSON file otherwise) and its one-time legacy-file import.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -75,6 +76,36 @@ class SharepointConnectionState(Base):
     connection_id: Mapped[str] = mapped_column(sa.String, primary_key=True)
     kind: Mapped[str] = mapped_column(sa.String, primary_key=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
+    )
+
+
+class SharepointCrawlItem(Base):
+    """One row per ``(connection_id, kind, stable_id)`` — the per-file
+    ``ctag``/``failed_items``/``empty_items`` bookkeeping split OUT of
+    ``SharepointConnectionState.payload`` (migration
+    ``0110_sharepoint_crawl_items``; see that migration's docstring for the
+    measured TOAST/dead-tuple incident this exists to fix).
+
+    ``kind`` matches ``connectors/sharepoint/crawler.py``'s
+    ``_crawl_state_kind()`` exactly — ``"crawl"`` for the connection-level
+    row, ``"crawl:<shard_key>"`` for one shard's own — so a shard child's
+    files never share a row with the parent's or a sibling's.
+    ``ctag``/``failed_entry``/``empty_entry`` are independently nullable:
+    a file only ever carries whichever of the three its own history has
+    touched. See ``connectors/sharepoint/state_store.py``'s
+    ``crawl_items_get``/``crawl_items_apply`` for the read/write seam.
+    """
+
+    __tablename__ = "sharepoint_crawl_items"
+
+    connection_id: Mapped[str] = mapped_column(sa.String, primary_key=True)
+    kind: Mapped[str] = mapped_column(sa.String, primary_key=True)
+    stable_id: Mapped[str] = mapped_column(sa.String, primary_key=True)
+    ctag: Mapped[Optional[str]] = mapped_column(sa.String, nullable=True)
+    failed_entry: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    empty_entry: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
     )

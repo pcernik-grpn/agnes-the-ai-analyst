@@ -247,17 +247,19 @@ class TestSplitMergeRoute:
         assert by_sibling[sib2]["runs_repointed"] == 0
 
         from src.repositories import extraction_runs_repo as er_repo
-        from src.repositories import sharepoint_state_repo, source_connections_repo
+        from src.repositories import sharepoint_crawl_items_repo, sharepoint_state_repo, source_connections_repo
 
         # Run history re-pointed, with provenance kept.
         run = er_repo().get(run_id)
         assert run["connection_id"] == target
         assert run["progress"]["merged_from"] == sib1
 
-        # Crawl state unioned onto the target.
+        # Crawl state unioned onto the target. `ctags` (and its two
+        # siblings) live in the per-file table after the split, not the
+        # blob — see migration 0110_sharepoint_crawl_items.
         target_state = sharepoint_state_repo().get(target, "crawl")
         assert target_state["delta_links"] == {"drive:a": "u1", "drive:b": "u2"}
-        assert target_state["ctags"] == {"graph:1": "c1"}
+        assert sharepoint_crawl_items_repo().get_all(target, "crawl")["ctags"] == {"graph:1": "c1"}
         # Siblings' own state rows are left untouched.
         assert sharepoint_state_repo().get(sib1, "crawl") == {
             "delta_links": {"drive:a": "u1"},

@@ -4854,6 +4854,203 @@ class TestState:
             crawler.load_state("conn1", shard_key="b!drive1")
 
 
+class TestItemTableSplit:
+    """``ctags``/``failed_items``/``empty_items`` split out of the hot
+    ``sharepoint_connection_state`` blob into a per-file Postgres table
+    (measured incident: a connection with a few hundred thousand documents
+    grew those three maps to tens of megabytes combined, and every
+    checkpoint rewrote that whole payload — every Postgres UPDATE produces
+    a brand-new toasted value for a changed ``jsonb`` column, so every
+    checkpoint orphaned the previous copy's TOAST chunks).
+
+    ``_drain_item_deltas``/``_TrackedDict`` are pure and need no fixture;
+    the ``save_state``/``load_state`` tests use ``FakeStateStore`` with
+    ``use_pg`` forced true so they exercise the split without a real
+    database (mirrors ``TestAutoParallelCrawlPlanner``'s own pattern)."""
+
+    # -- pure: _TrackedDict / _drain_item_deltas ---------------------------
+
+    def test_drain_item_deltas_reports_only_what_changed_regardless_of_map_size(self):
+        """The regression this whole split exists to fix: what a
+        checkpoint has to FLUSH must not scale with how many files this
+        connection has ever seen — only with how many changed since the
+        last checkpoint."""
+        ctags = crawler._TrackedDict({f"graph:{i}": "c0" for i in range(2000)})
+        ctags.drain_dirty()  # simulate "already on disk" — a fresh load, not fresh writes
+        ctags["graph:1000"] = "c1"  # exactly one file changed this checkpoint
+
+        deltas = crawler._drain_item_deltas(
+            {"ctags": ctags, "failed_items": crawler._TrackedDict(), "empty_items": crawler._TrackedDict()}
+        )
+
+        assert deltas["ctags"] == {"set": {"graph:1000": "c1"}, "removed": [], "reset": False}
+        assert deltas["failed_items"] == {"set": {}, "removed": [], "reset": False}
+        assert deltas["empty_items"] == {"set": {}, "removed": [], "reset": False}
+
+    def test_drain_item_deltas_reports_removals(self):
+        ctags = crawler._TrackedDict({"graph:1": "c1"})
+        ctags.drain_dirty()
+        ctags.pop("graph:1", None)
+
+        deltas = crawler._drain_item_deltas({"ctags": ctags, "failed_items": {}, "empty_items": {}})
+        assert deltas["ctags"] == {"set": {}, "removed": ["graph:1"], "reset": False}
+
+    def test_a_whole_key_reassignment_is_reported_as_a_reset(self):
+        """``state["failed_items"] = {}`` (the resync path) replaces the
+        tracked dict with a plain one — the per-item store must WIPE the
+        column, not just see an empty diff."""
+        deltas = crawler._drain_item_deltas({"ctags": {}, "failed_items": {}, "empty_items": {}})
+        assert deltas["failed_items"] == {"set": {}, "removed": [], "reset": True}
+
+    def test_an_absent_field_is_a_pure_no_op(self):
+        deltas = crawler._drain_item_deltas({})
+        for field in crawler._ITEM_TABLE_FIELDS:
+            assert deltas[field] == {"set": {}, "removed": [], "reset": False}
+
+    # -- save_state/load_state against a PG-mode FakeStateStore -----------
+
+    def _pg_store(self, monkeypatch) -> "FakeStateStore":
+        monkeypatch.setattr("src.repositories.use_pg", lambda: True)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        return store
+
+    def test_the_hot_blob_never_carries_the_three_split_fields_on_postgres(self, crawl_env, monkeypatch):
+        """Regression that names the bug: the payload
+        ``state_store.put`` receives for the connection-level row must not
+        contain ``ctags``/``failed_items``/``empty_items`` — those are what
+        grew a single row to tens of megabytes and got rewritten whole on
+        every checkpoint."""
+        store = self._pg_store(monkeypatch)
+
+        state = crawler.load_state("conn1")
+        for i in range(500):
+            state["ctags"][f"graph:{i}"] = f"c{i}"
+        crawler.save_state("conn1", state)
+
+        hot = store.data[("crawl", "conn1")]
+        for field in crawler._ITEM_TABLE_FIELDS:
+            assert field not in hot
+        assert store.items[("crawl", "conn1")]["ctags"] == {f"graph:{i}": f"c{i}" for i in range(500)}
+
+    def test_a_later_checkpoint_flushes_only_the_one_changed_file(self, crawl_env, monkeypatch):
+        """Two consecutive checkpoints, one file changed between them:
+        only that file's own delta is sent to the item store, not the
+        whole map (``connectors.sharepoint.state_store.crawl_items_apply``
+        spied on directly, since ``FakeStateStore`` only proves the FINAL
+        shape, not what each call transmitted)."""
+        from connectors.sharepoint import state_store
+
+        store = self._pg_store(monkeypatch)
+        state = crawler.load_state("conn1")
+        for i in range(200):
+            state["ctags"][f"graph:{i}"] = f"c{i}"
+        crawler.save_state("conn1", state)
+
+        applied = []
+        real_apply = state_store.crawl_items_apply
+
+        def _spy(kind, cid, deltas):
+            applied.append(deltas)
+            return real_apply(kind, cid, deltas)
+
+        monkeypatch.setattr(state_store, "crawl_items_apply", _spy)
+
+        state = crawler.load_state("conn1")
+        state["ctags"]["graph:100"] = "changed"
+        crawler.save_state("conn1", state)
+
+        assert len(applied) == 1
+        assert applied[0]["ctags"]["set"] == {"graph:100": "changed"}
+        assert applied[0]["ctags"]["removed"] == []
+        assert store.items[("crawl", "conn1")]["ctags"]["graph:100"] == "changed"
+        assert store.items[("crawl", "conn1")]["ctags"]["graph:5"] == "c5"  # untouched
+
+    def test_resume_reconstructs_the_same_effective_state(self, crawl_env, monkeypatch):
+        """Behaviour preservation: load -> mutate -> save -> load again
+        must reproduce exactly what was written, same as the pre-split
+        whole-blob behaviour."""
+        self._pg_store(monkeypatch)
+
+        state = crawler.load_state("conn1")
+        state["delta_links"]["d1"] = "url1"
+        state["ctags"]["graph:1"] = "c1"
+        state["failed_items"]["graph:2"] = {"attempts": 1}
+        state["empty_items"]["graph:3"] = {"first_seen_at": "t"}
+        crawler.save_state("conn1", state)
+
+        resumed = crawler.load_state("conn1")
+        assert resumed["delta_links"] == {"d1": "url1"}
+        assert resumed["ctags"] == {"graph:1": "c1"}
+        assert resumed["failed_items"] == {"graph:2": {"attempts": 1}}
+        assert resumed["empty_items"] == {"graph:3": {"first_seen_at": "t"}}
+
+    def test_shard_child_items_stay_isolated_from_the_parent_row(self, crawl_env, monkeypatch):
+        """The shard seam must keep working post-split: a shard child's
+        item rows never land under the connection-level ``kind``."""
+        store = self._pg_store(monkeypatch)
+
+        parent_state = crawler.load_state("conn1")
+        parent_state["ctags"]["graph:parent"] = "p"
+        crawler.save_state("conn1", parent_state)
+
+        child_state = crawler.load_state("conn1", shard_key="b!drive1")
+        child_state["ctags"]["graph:child"] = "c"
+        crawler.save_state("conn1", child_state, shard_key="b!drive1")
+
+        assert store.items[("crawl", "conn1")]["ctags"] == {"graph:parent": "p"}
+        assert store.items[("crawl:b!drive1", "conn1")]["ctags"] == {"graph:child": "c"}
+        # Neither call ever touches the other kind's item table entry.
+        assert "graph:child" not in store.items[("crawl", "conn1")]["ctags"]
+        assert "graph:parent" not in store.items[("crawl:b!drive1", "conn1")]["ctags"]
+
+    def test_a_whole_collection_reset_wipes_only_that_columns_backlog(self, crawl_env, monkeypatch):
+        """The resync path (``state["failed_items"] = {}``) must clear the
+        failed-items backlog without touching ``ctags`` — same behaviour
+        the pre-split single-blob write always gave."""
+        self._pg_store(monkeypatch)
+
+        state = crawler.load_state("conn1")
+        state["ctags"]["graph:1"] = "c1"
+        state["failed_items"]["graph:2"] = {"attempts": 1}
+        crawler.save_state("conn1", state)
+
+        state = crawler.load_state("conn1")
+        state["failed_items"] = {}
+        crawler.save_state("conn1", state)
+
+        resumed = crawler.load_state("conn1")
+        assert resumed["ctags"] == {"graph:1": "c1"}
+        assert resumed["failed_items"] == {}
+
+    def test_a_legacy_embedded_blob_is_imported_once_on_first_postgres_load(self, crawl_env, monkeypatch):
+        """Existing-state handling: a connection whose
+        ``sharepoint_connection_state`` row still embeds the pre-split
+        ``ctags``/``failed_items``/``empty_items`` (a crawl mid-flight when
+        this change deploys) must not be orphaned — the first
+        ``load_state`` after deploy imports them into the item table, and
+        the very next ``save_state`` stops carrying the giant embedded
+        copies in the hot blob."""
+        store = self._pg_store(monkeypatch)
+        store.data[("crawl", "conn1")] = {
+            "delta_links": {"d": "u"},
+            "ctags": {"graph:1": "c1"},
+            "failed_items": {"graph:2": {"attempts": 1}},
+            "empty_items": {},
+        }
+
+        state = crawler.load_state("conn1")
+        assert state["ctags"] == {"graph:1": "c1"}
+        assert state["failed_items"] == {"graph:2": {"attempts": 1}}
+        assert store.items[("crawl", "conn1")]["ctags"] == {"graph:1": "c1"}
+
+        crawler.save_state("conn1", state)
+        hot = store.data[("crawl", "conn1")]
+        for field in crawler._ITEM_TABLE_FIELDS:
+            assert field not in hot
+        assert hot["delta_links"] == {"d": "u"}
+
+
 class TestRehomeLegacyBacklog:
     """``crawler.rehome_legacy_backlog`` — the pure planner helper that
     splits a legacy (connection-level) ``failed_items``/``empty_items`` dict
@@ -7691,10 +7888,20 @@ class FakeStateStore:
     same ``(kind, connection_id) -> payload`` keying, no Postgres/DuckDB
     needed. Accepts ANY kind (including ``crawl:<key>``) — this fake
     doesn't enforce the backend-selection rules ``state_store`` itself
-    already has its own tests for."""
+    already has its own tests for.
+
+    ``crawl_items_get``/``crawl_items_apply`` mirror the REAL seam's own
+    ``use_pg()``-gated split (``ctags``/``failed_items``/``empty_items``
+    live in a separate in-memory table when ``use_pg()`` is true, else
+    ``None``/``False`` — the DuckDB-fallback answer, meaning "still
+    embedded in the hot blob `get`/`put` already model") — so a test that
+    patches ``src.repositories.use_pg`` to ``True`` (the shard-planner
+    tests) exercises the split, and every other test keeps today's
+    behaviour unchanged."""
 
     def __init__(self) -> None:
         self.data: Dict[Any, Dict[str, Any]] = {}
+        self.items: Dict[Any, Dict[str, Dict[str, Any]]] = {}
 
     def get(self, kind: str, connection_id: str) -> Optional[Dict[str, Any]]:
         stored = self.data.get((kind, connection_id))
@@ -7706,6 +7913,39 @@ class FakeStateStore:
     def list_kinds(self, connection_id: str, prefix: str) -> List[str]:
         return [k for (k, cid) in self.data if cid == connection_id and k.startswith(prefix)]
 
+    def crawl_items_get(
+        self, kind: str, connection_id: str, *, legacy: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        from src.repositories import use_pg
+
+        if not use_pg():
+            return None
+        key = (kind, connection_id)
+        current = self.items.get(key)
+        if current is None:
+            current = {"ctags": {}, "failed_items": {}, "empty_items": {}}
+            if legacy and any(legacy.values()):
+                for field_name in current:
+                    current[field_name] = dict(legacy.get(field_name) or {})
+            self.items[key] = current
+        return {field_name: dict(v) for field_name, v in current.items()}
+
+    def crawl_items_apply(self, kind: str, connection_id: str, deltas: Dict[str, Dict[str, Any]]) -> bool:
+        from src.repositories import use_pg
+
+        if not use_pg():
+            return False
+        current = self.items.setdefault((kind, connection_id), {"ctags": {}, "failed_items": {}, "empty_items": {}})
+        for field_name in ("ctags", "failed_items", "empty_items"):
+            delta = deltas[field_name]
+            target = current[field_name]
+            if delta["reset"]:
+                target.clear()
+            for stable_id in delta["removed"]:
+                target.pop(stable_id, None)
+            target.update(delta["set"])
+        return True
+
 
 def _install_fake_state_store(monkeypatch, store: "FakeStateStore") -> None:
     from connectors.sharepoint import state_store
@@ -7713,6 +7953,8 @@ def _install_fake_state_store(monkeypatch, store: "FakeStateStore") -> None:
     monkeypatch.setattr(state_store, "get", store.get)
     monkeypatch.setattr(state_store, "put", store.put)
     monkeypatch.setattr(state_store, "list_kinds", store.list_kinds)
+    monkeypatch.setattr(state_store, "crawl_items_get", store.crawl_items_get)
+    monkeypatch.setattr(state_store, "crawl_items_apply", store.crawl_items_apply)
 
 
 class TestAutoParallelCrawlPlanner:

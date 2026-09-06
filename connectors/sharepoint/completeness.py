@@ -34,9 +34,12 @@ counts (never stored, always recomputed):
   hides a real gap.
 
 **Attribution rules for the four reason counts, and their honest limits.**
-``failed``/``empty`` come from ``sharepoint_connection_state(kind="crawl")``
-(``connectors.sharepoint.state_store``)'s ``failed_items``/``empty_items`` —
-cumulative, itemized dicts keyed by stable id, each entry carrying the
+``failed``/``empty`` come from ``connectors.sharepoint.crawler.load_state``'s
+``failed_items``/``empty_items`` (per-FILE rows in ``sharepoint_crawl_items``
+since migration ``0110_sharepoint_crawl_items``, embedded in
+``sharepoint_connection_state(kind="crawl")`` on the DuckDB fallback —
+``load_state`` is what reconciles the two, so this module never reads either
+storage directly) — cumulative, itemized dicts keyed by stable id, each entry carrying the
 crawler's own ``state_key`` (``drive_id`` or ``drive_id:root_item_id``) and,
 usually, a ``path``. ``skipped_unsupported`` and ``oversize`` are NOT
 cumulative: the crawler only ever persists them inside ``last_run`` (the
@@ -252,14 +255,13 @@ async def compute_completeness(
     count against, so no Graph call is ever attempted); a connection WITH
     scopes always gets a resolved token from its caller.
     """
-    from connectors.sharepoint.crawler import _scope_kind, _unsupported_extensions
+    from connectors.sharepoint.crawler import _scope_kind, _unsupported_extensions, load_state
     from connectors.sharepoint.graph_client import (
         SharePointGraphError,
         get_item_web_url,
         list_root_children_with_url,
         search_document_count,
     )
-    from connectors.sharepoint.state_store import get as state_get
     from src.repositories import corpus_files_repo
 
     connection_id = connection["id"]
@@ -270,7 +272,11 @@ async def compute_completeness(
     ]
     if scopes:
         assert token is not None, "compute_completeness: token is required when the connection has confirmed scopes"
-    state = state_get("crawl", connection_id) or {}
+    # `load_state` (not a raw `state_store.get`) — `failed_items`/
+    # `empty_items` live in the per-file table on Postgres since migration
+    # 0110_sharepoint_crawl_items; `load_state` is the one place that knows
+    # how to reconstruct them regardless of backend or migration state.
+    state = load_state(connection_id)
     excluded_extensions = _unsupported_extensions()
     semaphore = asyncio.Semaphore(_COUNT_CONCURRENCY)
     files_repo = corpus_files_repo()

@@ -47,11 +47,31 @@ construction — ``sharepoint_connection_state`` (the table this reads/
 writes) has no DuckDB sibling itself, so this repository can never resolve
 on a DuckDB-backed instance (``RequiresPostgresBackend``, translated to a
 typed ``501`` by ``app/main.py``).
+
+``ctags``/``failed_items``/``empty_items`` for ``kind='crawl'`` moved out of
+``sharepoint_connection_state.payload`` into their own per-file table,
+``sharepoint_crawl_items`` (migration ``0110_sharepoint_crawl_items`` — see
+that migration's docstring for why: a checkpoint rewriting the whole blob
+orphaned tens of megabytes of TOAST chunks per write). :meth:`~
+SharePointConnectionMergePgRepository._read` transparently overlays the
+per-file table's rows onto whatever those three keys still hold on the
+blob (a sibling not yet re-crawled since the split shipped can still carry
+them there — see ``connectors.sharepoint.state_store.crawl_items_get``'s
+own "old shape, new shape" migration), so :func:`_merge_state` below needs
+no change at all: it still merges three plain ``stable_id -> ...`` dicts,
+regardless of which table they were assembled from. :meth:`~
+SharePointConnectionMergePgRepository._write` writes the merged result
+back to the per-file table (a full replace — this repository always writes
+the deterministic union of target + siblings, never an incremental delta,
+so there is nothing to preserve from the previous rows) and keeps those
+three keys OUT of the blob it writes, same as a normal crawl checkpoint
+now does.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 import sqlalchemy as sa
@@ -217,9 +237,96 @@ class SharePointConnectionMergePgRepository:
             .mappings()
             .first()
         )
-        return _decode(row["payload"]) if row is not None else {}
+        payload = _decode(row["payload"]) if row is not None else {}
+        if kind == "crawl":
+            # Overlay the per-file table (module docstring) onto whatever
+            # the blob still holds for these three keys — a sibling not
+            # re-crawled since the split shipped can still carry them on
+            # the blob; the per-file table wins a collision as the more
+            # current shape.
+            items = self._read_items(conn, connection_id, kind)
+            payload = dict(payload)
+            for field in ("ctags", "failed_items", "empty_items"):
+                payload[field] = {**(payload.get(field) or {}), **items[field]}
+        return payload
+
+    def _read_items(self, conn: Connection, connection_id: str, kind: str) -> Dict[str, Dict[str, Any]]:
+        """Mirrors ``SharepointCrawlItemsPgRepository.get_all`` — kept as
+        its own small query (rather than instantiating that repository)
+        because it must run on THIS caller's own ``conn``/transaction, not
+        open a second one; see :meth:`_write_items` for the write-side
+        half of the same constraint."""
+        out: Dict[str, Dict[str, Any]] = {"ctags": {}, "failed_items": {}, "empty_items": {}}
+        rows = conn.execute(
+            sa.text(
+                "SELECT stable_id, ctag, failed_entry, empty_entry FROM sharepoint_crawl_items "
+                "WHERE connection_id = :cid AND kind = :kind"
+            ),
+            {"cid": connection_id, "kind": kind},
+        ).mappings()
+        for row in rows:
+            stable_id = row["stable_id"]
+            if row["ctag"] is not None:
+                out["ctags"][stable_id] = row["ctag"]
+            failed = _decode(row["failed_entry"]) if row["failed_entry"] is not None else None
+            if failed is not None:
+                out["failed_items"][stable_id] = failed
+            empty = _decode(row["empty_entry"]) if row["empty_entry"] is not None else None
+            if empty is not None:
+                out["empty_items"][stable_id] = empty
+        return out
+
+    def _write_items(
+        self,
+        conn: Connection,
+        connection_id: str,
+        kind: str,
+        *,
+        ctags: Dict[str, Any],
+        failed_items: Dict[str, Any],
+        empty_items: Dict[str, Any],
+    ) -> None:
+        """Replace every per-file row for ``(connection_id, kind)`` with
+        the merged union — a full delete-then-insert, not an incremental
+        delta: :meth:`apply` always computes the deterministic union of
+        target + siblings from scratch, so there is no previous-row state
+        worth preserving, and a retried call converges to the identical
+        result rather than double-applying anything."""
+        conn.execute(
+            sa.text("DELETE FROM sharepoint_crawl_items WHERE connection_id = :cid AND kind = :kind"),
+            {"cid": connection_id, "kind": kind},
+        )
+        stable_ids = set(ctags) | set(failed_items) | set(empty_items)
+        now = datetime.now(timezone.utc)
+        for stable_id in stable_ids:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO sharepoint_crawl_items "
+                    "(connection_id, kind, stable_id, ctag, failed_entry, empty_entry, updated_at) "
+                    "VALUES (:cid, :kind, :sid, :ctag, CAST(:failed AS JSONB), CAST(:empty AS JSONB), :now)"
+                ),
+                {
+                    "cid": connection_id,
+                    "kind": kind,
+                    "sid": stable_id,
+                    "ctag": ctags.get(stable_id),
+                    "failed": json.dumps(failed_items[stable_id]) if stable_id in failed_items else None,
+                    "empty": json.dumps(empty_items[stable_id]) if stable_id in empty_items else None,
+                    "now": now,
+                },
+            )
 
     def _write(self, conn: Connection, connection_id: str, kind: str, payload: Dict[str, Any]) -> None:
+        payload = dict(payload)
+        if kind == "crawl":
+            self._write_items(
+                conn,
+                connection_id,
+                kind,
+                ctags=payload.pop("ctags", {}) or {},
+                failed_items=payload.pop("failed_items", {}) or {},
+                empty_items=payload.pop("empty_items", {}) or {},
+            )
         conn.execute(
             sa.text(
                 "INSERT INTO sharepoint_connection_state (connection_id, kind, payload, updated_at) "

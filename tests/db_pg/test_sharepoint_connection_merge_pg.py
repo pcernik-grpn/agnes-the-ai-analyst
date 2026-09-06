@@ -19,16 +19,28 @@ from __future__ import annotations
 def _make_repo(pg_engine, monkeypatch):
     monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
     import src.db_pg as db_pg
-    from src.models.sharepoint_state import SharepointConnectionState
+    from src.models.sharepoint_state import SharepointConnectionState, SharepointCrawlItem
 
     db_pg.dispose()
     engine = db_pg.get_engine()
     SharepointConnectionState.__table__.create(engine, checkfirst=True)
+    SharepointCrawlItem.__table__.create(engine, checkfirst=True)
 
     from src.repositories.sharepoint_connection_merge_pg import SharePointConnectionMergePgRepository
     from src.repositories.sharepoint_state_pg import SharepointStatePgRepository
 
     return SharePointConnectionMergePgRepository(engine), SharepointStatePgRepository(engine)
+
+
+def _read_crawl(merge_repo, connection_id: str):
+    """``ctags``/``failed_items``/``empty_items`` for ``kind='crawl'`` live
+    in the per-file table after the split (migration
+    ``0110_sharepoint_crawl_items``), not in the blob
+    ``SharepointStatePgRepository.get`` reads — this reads the SAME
+    composite view :meth:`SharePointConnectionMergePgRepository._read`
+    (and so ``plan``/``apply`` themselves) assemble."""
+    with merge_repo._engine.connect() as conn:
+        return merge_repo._read(conn, connection_id, "crawl")
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +73,8 @@ def test_apply_writes_the_union_onto_the_target_and_leaves_siblings_untouched(pg
 
     merge_repo.apply(target_id="target", sibling_ids=["sib-1", "sib-2"])
 
-    assert state_repo.get("target", "crawl") == {
+    assert state_repo.get("target", "crawl") == {"delta_links": {"drive:root": "u0", "drive:a": "u1", "drive:b": "u2"}}
+    assert _read_crawl(merge_repo, "target") == {
         "delta_links": {"drive:root": "u0", "drive:a": "u1", "drive:b": "u2"},
         "ctags": {},
         "failed_items": {},
@@ -121,7 +134,7 @@ def test_an_identical_value_on_both_sides_is_not_reported_as_a_conflict(pg_engin
 
     diag = merge_repo.apply(target_id="target", sibling_ids=["sib-1"])
     assert diag["sib-1"]["crawl"]["conflicts"] == []
-    assert state_repo.get("target", "crawl")["ctags"] == {"graph:1": "same"}
+    assert _read_crawl(merge_repo, "target")["ctags"] == {"graph:1": "same"}
 
 
 def test_failed_items_collision_keeps_the_newer_entry_by_last_failed_at(pg_engine, monkeypatch):
@@ -141,7 +154,7 @@ def test_failed_items_collision_keeps_the_newer_entry_by_last_failed_at(pg_engin
     assert diag["sib-1"]["crawl"]["conflicts"] == [
         {"kind": "failed_items", "key": "graph:1", "resolution": "kept_sibling_newer"}
     ]
-    assert state_repo.get("target", "crawl")["failed_items"]["graph:1"]["attempts"] == 5
+    assert _read_crawl(merge_repo, "target")["failed_items"]["graph:1"]["attempts"] == 5
 
 
 def test_empty_items_collision_keeps_the_targets_entry_when_it_is_newer(pg_engine, monkeypatch):
@@ -153,7 +166,7 @@ def test_empty_items_collision_keeps_the_targets_entry_when_it_is_newer(pg_engin
     assert diag["sib-1"]["crawl"]["conflicts"] == [
         {"kind": "empty_items", "key": "graph:1", "resolution": "kept_target_newer_or_tied"}
     ]
-    assert state_repo.get("target", "crawl")["empty_items"]["graph:1"]["last_seen_at"] == "2026-02-01T00:00:00Z"
+    assert _read_crawl(merge_repo, "target")["empty_items"]["graph:1"]["last_seen_at"] == "2026-02-01T00:00:00Z"
 
 
 def test_facts_docs_collision_prefers_status_done_over_not_done(pg_engine, monkeypatch):
@@ -194,7 +207,7 @@ def test_two_siblings_colliding_with_each_other_is_caught_on_the_second(pg_engin
     assert diag["sib-2"]["crawl"]["conflicts"] == [{"kind": "ctags", "key": "graph:1", "resolution": "kept_target"}]
     # sib-1 was folded in first, so it is now "target's own" value by the
     # time sib-2 is processed.
-    assert state_repo.get("target", "crawl")["ctags"] == {"graph:1": "from-sib-1"}
+    assert _read_crawl(merge_repo, "target")["ctags"] == {"graph:1": "from-sib-1"}
 
 
 # ---------------------------------------------------------------------------

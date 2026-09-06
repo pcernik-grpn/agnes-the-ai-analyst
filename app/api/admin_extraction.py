@@ -331,6 +331,33 @@ def _is_resumable(run: Dict[str, Any], report: Dict[str, Any]) -> bool:
     return reason in RESUMABLE_STOP_REASONS
 
 
+def _crawl_backlog_counts(connection_id: str) -> Dict[str, int]:
+    """``{"failed_items_count", "empty_items_count"}`` for this
+    connection's ``crawl`` state — summed across BOTH the legacy blob
+    (``SharepointStatePgRepository.backlog_counts``, still correct for a
+    connection whose ``failed_items``/``empty_items`` have not yet been
+    split out of ``sharepoint_connection_state.payload`` — see
+    ``connectors.sharepoint.crawler.load_state``'s one-time migration) and
+    the per-file table those two collections now live in once a crawl has
+    touched this connection (``SharepointCrawlItemsPgRepository.counts``,
+    migration ``0110_sharepoint_crawl_items``).
+
+    Summing both is always correct, never double-counting: the legacy
+    blob's embedded copy is stripped by the very next ``save_state`` after
+    it is imported into the per-file table (module docstring's "old shape
+    -> new shape, exactly once"), so exactly one of the two sources ever
+    holds a given connection's real backlog at a time.
+    """
+    from src.repositories import sharepoint_crawl_items_repo, sharepoint_state_repo
+
+    legacy = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
+    split = sharepoint_crawl_items_repo().counts(connection_id, "crawl")
+    return {
+        "failed_items_count": legacy["failed_items_count"] + split["failed_items_count"],
+        "empty_items_count": legacy["empty_items_count"] + split["empty_items_count"],
+    }
+
+
 def _shard_expected_by_key(connection_id: str) -> Dict[str, int]:
     """Every persisted shard's own ``expected`` (plan) document count, keyed
     by the SAME ``shard_key`` a child's own ``extraction_runs.shard_key``
@@ -1092,9 +1119,10 @@ def fleet_extraction_runs(
     next to a red "Stuck?" tag on the same row). ``facts`` is the facts
     stage's own numbers, read off the same row (:func:`_fleet_facts`).
     ``failed_items_count``/``empty_items_count`` are the SAME persisted-
-    backlog counts ``extraction/status`` carries (:meth:`SharepointStatePg
-    Repository.backlog_counts`) — what the table's own "Retry failed (N)"/
-    "Retry empty (N)" buttons show, one cheap query per row. A ``stalled``
+    backlog counts ``extraction/status`` carries (:func:`_crawl_backlog_
+    counts`) — what the table's own "Retry failed (N)"/"Retry empty (N)"
+    buttons show, one cheap query per row (two, post-split — see that
+    function's own docstring). A ``stalled``
     row (or one still merely ``running``) can also be force-cancelled — see
     ``POST …/extraction/runs/{run_id}/cancel`` below.
 
@@ -1187,7 +1215,6 @@ def fleet_extraction_runs(
         extraction_runs_repo,
         facts_ingest_runs_repo,
         jobs_repo,
-        sharepoint_state_repo,
         source_connections_repo,
     )
 
@@ -1321,7 +1348,7 @@ def fleet_extraction_runs(
             facts_ingest_usage=facts_ingest_usage,
         )
         row_cost = _fleet_row_cost(run, facts_ingest_usage)
-        backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
+        backlog = _crawl_backlog_counts(connection_id)
 
         # Shared-collection marker (cost-truth fix) — THIS row's own
         # attribution stays full (see `_fleet_row_cost`'s docstring for why
@@ -1432,9 +1459,7 @@ def fleet_extraction_runs(
     # (that one spans every SharePoint connection, not just what this
     # `active`/`all` call is rendering).
     facts_ledger_total_cost = sum(
-        cost
-        for run_id in rendered_facts_run_ids
-        if (cost := unique_facts_run_cost_by_id.get(run_id)) is not None
+        cost for run_id in rendered_facts_run_ids if (cost := unique_facts_run_cost_by_id.get(run_id)) is not None
     )
     totals["estimated_cost_usd"] = round(crawl_cost_total + facts_ledger_total_cost, 4)
     totals["cost_note"] = (
@@ -1858,12 +1883,14 @@ def extraction_status(
     ``failed_items_count``/``empty_items_count`` are the SIZE of this
     connection's persisted ``failed_items``/``empty_items`` backlogs
     (``connectors.sharepoint.crawler.load_state``), read with
-    :meth:`SharepointStatePgRepository.backlog_counts` — a cheap
-    ``jsonb_object_keys`` count, never a decode of the (potentially huge)
-    payload on this polled-every-few-seconds path. They are what the
-    source card's "Retry failed (N)"/"Retry empty (N)" buttons show as
-    ``N``, and are ``0`` (never ``null``) for a connection that has never
-    crawled — an honest "nothing to retry", not a missing signal.
+    :func:`_crawl_backlog_counts` — a cheap count (``jsonb_object_keys`` on
+    the legacy blob plus a row count on the per-file table, migration
+    ``0110_sharepoint_crawl_items``), never a decode of either's
+    (potentially huge) payload on this polled-every-few-seconds path. They
+    are what the source card's "Retry failed (N)"/"Retry empty (N)"
+    buttons show as ``N``, and are ``0`` (never ``null``) for a connection
+    that has never crawled — an honest "nothing to retry", not a missing
+    signal.
     ``skipped_unsupported_count`` is NOT a persisted backlog (no retry
     mechanism replays it — see ``CrawlStats.skipped_unsupported``'s
     docstring), so it is read off whichever of ``running``/``last_failed``/
@@ -1885,7 +1912,7 @@ def extraction_status(
     ``Queued`` rung.
     """
     connection = _sharepoint_connection_or_404(connection_id)
-    from src.repositories import extraction_runs_repo, sharepoint_state_repo
+    from src.repositories import extraction_runs_repo
 
     repo = extraction_runs_repo()
     now = datetime.now(timezone.utc)
@@ -1922,7 +1949,7 @@ def extraction_status(
             skipped_unsupported_count = candidate["skipped_unsupported"]
             break
 
-    backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
+    backlog = _crawl_backlog_counts(connection_id)
     facts_job = _facts_job_in_flight(connection_id)
     facts_pending = _facts_pending_documents(connection_id)
     facts_jobs = _facts_jobs_in_flight(connection_id)
