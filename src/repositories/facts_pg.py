@@ -1141,6 +1141,23 @@ class FactsPgRepository:
             },
         )
 
+        if facts_delta:
+            # TCRD-296 gap #81: this fact's FIRST claim in this collection —
+            # the same "genuinely new" condition `facts_delta` itself already
+            # gates on — so `fact_collection_type_counts` advances in lockstep
+            # with `fact_collection_stats.facts_count`, never independently.
+            fact_type = conn.execute(sa.text("SELECT type FROM facts WHERE id = :sid"), {"sid": subject_id}).scalar()
+            if fact_type is not None:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO fact_collection_type_counts (corpus_id, type, count) "
+                        "VALUES (:corpus_id, :type, 1) "
+                        "ON CONFLICT (corpus_id, type) DO UPDATE SET "
+                        "count = fact_collection_type_counts.count + 1"
+                    ),
+                    {"corpus_id": corpus_id, "type": fact_type},
+                )
+
     def _decrement_collection_stats_for_deleted_claims(
         self, conn: Connection, deleted_rows: Sequence[Mapping[str, Any]]
     ) -> None:
@@ -1220,6 +1237,28 @@ class FactsPgRepository:
                     {"corpus_id": corpus_id, "fact_id": fact_id},
                 )
                 facts_removed_per_corpus[corpus_id] += 1
+                # TCRD-296 gap #81: this fact's LAST claim in this collection
+                # just went away — the exact inverse condition the bump above
+                # increments on — so decrement `fact_collection_type_counts`
+                # too. `facts` itself is never touched by this delete path, so
+                # the type lookup here always resolves.
+                fact_type = conn.execute(sa.text("SELECT type FROM facts WHERE id = :fid"), {"fid": fact_id}).scalar()
+                if fact_type is not None:
+                    remaining_tc = conn.execute(
+                        sa.text(
+                            "UPDATE fact_collection_type_counts SET count = count - 1 "
+                            "WHERE corpus_id = :corpus_id AND type = :type "
+                            "RETURNING count"
+                        ),
+                        {"corpus_id": corpus_id, "type": fact_type},
+                    ).scalar()
+                    if remaining_tc is not None and remaining_tc <= 0:
+                        conn.execute(
+                            sa.text(
+                                "DELETE FROM fact_collection_type_counts WHERE corpus_id = :corpus_id AND type = :type"
+                            ),
+                            {"corpus_id": corpus_id, "type": fact_type},
+                        )
 
         for (corpus_id, edge_id), removed in edge_claims_removed.items():
             remaining = conn.execute(
@@ -1272,7 +1311,8 @@ class FactsPgRepository:
         from `claims` (the same ground-truth query `_rebuild_one_collection_
         stats` writes) and diff it against the currently MAINTAINED
         `fact_collection_membership`/`edge_collection_membership`/
-        `fact_collection_stats` rows, without writing anything.
+        `fact_collection_stats`/`fact_collection_type_counts` rows, without
+        writing anything.
 
         For tests (and an operator chasing a reported drift) to verify the
         incremental legs — `_bump_collection_stats_impl` on insert,
@@ -1312,6 +1352,13 @@ class FactsPgRepository:
                     {"cid": corpus_id},
                 ).mappings()
             }
+            maintained_type_counts = {
+                r["type"]: r["count"]
+                for r in conn.execute(
+                    sa.text("SELECT type, count FROM fact_collection_type_counts WHERE corpus_id = :cid"),
+                    {"cid": corpus_id},
+                ).mappings()
+            }
 
             computed_facts = {
                 r["fact_id"]: (r["claims_count"], r["documents_count"])
@@ -1329,6 +1376,17 @@ class FactsPgRepository:
                     sa.text(
                         "SELECT edge_id, COUNT(*) AS claims_count FROM claims "
                         "WHERE corpus_id = :cid AND edge_id IS NOT NULL GROUP BY edge_id"
+                    ),
+                    {"cid": corpus_id},
+                ).mappings()
+            }
+            computed_type_counts = {
+                r["type"]: r["n"]
+                for r in conn.execute(
+                    sa.text(
+                        "SELECT f.type AS type, COUNT(DISTINCT c.fact_id) AS n FROM claims c "
+                        "JOIN facts f ON f.id = c.fact_id "
+                        "WHERE c.corpus_id = :cid AND c.fact_id IS NOT NULL GROUP BY f.type"
                     ),
                     {"cid": corpus_id},
                 ).mappings()
@@ -1351,11 +1409,13 @@ class FactsPgRepository:
             "stats": dict(maintained_stats_row) if maintained_stats_row else None,
             "fact_membership": maintained_facts,
             "edge_membership": maintained_edges,
+            "type_counts": maintained_type_counts,
         }
         computed = {
             "stats": computed_stats,
             "fact_membership": computed_facts,
             "edge_membership": computed_edges,
+            "type_counts": computed_type_counts,
         }
         return {"consistent": maintained == computed, "maintained": maintained, "computed": computed}
 
@@ -1447,6 +1507,25 @@ class FactsPgRepository:
                 "SELECT corpus_id, edge_id, COUNT(*) FROM claims "
                 "WHERE corpus_id = :cid AND edge_id IS NOT NULL GROUP BY corpus_id, edge_id "
                 "ON CONFLICT (corpus_id, edge_id) DO UPDATE SET claims_count = EXCLUDED.claims_count"
+            ),
+            {"cid": corpus_id},
+        )
+        # TCRD-296 gap #81: the per-type companion (``fact_collection_type_
+        # counts``, migration 0110) — same DELETE-then-INSERT-with-ON-CONFLICT
+        # shape as the membership tables above, for the same concurrent-writer
+        # reasons. `COUNT(DISTINCT c.fact_id)` per type mirrors `facts_count`'s
+        # own "one per distinct fact" semantics, just partitioned by type.
+        conn.execute(
+            sa.text("DELETE FROM fact_collection_type_counts WHERE corpus_id = :cid"),
+            {"cid": corpus_id},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO fact_collection_type_counts (corpus_id, type, count) "
+                "SELECT c.corpus_id, f.type, COUNT(DISTINCT c.fact_id) FROM claims c "
+                "JOIN facts f ON f.id = c.fact_id "
+                "WHERE c.corpus_id = :cid AND c.fact_id IS NOT NULL GROUP BY c.corpus_id, f.type "
+                "ON CONFLICT (corpus_id, type) DO UPDATE SET count = EXCLUDED.count"
             ),
             {"cid": corpus_id},
         )
@@ -4108,6 +4187,42 @@ class FactsPgRepository:
         same way a write made THROUGH this repository already does."""
         _bump_corpus_facts_version(corpus_id)
 
+    def _maintained_type_counts_for_collection(self, conn: Connection, corpus_id: str) -> Optional[Dict[str, int]]:
+        """Read `fact_collection_type_counts` for ONE collection under the
+        caller's own open transaction — TCRD-296 gap #81's per-type
+        companion to `fact_collection_stats`, maintained by the SAME three
+        writers (`_bump_collection_stats_impl`, `_decrement_collection_
+        stats_impl`, `_rebuild_one_collection_stats`). Called from
+        :meth:`collection_facts_summary` for an unrestricted (admin) caller
+        only — this table cannot express per-caller visibility, so a
+        non-admin caller always takes the exact CTE path regardless of what
+        this returns.
+
+        Returns ``None`` — never an empty dict — until THIS table
+        specifically has been populated anywhere. Deliberately its OWN
+        bootstrap gate, not the sibling `fact_collection_stats`'s: this
+        table shipped in a LATER migration (0110) than the sibling (0105),
+        so an instance already running with `fact_collection_stats`
+        populated has a non-empty sibling but an EMPTY `fact_collection_
+        type_counts` until the next `rebuild_collection_stats` run —
+        borrowing the sibling's gate would misread that transient window as
+        "this collection genuinely has no facts". A genuinely empty
+        collection on an already-populated system correctly returns
+        ``{}``, which the caller must NOT treat as "fall back to the exact
+        query"."""
+        populated = conn.execute(sa.text("SELECT EXISTS (SELECT 1 FROM fact_collection_type_counts)")).scalar()
+        if not populated:
+            return None
+        rows = (
+            conn.execute(
+                sa.text("SELECT type, count FROM fact_collection_type_counts WHERE corpus_id = :corpus_id"),
+                {"corpus_id": corpus_id},
+            )
+            .mappings()
+            .all()
+        )
+        return {r["type"]: int(r["count"]) for r in rows}
+
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page
         (spec §13.2 "Collection detail"): fact count by type, a paged list of
@@ -4154,8 +4269,32 @@ class FactsPgRepository:
         exact `sum(type_counts)` whenever the corpus has no stats row yet;
         the two can differ by the same small `wrong`/`restricted` margin
         `approximate_counts_for_collections`'s own docstring already
-        documents. There is no per-type stats table, so `type_counts`
-        itself always comes from the (now single-execution) exact CTE.
+        documents.
+
+        **TCRD-296 gap #81** (production measurement, 2026-09-05: 4.5-4.8s
+        on a 291k-file/801k-fact collection — a `Parallel Seq Scan` of the
+        whole `facts` table, 837k rows, hash-joined to `fact_collection_
+        membership`, 801k rows, to produce a 27-row `type_counts`). For the
+        SAME unrestricted-caller population `total` already fast-paths, the
+        breakdown itself now comes from the maintained `fact_collection_
+        type_counts` companion table (:meth:`_maintained_type_counts_for_
+        collection`) instead of `type_counts_cte`'s `visible JOIN facts
+        GROUP BY f.type` — which is skipped entirely (a `WHERE FALSE` stub)
+        when the fast path applies, so this collection's summary no longer
+        touches `facts` at all. A non-admin caller's breakdown is
+        UNCHANGED — still the exact CTE below — because per-caller
+        visibility (RBAC narrowing, audience tiers, `all_evidence` mode) is
+        exactly what this maintained table cannot express; see that
+        method's docstring for the bootstrap-gate reasoning. The
+        `dup_edges_cte` OR (`e.src IN (...) OR e.dst IN (...)`) is rewritten
+        as a UNION of two joins for the same reason: Postgres compiles each
+        `IN (subquery)` disjunct as its OWN hashed SubPlan, so the OR forces
+        materializing/hashing the (potentially huge) `visible` candidate set
+        TWICE for 50 output rows, and — worse, with non-sequential ids —
+        can degrade into an `edges_pkey` order scan that visits nearly the
+        whole `edges` table chasing the `ORDER BY e.id LIMIT 50`. A UNION of
+        two real JOINs lets the planner build its hash from the (usually
+        tiny) `type = 'possible_duplicate_of'`-filtered side instead.
         """
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
@@ -4171,20 +4310,37 @@ class FactsPgRepository:
         cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
         sv_types = list(_single_valued_edge_types())
 
-        # One round trip for everything `visible`-derived. Each of the four
-        # pieces below is its own CTE off the shared `visible`/`candidates`
-        # chain, JSON-aggregated into one row so `visible` is computed
-        # exactly once regardless of how many of the four read it. Order is
-        # applied INSIDE each `json_agg` (never relied on from scan order),
-        # so a parallel or reordered plan can never scramble a section.
-        combined_sql = sa.text(
-            f"""
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+
+            # Gap #79: resolved INSIDE this same transaction so the maintained
+            # table's own bootstrap-populated check and the combined query
+            # below see a consistent snapshot.
+            maintained_type_counts = self._maintained_type_counts_for_collection(conn, corpus_id) if is_admin else None
+            if maintained_type_counts is not None:
+                # The facts JOIN is skipped entirely — `type_counts` is
+                # filled in from `maintained_type_counts` below instead of
+                # `combined_row["type_counts"]`.
+                type_counts_leg = "type_counts_cte AS (SELECT NULL::text AS type, NULL::bigint AS n WHERE FALSE),"
+            else:
+                type_counts_leg = (
+                    "type_counts_cte AS (\n"
+                    "                SELECT f.type AS type, COUNT(*) AS n\n"
+                    "                FROM visible v JOIN facts f ON f.id = v.subject_id\n"
+                    "                GROUP BY f.type\n"
+                    "            ),"
+                )
+
+            # One round trip for everything `visible`-derived. Each of the four
+            # pieces below is its own CTE off the shared `visible`/`candidates`
+            # chain, JSON-aggregated into one row so `visible` is computed
+            # exactly once regardless of how many of the four read it. Order is
+            # applied INSIDE each `json_agg` (never relied on from scan order),
+            # so a parallel or reordered plan can never scramble a section.
+            combined_sql = sa.text(
+                f"""
             WITH {cte},
-            type_counts_cte AS (
-                SELECT f.type AS type, COUNT(*) AS n
-                FROM visible v JOIN facts f ON f.id = v.subject_id
-                GROUP BY f.type
-            ),
+            {type_counts_leg}
             page_cte AS (
                 SELECT v.subject_id AS subject_id, v.is_revealed AS is_revealed, f.type AS type
                 FROM visible v JOIN facts f ON f.id = v.subject_id
@@ -4192,11 +4348,18 @@ class FactsPgRepository:
                 LIMIT :limit_plus_one OFFSET :offset
             ),
             dup_edges_cte AS (
-                SELECT DISTINCT e.id AS id, e.src AS src, e.dst AS dst
-                FROM edges e
-                WHERE e.type = 'possible_duplicate_of'
-                  AND (e.src IN (SELECT subject_id FROM visible) OR e.dst IN (SELECT subject_id FROM visible))
-                ORDER BY e.id
+                SELECT id, src, dst FROM (
+                    SELECT e.id AS id, e.src AS src, e.dst AS dst
+                    FROM edges e
+                    JOIN visible v ON v.subject_id = e.src
+                    WHERE e.type = 'possible_duplicate_of'
+                    UNION
+                    SELECT e.id AS id, e.src AS src, e.dst AS dst
+                    FROM edges e
+                    JOIN visible v ON v.subject_id = e.dst
+                    WHERE e.type = 'possible_duplicate_of'
+                ) matched
+                ORDER BY id
                 LIMIT 50
             ),
             sv_candidates_cte AS (
@@ -4233,18 +4396,19 @@ class FactsPgRepository:
                     '[]'
                 ) AS sv_candidates
             """
-        )
-        combined_params = dict(vis_params)
-        combined_params["limit_plus_one"] = limit + 1
-        combined_params["offset"] = offset
-        combined_params["sv_types"] = sv_types
+            )
+            combined_params = dict(vis_params)
+            combined_params["limit_plus_one"] = limit + 1
+            combined_params["offset"] = offset
+            combined_params["sv_types"] = sv_types
 
-        with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             combined_row = conn.execute(combined_sql, combined_params).mappings().first()
             assert combined_row is not None
 
-            type_counts = {r["type"]: int(r["n"]) for r in (_decode_jsonb(combined_row["type_counts"]) or [])}
+            if maintained_type_counts is not None:
+                type_counts = maintained_type_counts
+            else:
+                type_counts = {r["type"]: int(r["n"]) for r in (_decode_jsonb(combined_row["type_counts"]) or [])}
 
             page_rows = _decode_jsonb(combined_row["page"]) or []
             limit_applied = len(page_rows) > limit
@@ -4369,15 +4533,18 @@ class FactsPgRepository:
                 )
 
         total = sum(type_counts.values())
-        if is_admin:
+        if is_admin and maintained_type_counts is None:
             # Gap #78's other half: on a corpus large enough for the exact
             # breakdown above to matter, the O(1) `fact_collection_stats`
             # lookup the Library index already trusts for "how big is this"
             # (`approximate_counts_for_collections`, gap #70) is a strictly
             # cheaper number to page against than one that took a full scan
             # to produce — same "admin sees all" scope, no per-caller
-            # narrowing lost. Never substituted for `type_counts` itself (no
-            # per-type stats table exists) and left as `sum(type_counts)`
+            # narrowing lost. Skipped when `maintained_type_counts` already
+            # applied (gap #81): `sum(maintained_type_counts.values())` is
+            # additively the SAME number `fact_collection_stats.facts_count`
+            # holds (both maintained by the identical writers), so a second
+            # round trip here would be redundant. Left as `sum(type_counts)`
             # whenever the corpus has no stats row yet (pre-rebuild, or a
             # corpus with zero facts).
             approx = self.approximate_counts_for_collections([corpus_id])

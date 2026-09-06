@@ -14,6 +14,13 @@ collection" becomes a primary-key lookup instead of a `claims` table scan.
 ``FactCollectionStats`` is the aggregate: one row per collection, the
 numbers ``approximate_counts_for_collections``/the Library index/the admin
 graph-counts card need without a per-request `GROUP BY` over `claims`.
+
+``FactCollectionTypeCounts`` (migration ``0110``, TCRD-296 gap #81) is the
+per-type companion: one row per ``(corpus_id, type)``, the breakdown
+``collection_facts_summary`` needs for an unrestricted (admin) caller
+without joining `facts` for every candidate in the collection. See that
+method's docstring for why this is admin-only (a per-caller-visibility
+breakdown is NOT the same population this table maintains).
 """
 
 from __future__ import annotations
@@ -61,3 +68,11 @@ class EdgeCollectionMembership(Base):
     corpus_id: Mapped[str] = mapped_column(String, primary_key=True)
     edge_id: Mapped[str] = mapped_column(String, ForeignKey("edges.id", ondelete="CASCADE"), primary_key=True)
     claims_count: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+
+
+class FactCollectionTypeCounts(Base):
+    __tablename__ = "fact_collection_type_counts"
+
+    corpus_id: Mapped[str] = mapped_column(String, primary_key=True)
+    type: Mapped[str] = mapped_column(String, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)

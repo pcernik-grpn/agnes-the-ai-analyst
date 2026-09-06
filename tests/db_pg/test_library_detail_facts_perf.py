@@ -131,6 +131,46 @@ def test_library_detail_admin_skips_exact_visibility_cte(tmp_path, monkeypatch, 
     )
 
 
+def test_library_detail_admin_type_counts_skip_facts_join_when_maintained(tmp_path, monkeypatch, pg_engine):
+    """TCRD-296 gap #81 — the type-counts fast path's own regression. Once
+    `fact_collection_type_counts` is populated, the admin render must not
+    run the facts-joining `GROUP BY f.type` aggregate at all: production
+    measurement, 2026-09-05, 4.5-4.8s on a 291k-file/801k-fact collection —
+    a `Parallel Seq Scan` of the whole `facts` table hash-joined to
+    `fact_collection_membership` to produce a 27-row breakdown. Must fail
+    BEFORE the fast path exists (the pre-fix code always ran this
+    aggregate, regardless of whether a maintained table existed)."""
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "true")
+    from app.web.router import _reset_facts_summary_cache
+
+    _reset_facts_summary_cache()
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_many_claims_collection(pg_engine, collection_id="col_detail_typecounts", owner="uploader1")
+
+    from src.repositories import facts_repo
+
+    facts_repo().rebuild_collection_stats(corpus_ids=["col_detail_typecounts"])
+
+    import src.db_pg as db_pg
+
+    engine = db_pg.get_engine()
+    statements, capture = _capture_statements(engine)
+    sa.event.listen(engine, "before_cursor_execute", capture)
+    try:
+        resp = client.get("/library/col_detail_typecounts", headers={"Authorization": f"Bearer {admin_token}"})
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", capture)
+    assert resp.status_code == 200, resp.text
+
+    type_join_statements = [s for s in statements if "GROUP BY f.type" in s]
+    assert not type_join_statements, (
+        f"admin render ran the facts-joining type_counts aggregate {len(type_join_statements)} time(s) "
+        f"even though fact_collection_type_counts is populated"
+    )
+    # And the numbers must still be right.
+    assert f"{N_FACTS} engagements" in resp.text
+
+
 def test_library_detail_non_admin_runs_exact_cte_at_most_once(tmp_path, monkeypatch, pg_engine):
     """Non-admin render: the exact per-caller CTE branch (`endpoint_claims`)
     legitimately runs — RBAC narrowing genuinely needs it — but at most

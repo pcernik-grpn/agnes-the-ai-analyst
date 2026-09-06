@@ -159,6 +159,9 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     "fact_collection_stats": ["corpus_id"],
     "fact_collection_membership": ["corpus_id", "fact_id"],
     "edge_collection_membership": ["corpus_id", "edge_id"],
+    # per-type companion to fact_collection_stats (0110) — PG-only with no
+    # DuckDB source; keyed by (collection, type), not "id".
+    "fact_collection_type_counts": ["corpus_id", "type"],
 }
 
 

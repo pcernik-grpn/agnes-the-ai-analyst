@@ -102,6 +102,19 @@ def _make_group_with_grant(pg_engine, *, group_name: str, collection_id: str, me
     resource_grants_repo().create(grp["id"], "collection", collection_id, "test-fixture", "required")
 
 
+def _make_admin(member_user_id: str) -> None:
+    """Add ``member_user_id`` to the seeded ``Admin`` system group — the
+    ONLY thing `_readable_ids`/`is_user_admin` treat as admin (a bare dict
+    caller with no such membership resolves as narrowed, per
+    `test_reader_parity_between_fallback_and_summary_paths_admin`'s own
+    comment)."""
+    from src.repositories import user_group_members_repo, user_groups_repo
+
+    admin_group = user_groups_repo().get_by_name("Admin")
+    assert admin_group is not None, "Admin system group must already be seeded by pg_env"
+    user_group_members_repo().add_member(member_user_id, admin_group["id"], source="admin", added_by="test-fixture")
+
+
 def _membership_rows(pg_engine, corpus_id: str) -> dict:
     with pg_engine.connect() as conn:
         return {
@@ -139,6 +152,18 @@ def _wipe_summary(pg_engine) -> None:
         conn.execute(sa.text("DELETE FROM fact_collection_membership"))
         conn.execute(sa.text("DELETE FROM edge_collection_membership"))
         conn.execute(sa.text("DELETE FROM fact_collection_stats"))
+        conn.execute(sa.text("DELETE FROM fact_collection_type_counts"))
+
+
+def _type_counts_rows(pg_engine, corpus_id: str) -> dict:
+    with pg_engine.connect() as conn:
+        return {
+            r["type"]: r["count"]
+            for r in conn.execute(
+                sa.text("SELECT type, count FROM fact_collection_type_counts WHERE corpus_id = :c"),
+                {"c": corpus_id},
+            ).mappings()
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +244,167 @@ def test_add_claim_maintains_edge_membership(pg_env, repo):
     # The edge's two endpoints carry no claim of their own — facts_count
     # must not count them.
     assert stats["facts_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-type companion table (TCRD-296 gap #81) — maintained the SAME way as
+# the sibling counters, by the SAME three writers.
+# ---------------------------------------------------------------------------
+
+
+def test_add_claim_maintains_type_counts(pg_env, repo):
+    """Writer #1: the hot ingest path (`_bump_collection_stats_impl`, via
+    `add_claim`) advances `fact_collection_type_counts` in lockstep with
+    `fact_collection_stats.facts_count` — one increment per DISTINCT fact,
+    never per claim."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    engagement_id = repo.create_fact(type="engagement")
+    industry_id = repo.create_fact(type="industry")
+    repo.add_claim(
+        fact_id=engagement_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Quote one is here."
+    )
+    # A second claim on the SAME fact must not double-count its type.
+    repo.add_claim(
+        fact_id=engagement_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Quote two is here."
+    )
+    repo.add_claim(
+        fact_id=industry_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Quote three here."
+    )
+
+    assert _type_counts_rows(pg_env, CORPUS_A) == {"engagement": 1, "industry": 1}
+
+
+def test_add_claim_edge_claim_does_not_create_a_type_counts_row(pg_env, repo):
+    """An edge's own claim carries no fact `type` — `_bump_collection_stats_
+    impl`'s edge branch must never touch `fact_collection_type_counts`."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    src_id = repo.create_fact(type="engagement")
+    dst_id = repo.create_fact(type="industry")
+    edge_id = repo.create_edge(src=src_id, type="works_in_industry", dst=dst_id)
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Acme is in SaaS."
+    )
+
+    assert _type_counts_rows(pg_env, CORPUS_A) == {}
+
+
+def test_delete_claims_for_file_decrements_type_counts(pg_env, repo):
+    """Writer #2: the per-file delete path (`_decrement_collection_stats_
+    impl`) is the exact inverse of the bump above — decrements only when a
+    fact's LAST claim in this collection goes away, never while another
+    file still cites it."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+
+    engagement_id = repo.create_fact(type="engagement")
+    industry_id = repo.create_fact(type="industry")
+    repo.add_claim(
+        fact_id=engagement_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Quote one is here."
+    )
+    repo.add_claim(
+        fact_id=engagement_id,
+        corpus_file_id="cf_a2",
+        corpus_id=CORPUS_A,
+        file_sha256="s",
+        quote="Quote from another file.",
+    )
+    repo.add_claim(
+        fact_id=industry_id, corpus_file_id="cf_a2", corpus_id=CORPUS_A, file_sha256="s", quote="Quote two is here."
+    )
+    assert _type_counts_rows(pg_env, CORPUS_A) == {"engagement": 1, "industry": 1}
+
+    # cf_a1's delete leaves engagement_id still cited by cf_a2 — the type
+    # count must not drop.
+    repo.delete_claims_for_file("cf_a1")
+    assert _type_counts_rows(pg_env, CORPUS_A) == {"engagement": 1, "industry": 1}
+
+    # cf_a2's delete removes engagement_id's LAST claim in this collection
+    # and industry_id's only one.
+    repo.delete_claims_for_file("cf_a2")
+    assert _type_counts_rows(pg_env, CORPUS_A) == {}
+
+
+def test_rebuild_collection_stats_reconciles_type_counts(pg_env, repo):
+    """Writer #3: the full rebuild path (`_rebuild_one_collection_stats`)
+    repopulates `fact_collection_type_counts` too — a maintained table with
+    an unmaintained writer is the classic way this kind of summary drifts
+    silently."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    engagement_id = repo.create_fact(type="engagement")
+    industry_id = repo.create_fact(type="industry")
+    repo.add_claim(
+        fact_id=engagement_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Quote one is here."
+    )
+    repo.add_claim(
+        fact_id=industry_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Quote two is here."
+    )
+    assert _type_counts_rows(pg_env, CORPUS_A) == {"engagement": 1, "industry": 1}
+
+    # Simulate drift: wipe ONLY the type-counts table, as if this writer had
+    # never run (the pre-fix bug this migration and its writers now close).
+    with pg_env.begin() as conn:
+        conn.execute(sa.text("DELETE FROM fact_collection_type_counts WHERE corpus_id = :c"), {"c": CORPUS_A})
+    assert _type_counts_rows(pg_env, CORPUS_A) == {}
+
+    result = repo.rebuild_collection_stats(corpus_ids=[CORPUS_A])
+
+    assert result == {"collections_rebuilt": 1}
+    assert _type_counts_rows(pg_env, CORPUS_A) == {"engagement": 1, "industry": 1}
+
+
+def test_type_counts_maintained_equals_exact_computation(pg_env, repo):
+    """Anti-drift check: the maintained per-type breakdown, built entirely
+    through the normal ingest path (`add_claim`), must equal a from-scratch
+    recompute straight from `claims`/`facts` — the same ground-truth query
+    `_rebuild_one_collection_stats` writes."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+
+    engagement_ids = [repo.create_fact(type="engagement") for _ in range(3)]
+    industry_id = repo.create_fact(type="industry")
+    for i, fid in enumerate(engagement_ids):
+        repo.add_claim(
+            fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote=f"Engagement quote {i}."
+        )
+    repo.add_claim(
+        fact_id=industry_id, corpus_file_id="cf_a2", corpus_id=CORPUS_A, file_sha256="s", quote="Industry quote here."
+    )
+    # A second claim on an existing fact, from another file, must not
+    # double-count its type either.
+    repo.add_claim(
+        fact_id=engagement_ids[0],
+        corpus_file_id="cf_a2",
+        corpus_id=CORPUS_A,
+        file_sha256="s",
+        quote="A second quote for the first one.",
+    )
+
+    with pg_env.connect() as conn:
+        exact = {
+            r["type"]: r["n"]
+            for r in conn.execute(
+                sa.text(
+                    "SELECT f.type AS type, COUNT(DISTINCT c.fact_id) AS n FROM claims c "
+                    "JOIN facts f ON f.id = c.fact_id WHERE c.corpus_id = :c GROUP BY f.type"
+                ),
+                {"c": CORPUS_A},
+            ).mappings()
+        }
+    assert exact == {"engagement": 3, "industry": 1}
+    assert _type_counts_rows(pg_env, CORPUS_A) == exact
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +1131,101 @@ def test_reader_parity_between_fallback_and_summary_paths_admin(pg_env, repo):
     del admin
 
 
+def test_collection_facts_summary_type_counts_respects_visibility_boundary(pg_env, repo, monkeypatch):
+    """TCRD-296 gap #81 — the maintained fast path is admin-only. A caller
+    whose visibility is genuinely narrower than "sees everything" must get
+    counts for exactly what THEY can see, never the corpus-wide maintained
+    total — leaking the wider number across an audience boundary is the
+    primary risk in this change.
+
+    Uses `all_evidence` mode (same shape as `test_facts_ui.py::test_facts_
+    section_caller_scoped_two_users_different_grants`) so the narrowing is
+    genuinely per-caller RBAC, not a `wrong`/`restricted` correction that
+    would also withhold the fact from an admin and prove nothing about the
+    fast path."""
+    monkeypatch.setenv("AGNES_FACTS_VISIBILITY_MODE", "all_evidence")
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    # Spans both collections — under all_evidence, visible only to a caller
+    # who can read BOTH.
+    spanning_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=spanning_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Part A evidence."
+    )
+    repo.add_claim(
+        fact_id=spanning_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="s", quote="Part B evidence."
+    )
+    # Evidenced ONLY by corpus A — visible to anyone who can read A alone.
+    a_only_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=a_only_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="A-only evidence."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="bob", email="bob@test.com", name="Bob")
+    _make_group_with_grant(pg_env, group_name="group-bob-a", collection_id=CORPUS_A, member_user_id="bob")
+
+    users_repo().create(id="root-admin", email="root-admin@test.com", name="Root")
+    _make_admin("root-admin")
+
+    admin_summary = repo.collection_facts_summary(_dict_user("root-admin"), CORPUS_A)
+    bob_summary = repo.collection_facts_summary(_dict_user("bob"), CORPUS_A)
+
+    # The maintained fast path (admin) sees BOTH facts — either has >=1
+    # claim in corpus A — the corpus-wide maintained total.
+    assert admin_summary["type_counts"] == {"engagement": 2}
+    assert admin_summary["total"] == 2
+    # Bob can only read corpus A — under all_evidence, `spanning_id` (which
+    # also needs corpus B) is invisible to him. His numbers must reflect
+    # exactly his own narrower visibility, never the admin/maintained total.
+    assert bob_summary["type_counts"] == {"engagement": 1}
+    assert bob_summary["total"] == 1
+    assert bob_summary["type_counts"] != admin_summary["type_counts"]
+
+
+def test_collection_facts_summary_type_counts_maintained_skips_facts_join(pg_env, repo):
+    """Regression (TCRD-296 gap #81) — the bug this PR fixes. Once
+    `fact_collection_type_counts` is populated, an admin's
+    `collection_facts_summary` must not run the facts-joining `GROUP BY
+    f.type` aggregate at all. Must fail BEFORE the fast path exists (the
+    pre-fix code always ran it, regardless of whether a maintained table
+    existed)."""
+    from sqlalchemy import event
+
+    from src.repositories import users_repo
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Some quote.")
+
+    users_repo().create(id="root-admin2", email="root-admin2@test.com", name="Root")
+    _make_admin("root-admin2")
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(repo._engine, "before_cursor_execute", _capture)
+    try:
+        summary = repo.collection_facts_summary(_dict_user("root-admin2"), CORPUS_A)
+    finally:
+        event.remove(repo._engine, "before_cursor_execute", _capture)
+
+    assert summary["type_counts"] == {"engagement": 1}
+    assert not any("GROUP BY f.type" in s for s in statements), (
+        f"admin render ran the facts-joining type_counts aggregate even though "
+        f"fact_collection_type_counts is populated: {statements}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Perf-shaped: the fast path is an index lookup, not a `claims` seq scan.
 # ---------------------------------------------------------------------------
@@ -1044,3 +1325,133 @@ def test_candidate_source_avoids_claims_seq_scan_at_scale(pg_env, repo):
         f"expected an index lookup on fact_collection_membership, not a Seq Scan: {membership_scans}"
     )
     assert any(n.get("Actual Rows", 0) == claims_per_collection for n in membership_scans)
+
+
+def test_dup_edges_leg_matches_pre_rewrite_query_and_avoids_double_subplan(pg_env, repo):
+    """TCRD-296 gap #81's edges leg: `dup_edges_cte`'s
+    `e.src IN (...) OR e.dst IN (...)` compiles each disjunct as its OWN
+    hashed SubPlan (Postgres cannot flatten an OR of two IN-subqueries into
+    one semi-join) — materializing/hashing the `visible` candidate set
+    TWICE for 50 output rows. The UNION-of-two-JOINs rewrite must return
+    the exact SAME edges the old query did (#5) and its plan must contain
+    NO SubPlan node at all — a real JOIN, never a subquery, regardless of
+    data volume (this is a structural compilation difference, not a
+    cost-based one, so a small fixture is enough to prove it)."""
+    n_facts = 50
+    n_other_edges = 50
+    n_dup_edges = 10
+
+    with pg_env.begin() as conn:
+        conn.execute(sa.text("INSERT INTO users (id, email, name) VALUES ('uploader1', 'u@test.com', 'U')"))
+        conn.execute(
+            sa.text("INSERT INTO file_corpora (id, slug, name, created_by) VALUES (:c, :c, :c, 'uploader1')"),
+            {"c": CORPUS_A},
+        )
+        conn.execute(
+            sa.text("INSERT INTO corpus_files (id, corpus_id, filename, sha256) VALUES ('cf1', :c, 'cf1', 'sha')"),
+            {"c": CORPUS_A},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO facts (id, type) SELECT 'edge_fact_' || g, 'engagement' FROM generate_series(0, :n - 1) g"
+            ),
+            {"n": n_facts},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO claims (id, fact_id, corpus_file_id, corpus_id, file_sha256, quote, quote_hash) "
+                "SELECT 'edge_claim_' || g, 'edge_fact_' || g, 'cf1', :c, 'sha', 'quote ' || g, 'qh_' || g "
+                "FROM generate_series(0, :n - 1) g"
+            ),
+            {"n": n_facts, "c": CORPUS_A},
+        )
+        # Deterministic, collision-free (src is unique per row within a
+        # type, so the (src, type, dst) unique constraint can never fire)
+        # rather than random() — this test is about plan SHAPE, not scale.
+        conn.execute(
+            sa.text(
+                "INSERT INTO edges (id, src, dst, type) "
+                "SELECT 'e_other_' || g, 'edge_fact_' || g, "
+                "'edge_fact_' || ((g * 13 + 7) % :n), 'other_type' "
+                "FROM generate_series(0, :m - 1) g"
+            ),
+            {"n": n_facts, "m": n_other_edges},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO edges (id, src, dst, type) "
+                "SELECT 'e_dup_' || g, 'edge_fact_' || g, "
+                "'edge_fact_' || ((g * 13 + 7 + 5) % :n), 'possible_duplicate_of' "
+                "FROM generate_series(0, :d - 1) g"
+            ),
+            {"n": n_facts, "d": n_dup_edges},
+        )
+
+    repo.rebuild_collection_stats(corpus_ids=[CORPUS_A])
+    with pg_env.begin() as conn:
+        conn.execute(sa.text("ANALYZE"))
+
+    cte = repo._visible_facts_for_corpus_cte(is_admin=True, all_evidence=False)
+    old_sql_text = f"""
+        WITH {cte}
+        SELECT DISTINCT e.id AS id, e.src AS src, e.dst AS dst
+        FROM edges e
+        WHERE e.type = 'possible_duplicate_of'
+          AND (e.src IN (SELECT subject_id FROM visible) OR e.dst IN (SELECT subject_id FROM visible))
+        ORDER BY e.id
+        LIMIT 50
+        """
+    new_sql_text = f"""
+        WITH {cte}
+        SELECT id, src, dst FROM (
+            SELECT e.id AS id, e.src AS src, e.dst AS dst
+            FROM edges e JOIN visible v ON v.subject_id = e.src
+            WHERE e.type = 'possible_duplicate_of'
+            UNION
+            SELECT e.id AS id, e.src AS src, e.dst AS dst
+            FROM edges e JOIN visible v ON v.subject_id = e.dst
+            WHERE e.type = 'possible_duplicate_of'
+        ) matched
+        ORDER BY id
+        LIMIT 50
+        """
+
+    with pg_env.begin() as conn:
+        old_rows = {(r.id, r.src, r.dst) for r in conn.execute(sa.text(old_sql_text), {"corpus_id": CORPUS_A})}
+    with pg_env.begin() as conn:
+        new_rows = {(r.id, r.src, r.dst) for r in conn.execute(sa.text(new_sql_text), {"corpus_id": CORPUS_A})}
+
+    assert new_rows == old_rows
+    assert len(new_rows) == n_dup_edges  # every seeded dup edge fits under the 50-row cap here
+
+    def _flatten(node):
+        out = [node]
+        for child in node.get("Plans", []) or []:
+            out.extend(_flatten(child))
+        return out
+
+    with pg_env.begin() as conn:
+        old_plan = conn.execute(sa.text(f"EXPLAIN (FORMAT JSON) {old_sql_text}"), {"corpus_id": CORPUS_A}).scalar()
+        new_plan = conn.execute(sa.text(f"EXPLAIN (FORMAT JSON) {new_sql_text}"), {"corpus_id": CORPUS_A}).scalar()
+    old_plan = old_plan if isinstance(old_plan, list) else json.loads(old_plan)
+    new_plan = new_plan if isinstance(new_plan, list) else json.loads(new_plan)
+    old_nodes = _flatten(old_plan[0]["Plan"])
+    new_nodes = _flatten(new_plan[0]["Plan"])
+
+    # Scoped to a "CTE Scan" of `visible` reached as a SubPlan specifically —
+    # `visible` itself has its OWN internal SubPlan/InitPlan machinery (the
+    # `EXISTS (SELECT 1 FROM fact_collection_stats)` bootstrap check), which
+    # is IDENTICAL in both plans and unrelated to this rewrite; a broader
+    # "any SubPlan anywhere" check would flag that shared, pre-existing
+    # machinery as if it were the bug this test targets.
+    def _is_visible_in_subplan(n):
+        return (
+            n.get("Node Type") == "CTE Scan"
+            and n.get("CTE Name") == "visible"
+            and n.get("Parent Relationship") == "SubPlan"
+        )
+
+    old_subplans = [n for n in old_nodes if _is_visible_in_subplan(n)]
+    new_subplans = [n for n in new_nodes if _is_visible_in_subplan(n)]
+    assert old_subplans, f"expected the pre-rewrite OR to compile as hashed SubPlan(s): {old_nodes}"
+    assert not new_subplans, f"the UNION-of-joins rewrite must not compile as a SubPlan: {new_nodes}"

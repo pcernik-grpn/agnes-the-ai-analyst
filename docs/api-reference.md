@@ -3630,7 +3630,12 @@ admin graph-counts card all read candidacy from a maintained summary
 `edge_collection_membership`) instead of scanning `claims` per request —
 kept current incrementally on ingest, and by a scoped recompute on the
 delete/reassign/merge/split/consolidation paths (see
-`src/repositories/facts_pg.py`'s "Collection stats summary" section).
+`src/repositories/facts_pg.py`'s "Collection stats summary" section). The
+Library collection detail page's per-type fact-count breakdown reads a
+companion table the same way: `fact_collection_type_counts` (TCRD-296 gap
+#81), one row per `(corpus_id, type)`, maintained by the SAME writers —
+used for an unrestricted (admin) caller only, since a per-caller-narrowed
+caller's breakdown cannot be expressed by a per-collection total.
 `POST /api/admin/facts/stats/rebuild` (admin) recomputes it from `claims` —
 `{"corpus_ids": [...]}` scopes the rebuild to those collections, an absent/
 `null` body rebuilds every collection that currently carries a claim (the
