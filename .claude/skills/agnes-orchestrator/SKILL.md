@@ -63,7 +63,7 @@ in `CHANGELOG.md`. Adding a schema version means:
 
 1. Bumping the version constant in `src/db.py`.
 2. Adding the `vN-1 → vN` migration step.
-3. Adding a CHANGELOG bullet that names the version.
+3. Adding a CHANGELOG fragment (`changelog.d/<slug>.md`, `### Internal`) that names the version.
 4. Updating documentation that references the schema version (search for
    "schema v" in `docs/` + `CLAUDE.md`).
 

@@ -250,6 +250,28 @@ def test_changelog_passes_when_a_new_bullet_was_added():
     assert findings == []
 
 
+def test_changelog_passes_when_a_fragment_was_added():
+    """The post-#2295 shape: CHANGELOG.md untouched, one changelog.d/ file added."""
+    findings = check_changelog(
+        base_changelog=_CL_EMPTY,
+        head_changelog=_CL_EMPTY,
+        changed_paths=["app/api/foo.py", "changelog.d/foo-endpoint.md"],
+        version_bumped=False,
+    )
+    assert findings == []
+
+
+def test_changelog_readme_in_changelog_d_is_not_a_fragment():
+    findings = check_changelog(
+        base_changelog=_CL_EMPTY,
+        head_changelog=_CL_EMPTY,
+        changed_paths=["app/api/foo.py", "changelog.d/README.md"],
+        version_bumped=False,
+    )
+    assert len(findings) == 1
+    assert "changelog.d/<slug>.md" in findings[0].message
+
+
 def test_changelog_ignores_test_docs_and_tooling_only_changes():
     for path in (
         "tests/test_foo.py",

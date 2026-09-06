@@ -26,6 +26,14 @@ a bullet INTO an already-released block instead of racing on the heading
 itself (#1918). ``tests/test_changelog_integrity.py`` checks the live
 CHANGELOG against that stored digest on every push.
 
+Since #2295 a feature PR does not even write to ``CHANGELOG.md``: it adds one
+small **fragment** file under ``changelog.d/`` (``### <Group>`` headings +
+bullets, see ``changelog.d/README.md``). Two PRs never touch the same file, so
+the one merge conflict that fired on every ``main`` sync is gone. The cut
+folds every fragment into ``[Unreleased]`` (:func:`merge_fragments`) right
+before the rename and deletes the fragment files, so the released
+``CHANGELOG.md`` looks exactly as it always did.
+
 Usage::
 
     scripts/release_cut.py --dry-run --json      # plan only, no writes
@@ -48,6 +56,7 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -286,6 +295,172 @@ def cut_changelog(changelog_text: str, new_version: str, *, date: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CHANGELOG fragments (changelog.d/)
+#
+# Every PR used to append its bullet to the one ``## [Unreleased]`` section,
+# so any two PRs merging in the same window conflicted on CHANGELOG.md — 34
+# of the 37 merge conflicts across two long autonomous runs were that file
+# alone (#2295). A fragment is one small file per PR under ``changelog.d/``;
+# nothing in it is shared with any other PR, so two PRs cannot conflict on
+# it. The cut folds every fragment into ``[Unreleased]`` immediately before
+# the rename and deletes the files.
+# ---------------------------------------------------------------------------
+
+FRAGMENTS_DIR = "changelog.d"
+FRAGMENT_README = "README.md"
+_GROUP_HEADING_RE = re.compile(r"^### +(\S.*?)\s*$")
+_CONFLICT_MARKER_RE = re.compile(r"^(<{7}|={7}|>{7})( |$)")
+
+
+class FragmentFormatError(ChangelogFormatError):
+    """A ``changelog.d/`` fragment does not have the shape the cut can fold in."""
+
+
+def _fragment_fix_hint(name: str) -> str:
+    return (
+        f"Fix {FRAGMENTS_DIR}/{name}: one or more '### <Group>' headings, each followed by "
+        f"'- ' bullets at column 0, Group one of {', '.join(DEFAULT_SUBSECTIONS)} "
+        f"(see {FRAGMENTS_DIR}/{FRAGMENT_README})."
+    )
+
+
+def parse_fragment(name: str, text: str) -> dict[str, list[str]]:
+    """``{group: [raw body lines]}`` for one fragment, validated.
+
+    Rules, each an error whose message carries the fix:
+
+    * every ``### <Group>`` is one of :data:`DEFAULT_SUBSECTIONS`, once;
+    * no other heading level — a fragment is a piece of the ``[Unreleased]``
+      body, not a document of its own;
+    * nothing but blank lines before the first group heading;
+    * every group has at least one bullet (``-``/``*`` at column 0);
+    * no unresolved conflict markers.
+
+    Body lines come back raw (continuation lines and their indentation
+    intact, surrounding blank lines trimmed) because they are spliced into
+    ``CHANGELOG.md`` verbatim — the cut must never re-wrap prose.
+    """
+    where = f"{FRAGMENTS_DIR}/{name}"
+    groups: dict[str, list[str]] = {}
+    current: str | None = None
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        if _CONFLICT_MARKER_RE.match(raw):
+            raise FragmentFormatError(f"{where}:{lineno}: unresolved merge-conflict marker. {_fragment_fix_hint(name)}")
+        heading = _GROUP_HEADING_RE.match(raw)
+        if heading:
+            group = heading.group(1)
+            if group not in DEFAULT_SUBSECTIONS:
+                raise FragmentFormatError(f"{where}:{lineno}: unknown group '### {group}'. {_fragment_fix_hint(name)}")
+            if group in groups:
+                raise FragmentFormatError(
+                    f"{where}:{lineno}: '### {group}' appears twice — keep one heading per group. "
+                    f"{_fragment_fix_hint(name)}"
+                )
+            current = group
+            groups[group] = []
+            continue
+        if raw.startswith("#"):
+            raise FragmentFormatError(
+                f"{where}:{lineno}: only '### <Group>' headings belong in a fragment. {_fragment_fix_hint(name)}"
+            )
+        if current is None:
+            if raw.strip():
+                raise FragmentFormatError(
+                    f"{where}:{lineno}: text before the first '### <Group>' heading. {_fragment_fix_hint(name)}"
+                )
+            continue
+        groups[current].append(raw)
+
+    if not groups:
+        raise FragmentFormatError(f"{where}: no '### <Group>' heading. {_fragment_fix_hint(name)}")
+
+    for group, body in groups.items():
+        while body and not body[0].strip():
+            body.pop(0)
+        while body and not body[-1].strip():
+            body.pop()
+        if not _bullets_in([line + "\n" for line in body]):
+            raise FragmentFormatError(f"{where}: '### {group}' has no bullet. {_fragment_fix_hint(name)}")
+    return groups
+
+
+def read_fragments(directory: Path) -> dict[str, str]:
+    """``{filename: text}`` for every ``*.md`` in ``directory`` except the README.
+
+    Sorted by name, so the assembled order never depends on filesystem order.
+    An absent directory is an empty mapping — a checkout that predates
+    fragments still cuts from ``[Unreleased]`` alone.
+    """
+    if not directory.is_dir():
+        return {}
+    return {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(directory.glob("*.md"))
+        if path.is_file() and path.name != FRAGMENT_README
+    }
+
+
+def merge_fragments(changelog_text: str, fragments: Mapping[str, str]) -> str:
+    """Fold every fragment's bullets into ``## [Unreleased]``, in filename order.
+
+    Each fragment group's body is appended verbatim to the end of the matching
+    ``### <Group>`` of ``[Unreleased]``; a group heading the section lacks is
+    created in Keep-a-Changelog order. Everything outside the ``[Unreleased]``
+    body — preamble and every released section — is preserved byte-for-byte,
+    the same contract :func:`cut_changelog` keeps. No fragments: the text
+    comes back unchanged.
+    """
+    if not fragments:
+        return changelog_text
+    parsed = [parse_fragment(name, text) for name, text in sorted(fragments.items())]
+
+    lines = _lines(changelog_text)
+    start, end = _unreleased_bounds(changelog_text)
+    body = [line.rstrip("\n") for line in lines[start + 1 : end]]
+
+    preamble: list[str] = []
+    sections: list[tuple[str, str, list[str]]] = []  # (group, heading line, body lines)
+    for line in body:
+        heading = _GROUP_HEADING_RE.match(line)
+        if heading:
+            sections.append((heading.group(1), line, []))
+        elif sections:
+            sections[-1][2].append(line)
+        else:
+            preamble.append(line)
+
+    def _section_for(group: str) -> list[str]:
+        for name, _, section_body in sections:
+            if name == group:
+                return section_body
+        rank = DEFAULT_SUBSECTIONS.index(group)
+        insert_at = 0
+        for index, (name, _, _) in enumerate(sections):
+            if name in DEFAULT_SUBSECTIONS and DEFAULT_SUBSECTIONS.index(name) < rank:
+                insert_at = index + 1
+        fresh: list[str] = []
+        sections.insert(insert_at, (group, f"### {group}", fresh))
+        return fresh
+
+    for groups in parsed:
+        for group, fragment_body in groups.items():
+            section_body = _section_for(group)
+            while section_body and not section_body[-1].strip():
+                section_body.pop()
+            section_body.extend(fragment_body)
+
+    rebuilt: list[str] = list(preamble)
+    for _, heading_line, section_body in sections:
+        rebuilt.append(heading_line)
+        rebuilt.extend(section_body)
+        if not section_body or section_body[-1].strip():
+            rebuilt.append("")
+    new_body = "".join(line + "\n" for line in rebuilt)
+
+    return "".join(lines[: start + 1]) + new_body + "".join(lines[end:])
+
+
+# ---------------------------------------------------------------------------
 # released-region immutability checksum (CHANGELOG.md <-> pyproject.toml)
 #
 # #1918: every guard above is scoped to [Unreleased] on purpose (see their
@@ -392,6 +567,7 @@ class ReleaseCutPlan:
     pyproject_text: str | None = None
     server_json_text: str | None = None
     released_changelog_sha256: str | None = None
+    fragment_paths: tuple[str, ...] = ()
 
     def as_json(self) -> dict:
         return {
@@ -401,6 +577,7 @@ class ReleaseCutPlan:
             "bullets": list(self.bullets),
             "date": self.date,
             "released_changelog_sha256": self.released_changelog_sha256,
+            "fragments": list(self.fragment_paths),
         }
 
 
@@ -411,25 +588,32 @@ def plan_release_cut(
     server_json_text: str | None = None,
     bump: str = "minor",
     date: str,
+    fragments: Mapping[str, str] | None = None,
 ) -> ReleaseCutPlan:
     """Compute the cut without writing anything.
 
-    Idempotent by construction: an empty ``[Unreleased]`` (no bullets) always
-    returns ``noop=True`` regardless of ``bump`` — there is nothing to ship,
-    so re-running the daily workflow on a quiet day is a safe no-op.
+    ``fragments`` (``{filename: text}``, see :func:`read_fragments`) are
+    folded into ``[Unreleased]`` first; the plan lists them in
+    ``fragment_paths`` so the caller deletes exactly the files it shipped.
+
+    Idempotent by construction: nothing pending (no ``[Unreleased]`` bullet,
+    no fragment) always returns ``noop=True`` regardless of ``bump`` — there
+    is nothing to ship, so re-running the daily workflow on a quiet day is a
+    safe no-op.
     """
     if bump not in BUMPERS:
         raise ValueError(f"unknown bump kind: {bump!r} (expected one of {sorted(BUMPERS)})")
 
     assert_no_duplicate_headings(changelog_text)
     previous_version = read_pyproject_version(pyproject_text)
-    bullets = tuple(unreleased_bullets(changelog_text))
+    merged = merge_fragments(changelog_text, fragments or {})
+    bullets = tuple(unreleased_bullets(merged))
 
     if not bullets:
         return ReleaseCutPlan(noop=True, previous_version=previous_version, version=None, bullets=(), date=date)
 
     new_version = BUMPERS[bump](previous_version)
-    new_changelog = cut_changelog(changelog_text, new_version, date=date)
+    new_changelog = cut_changelog(merged, new_version, date=date)
     # The just-cut block is now part of the released region, so the digest
     # covering it is computed AFTER the rename — this is what keeps the
     # stored checksum and tests/test_changelog_integrity.py's live guard in
@@ -448,6 +632,7 @@ def plan_release_cut(
         pyproject_text=new_pyproject,
         server_json_text=new_server_json,
         released_changelog_sha256=digest,
+        fragment_paths=tuple(sorted(fragments or {})),
     )
 
 
@@ -500,6 +685,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pyproject", type=Path, default=Path("pyproject.toml"))
     parser.add_argument("--server-json", type=Path, default=Path("server.json"))
     parser.add_argument(
+        "--fragments-dir",
+        type=Path,
+        default=Path(FRAGMENTS_DIR),
+        help="per-PR CHANGELOG fragments folded into [Unreleased] by the cut and deleted (default: changelog.d/)",
+    )
+    parser.add_argument(
         "--no-server-json",
         action="store_true",
         help="skip server.json even if present (e.g. a checkout that dropped it)",
@@ -536,6 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             server_json_text=server_json_text,
             bump=args.bump,
             date=date,
+            fragments=read_fragments(args.fragments_dir),
         )
     except (ChangelogFormatError, ValueError, OSError) as exc:
         print(f"release_cut: {exc}", file=sys.stderr)
@@ -544,9 +736,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(plan.as_json(), indent=2))
     elif plan.noop:
-        print(f"release_cut: [Unreleased] is empty at {plan.previous_version} — nothing to cut today.")
+        print(
+            f"release_cut: nothing pending at {plan.previous_version} — [Unreleased] is empty and "
+            f"{args.fragments_dir}/ has no fragments; nothing to cut today."
+        )
     else:
-        print(f"release_cut: {plan.previous_version} -> {plan.version} ({len(plan.bullets)} bullet(s)):")
+        print(
+            f"release_cut: {plan.previous_version} -> {plan.version} "
+            f"({len(plan.bullets)} bullet(s), {len(plan.fragment_paths)} fragment(s)):"
+        )
         for bullet in plan.bullets:
             print(f"  {bullet}")
 
@@ -561,9 +759,13 @@ def main(argv: list[str] | None = None) -> int:
     if plan.server_json_text is not None:
         args.server_json.write_text(plan.server_json_text, encoding="utf-8")
         written.append(str(args.server_json))
+    for name in plan.fragment_paths:
+        (args.fragments_dir / name).unlink()
 
     if not args.json:
         print(f"release_cut: wrote {', '.join(written)}")
+        if plan.fragment_paths:
+            print(f"release_cut: removed {len(plan.fragment_paths)} fragment(s) from {args.fragments_dir}/")
 
     return 0
 

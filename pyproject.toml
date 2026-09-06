@@ -385,6 +385,13 @@ dev = [
     # only tripping if the missing arm is reached at runtime. The repo-wide
     # mypy step in ci.yml stays advisory; this is the part that gates.
     "mypy>=1.11",
+    # ruff — the post-edit hook (`scripts/post-edit-quality.sh`) and the
+    # pre-push lint run whatever ruff the venv has. Without it here a plain
+    # `uv pip install ".[dev,server]"` venv has none, the hook fails on every
+    # edit, and every session rediscovers the workaround (#2295). Pinned
+    # exact on purpose: a formatter version drift reformats whole files under
+    # an unrelated edit; bump it deliberately, in its own PR.
+    "ruff==0.16.6",
 ]
 
 [project.scripts]

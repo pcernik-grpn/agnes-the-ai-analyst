@@ -36,7 +36,7 @@ python3 scripts/verify_syncmap.py
 ```
 
 Covers the `CONTRIBUTING.md` sync-map rows that have **no CI guard**: an
-unregistered `ResourceType`, a missing `## [Unreleased]` CHANGELOG bullet, a new
+unregistered `ResourceType`, a missing `changelog.d/` CHANGELOG fragment, a new
 boolean scope flag, `query_mode='remote'` without `_remote_attach`, and (as a
 WARN) a new entity-scoped endpoint with no authz dependency.
 

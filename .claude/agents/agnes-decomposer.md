@@ -31,9 +31,11 @@ Derived from the sync-map — surfaces that must change together go in ONE task:
 
 ## Merge magnets (do NOT let implementers edit these in parallel)
 
-`CHANGELOG.md` and `CLAUDE.md` collide if edited in parallel worktrees. Mark them
-in EVERY task as "emit bullet via structured output" — the integrator folds all
-bullets in one pass. Implementers must NOT edit these files directly.
+`CLAUDE.md` collides if edited in parallel worktrees, and `CHANGELOG.md` is
+never edited by a feature change at all (entries are `changelog.d/` fragments).
+Mark both in EVERY task as "emit bullet via structured output" — the integrator
+writes one fragment and one `CLAUDE.md` edit. Implementers must NOT edit these
+files directly.
 
 ## Output (JSON only)
 

@@ -15,6 +15,7 @@ import pytest
 from scripts.release_cut import (
     ChangelogFormatError,
     DuplicateHeadingError,
+    FragmentFormatError,
     bump_major,
     bump_minor,
     bump_patch,
@@ -23,7 +24,10 @@ from scripts.release_cut import (
     cut_changelog,
     has_unreleased_content,
     main,
+    merge_fragments,
+    parse_fragment,
     plan_release_cut,
+    read_fragments,
     read_pyproject_version,
     read_released_checksum,
     released_region,
@@ -550,3 +554,178 @@ def test_main_rebaseline_refuses_a_malformed_changelog(tmp_path):
     rc = main(["--changelog", str(changelog), "--pyproject", str(pyproject), "--rebaseline"])
     assert rc == 1
     assert pyproject.read_text(encoding="utf-8") == _PYPROJECT  # untouched on failure
+
+
+# ---------------------------------------------------------------------------
+# changelog.d/ fragments (#2295)
+# ---------------------------------------------------------------------------
+
+_FRAG_ADDED = "### Added\n- **A thing from PR one.** Details.\n"
+_FRAG_TWO_GROUPS = "### Fixed\n- A fix from PR two,\n  wrapped onto a second line.\n\n### Internal\n- A refactor.\n"
+_PYPROJECT_FOR_FRAGMENTS = '[project]\nname = "agnes"\nversion = "0.88.0"\n'
+
+
+def test_parse_fragment_returns_groups_with_raw_body_lines():
+    groups = parse_fragment("one.md", _FRAG_TWO_GROUPS)
+    assert list(groups) == ["Fixed", "Internal"]
+    assert groups["Fixed"] == ["- A fix from PR two,", "  wrapped onto a second line."]
+    assert groups["Internal"] == ["- A refactor."]
+
+
+@pytest.mark.parametrize(
+    "bad, needle",
+    [
+        ("- a bullet with no heading\n", "text before the first"),
+        ("### Security\n- x\n", "unknown group"),
+        ("### Added\n\n", "has no bullet"),
+        ("## [Unreleased]\n### Added\n- x\n", "only '### <Group>'"),
+        ("### Added\n- x\n### Added\n- y\n", "appears twice"),
+        ("### Added\n<<<<<<< HEAD\n- x\n", "conflict marker"),
+        ("\n\n", "no '### <Group>' heading"),
+    ],
+)
+def test_parse_fragment_rejects_a_malformed_fragment_and_names_the_fix(bad, needle):
+    with pytest.raises(FragmentFormatError) as excinfo:
+        parse_fragment("bad.md", bad)
+    message = str(excinfo.value)
+    assert needle in message
+    assert "changelog.d/bad.md" in message
+    assert "changelog.d/README.md" in message
+
+
+def test_merge_fragments_appends_under_existing_groups_in_filename_order():
+    merged = merge_fragments(
+        _CL_WITH_BULLETS,
+        {"b.md": "### Added\n- From b.\n", "a.md": "### Added\n- From a.\n"},
+    )
+    assert unreleased_bullets(merged) == [
+        "- A new user-visible thing.",
+        "- From a.",
+        "- From b.",
+        "- A bug fix.",
+    ]
+
+
+def test_merge_fragments_creates_a_missing_group_in_keep_a_changelog_order():
+    merged = merge_fragments(_CL_WITH_BULLETS, {"x.md": "### Changed\n- Now different.\n"})
+    body = merged.split("## [Unreleased]")[1].split("## [0.88.0]")[0]
+    assert body.index("### Added") < body.index("### Changed") < body.index("### Fixed")
+    assert "### Changed\n- Now different.\n\n### Fixed" in body
+
+
+def test_merge_fragments_preserves_preamble_and_released_sections_byte_for_byte():
+    merged = merge_fragments(_CL_WITH_BULLETS, {"x.md": _FRAG_ADDED})
+    assert merged.startswith(_CL_HEADER)
+    assert released_region(merged) == released_region(_CL_WITH_BULLETS)
+
+
+def test_merge_fragments_keeps_continuation_lines_verbatim():
+    merged = merge_fragments(_CL_EMPTY_UNRELEASED, {"x.md": _FRAG_TWO_GROUPS})
+    assert "### Fixed\n- A fix from PR two,\n  wrapped onto a second line.\n\n### Removed" in merged
+    assert "### Internal\n- A refactor.\n\n## [0.88.0]" in merged
+
+
+def test_merge_fragments_without_fragments_is_the_identity():
+    assert merge_fragments(_CL_WITH_BULLETS, {}) == _CL_WITH_BULLETS
+
+
+def test_merge_fragments_surfaces_a_malformed_fragment():
+    with pytest.raises(FragmentFormatError):
+        merge_fragments(_CL_WITH_BULLETS, {"bad.md": "### Nope\n- x\n"})
+
+
+def test_plan_release_cut_folds_fragments_and_lists_them_for_deletion():
+    plan = plan_release_cut(
+        changelog_text=_CL_EMPTY_UNRELEASED,
+        pyproject_text=_PYPROJECT_FOR_FRAGMENTS,
+        date="2026-09-06",
+        fragments={"pr-2.md": _FRAG_TWO_GROUPS, "pr-1.md": _FRAG_ADDED},
+    )
+    assert plan.noop is False
+    assert plan.version == "0.89.0"
+    assert plan.fragment_paths == ("pr-1.md", "pr-2.md")
+    assert "- **A thing from PR one.** Details." in plan.bullets
+    assert "- A fix from PR two," in plan.bullets  # bullets are first lines, as before
+    assert plan.changelog_text is not None
+    assert "## [0.89.0] - 2026-09-06" in plan.changelog_text
+    assert "- **A thing from PR one.** Details." in plan.changelog_text
+    assert plan.as_json()["fragments"] == ["pr-1.md", "pr-2.md"]
+
+
+def test_plan_release_cut_is_a_noop_with_empty_unreleased_and_no_fragments():
+    plan = plan_release_cut(
+        changelog_text=_CL_EMPTY_UNRELEASED,
+        pyproject_text=_PYPROJECT_FOR_FRAGMENTS,
+        date="2026-09-06",
+        fragments={},
+    )
+    assert plan.noop is True
+    assert plan.fragment_paths == ()
+
+
+def test_read_fragments_skips_the_readme_and_non_markdown_and_sorts(tmp_path):
+    directory = tmp_path / "changelog.d"
+    directory.mkdir()
+    (directory / "README.md").write_text("how to", encoding="utf-8")
+    (directory / "b.md").write_text(_FRAG_ADDED, encoding="utf-8")
+    (directory / "a.md").write_text(_FRAG_ADDED, encoding="utf-8")
+    (directory / "notes.txt").write_text("ignored", encoding="utf-8")
+    assert list(read_fragments(directory)) == ["a.md", "b.md"]
+    assert read_fragments(tmp_path / "missing") == {}
+
+
+def _fragment_checkout(tmp_path):
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(_CL_EMPTY_UNRELEASED, encoding="utf-8")
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(_PYPROJECT_FOR_FRAGMENTS, encoding="utf-8")
+    fragments = tmp_path / "changelog.d"
+    fragments.mkdir()
+    (fragments / "README.md").write_text("how to", encoding="utf-8")
+    (fragments / "pr.md").write_text(_FRAG_ADDED, encoding="utf-8")
+    return changelog, pyproject, fragments
+
+
+def test_main_cut_deletes_exactly_the_fragments_it_shipped(tmp_path):
+    changelog, pyproject, fragments = _fragment_checkout(tmp_path)
+    rc = main(
+        [
+            "--changelog", str(changelog), "--pyproject", str(pyproject), "--no-server-json",
+            "--fragments-dir", str(fragments), "--date", "2026-09-06",
+        ]
+    )
+    assert rc == 0
+    assert not (fragments / "pr.md").exists()
+    assert (fragments / "README.md").exists()
+    written = changelog.read_text(encoding="utf-8")
+    assert "## [0.89.0] - 2026-09-06" in written
+    assert "- **A thing from PR one.** Details." in written
+    assert unreleased_bullets(written) == []
+
+
+def test_main_dry_run_leaves_the_fragments_in_place(tmp_path):
+    changelog, pyproject, fragments = _fragment_checkout(tmp_path)
+    rc = main(
+        [
+            "--changelog", str(changelog), "--pyproject", str(pyproject), "--no-server-json",
+            "--fragments-dir", str(fragments), "--date", "2026-09-06", "--dry-run",
+        ]
+    )
+    assert rc == 0
+    assert (fragments / "pr.md").exists()
+    assert changelog.read_text(encoding="utf-8") == _CL_EMPTY_UNRELEASED
+
+
+def test_main_reports_a_malformed_fragment_and_writes_nothing(tmp_path, capsys):
+    changelog, pyproject, fragments = _fragment_checkout(tmp_path)
+    (fragments / "bad.md").write_text("### Nope\n- x\n", encoding="utf-8")
+    rc = main(
+        [
+            "--changelog", str(changelog), "--pyproject", str(pyproject), "--no-server-json",
+            "--fragments-dir", str(fragments), "--date", "2026-09-06",
+        ]
+    )
+    assert rc == 1
+    assert "changelog.d/bad.md" in capsys.readouterr().err
+    assert changelog.read_text(encoding="utf-8") == _CL_EMPTY_UNRELEASED
+    assert (fragments / "pr.md").exists()

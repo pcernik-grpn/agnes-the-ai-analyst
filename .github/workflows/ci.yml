@@ -96,7 +96,7 @@ jobs:
           TESTING: "1"
 
   test-pg:
-    # Runs tests/db_pg/ split across 4 parallel jobs. Keeping these separate
+    # Runs tests/db_pg/ split across 8 parallel jobs. Keeping these separate
     # from the main split shards avoids the pgserver session-fixture startup
     # overhead (~60 s per worker) from landing in shard 1 and skewing the main
     # shards. pytest-split balances the groups by `.test_durations`; tests
@@ -109,11 +109,18 @@ jobs:
     # The split is nearly free to widen — a job's step timings show 26.3 of its
     # 27 min is the pytest run itself (checkout/setup-python/uv are cached to
     # ~0.1 min), and the committed durations cut 4 ways at 11.2 min each.
+    #
+    # 4 -> 8 groups (#2295): still the critical path at 4. Over three
+    # consecutive PR runs the four test-pg jobs took 22-27 min each while the
+    # eight main shards took 16-20 min, so every CI cycle waited 5-7 min on
+    # this job alone. The committed durations hold 57 min of db_pg test time
+    # against 102 min for the rest; 8 ways puts both jobs at ~7-13 min of
+    # tests and the main shards become the (shorter) long pole.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        group: [1, 2, 3, 4]
+        group: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v7
 
@@ -129,8 +136,8 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system ".[dev,server,extraction]"
 
-      - name: Run Postgres contract tests (shard ${{ matrix.group }}/4)
-        run: pytest tests/db_pg/ -v --tb=short -n auto --splits 4 --group ${{ matrix.group }}
+      - name: Run Postgres contract tests (shard ${{ matrix.group }}/8)
+        run: pytest tests/db_pg/ -v --tb=short -n auto --splits 8 --group ${{ matrix.group }}
         env:
           TESTING: "1"
 

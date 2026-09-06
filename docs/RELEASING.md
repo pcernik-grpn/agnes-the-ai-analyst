@@ -7,8 +7,8 @@ away**.
 
 ## Changelog discipline — non-negotiable
 
-**Every PR that adds, removes, or changes user-visible behavior MUST update
-`CHANGELOG.md` in the same PR.** No exceptions, no follow-ups, no "I'll do it
+**Every PR that adds, removes, or changes user-visible behavior MUST add a
+CHANGELOG fragment (`changelog.d/<slug>.md`) in the same PR.** No exceptions, no follow-ups, no "I'll do it
 after merge". User-visible = anything an operator, end-user, or downstream
 integrator can observe: CLI flags / output / exit codes, REST endpoints /
 payloads / status codes, web UI, `instance.yaml` schema, env vars,
@@ -16,8 +16,15 @@ payloads / status codes, web UI, `instance.yaml` schema, env vars,
 behaviors, breaking changes, security fixes.
 
 **How:**
-- Add a bullet under the topmost `## [Unreleased]` heading (create one if
-  missing — it sits above the latest released version).
+- Create `changelog.d/<slug>.md` (any unique name; the branch slug works) with
+  `### <Group>` headings and bullets — the format is `changelog.d/README.md`.
+  Never write the bullet under `## [Unreleased]` in `CHANGELOG.md`: that
+  section is assembled by the daily cut, and `tests/test_changelog_integrity.py`
+  rejects an inline bullet. One file per PR is what makes two PRs unable to
+  conflict on the changelog (#2295: 34 of 37 conflicts across two long runs).
+- The cut folds every fragment into `[Unreleased]` in filename order, renames
+  the section, and deletes the fragment files — so the released `CHANGELOG.md`
+  looks exactly as before.
 - Group by `### Added` / `### Changed` / `### Fixed` / `### Removed` /
   `### Internal` (Keep-a-Changelog sections).
 - Mark breaking changes with `**BREAKING**` at the start of the bullet —
@@ -82,7 +89,11 @@ merges.** If the cut PR ends up showing a merge conflict against a newer
 it and re-dispatch `daily-cut.yml` rather than resolving the conflict by
 hand — a hand-resolved overlap on `[Unreleased]` is exactly the collision
 class this exists to prevent. Bullets that land after a cut PR opened simply
-ride into the next day's cut; that is expected, not a bug.
+ride into the next day's cut; that is expected, not a bug. Since fragments
+(#2295) a PR merged past an open cut PR adds a *new* file under `changelog.d/`
+rather than editing `[Unreleased]`, so it no longer collides with the cut
+branch at all — the flush-first rule now only keeps a bullet from waiting a
+day, it no longer guards a conflict.
 
 ### Post-merge: tag + Release
 
@@ -141,11 +152,11 @@ cd agnes-<topic> && git checkout -b zs/<branch-name>
 # 2. Make the change + tests. Run the AREA pytest while iterating
 #    (e.g. `pytest tests/test_X.py -p no:xdist -q`).
 
-# 3. Add a CHANGELOG bullet under [Unreleased].
-#    Group: Added | Changed | Fixed | Removed | Internal
-#    Mark BREAKING with **BREAKING** prefix.
-#    Do NOT touch pyproject.toml, server.json, or the [Unreleased] heading
-#    itself — that is the cut PR's job, not this one's.
+# 3. Add a CHANGELOG fragment: changelog.d/<slug>.md with
+#    `### Added|Changed|Fixed|Removed|Internal` headings + bullets
+#    (format: changelog.d/README.md). Mark BREAKING with **BREAKING** prefix.
+#    Do NOT touch CHANGELOG.md, pyproject.toml or server.json — the cut PR
+#    folds the fragments in and owns the version.
 
 # 4. Commit the change(s).
 
@@ -299,6 +310,12 @@ re-run click, not a second push.
   you already created it.
 
 ### CHANGELOG merge hazards
+
+**Since #2295 a feature PR does not touch `CHANGELOG.md` at all** — its entry
+is a `changelog.d/` fragment, folded in by the cut. A `main` merge into a
+feature branch therefore no longer has a `CHANGELOG.md` side of yours to
+relocate, and neither failure mode below can start from a feature PR. The
+section stays for the cut PR itself and for branches that predate fragments.
 
 **The dedicated cut PR (above) eliminated failure mode 2 below, not failure
 mode 1.** Feature PRs never rename `[Unreleased]` or bump the version, so two
@@ -550,8 +567,8 @@ manually with the VM resource address — typical workflow_dispatch input is
 
 ## Appendix: CHANGELOG entry skeleton
 
-Copy this when adding to `## [Unreleased]` in `CHANGELOG.md`. Drop the sections
-you don't need; keep the Keep-a-Changelog order.
+Copy this into `changelog.d/<slug>.md`. Drop the sections you don't need; keep
+the Keep-a-Changelog order.
 
 ```markdown
 ### Added
@@ -570,8 +587,9 @@ you don't need; keep the Keep-a-Changelog order.
 - Refactors, test additions, dependency bumps with no behavior change.
 ```
 
-The daily cut PR (`.github/workflows/daily-cut.yml`) renames
-`## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and adds a fresh empty
+The daily cut PR (`.github/workflows/daily-cut.yml`) folds every
+`changelog.d/` fragment into `## [Unreleased]`, renames it to
+`## [X.Y.Z] - YYYY-MM-DD`, deletes the fragments, and adds a fresh empty
 `## [Unreleased]` on top — never a feature PR. CI publishes the matching
 `stable-YYYY.MM.N` image tag for the cut PR's merge commit (see Deploy
 workflows above).

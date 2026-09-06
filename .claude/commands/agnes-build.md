@@ -39,7 +39,7 @@ worktrees and must be integrated (next step).
 When all builders finish, spawn `agnes-integrator`
 (`subagent_type=agnes-integrator`) with the task graph + each worktree's
 path/branch/commit. It applies tasks in dependency order, lands the migration task
-LAST, folds the CHANGELOG/CLAUDE.md bullets, and STOPS on any non-merge-magnet
+LAST, writes the `changelog.d/` fragment + CLAUDE.md bullets, and STOPS on any non-merge-magnet
 conflict (reporting the colliding tasks). If it stops, surface that to the user —
 the decomposer under-coupled; do not force-merge.
 

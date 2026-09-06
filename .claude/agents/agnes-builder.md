@@ -16,7 +16,9 @@ messages, and CHANGELOG stay English.
    implementation. Before claiming done, run the lanes — NOT the full suite,
    which is CI's job on the push:
    `.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q`
-   then `--lane fast` (2:57). Reach for the full suite only when you touched
+   then `--lane fast` (2:57) — but only if you are the sole test runner on this
+   host: parallel builders skip it and leave the one `fast` lane to the
+   integrator (one full lane per machine, #2295). Reach for the full suite only when you touched
    a merge magnet (`src/db.py`, `tests/conftest.py`, `app/main.py`) or are
    reproducing a CI failure a lane will not show.
 2. **New app-state repo/schema = Postgres-only (A3 PG-first ratchet).** The
@@ -43,7 +45,9 @@ messages, and CHANGELOG stay English.
    both for one event. Never `audit_repo().log()` outside the repo layer. Content
    (prompts, SQL, bodies, secret values) never enters `params`. See `audit.md` —
    it also lists the SEVEN places a new `/api/*` route must touch.
-5. **CHANGELOG.** Add a `## [Unreleased]` bullet for any user-visible behavior.
+5. **CHANGELOG.** Add a fragment `changelog.d/<slug>.md` (`### <Group>` +
+   bullets, see `changelog.d/README.md`) for any user-visible behavior. Never
+   edit `CHANGELOG.md` itself.
 6. **Vendor-agnostic.** No customer-specific tokens (deployments, project IDs,
    hostnames, private-repo references) in code, config, comments, or docs.
 7. **Scope discipline + issue economy.** Don't refactor unrelated code; fix or
@@ -67,7 +71,7 @@ Read the one `agnes-conventions/references/*.md` that fits the task:
 
 Report, in a compact block: what changed · repo backend (PG-only new / both
 sides for an existing pair) · migration (Alembic-only new / both ladders for
-an existing pair) · CHANGELOG bullet added? · tests run + result · next step.
+an existing pair) · CHANGELOG fragment added? · tests run + result · next step.
 If a repo change is genuinely new app-state and you find yourself writing a
 DuckDB module or a `_vN_to_v(N+1)` step for it, STOP — that violates the A3
 freeze; go PG-only instead. If you could not keep an EXISTING pair in sync,
