@@ -676,20 +676,78 @@ def _clear_stale_stop(connection_id: str, *, not_after: Optional[Any] = None) ->
     repo.clear_stop_requested_if_unchanged(connection_id, stamp)
 
 
+def _shard_children_still_live(connection_id: str) -> bool:
+    """True if this connection still has a QUEUED or RUNNING ``corpus-
+    extraction-shard`` job — a child from a PREVIOUS sharded run whose
+    PARENT ``extraction_runs`` row a cancel already force-closed (by
+    design, immediately, "never waiting on the crawl to notice, because a
+    genuinely stuck loop might not" — see ``app/api/admin_extraction.py::
+    cancel_extraction_run``) without waiting for those children to
+    actually notice the stop flag and exit on their own.
+
+    :func:`_clear_stale_stop_for_trigger` consults this before clearing:
+    those children have NO OTHER stop signal than the connection-wide flag
+    it is about to erase — clearing it out from under them would silently
+    un-cancel work the operator explicitly stopped. A fresh trigger's own
+    shard plan would additionally collide on enqueue (idempotency key
+    ``corpus-extraction-shard:{connection_id}:{index}``) with one of
+    theirs still queued/running, landing the NEW plan's Nth child on the
+    OLD parent's bookkeeping instead of the new one's — exactly the
+    "genuine re-plan only ever runs once the PREVIOUS parent has
+    finalized" invariant :func:`_enqueue_shard_plan`'s own docstring
+    already assumes, which a cancel's early close silently breaks.
+
+    Bounded the same fleet-wide way ``app/api/admin_extraction.py::
+    _crawl_job_in_flight`` already scans its own job kind — there is no
+    per-connection index on the jobs table to query more narrowly.
+    """
+    from src.repositories import jobs_repo
+
+    repo = jobs_repo()
+    for status in ("queued", "running"):
+        for job in repo.list(status=status, kind=_SHARD_JOB_KIND, limit=200):
+            payload = job.get("payload_json") or {}
+            if str(payload.get("connection_id")) == str(connection_id):
+                return True
+    return False
+
+
 def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> None:
     """The single call site for :func:`_clear_stale_stop`, made once per
     TOP-LEVEL trigger (:func:`run_builtin_crawl`) — covering both the inline
     crawl and the auto-parallel planner's sharded path alike, since both
     reach this connection's stop flag through the SAME key.
 
-    Resolves ``not_after`` from the triggering job's own ``created_at`` —
-    ``job_id`` is only ever populated when this run was actually dispatched
-    through the worker (see ``app/worker/kinds.py::_payload_for_handler``);
-    a payload built outside it (a test, a manual replay) has no anchor and
-    falls back to :func:`_clear_stale_stop`'s unconditional clear. Best
-    effort throughout: neither the job lookup nor the clear itself may ever
-    block the run they are trying to let start cleanly.
+    Refuses to clear at all while :func:`_shard_children_still_live` says a
+    PREVIOUS sharded run's children are still draining: erasing their only
+    stop signal to let THIS trigger's own children run would silently
+    un-cancel that other work. This trigger's own children will then also
+    observe the (still-set, genuinely not-yet-stale) flag and stop
+    immediately too — the same no-op outcome the flag existed to produce
+    before this fix, but only in this one narrow overlap window, and only
+    until the old children finish; the next trigger, once they have,
+    clears cleanly. Never un-cancelling already-stopped work is worth that
+    one wasted retry.
+
+    Otherwise resolves ``not_after`` from the triggering job's own
+    ``created_at`` — ``job_id`` is only ever populated when this run was
+    actually dispatched through the worker (see ``app/worker/kinds.py::
+    _payload_for_handler``); a payload built outside it (a test, a manual
+    replay) has no anchor and falls back to :func:`_clear_stale_stop`'s
+    unconditional clear. Best effort throughout: no lookup or clear here
+    may ever block the run trying to start cleanly.
     """
+    try:
+        if _shard_children_still_live(connection_id):
+            logger.info(
+                "sharepoint crawl: connection %s still has live shard children from a cancelled run — "
+                "leaving the stop flag in place for them; retry once they finish",
+                connection_id,
+            )
+            return
+    except Exception as exc:  # noqa: BLE001 — never load-bearing
+        logger.debug("sharepoint crawl: could not check for live shard children for %s: %s", connection_id, exc)
+
     not_after = None
     if job_id:
         try:
@@ -698,14 +756,25 @@ def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> 
             job_row = jobs_repo().get(job_id)
             if job_row:
                 not_after = job_row.get("created_at")
-        except Exception as exc:  # noqa: BLE001 — never load-bearing
-            logger.debug(
+        except Exception as exc:  # noqa: BLE001 — never load-bearing, but see the warning below
+            # WARNING, not debug: a repo hiccup here means `not_after` stays
+            # `None`, which the caller cannot tell apart from "no anchor
+            # available", so this silently falls back to an unconditional
+            # clear — usually harmless, but on a genuinely stale-vs-fresh
+            # ambiguity it can reproduce this fix's own target symptom (a
+            # transient DB error making a run silently do nothing). An
+            # operator needs to SEE this, not just have it swallowed.
+            logger.warning(
                 "sharepoint crawl: could not resolve job %s's created_at for %s: %s", job_id, connection_id, exc
             )
     try:
         _clear_stale_stop(connection_id, not_after=not_after)
-    except Exception as exc:  # noqa: BLE001 — never load-bearing
-        logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
+    except Exception as exc:  # noqa: BLE001 — never load-bearing, but see the warning below
+        # WARNING: a failed clear leaves a stale flag stuck, and every
+        # child of THIS trigger will read it and stop immediately — the
+        # same zero-work outcome the whole fix targets, just from a
+        # transient repo failure instead of a missing clear call.
+        logger.warning("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
 
 
 def _stop_requested(connection_id: str) -> Optional[str]:

@@ -1254,26 +1254,36 @@ def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
     same JSON column. Called by BOTH the manual trigger and the sweep, so
     either path resets the "next due" clock — a manual run moments before
     the schedule would fire must not also queue a second run a tick later.
+
+    Writing a NEW key here (or in any other function in this module)? Add
+    it to ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`` above IN THE SAME
+    CHANGE — the generic connection editor's carry-forward (``app/api/
+    admin_source_connections.py::update_connection``) only preserves keys
+    listed there, and the ratchet test (``tests/
+    test_sharepoint_config_carry_forward_ratchet.py``) will fail otherwise.
+
+    Uses ``config_patch`` (a fresh, re-read-under-lock merge), NEVER the
+    caller's own ``row`` as the merge base: ``row`` is whatever the caller
+    fetched at the START of its own handler, and this is sometimes called
+    AFTER that same handler has already done its own write to ``config.
+    extraction`` — a selected-shard rerun clears a stale cooperative-stop
+    flag (``connectors.sharepoint.crawler._clear_stale_stop_for_trigger``)
+    before calling this. Merging from the stale ``row`` instead of the
+    live row would silently resurrect whatever this call's own snapshot
+    still had, undoing that clear (2026-09-07 finding: exactly this,
+    observed via ``_trigger_shard_rerun``). ``row`` is kept only for its
+    ``id`` — a fresh read failing (the connection deleted concurrently) is
+    ``config_patch``'s own no-op-on-unknown-id contract, not an error here.
     """
-    config = dict(row.get("config") or {})
-    # Writing a NEW key here (or in any other function in this module)?
-    # Add it to SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS above IN THE SAME
-    # CHANGE — the generic connection editor's carry-forward
-    # (app/api/admin_source_connections.py::update_connection) only
-    # preserves keys listed there, and the ratchet test
-    # (tests/test_sharepoint_config_carry_forward_ratchet.py) will fail
-    # otherwise.
-    # MERGE into the existing sub-object, never replace it: `config.extraction`
-    # also carries the per-connection overrides an admin set moments earlier
-    # (`facts.retry_mode` / `facts.transport`, `crawl.min_modified`, the Stop
-    # control's `stop_requested_at`). Replacing the dict here wiped them at
-    # the exact moment the crawl started (observed live 2026-09-02: a crawl
-    # triggered right after a `min_modified` PATCH ran unfiltered).
-    extraction = dict(config.get("extraction") or {})
-    extraction["last_run_at"] = datetime.now(timezone.utc).isoformat()
-    extraction["last_job_id"] = job_id
-    config["extraction"] = extraction
-    source_connections_repo().update(row["id"], config=config)
+    extraction_patch = {
+        "last_run_at": datetime.now(timezone.utc).isoformat(),
+        "last_job_id": job_id,
+    }
+    repo = source_connections_repo()
+    current = repo.get(row["id"]) or row
+    extraction = dict((current.get("config") or {}).get("extraction") or {})
+    extraction.update(extraction_patch)
+    repo.config_patch(row["id"], {"extraction": extraction})
 
 
 def _extraction_schedule_config() -> Optional[str]:
@@ -4343,8 +4353,20 @@ def _trigger_shard_rerun(
     planner itself uses, over a FILTERED shard list. Opens a fresh parent
     run scoped to only these shards; never re-plans (a genuine re-plan is
     what an ordinary trigger, or ``resync``, already does).
+
+    This entry point never runs through ``run_builtin_crawl`` — it calls
+    ``_enqueue_shard_plan`` directly from the request handler — so it must
+    clear a stale cooperative-stop flag itself; otherwise a rerun right
+    after a cancel would inherit the SAME stale flag every selected shard
+    immediately stops on. No ``job_id`` anchor exists here (there is no
+    top-level ``corpus-extraction`` job behind this call, dispatched
+    synchronously within the request instead of through the worker), so
+    this is the unconditional-clear form — same as any other trigger path
+    with nothing to anchor a race window against.
     """
-    from connectors.sharepoint.crawler import _enqueue_shard_plan, load_state
+    from connectors.sharepoint.crawler import _clear_stale_stop_for_trigger, _enqueue_shard_plan, load_state
+
+    _clear_stale_stop_for_trigger(connection_id, None)
 
     state = load_state(connection_id)
     persisted_shards = ((state.get("shard_plan") or {}).get("shards")) or []
