@@ -6,7 +6,7 @@ both backends; the same return shapes must come back.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -50,7 +50,7 @@ def _make_pg_repo(pg_engine, monkeypatch):
         )
 
     monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
-    import src.db_pg as db_pg
+    from src import db_pg
 
     db_pg.dispose()
     db_pg.get_engine()
@@ -624,6 +624,75 @@ def test_search_across_corpora_blank_query_matches_nothing(repo):
     assert repo.search_across_corpora("   ", limit=50) == []
 
 
+# ---------------------------------------------------------------------------
+# match_filenames — the RBAC-scoped counterpart to search_across_corpora,
+# used by app/chat/document_links.py to resolve a `document:` citation.
+# ---------------------------------------------------------------------------
+
+
+def test_match_filenames_is_scoped_to_the_given_corpus_ids(repo):
+    repo.add(
+        corpus_id="col_a", filename="Report.pdf", sha256="s1", file_type="pdf", size_bytes=10, storage_path="/tmp/1"
+    )
+    repo.add(
+        corpus_id="col_b", filename="Report.pdf", sha256="s2", file_type="pdf", size_bytes=10, storage_path="/tmp/2"
+    )
+    # Only col_a in scope: col_b's identically-named file must never surface.
+    results = repo.match_filenames(["col_a"], ["report"], limit=20)
+    assert {r["corpus_id"] for r in results} == {"col_a"}
+
+
+def test_match_filenames_none_scope_means_unrestricted(repo):
+    """``corpus_ids=None`` mirrors ``accessible_collection_ids``'s admin
+    convention: no restriction, not "match nothing"."""
+    repo.add(
+        corpus_id="col_a", filename="Report.pdf", sha256="s1", file_type="pdf", size_bytes=10, storage_path="/tmp/1"
+    )
+    repo.add(
+        corpus_id="col_b", filename="Report.pdf", sha256="s2", file_type="pdf", size_bytes=10, storage_path="/tmp/2"
+    )
+    results = repo.match_filenames(None, ["report"], limit=20)
+    assert {r["corpus_id"] for r in results} == {"col_a", "col_b"}
+
+
+def test_match_filenames_empty_corpus_list_matches_nothing(repo):
+    """An empty (never ``None``) scope must not vacuously match everything."""
+    repo.add(
+        corpus_id="col_a", filename="Report.pdf", sha256="s1", file_type="pdf", size_bytes=10, storage_path="/tmp/1"
+    )
+    assert repo.match_filenames([], ["report"], limit=20) == []
+
+
+def test_match_filenames_no_needles_matches_nothing(repo):
+    repo.add(
+        corpus_id="col_a", filename="Report.pdf", sha256="s1", file_type="pdf", size_bytes=10, storage_path="/tmp/1"
+    )
+    assert repo.match_filenames(["col_a"], [], limit=20) == []
+
+
+def test_match_filenames_matches_any_of_several_needles(repo):
+    repo.add(
+        corpus_id="col_a", filename="Alpha.pdf", sha256="s1", file_type="pdf", size_bytes=10, storage_path="/tmp/1"
+    )
+    repo.add(corpus_id="col_a", filename="Beta.pdf", sha256="s2", file_type="pdf", size_bytes=10, storage_path="/tmp/2")
+    results = repo.match_filenames(["col_a"], ["alpha", "beta"], limit=20)
+    assert {r["filename"] for r in results} == {"Alpha.pdf", "Beta.pdf"}
+
+
+def test_match_filenames_respects_limit(repo):
+    for i in range(5):
+        repo.add(
+            corpus_id="col_a",
+            filename=f"doc-{i}.pdf",
+            sha256=f"s{i}",
+            file_type="pdf",
+            size_bytes=10,
+            storage_path=f"/tmp/{i}",
+        )
+    results = repo.match_filenames(["col_a"], ["doc"], limit=2)
+    assert len(results) == 2
+
+
 def test_status_counts_for_corpora_groups_by_corpus_and_status_in_one_read(repo):
     """The batched sibling of ``count_by_corpus``: a caller with a LIST of
     corpus ids (e.g. a connection's confirmed scopes) gets every corpus's
@@ -861,7 +930,7 @@ def _seed_ordered(repo, n, corpus_id=CORPUS_ID, prefix="seed"):
     """Insert ``n`` files with strictly increasing ``created_at`` and return
     their ids oldest -> newest."""
     ids = []
-    base = datetime.now(timezone.utc)
+    base = datetime.now(UTC)
     for i in range(n):
         fid = repo.add(
             corpus_id=corpus_id,
@@ -904,7 +973,7 @@ def test_list_for_corpus_stable_tiebreak_pages_through_identical_created_at(repo
     """The single most important test here: files uploaded in one batch share
     a ``created_at``. Without an ``id`` tie-break, paging at limit=1 repeats
     or skips rows instead of covering the set exactly once."""
-    ts = datetime.now(timezone.utc)
+    ts = datetime.now(UTC)
     ids = []
     for i in range(4):
         fid = repo.add(

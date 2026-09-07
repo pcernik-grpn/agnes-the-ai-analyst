@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import duckdb
 
@@ -40,7 +40,7 @@ class CorpusFilesRepository:
     _SELECT = ", ".join(_COLS)
 
     @staticmethod
-    def _decode_row(row_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def _decode_row(row_dict: dict[str, Any]) -> dict[str, Any]:
         """Decode ``processing_detail`` from JSON text to dict (or keep None)."""
         v = row_dict.get("processing_detail")
         if v is None or v == "":
@@ -62,11 +62,11 @@ class CorpusFilesRepository:
         corpus_id: str,
         filename: str,
         sha256: str,
-        file_type: Optional[str],
-        size_bytes: Optional[int],
-        storage_path: Optional[str],
-        parent_file_id: Optional[str] = None,
-        path: Optional[str] = None,
+        file_type: str | None,
+        size_bytes: int | None,
+        storage_path: str | None,
+        parent_file_id: str | None = None,
+        path: str | None = None,
     ) -> str:
         """Insert a new file row with default status 'pending'.
 
@@ -84,7 +84,7 @@ class CorpusFilesRepository:
         )
         return file_id
 
-    def get(self, file_id: str) -> Optional[Dict[str, Any]]:
+    def get(self, file_id: str) -> dict[str, Any] | None:
         """Fetch one file row by id. Returns ``None`` if not found."""
         row = self.conn.execute(
             f"SELECT {self._SELECT} FROM corpus_files WHERE id = ?",
@@ -94,7 +94,7 @@ class CorpusFilesRepository:
             return None
         return self._decode_row(dict(zip(self._COLS, row)))
 
-    def get_by_path(self, corpus_id: str, path: str) -> Optional[Dict[str, Any]]:
+    def get_by_path(self, corpus_id: str, path: str) -> dict[str, Any] | None:
         """Fetch one file row by its ``(corpus_id, path)`` logical identity.
 
         Used for upsert-on-upload. Returns ``None`` when no row carries that
@@ -128,14 +128,14 @@ class CorpusFilesRepository:
         literally (see ``users.py::get_by_email_prefix`` for the same idiom)."""
         return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    def _filter_clause(self, corpus_id: str, q: Optional[str], status: Optional[str]) -> tuple[str, List[Any]]:
+    def _filter_clause(self, corpus_id: str, q: str | None, status: str | None) -> tuple[str, list[Any]]:
         """Shared WHERE-clause builder for ``list_for_corpus``/``count_for_corpus``.
 
         Blank (``None``/empty/whitespace-only) ``q``/``status`` means "no
         filter" — never "match nothing".
         """
         where = ["corpus_id = ?"]
-        params: List[Any] = [corpus_id]
+        params: list[Any] = [corpus_id]
         q_norm = q.strip() if q else ""
         if q_norm:
             pattern = f"%{self._escape_like(q_norm)}%"
@@ -151,12 +151,12 @@ class CorpusFilesRepository:
         self,
         corpus_id: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-        q: Optional[str] = None,
-        status: Optional[str] = None,
+        q: str | None = None,
+        status: str | None = None,
         order: str = "oldest",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Files for a given corpus, paginated/filtered/ordered.
 
         Backwards compatible: a bare ``list_for_corpus(corpus_id)`` call
@@ -179,8 +179,8 @@ class CorpusFilesRepository:
         self,
         corpus_id: str,
         *,
-        q: Optional[str] = None,
-        status: Optional[str] = None,
+        q: str | None = None,
+        status: str | None = None,
     ) -> int:
         """Row count for ``list_for_corpus`` under the same ``q``/``status``
         filters (and nothing else — no limit/offset applies to a count)."""
@@ -203,7 +203,7 @@ class CorpusFilesRepository:
         ).fetchone()
         return int(row[0]) if row else 0
 
-    def count_by_corpus(self) -> Dict[str, int]:
+    def count_by_corpus(self) -> dict[str, int]:
         """``corpus_id -> file count`` for every corpus that has files, in ONE
         query.
 
@@ -218,7 +218,7 @@ class CorpusFilesRepository:
         rows = self.conn.execute("SELECT corpus_id, COUNT(*) FROM corpus_files GROUP BY corpus_id").fetchall()
         return {r[0]: int(r[1]) for r in rows}
 
-    def search_across_corpora(self, q: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+    def search_across_corpora(self, q: str, *, limit: int = 50) -> list[dict[str, Any]]:
         """Files across EVERY corpus whose filename or path matches ``q``.
 
         The bounded, on-demand counterpart to the admin ``/access`` overview
@@ -244,7 +244,62 @@ class CorpusFilesRepository:
         ).fetchall()
         return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
 
-    def filenames_for_ids(self, file_ids: List[str]) -> Dict[str, Optional[str]]:
+    def match_filenames(
+        self,
+        corpus_ids: list[str] | None,
+        needles: list[str],
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Files whose ``filename`` or ``path`` contains any of ``needles``
+        (case-insensitive substring), scoped to ``corpus_ids``.
+
+        The RBAC-scoped counterpart to :meth:`search_across_corpora`: that
+        method deliberately searches every corpus (an admin-only picker
+        behind its own access gate), while this one exists for a caller that
+        must never see a match outside corpora it can already reach — a
+        `document:` source-claim link (``app/chat/document_links.py``)
+        resolves a citation's filename to a real file, and the citation ref
+        is written by the model, not chosen from a list, so the scope has to
+        be enforced in the query rather than trusted from the caller.
+
+        ``corpus_ids=None`` means "no restriction" (an admin, who already
+        sees every collection — mirrors ``accessible_collection_ids``'s own
+        ``None`` convention); ``corpus_ids=[]`` returns ``[]`` outright rather
+        than running a query that, on some engines, could vacuously match
+        every row with no ``corpus_id`` to compare against.
+
+        Returns candidate ROWS, not a decision — a substring hit is not the
+        same claim as an equality match. The caller (``resolve_document_url``)
+        re-normalizes ``filename``/``path`` the same way :func:`app.chat.
+        sources.verify` does and treats more than one distinct file id as no
+        match at all, rather than guessing.
+        """
+        if not needles:
+            return []
+        if corpus_ids is not None and not corpus_ids:
+            return []
+        where: list[str] = []
+        params: list[Any] = []
+        if corpus_ids is not None:
+            placeholders = ", ".join("?" for _ in corpus_ids)
+            where.append(f"corpus_id IN ({placeholders})")
+            params.extend(corpus_ids)
+        like_clauses = []
+        for n in needles:
+            like_clauses.append("(LOWER(filename) LIKE LOWER(?) ESCAPE '\\' OR LOWER(path) LIKE LOWER(?) ESCAPE '\\')")
+            pattern = f"%{self._escape_like(n)}%"
+            params.extend([pattern, pattern])
+        where.append("(" + " OR ".join(like_clauses) + ")")
+        sql = (
+            f"SELECT {self._SELECT} FROM corpus_files WHERE {' AND '.join(where)} "
+            "ORDER BY LOWER(filename) ASC, id ASC LIMIT ?"
+        )
+        params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
+
+    def filenames_for_ids(self, file_ids: list[str]) -> dict[str, str | None]:
         """``{file_id: filename}`` for exactly the given ids, in ONE query.
 
         The bulk-by-ids counterpart to :meth:`get`, for a caller that needs
@@ -270,7 +325,7 @@ class CorpusFilesRepository:
         ).fetchall()
         return {r[0]: r[1] for r in rows}
 
-    def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
+    def status_counts_for_corpora(self, corpus_ids: list[str]) -> dict[str, dict[str, int]]:
         """``{corpus_id: {processing_status: count}}`` for exactly the given
         corpus ids, in ONE query.
 
@@ -290,12 +345,12 @@ class CorpusFilesRepository:
             f"WHERE corpus_id IN ({placeholders}) GROUP BY corpus_id, processing_status",
             list(corpus_ids),
         ).fetchall()
-        out: Dict[str, Dict[str, int]] = {}
+        out: dict[str, dict[str, int]] = {}
         for corpus_id, status, n in rows:
             out.setdefault(corpus_id, {})[status or "pending"] = int(n)
         return out
 
-    def top_folder_status_counts(self, corpus_id: str) -> Dict[str, Dict[str, int]]:
+    def top_folder_status_counts(self, corpus_id: str) -> dict[str, dict[str, int]]:
         """``{top_folder: {processing_status: count}}`` for one corpus, in ONE
         grouped query — ``top_folder`` is the first ``/``-delimited segment
         of ``path`` (``""`` for a file with no ``/`` in its path, i.e. one
@@ -317,12 +372,12 @@ class CorpusFilesRepository:
             "GROUP BY top_folder, processing_status",
             [corpus_id],
         ).fetchall()
-        out: Dict[str, Dict[str, int]] = {}
+        out: dict[str, dict[str, int]] = {}
         for top_folder, status, n in rows:
             out.setdefault(top_folder, {})[status or "pending"] = int(n)
         return out
 
-    def extension_status_counts(self, corpus_ids: List[str]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    def extension_status_counts(self, corpus_ids: list[str]) -> dict[str, dict[str, dict[str, int]]]:
         """``{extension: {processing_status: {count, bytes}}}`` across every
         given corpus id, in ONE query — the extraction breakdown surface's
         "indexed / failed / rejected / skipped, by file type" table
@@ -362,12 +417,12 @@ class CorpusFilesRepository:
             "GROUP BY extension, processing_status",
             list(corpus_ids),
         ).fetchall()
-        out: Dict[str, Dict[str, Dict[str, int]]] = {}
+        out: dict[str, dict[str, dict[str, int]]] = {}
         for extension, status, n, size_bytes in rows:
             out.setdefault(extension, {})[status or "pending"] = {"count": int(n), "bytes": int(size_bytes or 0)}
         return out
 
-    def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
+    def list_children(self, parent_file_id: str) -> list[dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         rows = self.conn.execute(
             f"SELECT {self._SELECT} FROM corpus_files WHERE parent_file_id = ? ORDER BY created_at",
@@ -380,7 +435,7 @@ class CorpusFilesRepository:
         file_id: str,
         *,
         status: str,
-        detail: Optional[Dict[str, Any]] = None,
+        detail: dict[str, Any] | None = None,
     ) -> None:
         """Update processing_status (and optionally processing_detail).
 
@@ -422,10 +477,10 @@ class CorpusFilesRepository:
         *,
         filename: str,
         sha256: str,
-        file_type: Optional[str],
-        size_bytes: Optional[int],
-        storage_path: Optional[str],
-        path: Optional[str],
+        file_type: str | None,
+        size_bytes: int | None,
+        storage_path: str | None,
+        path: str | None,
     ) -> None:
         """Upsert-in-place: refresh identity/content fields on an EXISTING
         row, preserving its id (fact-graph-over-Collections §6 prerequisite —
@@ -446,7 +501,7 @@ class CorpusFilesRepository:
             [filename, sha256, file_type, size_bytes, storage_path, path, file_id],
         )
 
-    def update_path(self, file_id: str, *, path: Optional[str], filename: str) -> None:
+    def update_path(self, file_id: str, *, path: str | None, filename: str) -> None:
         """Narrower sibling of :meth:`update_in_place`: a rename/move whose
         CONTENT is unchanged (the caller already proved that — e.g. a
         SharePoint crawl item whose cTag still matches, see

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -31,7 +31,7 @@ class CorpusFilesPgRepository:
         self._engine = engine
 
     @staticmethod
-    def _decode_row(row_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def _decode_row(row_dict: dict[str, Any]) -> dict[str, Any]:
         """Decode ``processing_detail`` from JSON text to dict (or keep None).
 
         PG stores the column as VARCHAR (not JSONB), so psycopg returns
@@ -59,11 +59,11 @@ class CorpusFilesPgRepository:
         corpus_id: str,
         filename: str,
         sha256: str,
-        file_type: Optional[str],
-        size_bytes: Optional[int],
-        storage_path: Optional[str],
-        parent_file_id: Optional[str] = None,
-        path: Optional[str] = None,
+        file_type: str | None,
+        size_bytes: int | None,
+        storage_path: str | None,
+        parent_file_id: str | None = None,
+        path: str | None = None,
     ) -> str:
         """Insert a new file row with default status 'pending'.
 
@@ -95,7 +95,7 @@ class CorpusFilesPgRepository:
             )
         return file_id
 
-    def get(self, file_id: str) -> Optional[Dict[str, Any]]:
+    def get(self, file_id: str) -> dict[str, Any] | None:
         """Fetch one file row by id. Returns ``None`` if not found."""
         with self._engine.connect() as conn:
             row = (
@@ -108,7 +108,7 @@ class CorpusFilesPgRepository:
             )
         return self._decode_row(dict(row)) if row else None
 
-    def get_by_path(self, corpus_id: str, path: str) -> Optional[Dict[str, Any]]:
+    def get_by_path(self, corpus_id: str, path: str) -> dict[str, Any] | None:
         """Fetch one file row by its ``(corpus_id, path)`` logical identity.
 
         Used for upsert-on-upload. Returns ``None`` when no row carries that
@@ -147,14 +147,14 @@ class CorpusFilesPgRepository:
         literally (see ``users_pg.py::get_by_email_prefix`` for the same idiom)."""
         return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    def _filter_clause(self, corpus_id: str, q: Optional[str], status: Optional[str]) -> tuple[str, Dict[str, Any]]:
+    def _filter_clause(self, corpus_id: str, q: str | None, status: str | None) -> tuple[str, dict[str, Any]]:
         """Shared WHERE-clause builder for ``list_for_corpus``/``count_for_corpus``.
 
         Blank (``None``/empty/whitespace-only) ``q``/``status`` means "no
         filter" — never "match nothing".
         """
         where = ["corpus_id = :corpus_id"]
-        params: Dict[str, Any] = {"corpus_id": corpus_id}
+        params: dict[str, Any] = {"corpus_id": corpus_id}
         q_norm = q.strip() if q else ""
         if q_norm:
             pattern = f"%{self._escape_like(q_norm)}%"
@@ -170,12 +170,12 @@ class CorpusFilesPgRepository:
         self,
         corpus_id: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-        q: Optional[str] = None,
-        status: Optional[str] = None,
+        q: str | None = None,
+        status: str | None = None,
         order: str = "oldest",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Files for a given corpus, paginated/filtered/ordered.
 
         Backwards compatible: a bare ``list_for_corpus(corpus_id)`` call
@@ -199,8 +199,8 @@ class CorpusFilesPgRepository:
         self,
         corpus_id: str,
         *,
-        q: Optional[str] = None,
-        status: Optional[str] = None,
+        q: str | None = None,
+        status: str | None = None,
     ) -> int:
         """Row count for ``list_for_corpus`` under the same ``q``/``status``
         filters (and nothing else — no limit/offset applies to a count)."""
@@ -235,14 +235,14 @@ class CorpusFilesPgRepository:
             )
         return int(row["n"]) if row else 0
 
-    def count_by_corpus(self) -> Dict[str, int]:
+    def count_by_corpus(self) -> dict[str, int]:
         """``corpus_id -> file count`` for every corpus that has files, in one
         query. See the DuckDB sibling for why this exists."""
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text("SELECT corpus_id, COUNT(*) AS n FROM corpus_files GROUP BY corpus_id")).all()
         return {r[0]: int(r[1]) for r in rows}
 
-    def search_across_corpora(self, q: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+    def search_across_corpora(self, q: str, *, limit: int = 50) -> list[dict[str, Any]]:
         """Mirrors the DuckDB sibling — see its docstring."""
         q_norm = (q or "").strip()
         if not q_norm:
@@ -263,7 +263,41 @@ class CorpusFilesPgRepository:
             )
         return [self._decode_row(dict(r)) for r in rows]
 
-    def filenames_for_ids(self, file_ids: List[str]) -> Dict[str, Optional[str]]:
+    def match_filenames(
+        self,
+        corpus_ids: list[str] | None,
+        needles: list[str],
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Mirrors the DuckDB sibling — see its docstring for the RBAC
+        rationale and the ``corpus_ids=None``/``[]`` conventions."""
+        if not needles:
+            return []
+        if corpus_ids is not None and not corpus_ids:
+            return []
+        where: list[str] = []
+        params: dict[str, Any] = {}
+        if corpus_ids is not None:
+            where.append("corpus_id = ANY(:corpus_ids)")
+            params["corpus_ids"] = list(corpus_ids)
+        like_clauses = []
+        for i, n in enumerate(needles):
+            key = f"n{i}"
+            like_clauses.append(
+                f"(LOWER(filename) LIKE LOWER(:{key}) ESCAPE '\\' OR LOWER(path) LIKE LOWER(:{key}) ESCAPE '\\')"
+            )
+            params[key] = f"%{self._escape_like(n)}%"
+        where.append("(" + " OR ".join(like_clauses) + ")")
+        params["limit"] = limit
+        sql = (
+            f"SELECT * FROM corpus_files WHERE {' AND '.join(where)} ORDER BY LOWER(filename) ASC, id ASC LIMIT :limit"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return [self._decode_row(dict(r)) for r in rows]
+
+    def filenames_for_ids(self, file_ids: list[str]) -> dict[str, str | None]:
         """Mirrors the DuckDB sibling — see its docstring for why this
         exists (the whole-corpus-listing cost it replaces)."""
         if not file_ids:
@@ -275,7 +309,7 @@ class CorpusFilesPgRepository:
             ).all()
         return {r[0]: r[1] for r in rows}
 
-    def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
+    def status_counts_for_corpora(self, corpus_ids: list[str]) -> dict[str, dict[str, int]]:
         """``{corpus_id: {processing_status: count}}`` for exactly the given
         corpus ids, in ONE query. Mirrors the DuckDB sibling — see its
         docstring for why this exists (the per-scope N+1 it replaces)."""
@@ -289,12 +323,12 @@ class CorpusFilesPgRepository:
                 ),
                 {"ids": list(corpus_ids)},
             ).all()
-        out: Dict[str, Dict[str, int]] = {}
+        out: dict[str, dict[str, int]] = {}
         for corpus_id, status, n in rows:
             out.setdefault(corpus_id, {})[status or "pending"] = int(n)
         return out
 
-    def top_folder_status_counts(self, corpus_id: str) -> Dict[str, Dict[str, int]]:
+    def top_folder_status_counts(self, corpus_id: str) -> dict[str, dict[str, int]]:
         """Mirrors the DuckDB sibling — see its docstring."""
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -306,12 +340,12 @@ class CorpusFilesPgRepository:
                 ),
                 {"id": corpus_id},
             ).all()
-        out: Dict[str, Dict[str, int]] = {}
+        out: dict[str, dict[str, int]] = {}
         for top_folder, status, n in rows:
             out.setdefault(top_folder, {})[status or "pending"] = int(n)
         return out
 
-    def extension_status_counts(self, corpus_ids: List[str]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    def extension_status_counts(self, corpus_ids: list[str]) -> dict[str, dict[str, dict[str, int]]]:
         """Mirrors the DuckDB sibling — see its docstring."""
         if not corpus_ids:
             return {}
@@ -334,12 +368,12 @@ class CorpusFilesPgRepository:
                 ),
                 {"ids": list(corpus_ids)},
             ).all()
-        out: Dict[str, Dict[str, Dict[str, int]]] = {}
+        out: dict[str, dict[str, dict[str, int]]] = {}
         for extension, status, n, size_bytes in rows:
             out.setdefault(extension, {})[status or "pending"] = {"count": int(n), "bytes": int(size_bytes or 0)}
         return out
 
-    def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
+    def list_children(self, parent_file_id: str) -> list[dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         with self._engine.connect() as conn:
             rows = (
@@ -357,7 +391,7 @@ class CorpusFilesPgRepository:
         file_id: str,
         *,
         status: str,
-        detail: Optional[Dict[str, Any]] = None,
+        detail: dict[str, Any] | None = None,
     ) -> None:
         """Update processing_status (and optionally processing_detail).
 
@@ -411,10 +445,10 @@ class CorpusFilesPgRepository:
         *,
         filename: str,
         sha256: str,
-        file_type: Optional[str],
-        size_bytes: Optional[int],
-        storage_path: Optional[str],
-        path: Optional[str],
+        file_type: str | None,
+        size_bytes: int | None,
+        storage_path: str | None,
+        path: str | None,
     ) -> None:
         """Postgres twin of the DuckDB ``update_in_place`` — see its
         docstring (fact-graph-over-Collections §6 prerequisite)."""
@@ -438,7 +472,7 @@ class CorpusFilesPgRepository:
                 },
             )
 
-    def update_path(self, file_id: str, *, path: Optional[str], filename: str) -> None:
+    def update_path(self, file_id: str, *, path: str | None, filename: str) -> None:
         """Postgres twin of the DuckDB ``update_path`` — see its docstring."""
         with self._engine.begin() as conn:
             conn.execute(
