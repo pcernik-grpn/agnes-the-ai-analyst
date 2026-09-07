@@ -14,6 +14,30 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
 5. Add a CHANGELOG fragment (`changelog.d/<slug>.md`, see `changelog.d/README.md`) for any user-visible behavior change. Never write into `CHANGELOG.md` itself.
 
+## Landing a PR — the train is the gate, not the review badge
+
+What merges a ready (non-draft) PR is a **merge train** driven by a person
+with ruleset bypass, not GitHub's review state (`docs/RELEASING.md` → *The
+train-driver role*). `main`'s active ruleset asks for one approving review
+plus an extra approval for unattributed changes, but the core team bypasses
+it — which is why PRs routinely land with `reviewDecision: REVIEW_REQUIRED`
+still set. What follows from that, for an agent or a person:
+
+- **A PR sitting `BEHIND` between trains is normal.** Do not merge `main` into
+  it because `main` moved; the train re-verifies the merged tree. Sync before a
+  build wave, before review, and when the driver asks — not once per train.
+- **Waiting on a gate is a `BLOCKER` with an owner, not a wait.** Name the gate
+  and the person who can open it, in the PR or the issue, and re-ping that
+  person every two hours until it moves. Two long autonomous runs lost 18 h and
+  33 h each modelling "needs an approving review" for a badge that was never
+  the gate (#2295).
+- **Un-draft only when you would merge as-is** (`CLAUDE.md`: "ready for review"
+  means "ready to merge") and name a reviewer at un-draft time, so the blocker
+  has an owner from the first minute.
+- **`ci.yml` already runs on `merge_group`**, so a GitHub merge queue can
+  replace the hand-driven train the day the team enables it on `main`. The
+  queue tests the merged result once, then lands it.
+
 ## Testing conventions
 
 **A visibility/filtering assertion needs a non-admin caller as its proof.**

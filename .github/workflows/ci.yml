@@ -26,6 +26,11 @@ on:
     # this filter GitHub fires no workflow at all for them and the PR shows
     # a green rollup that asserted nothing.
     branches: [main, integration]
+  # Inert until a merge queue is enabled on `main` (a ruleset rule). Once it
+  # is, the queue builds the merged result once and needs this event to run
+  # the required checks on it — the automated form of the hand-driven merge
+  # train, and what makes `main`'s `strict` up-to-date rule redundant (#2295).
+  merge_group:
   schedule:
     - cron: "0 3 * * *"  # Nightly at 03:00 UTC — runs docker-e2e
   workflow_dispatch:

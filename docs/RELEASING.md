@@ -93,7 +93,10 @@ ride into the next day's cut; that is expected, not a bug. Since fragments
 (#2295) a PR merged past an open cut PR adds a *new* file under `changelog.d/`
 rather than editing `[Unreleased]`, so it no longer collides with the cut
 branch at all — the flush-first rule now only keeps a bullet from waiting a
-day, it no longer guards a conflict.
+day, it no longer guards a conflict. `ci.yml` also runs on the `merge_group`
+event, so this role can become a GitHub merge queue (a ruleset rule on `main`,
+no workflow change): the queue tests the merged result once and lands it — the
+automated form of the train.
 
 ### Post-merge: tag + Release
 
