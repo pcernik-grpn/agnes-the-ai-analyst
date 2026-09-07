@@ -690,8 +690,15 @@ def test_main_cut_deletes_exactly_the_fragments_it_shipped(tmp_path):
     changelog, pyproject, fragments = _fragment_checkout(tmp_path)
     rc = main(
         [
-            "--changelog", str(changelog), "--pyproject", str(pyproject), "--no-server-json",
-            "--fragments-dir", str(fragments), "--date", "2026-09-06",
+            "--changelog",
+            str(changelog),
+            "--pyproject",
+            str(pyproject),
+            "--no-server-json",
+            "--fragments-dir",
+            str(fragments),
+            "--date",
+            "2026-09-06",
         ]
     )
     assert rc == 0
@@ -707,8 +714,16 @@ def test_main_dry_run_leaves_the_fragments_in_place(tmp_path):
     changelog, pyproject, fragments = _fragment_checkout(tmp_path)
     rc = main(
         [
-            "--changelog", str(changelog), "--pyproject", str(pyproject), "--no-server-json",
-            "--fragments-dir", str(fragments), "--date", "2026-09-06", "--dry-run",
+            "--changelog",
+            str(changelog),
+            "--pyproject",
+            str(pyproject),
+            "--no-server-json",
+            "--fragments-dir",
+            str(fragments),
+            "--date",
+            "2026-09-06",
+            "--dry-run",
         ]
     )
     assert rc == 0
@@ -716,13 +731,53 @@ def test_main_dry_run_leaves_the_fragments_in_place(tmp_path):
     assert changelog.read_text(encoding="utf-8") == _CL_EMPTY_UNRELEASED
 
 
+def test_main_default_fragments_dir_follows_the_changelog_not_the_cwd(tmp_path, monkeypatch):
+    """Regression: the default used to be ``Path("changelog.d")`` against CWD, so
+    a ``main()`` pointed at a temp ``--changelog`` (this very test module) read the
+    REPO's fragments into the temp cut and deleted them from the checkout."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    decoy_dir = checkout / "changelog.d"
+    decoy_dir.mkdir()
+    (decoy_dir / "decoy.md").write_text("### Added\n- Must survive.\n", encoding="utf-8")
+    monkeypatch.chdir(checkout)
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    changelog, pyproject, fragments = _fragment_checkout(elsewhere)
+    rc = main(
+        [
+            "--changelog",
+            str(changelog),
+            "--pyproject",
+            str(pyproject),
+            "--no-server-json",
+            "--date",
+            "2026-09-06",
+        ]
+    )
+    assert rc == 0
+    assert (decoy_dir / "decoy.md").exists(), "the CWD's fragments must not be touched"
+    written = changelog.read_text(encoding="utf-8")
+    assert "- Must survive." not in written
+    assert "- **A thing from PR one.** Details." in written, "the changelog's own changelog.d/ IS folded"
+    assert not (fragments / "pr.md").exists()
+
+
 def test_main_reports_a_malformed_fragment_and_writes_nothing(tmp_path, capsys):
     changelog, pyproject, fragments = _fragment_checkout(tmp_path)
     (fragments / "bad.md").write_text("### Nope\n- x\n", encoding="utf-8")
     rc = main(
         [
-            "--changelog", str(changelog), "--pyproject", str(pyproject), "--no-server-json",
-            "--fragments-dir", str(fragments), "--date", "2026-09-06",
+            "--changelog",
+            str(changelog),
+            "--pyproject",
+            str(pyproject),
+            "--no-server-json",
+            "--fragments-dir",
+            str(fragments),
+            "--date",
+            "2026-09-06",
         ]
     )
     assert rc == 1

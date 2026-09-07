@@ -687,8 +687,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fragments-dir",
         type=Path,
-        default=Path(FRAGMENTS_DIR),
-        help="per-PR CHANGELOG fragments folded into [Unreleased] by the cut and deleted (default: changelog.d/)",
+        default=None,
+        help=(
+            "per-PR CHANGELOG fragments folded into [Unreleased] by the cut and deleted "
+            "(default: the changelog.d/ next to --changelog — never the current directory's, so a cut "
+            "pointed at another CHANGELOG cannot consume this checkout's fragments)"
+        ),
     )
     parser.add_argument(
         "--no-server-json",
@@ -709,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.fragments_dir is None:
+        args.fragments_dir = args.changelog.parent / FRAGMENTS_DIR
 
     if args.rebaseline:
         return _rebaseline(args)
