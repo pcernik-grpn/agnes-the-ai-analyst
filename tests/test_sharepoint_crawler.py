@@ -7510,14 +7510,19 @@ class TestClearStaleStopForTrigger:
 
         assert "stop_requested_at" not in connection["config"]["extraction"]
 
-    def test_an_unresolvable_job_id_falls_back_to_the_unconditional_clear(self, monkeypatch):
+    def test_an_unresolvable_job_id_preserves_the_flag_rather_than_guessing(self, monkeypatch):
+        """2026-09-07 review finding: a ``job_id`` that was GIVEN but fails
+        to resolve (the row is gone) proves an anchor was expected — this
+        must NOT collapse into the job-id-less unconditional-clear path,
+        or a fresh stop on a run whose triggering job row has (for
+        whatever reason) vanished would be silently erased."""
         connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
         monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: FakeJobsRepo())  # empty — job1 unknown to it
 
         crawler._clear_stale_stop_for_trigger("conn1", "job1")  # must not raise
 
-        assert "stop_requested_at" not in connection["config"]["extraction"]
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
 
     def test_never_clears_while_a_previous_runs_shard_children_are_still_live(self, monkeypatch):
         """2026-09-07 review finding: a cancel force-closes the PARENT
@@ -7561,7 +7566,11 @@ class TestClearStaleStopForTrigger:
 
         assert "stop_requested_at" not in connection["config"]["extraction"]
 
-    def test_a_jobs_repo_failure_never_blocks_the_run(self, monkeypatch):
+    def test_a_jobs_repo_failure_never_blocks_the_run_but_preserves_the_flag(self, monkeypatch):
+        """A `jobs_repo()` failure here happens inside `_shard_children_
+        still_live`'s own lookup first — unknown liveness is treated the
+        same as "still live": never raises, but never clears either,
+        rather than guessing it is safe to."""
         connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
         monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
 
@@ -7572,9 +7581,25 @@ class TestClearStaleStopForTrigger:
 
         crawler._clear_stale_stop_for_trigger("conn1", "job1")  # must not raise
 
-        # No anchor resolved — falls back to the unconditional clear, same
-        # as `job_id=None`, rather than leaving the flag stuck forever.
-        assert "stop_requested_at" not in connection["config"]["extraction"]
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
+
+    def test_a_job_lookup_failure_after_liveness_check_succeeds_also_preserves_the_flag(self, monkeypatch):
+        """2026-09-07 review finding, the exact scenario named: `jobs_repo
+        ().get(job_id)` itself fails (the shard-liveness scan succeeded —
+        this is not the same failure as the test above) — must not
+        collapse into the unconditional clear."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        class _FlakyJobsRepo(FakeJobsRepo):
+            def get(self, job_id):
+                raise RuntimeError("db unavailable")
+
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: _FlakyJobsRepo())
+
+        crawler._clear_stale_stop_for_trigger("conn1", "job1")  # must not raise
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
 
 
 class TestStopWatcher:

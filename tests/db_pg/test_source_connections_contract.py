@@ -169,6 +169,63 @@ def test_config_patch_preserves_concurrently_written_other_key(repo):
 
 
 # ---------------------------------------------------------------------------
+# merge_extraction — the NESTED counterpart to config_patch, atomically
+# merging into config.extraction itself rather than a top-level sibling of
+# it (2026-09-07 finding: _record_extraction_dispatch's own separate
+# get()-then-config_patch() pair still left a window for a concurrent
+# request_stop to commit a stop_requested_at that got silently overwritten).
+# ---------------------------------------------------------------------------
+
+
+def test_merge_extraction_merges_into_the_nested_sub_object(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"tenant_id": "t", "extraction": {}})
+
+    row = repo.merge_extraction("c1", {"last_run_at": "t1", "last_job_id": "job-1"})
+
+    assert row["config"]["extraction"]["last_run_at"] == "t1"
+    assert row["config"]["extraction"]["last_job_id"] == "job-1"
+    assert row["config"]["tenant_id"] == "t"
+    # Persisted, not just returned.
+    assert repo.get("c1")["config"]["extraction"]["last_job_id"] == "job-1"
+
+
+def test_merge_extraction_preserves_a_flag_committed_just_before_by_a_different_writer(repo):
+    # The exact race the finding names: `request_stop` (a plain
+    # `config_patch` call on the SAME nested sub-object) commits its flag
+    # AFTER whatever the caller of `merge_extraction` last read, but
+    # BEFORE this call — `merge_extraction` must still see it, since it
+    # re-reads fresh under its own transaction rather than trusting a
+    # snapshot the caller might be holding.
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"extraction": {}})
+    repo.config_patch("c1", {"extraction": {"stop_requested_at": "fresh"}})
+
+    row = repo.merge_extraction("c1", {"last_run_at": "t1", "last_job_id": "job-1"})
+
+    assert row["config"]["extraction"]["stop_requested_at"] == "fresh"
+    assert row["config"]["extraction"]["last_run_at"] == "t1"
+    assert row["config"]["extraction"]["last_job_id"] == "job-1"
+
+
+def test_merge_extraction_preserves_other_extraction_siblings(repo):
+    repo.create(
+        id="c1",
+        name="a",
+        source_type="sharepoint",
+        config={"extraction": {"facts": {"retry_mode": "off"}, "crawl": {"min_modified": "2023-12-31"}}},
+    )
+
+    row = repo.merge_extraction("c1", {"last_run_at": "t1", "last_job_id": "job-1"})
+
+    ext = row["config"]["extraction"]
+    assert ext["facts"] == {"retry_mode": "off"}
+    assert ext["crawl"] == {"min_modified": "2023-12-31"}
+
+
+def test_merge_extraction_unknown_id_returns_none(repo):
+    assert repo.merge_extraction("nope", {"last_run_at": "t1"}) is None
+
+
+# ---------------------------------------------------------------------------
 # clear_stop_requested_if_unchanged — the compare-and-delete counterpart to
 # connectors.sharepoint.crawler.request_stop's write (2026-09-06 incident:
 # `_clear_stale_stop`'s own read-then-config_patch could clobber a FRESH

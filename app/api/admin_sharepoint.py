@@ -1262,28 +1262,29 @@ def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
     listed there, and the ratchet test (``tests/
     test_sharepoint_config_carry_forward_ratchet.py``) will fail otherwise.
 
-    Uses ``config_patch`` (a fresh, re-read-under-lock merge), NEVER the
-    caller's own ``row`` as the merge base: ``row`` is whatever the caller
-    fetched at the START of its own handler, and this is sometimes called
-    AFTER that same handler has already done its own write to ``config.
-    extraction`` — a selected-shard rerun clears a stale cooperative-stop
-    flag (``connectors.sharepoint.crawler._clear_stale_stop_for_trigger``)
-    before calling this. Merging from the stale ``row`` instead of the
-    live row would silently resurrect whatever this call's own snapshot
-    still had, undoing that clear (2026-09-07 finding: exactly this,
-    observed via ``_trigger_shard_rerun``). ``row`` is kept only for its
-    ``id`` — a fresh read failing (the connection deleted concurrently) is
-    ``config_patch``'s own no-op-on-unknown-id contract, not an error here.
+    Uses ``merge_extraction`` — ONE atomic, re-read-under-lock merge
+    straight into ``config.extraction`` — NEVER the caller's own ``row``
+    as the merge base, and never a separate read-then-``config_patch``
+    pair either: ``row`` is whatever the caller fetched at the START of
+    its own handler, and this is sometimes called AFTER that same handler
+    has already done its own write to ``config.extraction`` — a
+    selected-shard rerun clears a stale cooperative-stop flag
+    (``connectors.sharepoint.crawler._clear_stale_stop_for_trigger``)
+    before calling this. A prior version of this function did ``repo.
+    get()`` THEN ``repo.config_patch(..., {"extraction": extraction})`` —
+    still a plain read-then-write two calls apart, with a real window for
+    a `request_stop` to commit a fresh flag in between that the second
+    call's already-computed snapshot would silently overwrite (2026-09-07
+    finding, on top of the first one this docstring already described).
+    ``merge_extraction`` closes both in one step: the read, the merge, and
+    the write happen in the SAME transaction/lock the real repos already
+    use for exactly this class of race.
     """
     extraction_patch = {
         "last_run_at": datetime.now(timezone.utc).isoformat(),
         "last_job_id": job_id,
     }
-    repo = source_connections_repo()
-    current = repo.get(row["id"]) or row
-    extraction = dict((current.get("config") or {}).get("extraction") or {})
-    extraction.update(extraction_patch)
-    repo.config_patch(row["id"], {"extraction": extraction})
+    source_connections_repo().merge_extraction(row["id"], extraction_patch)
 
 
 def _extraction_schedule_config() -> Optional[str]:

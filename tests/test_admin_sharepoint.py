@@ -5905,7 +5905,10 @@ class TestDispatchBookkeepingKeepsSiblings:
         `.get()` returns the live row (by reference, so a `config_patch`
         is immediately visible to the next `.get()`), `.config_patch()`
         merges the patch's top-level keys the same shallow way both real
-        repos do — mirrors `tests/test_sharepoint_crawler.py`'s
+        repos do, and `.merge_extraction()` merges directly into the
+        nested `config.extraction` sub-object (re-reading the live
+        connection each call, same as the real repos' own re-read-under-
+        lock) — mirrors `tests/test_sharepoint_crawler.py`'s
         `FakeSourceConnectionsRepo`, kept local rather than shared."""
 
         def __init__(self, connection):
@@ -5919,6 +5922,16 @@ class TestDispatchBookkeepingKeepsSiblings:
                 return None
             config = dict(self.connection.get("config") or {})
             config.update(patch)
+            self.connection["config"] = config
+            return self.connection
+
+        def merge_extraction(self, connection_id, patch):
+            if connection_id != self.connection.get("id"):
+                return None
+            config = dict(self.connection.get("config") or {})
+            extraction = dict(config.get("extraction") or {})
+            extraction.update(patch)
+            config["extraction"] = extraction
             self.connection["config"] = config
             return self.connection
 

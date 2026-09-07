@@ -734,46 +734,79 @@ def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> 
     actually dispatched through the worker (see ``app/worker/kinds.py::
     _payload_for_handler``); a payload built outside it (a test, a manual
     replay) has no anchor and falls back to :func:`_clear_stale_stop`'s
-    unconditional clear. Best effort throughout: no lookup or clear here
-    may ever block the run trying to start cleanly.
+    unconditional clear.
+
+    "Unknown" always means PRESERVE, never "guess it's safe to clear" — a
+    2026-09-07 finding on the previous version of this function, which
+    collapsed a FAILED shard-liveness check or job lookup into the exact
+    same ``not_after=None`` path a genuinely job-id-less caller gets,
+    silently erasing a fresh stop the caller's own ``job_id`` proves an
+    anchor was expected for. Concretely: a repo hiccup checking for live
+    shard children, or a ``job_id`` that was GIVEN but fails to resolve
+    (the lookup raises, or the row is gone), now leaves the flag exactly
+    as it found it — the run this trigger is starting may stop on a flag
+    that turns out to have been stale, but that costs one no-op retry,
+    never a silently un-cancelled or silently ignored stop. Only a
+    caller that never had a ``job_id`` to begin with — nothing to fail to
+    resolve — takes the unconditional-clear path.
     """
     try:
-        if _shard_children_still_live(connection_id):
-            logger.info(
-                "sharepoint crawl: connection %s still has live shard children from a cancelled run — "
-                "leaving the stop flag in place for them; retry once they finish",
-                connection_id,
-            )
-            return
-    except Exception as exc:  # noqa: BLE001 — never load-bearing
-        logger.debug("sharepoint crawl: could not check for live shard children for %s: %s", connection_id, exc)
+        still_live = _shard_children_still_live(connection_id)
+    except Exception as exc:  # noqa: BLE001
+        # Unknown whether children are still live — treat that exactly like
+        # "yes": leaving a possibly-already-stale flag in place costs one
+        # no-op retry; wrongly clearing it could un-cancel real work.
+        logger.warning(
+            "sharepoint crawl: could not check for live shard children for %s: %s — leaving any stop flag in "
+            "place rather than risking an un-cancel",
+            connection_id,
+            exc,
+        )
+        return
+    if still_live:
+        logger.info(
+            "sharepoint crawl: connection %s still has live shard children from a cancelled run — "
+            "leaving the stop flag in place for them; retry once they finish",
+            connection_id,
+        )
+        return
 
-    not_after = None
-    if job_id:
+    if job_id is None:
         try:
-            from src.repositories import jobs_repo
+            _clear_stale_stop(connection_id, not_after=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
+        return
 
-            job_row = jobs_repo().get(job_id)
-            if job_row:
-                not_after = job_row.get("created_at")
-        except Exception as exc:  # noqa: BLE001 — never load-bearing, but see the warning below
-            # WARNING, not debug: a repo hiccup here means `not_after` stays
-            # `None`, which the caller cannot tell apart from "no anchor
-            # available", so this silently falls back to an unconditional
-            # clear — usually harmless, but on a genuinely stale-vs-fresh
-            # ambiguity it can reproduce this fix's own target symptom (a
-            # transient DB error making a run silently do nothing). An
-            # operator needs to SEE this, not just have it swallowed.
-            logger.warning(
-                "sharepoint crawl: could not resolve job %s's created_at for %s: %s", job_id, connection_id, exc
-            )
     try:
-        _clear_stale_stop(connection_id, not_after=not_after)
-    except Exception as exc:  # noqa: BLE001 — never load-bearing, but see the warning below
-        # WARNING: a failed clear leaves a stale flag stuck, and every
-        # child of THIS trigger will read it and stop immediately — the
-        # same zero-work outcome the whole fix targets, just from a
-        # transient repo failure instead of a missing clear call.
+        from src.repositories import jobs_repo
+
+        job_row = jobs_repo().get(job_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "sharepoint crawl: could not resolve job %s's created_at for %s: %s — leaving any stop flag in "
+            "place rather than guessing it is stale",
+            job_id,
+            connection_id,
+            exc,
+        )
+        return
+    if not job_row:
+        logger.warning(
+            "sharepoint crawl: job %s not found while resolving its created_at for %s — leaving any stop flag "
+            "in place rather than guessing it is stale",
+            job_id,
+            connection_id,
+        )
+        return
+
+    try:
+        _clear_stale_stop(connection_id, not_after=job_row.get("created_at"))
+    except Exception as exc:  # noqa: BLE001
+        # A failed clear leaves a stale flag stuck, and every child of THIS
+        # trigger will read it and stop immediately — the same zero-work
+        # outcome the whole fix targets, just from a transient repo failure
+        # instead of a missing clear call.
         logger.warning("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
 
 

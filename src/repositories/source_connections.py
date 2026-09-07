@@ -224,6 +224,65 @@ class SourceConnectionsRepository:
             raise last_err
         return None
 
+    def merge_extraction(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Atomically merge ``patch``'s keys into THIS row's ``config.
+        extraction`` sub-object — the NESTED counterpart to
+        :meth:`config_patch`'s own top-level merge, for a caller that only
+        ever touches keys INSIDE ``extraction`` (never a sibling of it on
+        ``config`` itself). Re-reads ``config`` fresh inside this same
+        transaction, exactly like :meth:`config_patch` does, so a
+        DIFFERENT writer's OWN key inside ``extraction`` — most
+        pointedly, ``connectors.sharepoint.crawler.request_stop``'s
+        ``stop_requested_at`` — committed after the caller's own last read
+        can never be clobbered by this merge.
+
+        2026-09-07 finding: ``_record_extraction_dispatch`` used to do its
+        own ``repo.get()`` THEN ``repo.config_patch(..., {"extraction":
+        extraction})`` — two separate calls, with a real (if narrow)
+        window between them for a concurrent ``request_stop`` to commit a
+        fresh flag that the second call's already-computed ``extraction``
+        snapshot would then silently overwrite. This collapses both into
+        ONE transaction so there is no such window at all.
+        """
+        last_err: Optional[duckdb.Error] = None
+        for attempt in range(_CONFIG_PATCH_CONFLICT_RETRIES):
+            try:
+                self.conn.execute("BEGIN")
+                row = self.conn.execute(
+                    "SELECT config FROM source_connections WHERE id = ?",
+                    [connection_id],
+                ).fetchone()
+                if row is None:
+                    self.conn.execute("ROLLBACK")
+                    return None
+                current = row[0]
+                if isinstance(current, str):
+                    try:
+                        current = json.loads(current)
+                    except (json.JSONDecodeError, TypeError):
+                        current = {}
+                elif not isinstance(current, dict):
+                    current = {}
+                extraction = dict(current.get("extraction") or {})
+                extraction.update(patch)
+                merged = {**current, "extraction": extraction}
+                self.conn.execute(
+                    "UPDATE source_connections SET config = ? WHERE id = ?",
+                    [json.dumps(merged), connection_id],
+                )
+                self.conn.execute("COMMIT")
+                return self.get(connection_id)
+            except duckdb.TransactionException as e:
+                self._safe_rollback()
+                last_err = e
+                time.sleep(_CONFIG_PATCH_CONFLICT_BACKOFF_S * (attempt + 1))
+            except Exception:
+                self._safe_rollback()
+                raise
+        if last_err is not None:
+            raise last_err
+        return None
+
     def clear_stop_requested_if_unchanged(self, connection_id: str, expected_stop_at: str) -> bool:
         """Clear ``config.extraction.stop_requested_at`` — but ONLY if its
         CURRENT value (re-read here, under the same transaction) still

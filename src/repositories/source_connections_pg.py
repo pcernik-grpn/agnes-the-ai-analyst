@@ -188,6 +188,46 @@ class SourceConnectionsPgRepository:
             )
         return self._decode(dict(updated) if updated else None)
 
+    def merge_extraction(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Mirrors the DuckDB sibling — see its docstring for the race this
+        closes (``_record_extraction_dispatch``'s own separate ``get()``
+        then ``config_patch()`` leaving a window for a concurrent
+        ``request_stop`` to commit a flag that gets silently overwritten).
+        The row lock (``SELECT ... FOR UPDATE``) inside this same
+        transaction is what makes the re-read and the merge atomic.
+        """
+        with self._engine.begin() as cx:
+            row = cx.execute(
+                sa.text("SELECT config FROM source_connections WHERE id = :id FOR UPDATE"),
+                {"id": connection_id},
+            ).first()
+            if row is None:
+                return None
+            current = row[0]
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except (json.JSONDecodeError, TypeError):
+                    current = {}
+            elif not isinstance(current, dict):
+                current = {}
+            extraction = dict(current.get("extraction") or {})
+            extraction.update(patch)
+            merged = {**current, "extraction": extraction}
+            cx.execute(
+                sa.text("UPDATE source_connections SET config = :c WHERE id = :id"),
+                {"c": json.dumps(merged), "id": connection_id},
+            )
+            updated = (
+                cx.execute(
+                    sa.text("SELECT * FROM source_connections WHERE id = :id"),
+                    {"id": connection_id},
+                )
+                .mappings()
+                .first()
+            )
+        return self._decode(dict(updated) if updated else None)
+
     def clear_stop_requested_if_unchanged(self, connection_id: str, expected_stop_at: str) -> bool:
         """Mirrors the DuckDB sibling — see its docstring for the race this
         closes (a `request_stop` committing a FRESH flag between a

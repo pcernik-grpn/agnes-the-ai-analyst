@@ -26,7 +26,7 @@ in EITHER direction (a real writer key missing from the list is the erasure
 risk; a stale list entry with no real writer is dead weight worth noticing
 too). The failure message names the exact fix.
 
-What the detector recognizes (the three shapes current writers use):
+What the detector recognizes (the four shapes current writers use):
 
 * ``NAME = {**base, "KEY": value}`` — a dict literal with a ``**`` unpack
   plus an explicit literal-string key (``confirm_scope`` / ``remove_scope``'s
@@ -38,10 +38,17 @@ What the detector recognizes (the three shapes current writers use):
   DIRECTLY as the patch argument (positional or ``patch=``), no intermediate
   variable to track: ``config_patch`` re-reads the row fresh and merges this
   dict's top-level keys itself, so there is no separate ``config=``-bound
-  local the first two shapes rely on (``_record_extraction_dispatch``'s
-  current shape, since 2026-09-07 — safer than the old whole-``config``
-  ``update()`` it replaced, exactly the class of bug ``config_patch`` exists
-  to close: see its own docstring).
+  local the first two shapes rely on.
+* ``....merge_extraction(id, {...})`` — ANY call to this method is a write
+  of the literal key ``"extraction"``, unconditionally: unlike
+  ``config_patch``, the target key is not one of the call's own arguments
+  at all, it is the method's own contract ("merge into ``config.
+  extraction``"). ``_record_extraction_dispatch``'s current shape, since
+  2026-09-07 — first moved off a whole-``config`` ``update()`` onto
+  ``config_patch`` (closing one race), then onto this ONE-transaction
+  nested merge (closing the race THAT left open — a separate ``get()``
+  then ``config_patch()`` call pair still had a window for a concurrent
+  ``request_stop`` to land in between).
 
 The first two are scoped to the SAME local variable name that flows into a
 ``config=`` keyword in an ``....update(...)`` call within the SAME function
@@ -91,12 +98,13 @@ ADMIN_SHAREPOINT_PATH = REPO_ROOT / "app" / "api" / "admin_sharepoint.py"
 
 def config_writer_keys(tree: ast.Module) -> set[str]:
     """Every literal-string key written into a SharePoint connection's
-    ``config`` by a function in ``tree`` — either into the local variable it
-    passes as ``config=`` to a ``....update(...)`` call, or directly as a
-    literal dict passed to ``....config_patch(...)``. See the module
-    docstring for the exact three shapes recognized and why the first two
-    are scoped per-function to one variable name while the third needs no
-    such scoping."""
+    ``config`` by a function in ``tree`` — into the local variable it
+    passes as ``config=`` to a ``....update(...)`` call, directly as a
+    literal dict passed to ``....config_patch(...)``, or (unconditionally)
+    ``"extraction"`` for any ``....merge_extraction(...)`` call. See the
+    module docstring for the exact four shapes recognized and why the
+    first two are scoped per-function to one variable name while the last
+    two need no such scoping."""
     keys: set[str] = set()
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -116,6 +124,20 @@ def config_writer_keys(tree: ast.Module) -> set[str]:
                 for k in patch_dict.keys:
                     if isinstance(k, ast.Constant) and isinstance(k.value, str):
                         keys.add(k.value)
+
+        # ....merge_extraction(id, {...}) — the method's own contract IS
+        # "merge these keys into config.extraction", so any call to it is
+        # a write of the literal key "extraction" by construction, whatever
+        # its second argument looks like (unlike config_patch, there is no
+        # dict-literal shape to inspect — the target key isn't an argument
+        # at all, it's baked into the method name).
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "merge_extraction"
+            ):
+                keys.add("extraction")
 
         config_vars: set[str] = set()
         for node in ast.walk(func):
@@ -230,6 +252,19 @@ def test_detector_ignores_a_config_patch_call_with_no_literal_dict():
     hallucinate a key on it either."""
     tree = ast.parse("def record_widget(row, patch):\n    source_connections_repo().config_patch(row['id'], patch)\n")
     assert config_writer_keys(tree) == set(), "a non-literal config_patch argument was wrongly flagged"
+
+
+def test_detector_flags_a_planted_merge_extraction_call():
+    """A new writer calling `....merge_extraction(...)` must be flagged as
+    an "extraction" write — `_record_extraction_dispatch`'s CURRENT shape
+    (2026-09-07: the one-transaction nested merge that closed the race a
+    separate `get()`/`config_patch()` pair still left open)."""
+    tree = ast.parse(
+        "def record_widget(row):\n"
+        "    patch = {'last_run_at': 'x'}\n"
+        "    source_connections_repo().merge_extraction(row['id'], patch)\n"
+    )
+    assert config_writer_keys(tree) == {"extraction"}, "detector failed to flag a planted merge_extraction call"
 
 
 def test_detector_ignores_an_unrelated_dict_with_no_config_update_call():
