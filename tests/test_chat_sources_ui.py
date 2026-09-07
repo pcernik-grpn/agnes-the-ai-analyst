@@ -837,12 +837,13 @@ def test_an_unverified_document_is_flagged_like_any_other_reference():
     assert flags == ["1 unverified"]
 
 
-def test_a_document_chip_is_a_label_not_a_dead_link():
+def test_an_unresolved_document_chip_is_a_label_not_a_dead_link():
     """#1974's rule is that a chip links when its ref identifies a page. A
-    filename does not: document detail is `/library/{slug}/f/{file_id}`, and
-    the model knows neither the collection slug nor the file id. So a document
-    stays a plain label rather than becoming a link to a guess — the same
-    reason an assumption is not one."""
+    bare filename does not — document detail is `/library/{slug}/f/{file_id}`,
+    and the client knows neither the collection slug nor the file id. Server
+    resolution (`app/chat/document_links.py`) is what can turn a `document:`
+    citation into one of those; absent a `url` from the server, the chip
+    stays a plain label rather than becoming a link to a guess."""
     node = shutil.which("node")
     if not node:
         pytest.skip("node not available")
@@ -860,12 +861,46 @@ process.stdout.write(JSON.stringify({
     out = subprocess.run([node, "-e", script], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     res = json.loads(out.stdout)
-    assert res["document"] == "", "a filename does not identify a page"
+    assert res["document"] == "", "an unresolved filename does not identify a page"
     assert res["table"] == "/catalog/t/orders", "the kinds that DO resolve still link"
 
     rows = _render({"declared": True, "claims": [_DOCUMENT]})
     (chip,) = _chips(rows[0])
     assert chip["tag"] == "span" and "is-link" not in chip["cls"]
+
+
+def test_a_server_resolved_document_chip_is_a_real_link():
+    """The other half of the same contract: when the server DID resolve the
+    citation (a `url` rides the claim — see `attach_document_urls` in
+    `app/chat/document_links.py`), the chip becomes a link like `table`/
+    `metric`/`glossary` already are, and keeps its verified/unverified state."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _claimHref") : js.index("function renderSourcesChips")]
+    script = (
+        fn
+        + """
+process.stdout.write(JSON.stringify({
+  resolved: _claimHref({kind: 'document', ref: 'Q3_Board_Review.pdf', url: '/library/board/f/cf_abc123'}),
+  escaped_ref_ignored: _claimHref({kind: 'document', ref: 'a b/c?d', url: '/library/board/f/cf_abc123'}),
+}));
+"""
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["resolved"] == "/library/board/f/cf_abc123"
+    assert res["escaped_ref_ignored"] == "/library/board/f/cf_abc123", (
+        "a server-built url is used as-is — the ref that produced it plays no further part"
+    )
+
+    resolved_claim = dict(_DOCUMENT, url="/library/board/f/cf_abc123")
+    rows = _render({"declared": True, "claims": [resolved_claim]})
+    (chip,) = _chips(rows[0])
+    assert chip["tag"] == "a" and "is-link" in chip["cls"]
+    assert "is-ok" in chip["cls"], "the link must not cost the verified/unverified signal"
 
 
 def test_the_client_knows_every_kind_the_server_can_send():
