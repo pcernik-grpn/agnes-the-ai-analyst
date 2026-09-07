@@ -943,7 +943,14 @@
     //    readable — on the row when it fits, in the panel when it does not —
     //    and never twice.
     function trimRedundantDescriptions() {
-        document.querySelectorAll('.sl-item[data-cat]').forEach(item => {
+        /* `[data-tab]`, not `[data-cat]`: no `.sl-item` has ever carried a
+           `data-cat` attribute — that name belongs to the filter menu's
+           `.fbar-cat` categories — so this selector matched zero rows and the
+           function has been a no-op, leaving every metric's description
+           printed twice. Both row kinds carry `data-tab` (`all_metrics` /
+           `all_glossary`), and the `!row || !panel` guard below already skips
+           the glossary rows, which have no detail panel. */
+        document.querySelectorAll('.sl-item[data-tab]').forEach(item => {
             const row = item.querySelector('.sl-row__desc');
             const panel = item.querySelector('.sl-detail__desc');
             if (!row || !panel) return;

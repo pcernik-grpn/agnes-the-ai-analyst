@@ -4006,8 +4006,19 @@
   function syncCrossTab() {
     const el = document.getElementById('lib-crosstab');
     if (!el) return;
-    const searching = !!(document.getElementById('lib-search') || {}).value;
-    const filtered = !!document.querySelector('#lib-filter-menu input[data-facet]:checked');
+    //: `.trim()` because a stray space is not a search. Untrimmed, typing one
+    //: character and deleting it leaves a value that is truthy, and the notice
+    //: offers to carry a query the reader never made to the other tab.
+    const searching = !!((document.getElementById('lib-search') || {}).value || '').trim();
+    //: Two spellings of "a filter is on", and reading only the first one meant
+    //: the notice stayed silent for the facet most likely to hide rows.
+    //: Menu facets are checkboxes; a `toggle` facet declared with a `control`
+    //: (LIB_FACETS' `stack` → `#lib-stack-toggle`) rides the bar as a button
+    //: and carries its state in `aria-pressed`, never in the menu.
+    const filtered = !!(
+      document.querySelector('#lib-filter-menu input[data-facet]:checked')
+      || document.querySelector('#lib-stack-toggle[aria-pressed="true"]')
+    );
     const box = document.getElementById('lib-noresults');
     const thisTabEmpty = box && !box.hidden;
     const other = (searching || filtered) && !thisTabEmpty ? otherTabHit() : null;
