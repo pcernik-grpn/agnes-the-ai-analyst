@@ -486,10 +486,18 @@ def _waking_response(request: Request, slug: str, accepts_json: bool) -> Respons
         return JSONResponse({"status": "waking"}, status_code=503)
     from app.web.router import templates
 
+    # `start_grace_seconds` is the page's own give-up horizon. It is the
+    # server's `_START_GRACE_SECONDS` rather than a number chosen in the
+    # template, so the holding page stops calling the app "starting" at the
+    # same moment this module does — one constant, not two that drift.
     return templates.TemplateResponse(
         request,
         "data_app_waking.html",
-        {"slug": slug, "readiness_url": _readiness_poll_url(request, slug)},
+        {
+            "slug": slug,
+            "readiness_url": _readiness_poll_url(request, slug),
+            "start_grace_seconds": _START_GRACE_SECONDS,
+        },
         status_code=503,
     )
 

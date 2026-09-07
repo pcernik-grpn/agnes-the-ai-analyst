@@ -1,18 +1,65 @@
 <!doctype html>
 <title>Starting…</title>
-<style>body{font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0}</style>
-<div><h2>⏳ App is waking up…</h2><p>This page reloads automatically.</p></div>
+<style>
+  body{font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0}
+  .box{max-width:34rem;padding:0 1.5rem;text-align:center}
+  button{font:inherit;padding:.5rem 1rem;margin-top:.75rem;cursor:pointer}
+  [hidden]{display:none!important}
+</style>
+<div class="box">
+  <h2 id="wake-head">⏳ App is waking up…</h2>
+  <p id="wake-msg">This page reloads automatically.</p>
+  <button id="wake-reload" hidden onclick="location.reload()">Reload now</button>
+</div>
 <script>
+  {# Bounded on purpose. An unbounded retry turned every failure into a
+     spinner sitting under a page that PROMISES it reloads by itself, which
+     is the one thing it then never does. Two failures need different words:
+
+       * the poll cannot work at all — on an app subdomain with no
+         `server.public_url` the readiness URL stays relative, the subdomain
+         middleware rewrites it back onto this very page, and `r.json()`
+         throws on the HTML it gets (see `_readiness_poll_url`). Waiting
+         fixes nothing, so stop early and hand over a reload — the wake WAS
+         triggered, so a reload usually lands on the running app.
+       * the app is genuinely slow — normal. The server's own start grace
+         (`_START_GRACE_SECONDS`, passed in) is the honest horizon to wait
+         out before saying so, so the page and the proxy agree on when
+         "starting" stops being the explanation. #}
+  const READINESS_URL = "{{ readiness_url }}";
+  const GRACE_MS = {{ start_grace_seconds }} * 1000;
+  const INTERVAL_MS = 2000;
+  const ERROR_LIMIT = 5;  // ~10s of a poll that cannot answer at all
+
+  const head = document.getElementById("wake-head");
+  const msg = document.getElementById("wake-msg");
+  const reload = document.getElementById("wake-reload");
+  const startedAt = Date.now();
+  let errors = 0;
+
+  const stop = (text) => {
+    head.textContent = "⏳ Still starting…";
+    msg.textContent = text;
+    reload.hidden = false;
+  };
+
   const poll = async () => {
     try {
-      {# Absolute on an app subdomain: the subdomain middleware rewrites every
-         path to /apps/<slug>/… with no /api carve-out, so a relative poll came
-         back as this very page and the loop spun forever. #}
-      const r = await fetch("{{ readiness_url }}", { credentials: "include" });
+      const r = await fetch(READINESS_URL, { credentials: "include" });
       const j = await r.json();
+      errors = 0;
       if (j.ready) { location.reload(); return; }
-    } catch (e) {}
-    setTimeout(poll, 2000);
+    } catch (e) {
+      if (++errors >= ERROR_LIMIT) {
+        stop("This page can’t check the app’s status automatically on this deployment. The app was asked to start — reload to see whether it is up.");
+        return;
+      }
+    }
+    if (Date.now() - startedAt > GRACE_MS) {
+      stop("The app is taking longer than usual to start. Reload to check again.");
+      return;
+    }
+    setTimeout(poll, INTERVAL_MS);
   };
   poll();
 </script>

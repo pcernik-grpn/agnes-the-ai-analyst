@@ -365,6 +365,29 @@ def test_sleeping_app_returns_holding_page_and_wakes(client_granted, fake_runner
     assert fake_runner.up_calls  # wake fired exactly once
 
 
+def test_holding_page_bounds_its_retry_on_the_servers_own_start_grace(
+    client_granted, fake_runner, sleeping_app, monkeypatch
+):
+    """The holding page used to retry forever under a line promising it
+    reloads by itself — so every failure, including a poll that structurally
+    cannot answer (an app subdomain with no ``server.public_url``; see
+    ``_readiness_poll_url``), presented as an app that was still starting.
+
+    It now gives up and offers a reload. The horizon it gives up on is the
+    server's ``_START_GRACE_SECONDS``, passed into the template rather than
+    written there, so the page stops calling an app "starting" at the same
+    moment this module does — pinned here, since two copies of that number
+    is exactly how they would drift.
+    """
+    import app.api.data_apps_proxy as proxy_api
+
+    monkeypatch.setattr(proxy_api, "_START_GRACE_SECONDS", 137)
+    r = client_granted.get(f"/apps/{sleeping_app}/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert "const GRACE_MS = 137 * 1000;" in r.text
+    assert 'id="wake-reload"' in r.text
+
+
 def test_sleeping_app_json_accept(client_granted, fake_runner, sleeping_app):
     r = client_granted.get("/apps/s/", headers={"accept": "application/json"})
     assert r.status_code == 503
@@ -1353,7 +1376,9 @@ def test_the_waking_page_polls_a_relative_url_on_the_path_form(client_granted, f
     """No host pinned into the page when it is not needed."""
     r = client_granted.get("/apps/s/", headers={"accept": "text/html"})
     assert r.status_code == 503
-    assert 'fetch("/api/data-apps/s/readiness", { credentials: "include" })' in r.text
+    # Asserted on the URL the page is handed, not on the shape of the fetch
+    # call that consumes it — the value is the contract here.
+    assert 'const READINESS_URL = "/api/data-apps/s/readiness";' in r.text
 
 
 def test_the_waking_page_polls_an_absolute_url_on_a_subdomain(monkeypatch):
