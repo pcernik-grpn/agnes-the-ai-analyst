@@ -76,8 +76,9 @@ a day.
 
 Since 2026-09-07 `main` has a GitHub **merge queue** (ruleset *Merge queue on
 main*: merge-commit method, `ALLGREEN` grouping, up to five entries per group,
-60 min check timeout, no bypass actors) and its "require branch up to date"
-rule is off. This is the automated form of the merge train that used to land
+60 min check timeout; the queue ruleset has no bypass actors, so nobody merges
+around it — the *review* ruleset's core-team bypass below is a different rule)
+and its "require branch up to date" rule is off. This is the automated form of the merge train that used to land
 most of `main` as `Train N: #…`; the hand-driven train is retired.
 
 - **Queue a ready PR** with `gh pr merge <N> --merge --auto --delete-branch`
@@ -313,13 +314,12 @@ re-run click, not a second push.
 - **Force-pushed and lost auto-merge?** GitHub *usually* preserves auto-merge
   across force-pushes for the same PR; if it cleared, just re-run
   `gh pr merge <N> --merge --auto --delete-branch` to re-queue it.
-- **A cut PR went stale (merge conflict against a newer `main`)?** The queue
-  wasn't fully flushed before something else merged past it — close the
+- **A cut PR went stale (merge conflict against a newer `main`)?** Close the
   stale cut PR and re-dispatch `daily-cut.yml` rather than resolving the
-  conflict by hand (see § Landing PRs through the merge queue above). Closing the PR
-  leaves its `release-cut/vX.Y.Z` branch behind on the remote; there is
-  nothing to clean up first — the branch is workflow-owned, and the
-  re-dispatch force-pushes over it when it computes the same version.
+  conflict by hand (see § Landing PRs through the merge queue above).
+  Closing the PR leaves its `release-cut/vX.Y.Z` branch behind on the
+  remote; there is nothing to clean up first — the branch is workflow-owned,
+  and the re-dispatch force-pushes over it when it computes the same version.
 - **Wrong version number tagged?** `git tag -d vX.Y.Z && git push --delete
   origin vX.Y.Z` then re-tag against the right SHA. Update the GitHub Release if
   you already created it.
