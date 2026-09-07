@@ -23,11 +23,11 @@ plus an extra approval for unattributed changes, which the core team bypasses â€
 so PRs routinely land with `reviewDecision: REVIEW_REQUIRED` still set. What
 follows from that, for an agent or a person:
 
-- **To land a ready PR, queue it:** `gh pr merge <N> --merge --auto
-  --delete-branch` (or "Merge when ready" in the UI). The queue builds `main`
+- **To land a ready PR, queue it:** `gh pr merge <N> --merge --auto` (or "Merge when ready" in the UI). The queue builds `main`
   plus your PR plus whatever else is queued, runs the required checks on that
   merged result once (`ci.yml` runs on `merge_group`), and merges. The merge
   method is the queue's (merge commit), set in the ruleset, not per PR.
+  GitHub deletes the head branch after the queue merges it (repo setting *Automatically delete head branches*).
 - **A PR sitting `BEHIND` is normal.** `main` no longer requires an up-to-date
   branch. Do not merge `main` into a PR because `main` moved; the queue tests
   the merged result. Sync before a build wave, before review, and when a

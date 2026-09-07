@@ -88,7 +88,7 @@ is enough.
 
 Since 2026-09-07 a GitHub merge queue on `main` lands ready PRs — the
 hand-driven merge trains are retired. Queue a PR with
-`gh pr merge <N> --merge --auto --delete-branch` (or "Merge when ready"); the
+`gh pr merge <N> --merge --auto` (or "Merge when ready"); the
 queue tests `main` + the queued PRs once on the `merge_group` event and merges.
 `main` no longer requires an up-to-date branch, so never merge `main` into a PR
 because `main` moved. The cut PR rides the same queue: queue it after the

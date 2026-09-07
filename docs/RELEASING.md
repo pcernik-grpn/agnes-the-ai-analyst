@@ -81,8 +81,8 @@ around it — the *review* ruleset's core-team bypass below is a different rule)
 and its "require branch up to date" rule is off. This is the automated form of the merge train that used to land
 most of `main` as `Train N: #…`; the hand-driven train is retired.
 
-- **Queue a ready PR** with `gh pr merge <N> --merge --auto --delete-branch`
-  or "Merge when ready" in the UI. The queue creates a temporary branch with
+- **Queue a ready PR** with `gh pr merge <N> --merge --auto`
+  or "Merge when ready" in the UI (GitHub deletes the head branch after the queue merges it (repo setting *Automatically delete head branches*).) The queue creates a temporary branch with
   `main` + the queued PRs, `ci.yml` runs on that `merge_group` event, and the
   required checks (`test`, `docker-build`) must pass on the merged result
   before it lands. A group in which one entry fails is re-formed without it.
@@ -185,7 +185,7 @@ cd agnes-<topic> && git checkout -b zs/<branch-name>
 #    gh pr create --repo keboola/agnes-the-ai-analyst \
 #      --head <branch> --title "<...>" --body "<...>"
 #    gh pr merge <N> --repo keboola/agnes-the-ai-analyst \
-#      --merge --auto --delete-branch
+#      --merge --auto
 ```
 
 That's it for a feature PR — no version bump, no tag, no Release. The cut
@@ -313,7 +313,7 @@ re-run click, not a second push.
 
 - **Force-pushed and lost auto-merge?** GitHub *usually* preserves auto-merge
   across force-pushes for the same PR; if it cleared, just re-run
-  `gh pr merge <N> --merge --auto --delete-branch` to re-queue it.
+  `gh pr merge <N> --merge --auto` to re-queue it.
 - **A cut PR went stale (merge conflict against a newer `main`)?** Close the
   stale cut PR and re-dispatch `daily-cut.yml` rather than resolving the
   conflict by hand (see § Landing PRs through the merge queue above).
