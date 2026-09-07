@@ -91,7 +91,7 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
 - **One approving review gates entry to the queue**, evaluated by the queue
   itself — ruleset bypass does not apply inside it. For an organization
   member's PR a clean Devin verdict supplies that approval
-  (`.github/workflows/devin-clean-approves.yml`: approves on "No Issues
+  (`.github/workflows/devin-clean-approves.yml`, added in #2339: approves on "No Issues
   Found", dismisses its approval when a later verdict lists issues), and the
   ruleset dismisses approvals on every push, so the gate is CI green + Devin
   clean. An outside collaborator's PR needs a human approval; so does the cut
@@ -208,16 +208,21 @@ writes that field, there is no drift to reconcile and no need to cross-check
 
 ### Authoring expectations on the PR
 
-- **Self-PRs** (you're both author and reviewer): GitHub forbids self-approve.
-  If branch protection requires N approving reviews (we don't today —
-  `required_approving_review_count = 0`), you need someone else to approve. With
-  our current 0-review setup, self-PRs can still merge automatically once
-  required CI passes.
+- **Approval to enter the queue.** The ruleset requires one approving review,
+  evaluated by the queue itself, so nobody's bypass helps and GitHub still
+  forbids self-approval. For an organization member's PR the approval comes
+  from Devin's clean verdict (`.github/workflows/devin-clean-approves.yml`,
+  added in #2339): fix what Devin flagged, push, wait for the re-review. Every
+  push dismisses approvals until Devin has cleared the new head. An outside
+  collaborator's PR and the cut PR need a person other than the author to
+  approve (`gh pr review <N> --approve`).
 - **Other people's PRs you're taking over**: dismiss any prior
-  CHANGES_REQUESTED reviews (yours or someone else's) before auto-merge can
-  fire. `gh pr review <N> --approve --body "..."` after pushing your fixes.
-- **Devin Review**: not a required check today; runs in parallel and posts a
-  comment. Don't wait on it for merge unless the human reviewer explicitly asks.
+  CHANGES_REQUESTED reviews (yours or someone else's) before the queue will
+  take the PR; after pushing your fixes, wait for Devin's verdict (member PR)
+  or get the human approval.
+- **Devin Review**: not a required status check, but no longer advisory for a
+  member's PR — its verdict IS the approval. Read its findings; a verdict that
+  lists issues keeps the PR out of the queue until the next clean one.
 
 ### CI quirks you WILL hit
 

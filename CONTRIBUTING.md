@@ -22,7 +22,7 @@ queue*), and what decides whether a PR may *enter* the queue is the ruleset's
 one-approval rule, evaluated by the queue itself — ruleset bypass does not
 apply inside the queue, so a bypass actor's own unreviewed PR is refused like
 anyone else's. For an organization member's PR that approval comes from a
-clean Devin verdict (`.github/workflows/devin-clean-approves.yml` approves on
+clean Devin verdict (`.github/workflows/devin-clean-approves.yml`, added in #2339, approves on
 "No Issues Found" and dismisses its approval when a later verdict lists
 issues), so the gate reads **CI green + Devin clean = the author queues**. An
 outside collaborator's PR and the daily release-cut PR need a human approval.
