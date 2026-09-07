@@ -482,6 +482,23 @@ def _app_url(slug: str, cfg: dict) -> str:
     return f"/apps/{slug}/"
 
 
+#: App states the ingress proxy will actually serve a viewer from — straight
+#: through (``running``) or via the holding page while the container comes up
+#: (``sleeping`` wakes on request, ``deploying`` is already on its way). Every
+#: other state answers 409 there and can only be left by a redeploy, which is
+#: owner/Admin-only — so a viewer offered a link to one has nothing to click
+#: and no way to fix it.
+#:
+#: Mirrors the branch table in ``app/api/data_apps_proxy.py::proxy_app``, and
+#: is pinned against it by
+#: ``tests/test_data_apps_proxy.py::test_reachable_states_matches_what_the_proxy_actually_serves``.
+#: The UI reads this through ``_serialize``'s ``reachable`` rather than
+#: restating it: both app templates used to test ``state == 'running'`` alone,
+#: so a sleeping app — the one non-running state a viewer CAN wake — rendered a
+#: dead ``<code>`` instead of a link.
+REACHABLE_STATES: frozenset[str] = frozenset({"running", "sleeping", "deploying"})
+
+
 def _serialize(row: dict, cfg: Optional[dict] = None) -> dict:
     cfg = cfg if cfg is not None else _effective_config()
     out = {k: v for k, v in row.items() if k not in ("secrets_enc", "service_token_id")}
@@ -492,6 +509,11 @@ def _serialize(row: dict, cfg: Optional[dict] = None) -> dict:
     # override the synced description without the next sync clobbering it.
     out["url"] = (row.get("external_url") or "") if kind == "linked" else _app_url(row["slug"], cfg)
     out["effective_description"] = row.get("description_override") or row.get("description") or ""
+    # Whether offering this app's URL as a link is honest. A linked app opens at
+    # its external URL and is never proxied by us, so its reachability is not
+    # ours to judge; a hosted app is reachable exactly when the proxy would
+    # serve it (see REACHABLE_STATES).
+    out["reachable"] = True if kind == "linked" else row.get("state") in REACHABLE_STATES
     return out
 
 

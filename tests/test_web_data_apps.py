@@ -430,3 +430,42 @@ def test_app_publishing_calls_real_access_endpoints():
     # It is the ONE caller that designates its tool as the data-app lister —
     # without the flag the server never projects a targeted run.
     assert "lister: true" in src
+
+
+# ---------------------------------------------------------------------------
+# URL clickability on the detail page — must follow what the proxy would serve
+# ---------------------------------------------------------------------------
+#
+# Only the DETAIL page is exercised here, deliberately. The Library's
+# Artifacts band is the live inventory surface (`/apps` 302s into it whenever
+# the feature is on and the caller has a visible app row), and its rows link to
+# `/apps/detail/<slug>` (`app/web/router.py::library_page`) — so the detail
+# page's URL field is the only place a viewer is offered the app itself.
+# `data_apps.html` keeps the same corrected condition for consistency, but it
+# renders its table only on the fallback path the redirect leaves behind (the
+# caller has nothing visible), where there is no row to assert on.
+
+
+@pytest.mark.parametrize("state", ["running", "sleeping", "deploying"])
+def test_detail_page_links_the_url_when_the_proxy_would_serve_it(web_env, state):
+    """A sleeping app wakes on request for anyone allowed to view it
+    (``data_apps_proxy.proxy_app``: ``sleeping`` triggers a wake and answers
+    the holding page, ``deploying`` answers it outright), so its URL has to be
+    a link. The page used to test ``state == 'running'`` alone, which left a
+    granted viewer nothing to click on the very states that would have worked
+    — and no way out, since the endpoint that restarts an app is
+    owner/Admin-only.
+    """
+    _create_app_row(slug="wake1", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/wake1", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/wake1/"' in resp.text
+
+
+@pytest.mark.parametrize("state", ["created", "stopped", "error"])
+def test_detail_page_does_not_link_the_url_when_the_proxy_would_refuse(web_env, state):
+    _create_app_row(slug="dead1", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/dead1", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/dead1/"' not in resp.text
+    assert "<code>/apps/dead1/</code>" in resp.text

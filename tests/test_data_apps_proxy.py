@@ -1523,3 +1523,26 @@ def test_logged_out_on_subdomain_carries_a_usable_return_url(proxy_client, runni
     assert "/apps/s" not in nxt, f"the rewritten path leaked into the return URL: {nxt}"
     assert "//s.apps.example.com" in nxt, nxt
     assert safe_next_path(nxt, default="/D") == nxt, "login would discard this target"
+
+
+@pytest.mark.parametrize("state", ["sleeping", "deploying", "created", "stopped", "error"])
+def test_reachable_states_matches_what_the_proxy_actually_serves(client_granted, fake_runner, state):
+    """``REACHABLE_STATES`` is a SECOND statement of this module's branch
+    table — the UI reads it to decide whether an app's URL is worth offering
+    as a link (``data_apps.html``, ``data_app_detail.html``). Pin the two
+    together so the copy cannot drift again: a state in the set must not be
+    answered with ``app_not_running``/``app_error``, and a state outside it
+    must be. Drift is exactly how a sleeping app — which this proxy wakes for
+    any viewer — came to render a dead ``<code>`` and a "not running" label.
+
+    ``running`` is left to ``test_running_app_is_proxied``: proving it here
+    would need the mocked upstream, and it is the one state that was never
+    in doubt.
+    """
+    from app.api.data_apps import REACHABLE_STATES
+
+    slug = f"rs-{state}"
+    _create_app_row(slug=slug, state=state)
+    r = client_granted.get(f"/apps/{slug}/", headers={"accept": "application/json"})
+    refused = r.status_code == 409 and r.json().get("detail") in ("app_not_running", "app_error")
+    assert refused is (state not in REACHABLE_STATES)
