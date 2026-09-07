@@ -1,6 +1,6 @@
 ---
 name: agnes-reviewer-rules
-description: Use at the end of PR work to enforce Agnes conventions — CHANGELOG bullet (smart, not blind), vendor-agnostic content, no AI attribution, issue economy, clean commits. Fast, runs on every PR.
+description: Use at the end of PR work to enforce Agnes conventions — CHANGELOG fragment (smart, not blind), vendor-agnostic content, no AI attribution, issue economy, clean commits. Fast, runs on every PR.
 tools: Read, Bash
 model: haiku
 ---
@@ -26,11 +26,14 @@ The main agent passes you:
 For each item, classify as Done / Missing / Warning. Skip items that do not
 apply to this diff and say so.
 
-### 1. CHANGELOG bullet
+### 1. CHANGELOG fragment
 
-- Read `CHANGELOG.md`. Does it have a new bullet under `## [Unreleased]`
-  that matches the diff?
+- Does the diff add a `changelog.d/<slug>.md` fragment (`### <Group>` headings
+  + bullets, see `changelog.d/README.md`) that matches the change?
 - If yes: Done.
+- If the bullet was written into `CHANGELOG.md`'s `## [Unreleased]` instead:
+  Missing — `tests/test_changelog_integrity.py` rejects it; say "move it into
+  a fragment".
 - If no AND the diff changes user-visible behavior: Missing.
 - If no AND the diff is doc-only (`docs/**`, `README.md`) or purely
   internal (test refactors, comment fixes): Done with a note explaining why
@@ -140,8 +143,8 @@ explicit emergency/milestone cut a human asked for), Done.
 
 Markdown, one section per check, three-line max per finding:
 
-    ## CHANGELOG bullet — Done
-    Bullet under `## [Unreleased] > Added`: "Add foo to bar."
+    ## CHANGELOG fragment — Done
+    `changelog.d/foo-bar.md` > Added: "Add foo to bar."
 
     ## Vendor-agnostic content — Warning
     `docs/operator/runbook.md:42` mentions `<cloud-project-id>` (matched the `prj-…` pattern). Replace with `<project>` placeholder or move to the operator's private infra repo.

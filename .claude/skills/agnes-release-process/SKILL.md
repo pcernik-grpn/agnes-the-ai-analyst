@@ -21,9 +21,14 @@ documents above, the master documents win — update this skill.
 
 ## CHANGELOG discipline
 
-Every PR that changes **user-visible behavior** MUST add a bullet under
-`## [Unreleased]` in `CHANGELOG.md`, grouped under Added / Changed / Fixed /
-Removed / Internal. Breaking changes are prefixed `**BREAKING**`.
+Every PR that changes **user-visible behavior** MUST add a CHANGELOG
+**fragment**: one file `changelog.d/<slug>.md` with `### Added` / `### Changed` /
+`### Fixed` / `### Removed` / `### Internal` headings and bullets (format:
+`changelog.d/README.md`). Breaking changes are prefixed `**BREAKING**`. Never
+write the bullet into `CHANGELOG.md`: its `## [Unreleased]` is assembled by the
+cut, and `tests/test_changelog_integrity.py` rejects an inline bullet with the
+fix. One file per PR is what removed the conflict that fired on every `main`
+sync (#2295).
 
 Doc-only PRs (`docs/**`, README) typically do not need a bullet. Apply
 judgment based on the diff — if the docs change describes new behavior that
@@ -36,7 +41,7 @@ follow-up PR.
 
 **A feature/fix PR never bumps `pyproject.toml`, never touches `server.json`'s
 version field, and never renames `## [Unreleased]`.** It only ever adds a
-bullet. This is deliberate: the old rule (the release-cut ships in whichever
+`changelog.d/` fragment. This is deliberate: the old rule (the release-cut ships in whichever
 PR happens to land last with content in `[Unreleased]`) raced two PRs against
 the same version number and produced a duplicated `## [X.Y.Z]` CHANGELOG
 heading on merge — see `docs/RELEASING.md` § CHANGELOG merge hazards for the
@@ -44,7 +49,8 @@ failure signature.
 
 The cut is centralized: `.github/workflows/daily-cut.yml` runs once a day
 (and on manual dispatch), computes the next version from `pyproject.toml`,
-rewrites `CHANGELOG.md` + `pyproject.toml` + `server.json`, and opens a PR
+folds `changelog.d/` into `CHANGELOG.md`, rewrites it + `pyproject.toml` +
+`server.json`, deletes the shipped fragments, and opens a PR
 labeled `release-cut`. A human reviews and merges it — the workflow never
 merges or tags anything itself. The cut arithmetic is pure functions in
 `scripts/release_cut.py`; use it directly for a manual/emergency cut instead
@@ -55,7 +61,8 @@ python3 scripts/release_cut.py --dry-run --json   # inspect the plan first
 python3 scripts/release_cut.py --bump patch       # write the cut, e.g. for a hotfix
 ```
 
-An empty `[Unreleased]` is a no-op (nothing written, exit 0) — safe to run
+Nothing pending (no fragment, empty `[Unreleased]`) is a no-op (nothing
+written, exit 0) — safe to run
 speculatively.
 
 ### Reviewing a PR for this rule

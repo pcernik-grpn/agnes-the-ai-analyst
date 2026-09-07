@@ -27,10 +27,12 @@ Triggered by the user / main agent saying "review the release-cut PR" or
    check it was built correctly —
    - `pyproject.toml`'s `version` and `server.json`'s `version` (if present)
      match, and match the new `## [X.Y.Z]` CHANGELOG heading.
-   - The CHANGELOG rename preserved every bullet that was under
-     `[Unreleased]` (compare against `git show <base>:CHANGELOG.md`) and did
-     not touch any previously released section.
-   - No OTHER open PR still carries un-shipped `[Unreleased]` content that
+   - The cut folded every `changelog.d/` fragment that existed at the base
+     (all of them deleted in this diff; `python3 scripts/release_cut.py
+     --dry-run` on the base lists the bullets) plus whatever sat under
+     `[Unreleased]` into the new block, and did not touch any previously
+     released section.
+   - No OTHER open PR still carries an un-shipped fragment that
      should have been merged before this cut was opened (if one does, flag
      it — the train-driver should flush the queue first per
      `Skill(agnes-release-process)`).
@@ -45,8 +47,12 @@ Triggered by the user / main agent saying "review the release-cut PR" or
      an emergency hotfix; `major` only on explicit user confirmation this is
      a milestone.
    - Run `python3 scripts/release_cut.py --bump <kind>` for real (writes
-     `CHANGELOG.md`, `pyproject.toml`, `server.json`).
-   - `git checkout -b release-cut/v<version>`, commit as `release: <version>`,
+     `CHANGELOG.md`, `pyproject.toml`, `server.json` and deletes the shipped
+     `changelog.d/` fragments).
+   - `git checkout -b release-cut/v<version>`, `git add -A changelog.d
+     CHANGELOG.md pyproject.toml server.json` (the fragment deletions must be
+     staged too, exactly as `daily-cut.yml` does — otherwise the next cut
+     republishes the same notes), commit as `release: <version>`,
      push, and `gh pr create --label release-cut --title "release: <version>"`
      with a body listing the shipped bullets (from the dry-run output).
    - **Report:** print the version, the branch/PR, and tell the user: "cut PR
