@@ -5,6 +5,13 @@
 #
 #   scripts/ci/install-from-lock.sh [--no-dev] EXTRA [EXTRA...]
 #
+# `--no-dev` is uv's flag: it drops the `[tool.uv] dev-dependencies` GROUP
+# (pytest, ruff, …) from the export — the image passes it. It says nothing
+# about the `dev` optional-dependency EXTRA, which, like `server` or
+# `extraction`, is requested positionally: `--no-dev dev server` would still
+# install the `dev` extra. CI asks for `dev server extraction` with no flag and
+# gets both the group and the extra (they mirror each other on purpose).
+#
 # `uv export --frozen` turns the lock into a requirements file for the given
 # extras (hashes included, so `uv pip install` verifies every artifact), then
 # the project itself goes on top with `--no-deps`. `--frozen` never rewrites
