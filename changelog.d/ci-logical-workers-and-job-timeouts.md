@@ -1,2 +1,3 @@
 ### Internal
 - CI test shards run pytest with `-n logical` instead of `-n auto`. xdist's `auto` counts physical cores when psutil is installed, so every `test-shard` and `test-pg` job had been running on a single worker (`created: 1/1 worker`); the runner's CPU and RAM are now printed at the top of each test step. Both test jobs also carry `timeout-minutes: 45`, so a degraded runner or a hung test fails fast instead of holding the required `test` check for GitHub's 6 h default (#2295).
+- The Library index render-time guard (`tests/db_pg/test_library_index_perf.py`) budgets 2 s instead of 1 s: the regressions it guards measured 4.5-4.8 s, and 1.05 s is what the healthy page legitimately takes on a shared 2-CPU runner with two workers.
