@@ -60,6 +60,10 @@ concurrency:
 
 jobs:
   test-shard:
+    # A shard normally finishes in ~15 min; a degraded runner (2026-09-07: every
+    # test 4.5x slower, 78% done after 59 min) or a genuine hang would otherwise
+    # hold the required `test` check for GitHub's 6 h default. Fail fast, re-run.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -82,7 +86,10 @@ jobs:
 
       - name: Run tests (shard ${{ matrix.group }}/8)
         # pytest-split shards the suite across 8 parallel jobs, balanced by
-        # the committed `.test_durations` file; `-n auto` parallelises
+        # the committed `.test_durations` file; `-n logical` (one worker per
+        # logical CPU — xdist's `auto` counts PHYSICAL cores when psutil is
+        # installed, which gave every shard a SINGLE worker on these runners
+        # until 2026-09-07, `created: 1/1 worker` in every log) parallelises
         # within each shard across the runner's cores. tests/db_pg/ is
         # excluded here and runs in the dedicated test-pg job below so that
         # the pgserver session fixture doesn't inflate shard 1's wall-clock.
@@ -96,7 +103,9 @@ jobs:
         # including the entire failure-semantics surface of the jira connector.
         # Their measured `.test_durations` entries are committed alongside, so
         # they shard like any other test.
-        run: pytest tests/ connectors/ --ignore=tests/db_pg -v --tb=short -n auto --splits 8 --group ${{ matrix.group }}
+        run: |
+          echo "runner: $(nproc) logical CPUs, $(free -g | awk '/^Mem/{print $2}') GB RAM"
+          pytest tests/ connectors/ --ignore=tests/db_pg -v --tb=short -n logical --splits 8 --group ${{ matrix.group }}
         env:
           TESTING: "1"
 
@@ -117,6 +126,10 @@ jobs:
     # 57 min of db_pg test time against 102 min for the rest, so 8 ways puts
     # both jobs at roughly 7-13 min of tests with the main shards as the
     # (shorter) long pole. If test-pg is the slowest job again, widen it again.
+    # A shard normally finishes in ~15 min; a degraded runner (2026-09-07: every
+    # test 4.5x slower, 78% done after 59 min) or a genuine hang would otherwise
+    # hold the required `test` check for GitHub's 6 h default. Fail fast, re-run.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -138,7 +151,9 @@ jobs:
         run: uv pip install --system ".[dev,server,extraction]"
 
       - name: Run Postgres contract tests (shard ${{ matrix.group }}/8)
-        run: pytest tests/db_pg/ -v --tb=short -n auto --splits 8 --group ${{ matrix.group }}
+        run: |
+          echo "runner: $(nproc) logical CPUs, $(free -g | awk '/^Mem/{print $2}') GB RAM"
+          pytest tests/db_pg/ -v --tb=short -n logical --splits 8 --group ${{ matrix.group }}
         env:
           TESTING: "1"
 
