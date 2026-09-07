@@ -10,6 +10,8 @@
   had been behind `pyproject.toml` since the 0.95.0 cut (six releases and two
   added dependencies), which is also why any `uv run` in a worktree rewrote it.
 
+- **The build backend is pinned exactly** (`hatchling==1.32.0` in `[build-system]`): uv.lock does not cover build requirements, so this was the one input a `uv build` / `uv pip install .` still resolved fresh.
+
 ### Internal
 - The post-edit and typecheck hooks' `uv run` fallbacks pass `--frozen`, so
   local tooling never rewrites `uv.lock` again — the source of the dirty lock

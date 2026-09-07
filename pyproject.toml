@@ -398,7 +398,12 @@ dev = [
 agnes = "cli.main:main"
 
 [build-system]
-requires = ["hatchling"]
+# Pinned exactly: the build backend is resolved in an isolated PEP 517
+# environment at every `uv build` / `uv pip install .`, and uv.lock does not
+# cover build requirements — an unpinned `hatchling` was the one dependency
+# the "install from the lock" contract (scripts/ci/install-from-lock.sh) left
+# floating. Bumping it is a deliberate one-line dependency PR.
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

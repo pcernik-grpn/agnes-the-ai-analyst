@@ -86,6 +86,15 @@ class TestTheLockCannotFallBehind:
             assert "uv run --frozen" in s, h.name
             assert re.search(r"uv run (?!--frozen)", s) is None, f"{h.name}: an unfrozen `uv run` re-locks a stale lock"
 
+    def test_the_build_backend_is_pinned_exactly(self):
+        """uv.lock does not cover `[build-system] requires`; the project's own
+        build (`uv build`, `uv pip install .`) fetches the backend into an
+        isolated env at build time. A floating `hatchling` was the one input
+        the lock left unpinned (Copilot review on the lock PR)."""
+        block = re.search(r"\[build-system\]\n(.*?)\n\n", _read(ROOT / "pyproject.toml"), re.DOTALL).group(1)
+        m = re.search(r'requires = \["hatchling==(\d+\.\d+\.\d+)"\]', block)
+        assert m, f"[build-system] requires must pin hatchling exactly, got:\n{block}"
+
     def test_the_lock_records_the_current_project_version(self):
         """The class of drift the cut used to leave behind (0.95.0 in the lock,
         0.101.0 in pyproject) — checkable without uv."""
