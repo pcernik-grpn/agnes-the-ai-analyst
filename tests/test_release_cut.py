@@ -802,6 +802,37 @@ def test_main_rolls_the_whole_cut_back_when_a_fragment_deletion_fails(tmp_path, 
     assert (fragments / "second.md").exists()
 
 
+def test_main_rolls_the_cut_back_on_ctrl_c_too(tmp_path, monkeypatch):
+    """A KeyboardInterrupt between steps is not an OSError; rollback must still
+    run before it propagates, or a retry cuts the same version twice."""
+    changelog, pyproject, fragments = _fragment_checkout(tmp_path)
+    real_unlink = Path.unlink
+
+    def _interrupted_unlink(self, *a, **kw):
+        if self.name == "pr.md":
+            raise KeyboardInterrupt
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _interrupted_unlink)
+    with pytest.raises(KeyboardInterrupt):
+        main(
+            [
+                "--changelog",
+                str(changelog),
+                "--pyproject",
+                str(pyproject),
+                "--no-server-json",
+                "--fragments-dir",
+                str(fragments),
+                "--date",
+                "2026-09-06",
+            ]
+        )
+    assert changelog.read_text(encoding="utf-8") == _CL_EMPTY_UNRELEASED
+    assert pyproject.read_text(encoding="utf-8") == _PYPROJECT_FOR_FRAGMENTS
+    assert (fragments / "pr.md").exists()
+
+
 def test_main_reports_a_malformed_fragment_and_writes_nothing(tmp_path, capsys):
     changelog, pyproject, fragments = _fragment_checkout(tmp_path)
     (fragments / "bad.md").write_text("### Nope\n- x\n", encoding="utf-8")

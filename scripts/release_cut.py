@@ -684,10 +684,14 @@ def _apply_plan(plan: ReleaseCutPlan, args: argparse.Namespace) -> list[str]:
     """Write the cut to disk all-or-nothing; returns the paths written.
 
     Every write and every fragment deletion is recorded with its undo. If any
-    step fails, the steps already applied are reverted in reverse order before
-    the error propagates, so a retry sees the pre-cut checkout instead of
-    bumping the version a second time on top of a half-applied cut (and
-    republishing fragments the first attempt had already folded in).
+    step fails — or the operator hits Ctrl-C between steps — the steps already
+    applied are reverted in reverse order before the exception propagates, so
+    a retry sees the pre-cut checkout instead of bumping the version a second
+    time on top of a half-applied cut (and republishing fragments the first
+    attempt had already folded in). A hard kill (SIGKILL, power loss) is
+    outside what a Python handler can catch; the cut runs in a git checkout,
+    so ``git checkout -- CHANGELOG.md pyproject.toml server.json changelog.d``
+    is the recovery there, and the git diff shows exactly how far it got.
     """
     assert plan.changelog_text is not None
     assert plan.pyproject_text is not None
@@ -710,7 +714,7 @@ def _apply_plan(plan: ReleaseCutPlan, args: argparse.Namespace) -> list[str]:
             written.append(str(args.server_json))
         for name in plan.fragment_paths:
             _remove(args.fragments_dir / name)
-    except OSError:
+    except BaseException:  # KeyboardInterrupt included — roll back, then let it propagate
         for path, original in reversed(undo):
             if original is None:
                 path.unlink(missing_ok=True)
