@@ -10,6 +10,8 @@ human both call the exact same code these tests pin.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.release_cut import (
@@ -763,6 +765,41 @@ def test_main_default_fragments_dir_follows_the_changelog_not_the_cwd(tmp_path, 
     assert "- Must survive." not in written
     assert "- **A thing from PR one.** Details." in written, "the changelog's own changelog.d/ IS folded"
     assert not (fragments / "pr.md").exists()
+
+
+def test_main_rolls_the_whole_cut_back_when_a_fragment_deletion_fails(tmp_path, monkeypatch, capsys):
+    """All-or-nothing: a failed unlink after the release files were written must
+    restore them, so a retry does not bump the version a second time and
+    republish the fragments the first attempt already folded in."""
+    changelog, pyproject, fragments = _fragment_checkout(tmp_path)
+    (fragments / "second.md").write_text("### Fixed\n- Second.\n", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def _failing_unlink(self, *a, **kw):
+        if self.name == "second.md":
+            raise PermissionError(f"simulated: {self}")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _failing_unlink)
+    rc = main(
+        [
+            "--changelog",
+            str(changelog),
+            "--pyproject",
+            str(pyproject),
+            "--no-server-json",
+            "--fragments-dir",
+            str(fragments),
+            "--date",
+            "2026-09-06",
+        ]
+    )
+    assert rc == 1
+    assert "rolled back" in capsys.readouterr().err
+    assert changelog.read_text(encoding="utf-8") == _CL_EMPTY_UNRELEASED
+    assert pyproject.read_text(encoding="utf-8") == _PYPROJECT_FOR_FRAGMENTS
+    assert (fragments / "pr.md").exists(), "the fragment deleted before the failure is restored"
+    assert (fragments / "second.md").exists()
 
 
 def test_main_reports_a_malformed_fragment_and_writes_nothing(tmp_path, capsys):

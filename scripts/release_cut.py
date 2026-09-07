@@ -10,8 +10,9 @@ heading once merged, silently, because git's merge strategy matches the
 heading line as "the same" section on both sides and interleaves the bodies
 instead of conflicting (see ``docs/RELEASING.md`` § CHANGELOG merge hazards).
 
-The fix moves the cut out of feature PRs entirely: they only ever add
-``## [Unreleased]`` bullets. A single **cut PR** (opened by
+The fix moves the cut out of feature PRs entirely: they only ever add a
+changelog entry — since #2295 a ``changelog.d/`` fragment, see below — and
+never the version bump or rename. A single **cut PR** (opened by
 ``.github/workflows/daily-cut.yml``, or by a human for an emergency hotfix)
 does the version bump + rename, once a day, from a clean ``main``. This module
 is the cut logic as pure functions over file contents, so the workflow and a
@@ -679,6 +680,46 @@ def _rebaseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_plan(plan: ReleaseCutPlan, args: argparse.Namespace) -> list[str]:
+    """Write the cut to disk all-or-nothing; returns the paths written.
+
+    Every write and every fragment deletion is recorded with its undo. If any
+    step fails, the steps already applied are reverted in reverse order before
+    the error propagates, so a retry sees the pre-cut checkout instead of
+    bumping the version a second time on top of a half-applied cut (and
+    republishing fragments the first attempt had already folded in).
+    """
+    assert plan.changelog_text is not None
+    assert plan.pyproject_text is not None
+    undo: list[tuple[Path, str | None]] = []  # (path, original text; None = did not exist)
+
+    def _write(path: Path, text: str) -> None:
+        undo.append((path, path.read_text(encoding="utf-8") if path.is_file() else None))
+        path.write_text(text, encoding="utf-8")
+
+    def _remove(path: Path) -> None:
+        undo.append((path, path.read_text(encoding="utf-8")))
+        path.unlink()
+
+    try:
+        _write(args.changelog, plan.changelog_text)
+        _write(args.pyproject, plan.pyproject_text)
+        written = [str(args.changelog), str(args.pyproject)]
+        if plan.server_json_text is not None:
+            _write(args.server_json, plan.server_json_text)
+            written.append(str(args.server_json))
+        for name in plan.fragment_paths:
+            _remove(args.fragments_dir / name)
+    except OSError:
+        for path, original in reversed(undo):
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(original, encoding="utf-8")
+        raise
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
@@ -757,16 +798,11 @@ def main(argv: list[str] | None = None) -> int:
     if plan.noop or args.dry_run:
         return 0
 
-    assert plan.changelog_text is not None
-    assert plan.pyproject_text is not None
-    args.changelog.write_text(plan.changelog_text, encoding="utf-8")
-    args.pyproject.write_text(plan.pyproject_text, encoding="utf-8")
-    written = [str(args.changelog), str(args.pyproject)]
-    if plan.server_json_text is not None:
-        args.server_json.write_text(plan.server_json_text, encoding="utf-8")
-        written.append(str(args.server_json))
-    for name in plan.fragment_paths:
-        (args.fragments_dir / name).unlink()
+    try:
+        written = _apply_plan(plan, args)
+    except OSError as exc:
+        print(f"release_cut: {exc} — the partial cut was rolled back, nothing changed", file=sys.stderr)
+        return 1
 
     if not args.json:
         print(f"release_cut: wrote {', '.join(written)}")

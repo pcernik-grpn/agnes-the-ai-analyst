@@ -1,6 +1,9 @@
 # CHANGELOG fragments
 
-One file per PR. The daily release cut (`scripts/release_cut.py`, run by
+One file per PR — a PR adds its own fragment and never edits another PR's
+(`scripts/verify_syncmap.py` counts only a fragment that is new in the PR;
+appending to an existing one is the shared-file edit that used to conflict on
+every merge). The daily release cut (`scripts/release_cut.py`, run by
 `.github/workflows/daily-cut.yml`) folds every fragment in this directory into
 the `## [Unreleased]` section of `CHANGELOG.md`, renames that section to the
 new version, and deletes the fragment files. Nothing here is shared between

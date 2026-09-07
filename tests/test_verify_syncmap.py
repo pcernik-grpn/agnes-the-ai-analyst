@@ -254,38 +254,42 @@ def test_changelog_passes_when_a_new_bullet_was_added():
 _FRAG = "### Added\n- a new user-visible thing\n"
 
 
-def _check_with_fragments(before: dict[str, str], after: dict[str, str]):
+def _check_with_fragments(changed: list[str], added: dict[str, str]):
+    """``changed`` = every fragment path git lists (added, modified or deleted);
+    ``added`` = only the NEW files, path -> working-tree text."""
     return check_changelog(
         base_changelog=_CL_EMPTY,
         head_changelog=_CL_EMPTY,
-        changed_paths=["app/api/foo.py", *after.keys(), *before.keys()],
+        changed_paths=["app/api/foo.py", *changed],
         version_bumped=False,
-        fragments_before=before,
-        fragments_after=after,
+        added_fragments=added,
     )
 
 
 def test_changelog_passes_when_a_fragment_was_added():
-    """The post-#2295 shape: CHANGELOG.md untouched, one changelog.d/ file added."""
-    assert _check_with_fragments({}, {"changelog.d/foo-endpoint.md": _FRAG}) == []
+    """The post-#2295 shape: CHANGELOG.md untouched, one NEW changelog.d/ file."""
+    assert _check_with_fragments(["changelog.d/foo-endpoint.md"], {"changelog.d/foo-endpoint.md": _FRAG}) == []
+
+
+def test_changelog_added_fragment_without_a_bullet_does_not_count():
+    findings = _check_with_fragments(["changelog.d/empty.md"], {"changelog.d/empty.md": "### Added\n"})
+    assert len(findings) == 1
 
 
 def test_changelog_deleted_fragment_does_not_count():
     """`git diff --name-only` lists deletions too; a deleted fragment is no entry."""
-    findings = _check_with_fragments({"changelog.d/old.md": _FRAG}, {"changelog.d/old.md": ""})
+    findings = _check_with_fragments(["changelog.d/old.md"], {})
     assert len(findings) == 1
     assert "changelog.d/<slug>.md" in findings[0].message
 
 
-def test_changelog_touched_fragment_without_a_new_bullet_does_not_count():
-    """Re-wrapping someone else's fragment is not this PR's release note."""
-    rewrapped = _FRAG.replace("- a new user-visible thing", "-   a new user-visible thing")
-    assert len(_check_with_fragments({"changelog.d/theirs.md": _FRAG}, {"changelog.d/theirs.md": rewrapped})) == 1
-
-
-def test_changelog_fragment_that_gains_a_bullet_counts():
-    grown = _FRAG + "- and a second thing from this PR\n"
-    assert _check_with_fragments({"changelog.d/mine.md": _FRAG}, {"changelog.d/mine.md": grown}) == []
+def test_changelog_modified_fragment_does_not_count_even_when_it_grows():
+    """Appending to a fragment that already exists at the base is the shared-file
+    edit that recreated the CHANGELOG conflict on every merge — one file per
+    PR is enforced, not just documented (changelog.d/README.md)."""
+    findings = _check_with_fragments(["changelog.d/theirs.md"], {})
+    assert len(findings) == 1
+    assert "appending to another PR's fragment does not count" in findings[0].message
 
 
 def test_changelog_fragment_path_alone_is_not_enough():
