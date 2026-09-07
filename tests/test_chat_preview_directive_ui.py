@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 CHAT_JS = Path("app/web/static/js/chat.js")
+CHAT_CSS = Path("app/web/static/css/chat.css")
 
 
 def _read() -> str:
@@ -137,3 +138,32 @@ class TestTheCallSitesArePinned:
         js = _read()
         branch = js[js.index("if (_isPreviewTool(frame.tool)) {") : js.index('if (frame.tool === "AskUserQuestion") {')]
         assert "_sealStreamingSegment();" in branch
+
+
+class TestThePaneHasAColumnUnderRail:
+    """The second half of the same transcript: once the directive WAS
+    recognised, the pane still showed as a 0px strip — "App preview" and
+    nothing under it. The rail layout collapses the shell to one grid column
+    with a selector that outranks `.cloud-chat-shell.has-preview-pane`, so the
+    pane (the shell's second child) fell into an implicit row of a
+    `grid-template-rows: 100%` grid. The rail layout is hard-wired since Wave 0,
+    so the pane needs its own rail-scoped track."""
+
+    def _rail_pane_rule(self) -> str:
+        css = CHAT_CSS.read_text(encoding="utf-8")
+        start = css.index('html[data-ui-layout="rail"] .cloud-chat-shell.has-preview-pane {')
+        return css[start : css.index("}", start)]
+
+    def test_rail_gives_the_open_pane_a_grid_track(self):
+        rule = self._rail_pane_rule()
+        assert "grid-template-columns" in rule
+        assert "--chat-preview-width" in rule, "the pane track must be sized off the same var the pane reads"
+        assert "--chat-sidebar-width" not in rule, "rail renders no sidebar; a sidebar track would swallow the thread"
+
+    def test_narrow_viewports_stack_the_pane_with_an_explicit_row(self):
+        css = CHAT_CSS.read_text(encoding="utf-8")
+        media = css.index(
+            "@media (max-width: 900px)", css.index('html[data-ui-layout="rail"] .cloud-chat-shell.has-preview-pane {')
+        )
+        block = css[media : css.index("\n}\n", media)]
+        assert "grid-template-rows" in block, "without an explicit second row the pane is a 0px strip again"

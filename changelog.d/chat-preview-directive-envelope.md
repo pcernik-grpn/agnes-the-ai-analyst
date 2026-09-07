@@ -10,3 +10,11 @@
   streaming bubble like every other inline block, so the sentence before it
   and the one after no longer run together ("Let me refresh it:The preview
   should be refreshing now").
+- **Web chat: the data-app preview pane is visible again under the rail
+  layout.** The rail layout collapses the chat shell to one grid column with
+  a rule that outranks the pane's own, so an open preview landed in an
+  implicit 0px row below the thread — the "App preview" header and nothing
+  under it, which is how a working dashboard read as "I can't see the
+  dashboard". The pane now gets its own column beside the thread (widening on
+  large screens) and stacks under the thread as a bottom sheet on viewports
+  narrower than 900px.
