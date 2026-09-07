@@ -41,8 +41,10 @@ Never deploy the prod row (`data_app_deploy(slug)` with no `mode`) before the
 user has picked "Publish" — that is the promote flow
 (`references/promote-flow.md`), not the first deploy.
 
-For an app that already exists, skip step 1; if it has no open draft, start
-at step 3.
+For an app that already exists, skip step 1. If its repo has no `main`
+commit yet (created, never seeded), complete step 2 before step 3 —
+`data_app_create_draft` refuses a repo without `main`
+(`parent_has_no_main`). Otherwise, if it has no open draft, start at step 3.
 
 ## 0b. Cloning the repo: use the relay, not the credential URL
 
