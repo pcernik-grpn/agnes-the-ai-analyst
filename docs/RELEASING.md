@@ -223,11 +223,12 @@ writes that field, there is no drift to reconcile and no need to cross-check
   `pass` and `fail` rows, the `fail` row is from an older auto-cancelled SHA.
   Verify with `gh api repos/keboola/agnes-the-ai-analyst/commits/<sha>/check-runs`
   — the raw API distinguishes `cancelled` from `failure` truthfully.
-- **Branch protection's "strict" mode caches cancelled `test` as blocking** even
-  after newer `test` runs succeed. Symptom: `mergeable_state: blocked` despite
-  all required checks green on the latest SHA. Fix: re-run the cancelled
-  `Release` workflow run (`gh run rerun <run-id>`); once its `test` job lands as
-  success, the block clears. We've hit this on PRs #273, #281, #285, #286.
+- **(Historical, pre-2026-09-07) branch protection's "strict" mode cached a
+  cancelled `test` as blocking** even after newer `test` runs succeeded;
+  the fix was to re-run the cancelled `Release` run (`gh run rerun <run-id>`).
+  The strict (up-to-date) rule is off now and the merge queue owns the
+  "tested against current `main`" guarantee, so this block can no longer
+  occur. Kept because PRs #273, #281, #285, #286 in the history reference it.
 - **Required checks** (per branch protection): `test` + `docker-build` only.
   Other workflows (`cli-wheel-clean-install`, `build-and-push`,
   `Release`-pipeline, Devin Review) are advisory — green/red doesn't gate merge.
@@ -273,16 +274,17 @@ and opening the PR under your own identity produces the *same* diff, and its
 `pull_request` run starts immediately — the queue-for-approval rule keys on
 who opened the PR, not on what the branch contains. 0.97.0 shipped this way.
 
-**The same 405 has a second, unrelated cause: a branch that is behind.**
-Required status checks are evaluated against the CURRENT base, so a PR whose
-`test` and `docker-build` are green — but whose head predates the latest
-`main` — is refused with that identical message, with nothing waiting for
-approval. Tell the two apart by `mergeable_state`, which reads `behind` here
-and `blocked` in the unapproved-run case, and by the checks themselves:
-green-but-stale versus never reported. The fix is to update the branch (merge
-`main` in, or *Update branch*) and let CI re-run against the new base. Worth
-stating because the message names neither cause, so the one that comes to
-mind is whichever you debugged last.
+**Until 2026-09-07 the same 405 had a second, unrelated cause: a branch that
+was behind.** Branch protection's "require branches to be up to date" rule
+evaluated the required checks against the CURRENT base, so a PR whose `test`
+and `docker-build` were green — but whose head predated the latest `main` —
+was refused with that identical message, and the fix was to update the branch.
+That rule is off now and the merge queue tests the merged result itself, so a
+PR reading `mergeable_state: behind` is not refused: queue it. If you still
+see the 405 on a behind PR, the cause is the unapproved-run one above (check
+`blocked` and the never-reported checks), never the staleness. Worth stating
+because the message names neither cause, so the one that comes to mind is
+whichever you debugged last — and this one no longer exists.
 
 **Do not reach for `gh workflow run ci.yml` instead.** It looks like the
 obvious workaround and it is not one. A `workflow_dispatch` run does put
