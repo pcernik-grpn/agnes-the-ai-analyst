@@ -98,6 +98,7 @@ default turn, which names the others.
 | `console`          | a rich box-drawing table, the shape `agnes query`/`agnes catalog` actually print — for the `<pre>` route that keeps its column alignment |
 | `doc`              | a DOCUMENT-shaped answer — h1/h2/h3, numbered steps, fenced code, a bullet list, a table, a rule, a quote. Nothing to do with tool calls: it is the message body's own markdown rhythm, only judgeable on a real document |
 | `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip |
+| `preview`          | text → data-app preview tool → text → credentials tool → text, each result a render directive inside an MCP envelope — the split-pane / shareable-URL path. No card for either call, so the prose must still break at them, and neither may render as "Preview unavailable." |
 | `deliverable`      | a turn that registers `outputs/report.docx` + `outputs/deck.pptx` in the stub's sandbox file store — for the **Files** overlay |
 
 Knobs: `KAI_STUB_STEP_DELAY` (seconds between SSE records, default `0.35` so
