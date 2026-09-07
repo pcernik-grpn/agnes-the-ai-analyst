@@ -1,6 +1,6 @@
 ---
 name: agnes-release-process
-description: Rules for opening a PR, the CHANGELOG bullet, the daily release-cut PR, and the post-merge tag + GitHub Release. Use before opening a PR, before merge, when handling a release-cut, and when picking a version bump.
+description: Rules for opening a PR, the CHANGELOG fragment, the daily release-cut PR, and the post-merge tag + GitHub Release. Use before opening a PR, before merge, when handling a release-cut, and when picking a version bump.
 ---
 
 # Agnes release process
