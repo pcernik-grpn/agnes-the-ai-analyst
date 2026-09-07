@@ -96,10 +96,14 @@ class TestTheLockCannotFallBehind:
         assert dc.index("run: uv lock\n") < dc.index("git add CHANGELOG.md"), "re-lock before the commit"
 
     def test_hooks_never_rewrite_the_lock(self):
+        """Every non-comment `uv run` in a hook carries --frozen, whatever the
+        flag order — `uv run --quiet --frozen ruff` is as good as
+        `uv run --frozen --quiet ruff`."""
         for h in HOOKS:
-            s = _read(h)
-            assert "uv run --frozen" in s, h.name
-            assert re.search(r"uv run (?!--frozen)", s) is None, f"{h.name}: an unfrozen `uv run` re-locks a stale lock"
+            invocations = [ln for ln in _read(h).splitlines() if "uv run" in ln and not ln.lstrip().startswith("#")]
+            assert invocations, f"{h.name}: the uv fallback is gone — was it meant to be?"
+            unfrozen = [ln.strip() for ln in invocations if "--frozen" not in ln]
+            assert unfrozen == [], f"{h.name}: an unfrozen `uv run` re-locks a stale lock: {unfrozen}"
 
     def test_the_build_backend_is_pinned_exactly(self):
         """uv.lock does not cover `[build-system] requires`; the project's own
