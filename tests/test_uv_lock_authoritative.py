@@ -38,9 +38,12 @@ class TestOneInstallPath:
         assert "uv export --frozen --no-emit-project" in s, (
             "--frozen: never rewrite the lock; --no-emit-project: the project goes on top"
         )
-        assert "uv pip install --system --no-cache -r" in s
-        assert "uv pip install --system --no-cache --no-deps ." in s, (
+        assert 'uv pip install $TARGET --no-cache -r "$REQ"' in s
+        assert "uv pip install $TARGET --no-cache --no-deps ." in s, (
             "the project itself, with its deps already pinned-installed"
+        )
+        assert 'TARGET="--system"' in s and 'TARGET="--python $INSTALL_PYTHON"' in s, (
+            "system interpreter by default; INSTALL_PYTHON targets an explicit venv (the e2e jobs)"
         )
         assert os.access(SCRIPT, os.X_OK), "the Dockerfile and workflows exec it directly"
 
@@ -53,12 +56,24 @@ class TestOneInstallPath:
         )
 
     def test_no_workflow_resolves_from_the_ranges(self):
-        offenders = [w.name for w in WORKFLOWS if re.search(r'uv pip install --system "?\.\[', _read(w))]
+        # Any install of the PROJECT from its ranges — `uv pip install --system
+        # ".[…]"`, `pip install -e ".[…]"`, `pip install .` — not tool installs
+        # like `pip install ruff` (the advisory lint job's, not a dependency).
+        project_install = re.compile(r'pip install(?: [^\n"]*)? (?:-e )?"?\.(?:\[|"|\s|$)', re.MULTILINE)
+        offenders = [w.name for w in WORKFLOWS if project_install.search(_read(w))]
         assert offenders == [], (
             f"workflows re-resolving pyproject ranges instead of installing from the lock: {offenders}"
         )
         users = [w.name for w in WORKFLOWS if "scripts/ci/install-from-lock.sh" in _read(w)]
-        assert {"ci.yml", "keboola-deploy.yml", "update-test-durations.yml"} <= set(users), users
+        assert {"ci.yml", "keboola-deploy.yml", "update-test-durations.yml", "e2e-docker.yml"} <= set(users), users
+
+    def test_the_e2e_venv_jobs_install_from_the_lock_too(self):
+        """They run pytest from a Python 3.11 venv; without INSTALL_PYTHON they
+        fell back to `pip install -e ".[dev,server]"` and re-resolved the
+        ranges (Devin Review on the lock PR)."""
+        e2e = _read(ROOT / ".github" / "workflows" / "e2e-docker.yml")
+        assert e2e.count("INSTALL_PYTHON=.venv/bin/python scripts/ci/install-from-lock.sh dev server") == 2
+        assert "pip install -e" not in e2e
 
 
 class TestTheLockCannotFallBehind:

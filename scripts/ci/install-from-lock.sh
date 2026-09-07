@@ -14,6 +14,11 @@
 # Extras are positional and space-separated; an empty argument is skipped, so
 # the Dockerfile can splice its comma-list ARG straight in via `tr ',' ' '`.
 #
+# Target: the system interpreter by default (the image, GitHub-hosted runners).
+# Set INSTALL_PYTHON=<interpreter> to install into that environment instead —
+# the e2e jobs' explicit `.venv`, say — so a venv job pins the same set rather
+# than falling back to `pip install -e` and re-resolving the ranges.
+#
 # The project's own build (the last step) runs in an isolated PEP 517 env whose
 # backend is NOT in uv.lock; `[build-system] requires` pins `hatchling` exactly
 # so that step is reproducible too.
@@ -35,5 +40,12 @@ trap 'rm -f "$REQ"' EXIT
 
 # shellcheck disable=SC2086  # NO_DEV / EXTRA_FLAGS are deliberately word-split
 uv export --frozen --no-emit-project $NO_DEV $EXTRA_FLAGS --format requirements-txt --output-file "$REQ"
-uv pip install --system --no-cache -r "$REQ"
-uv pip install --system --no-cache --no-deps .
+if [ -n "${INSTALL_PYTHON:-}" ]; then
+    TARGET="--python $INSTALL_PYTHON"
+else
+    TARGET="--system"
+fi
+# shellcheck disable=SC2086
+uv pip install $TARGET --no-cache -r "$REQ"
+# shellcheck disable=SC2086
+uv pip install $TARGET --no-cache --no-deps .
