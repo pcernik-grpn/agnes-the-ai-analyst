@@ -276,6 +276,14 @@ def test_changelog_added_fragment_without_a_bullet_does_not_count():
     assert len(findings) == 1
 
 
+def test_changelog_fragment_bullet_needs_the_marker_and_a_space():
+    """Same contract as release_cut.parse_fragment: `-not a bullet` is prose. A
+    local pass here for a fragment CI's format guard rejects would mislead."""
+    prose = {"changelog.d/prose.md": "### Added\n-not a bullet\n*nor this\n"}
+    assert len(_check_with_fragments(["changelog.d/prose.md"], prose)) == 1
+    assert _check_with_fragments(["changelog.d/ok.md"], {"changelog.d/ok.md": "### Added\n* star bullets are fine\n"}) == []
+
+
 def test_changelog_deleted_fragment_does_not_count():
     """`git diff --name-only` lists deletions too; a deleted fragment is no entry."""
     findings = _check_with_fragments(["changelog.d/old.md"], {})

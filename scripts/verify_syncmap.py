@@ -252,20 +252,21 @@ def _is_changelog_fragment(path: str) -> bool:
 
 
 def fragment_bullets(text: str) -> list[str]:
-    """Normalised column-0 bullets of one ``changelog.d/`` fragment.
+    """Normalised bullets of one ``changelog.d/`` fragment.
 
-    Same normalisation as :func:`unreleased_bullets`, so re-wrapping or
+    Same contract as ``scripts/release_cut.py::parse_fragment``: a bullet is
+    ``- `` or ``* `` at column 0 — ``-not a bullet`` is prose, and counting it
+    here would report a local pass for a fragment CI's format guard rejects.
+    Normalisation matches :func:`unreleased_bullets`, so re-wrapping or
     re-indenting an existing bullet is not a new one.
     """
     bullets: list[str] = []
     for raw in text.splitlines():
-        if not raw or raw[0] not in "-*":
+        if not raw.startswith(("- ", "* ")):
             continue
-        stripped = raw.strip()
-        body = stripped[1:].strip()
-        if not body or set(stripped) <= {"-", "*", " "}:
-            continue
-        bullets.append("- " + " ".join(body.split()))
+        body = raw[2:].strip()
+        if body:
+            bullets.append("- " + " ".join(body.split()))
     return bullets
 
 
