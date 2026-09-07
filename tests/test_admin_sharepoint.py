@@ -3403,6 +3403,9 @@ class TestExtractionTriggerShardRerun:
             def list(self, *, status, kind, limit=200):
                 return []  # no live shard children from any prior run
 
+            def list_by_idempotency_prefix(self, prefix, *, statuses=None):
+                return []  # no live shard children from any prior run
+
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: FakeJobsRepo())
 
         c = seeded_app["client"]

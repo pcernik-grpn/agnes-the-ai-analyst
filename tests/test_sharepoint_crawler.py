@@ -26,7 +26,7 @@ import threading
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import httpx
 import pytest
@@ -7393,14 +7393,22 @@ class TestShardChildrenStillLive:
 
     def test_true_for_a_queued_child_of_this_connection(self, monkeypatch):
         jobs = FakeJobsRepo()
-        jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn1", "shard_index": 1})
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
         assert crawler._shard_children_still_live("conn1") is True
 
     def test_true_for_a_running_child_of_this_connection(self, monkeypatch):
         jobs = FakeJobsRepo()
-        row = jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn1", "shard_index": 1})
+        row = jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
         row["status"] = "running"
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
@@ -7414,18 +7422,48 @@ class TestShardChildrenStillLive:
 
     def test_false_for_a_live_child_of_a_different_connection(self, monkeypatch):
         jobs = FakeJobsRepo()
-        jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn-other", "shard_index": 1})
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn-other", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn-other:1",
+        )
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
         assert crawler._shard_children_still_live("conn1") is False
 
     def test_false_for_a_terminal_child_of_this_connection(self, monkeypatch):
         jobs = FakeJobsRepo()
-        row = jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn1", "shard_index": 1})
+        row = jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
         row["status"] = "done"
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
         assert crawler._shard_children_still_live("conn1") is False
+
+    def test_true_even_when_200_other_connections_own_newer_shard_jobs_in_the_same_status(self, monkeypatch):
+        """2026-09-07 review finding: querying by idempotency-key prefix,
+        not `list()`'s own `kind`+`status`+`limit` scan, is what keeps this
+        correct on a busy fleet — 200 OTHER connections' newer shard jobs
+        sharing the same status must never make this connection's own
+        (older) child invisible."""
+        jobs = FakeJobsRepo()
+        for i in range(200):
+            jobs.enqueue(
+                "corpus-extraction-shard",
+                {"connection_id": f"conn-other-{i}", "shard_index": 1},
+                idempotency_key=f"corpus-extraction-shard:conn-other-{i}:1",
+            )
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is True
 
     def test_ignores_a_live_job_of_a_different_kind(self, monkeypatch):
         jobs = FakeJobsRepo()
@@ -7490,7 +7528,11 @@ class TestClearStaleStopForTrigger:
         connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
         monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
         jobs = FakeJobsRepo()
-        jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn1", "shard_index": 1})
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
         jobs.jobs_by_id["job1"] = {"id": "job1", "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc)}
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
@@ -7507,7 +7549,11 @@ class TestClearStaleStopForTrigger:
         jobs = FakeJobsRepo()
         # A live shard child, but for a DIFFERENT connection — must not
         # block this one's own clear.
-        jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn-other", "shard_index": 1})
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn-other", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn-other:1",
+        )
         jobs.jobs_by_id["job1"] = {"id": "job1", "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc)}
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
@@ -8139,13 +8185,23 @@ class FakeJobsRepo:
         return self.jobs_by_id.get(job_id)
 
     def list(self, *, kind: str, status: str, limit: int = 200) -> List[Dict[str, Any]]:
-        """Filters ``self.enqueued`` by kind/status — real enough for both
-        existing callers: ``maybe_run_facts_extraction``'s ``_standalone_
-        facts_pass_in_flight`` check (these planner tests never enqueue a
+        """Filters ``self.enqueued`` by kind/status — real enough for
+        ``maybe_run_facts_extraction``'s ``_standalone_facts_pass_in_
+        flight`` check (these planner tests never enqueue a
         ``sharepoint-facts-extraction`` job, so this naturally still
-        returns ``[]`` for it) and ``_shard_children_still_live``'s own
-        ``corpus-extraction-shard`` scan."""
+        returns ``[]`` for it)."""
         return [j for j in self.enqueued if j["kind"] == kind and j.get("status") == status][:limit]
+
+    def list_by_idempotency_prefix(
+        self, prefix: str, *, statuses: Optional[Sequence[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Mirrors the real repos' prefix scan — ``_shard_children_still_
+        live`` uses this instead of ``list()`` precisely so a fleet-wide
+        ``limit`` can never hide one connection's own shard job."""
+        matches = [j for j in self.enqueued if (j.get("idempotency_key") or "").startswith(prefix)]
+        if statuses is not None:
+            matches = [j for j in matches if j.get("status") in statuses]
+        return matches
 
 
 class FakeStateStore:
@@ -8911,7 +8967,11 @@ class TestStopFlagSurvivesATrigger(TestAutoParallelCrawlPlanner):
         connection["config"]["extraction"] = {"stop_requested_at": "2020-01-01T00:00:00+00:00"}
         # A child from the run that was just cancelled — still queued,
         # depending entirely on the connection-wide flag to know to stop.
-        jobs.enqueue("corpus-extraction-shard", {"connection_id": "conn1", "shard_index": 1})
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
         jobs.jobs_by_id["job-trigger-3"] = {
             "id": "job-trigger-3",
             "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc),

@@ -68,7 +68,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -244,6 +244,28 @@ class JobsPgRepository:
             sql += " AND kind = :kind"
             params["kind"] = kind
         sql += " ORDER BY created_at DESC LIMIT :limit"
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return [self._decode(dict(r)) for r in rows]
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def list_by_idempotency_prefix(
+        self, prefix: str, *, statuses: Optional[Sequence[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Mirrors the DuckDB sibling — see its docstring for why this
+        exists (an exact, prefix-indexed alternative to :meth:`list`'s
+        ``kind``+``status``+``limit`` scan, built for
+        ``connectors.sharepoint.crawler._shard_children_still_live``)."""
+        escaped = self._escape_like(prefix)
+        sql = "SELECT * FROM jobs WHERE idempotency_key LIKE :prefix ESCAPE '\\'"
+        params: Dict[str, Any] = {"prefix": f"{escaped}%"}
+        if statuses:
+            status_params = {f"status_{i}": s for i, s in enumerate(statuses)}
+            sql += " AND status IN (" + ", ".join(f":{k}" for k in status_params) + ")"
+            params.update(status_params)
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [self._decode(dict(r)) for r in rows]

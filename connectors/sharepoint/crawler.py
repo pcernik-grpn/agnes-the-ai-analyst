@@ -697,19 +697,19 @@ def _shard_children_still_live(connection_id: str) -> bool:
     finalized" invariant :func:`_enqueue_shard_plan`'s own docstring
     already assumes, which a cancel's early close silently breaks.
 
-    Bounded the same fleet-wide way ``app/api/admin_extraction.py::
-    _crawl_job_in_flight`` already scans its own job kind — there is no
-    per-connection index on the jobs table to query more narrowly.
+    Queries by that SAME idempotency-key prefix (``jobs_repo().
+    list_by_idempotency_prefix``, ``idx_jobs_idem``-backed) rather than
+    ``list()``'s own ``kind``+``status``+``limit`` scan: a fleet busy
+    enough to have 200+ OTHER connections' shard jobs in the same status
+    would make that scan's ``created_at DESC LIMIT 200`` miss an OLDER
+    connection's own still-live child entirely — exactly the failure this
+    function exists to prevent, just reintroduced by its own bound.
     """
     from src.repositories import jobs_repo
 
-    repo = jobs_repo()
-    for status in ("queued", "running"):
-        for job in repo.list(status=status, kind=_SHARD_JOB_KIND, limit=200):
-            payload = job.get("payload_json") or {}
-            if str(payload.get("connection_id")) == str(connection_id):
-                return True
-    return False
+    prefix = f"{_SHARD_JOB_KIND}:{connection_id}:"
+    jobs = jobs_repo().list_by_idempotency_prefix(prefix, statuses=("queued", "running"))
+    return any(job.get("kind") == _SHARD_JOB_KIND for job in jobs)
 
 
 def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> None:
