@@ -18,3 +18,10 @@
   dashboard". The pane now gets its own column beside the thread (widening on
   large screens) and stacks under the thread as a bottom sheet on viewports
   narrower than 900px.
+- **Data-apps skill: a new app gets its draft before the first dev deploy.**
+  The `agnes-data-apps-extras` skill told the agent to create a draft "only
+  when iterating off a deployed app" and then to dev-deploy `draft_slug`, so
+  for a new app it dev-deployed the prod row, hit `400 dev_requires_draft`,
+  and only then created the draft. Section 0 now spells out the fixed order
+  (create → seed `main` → `data_app_create_draft` → dev deploy of the draft),
+  and the `data_app_create` tool docs (HTTP and stdio) say the same.
