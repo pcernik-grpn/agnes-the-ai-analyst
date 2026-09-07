@@ -319,7 +319,7 @@ class FragmentFormatError(ChangelogFormatError):
 def _fragment_fix_hint(name: str) -> str:
     return (
         f"Fix {FRAGMENTS_DIR}/{name}: one or more '### <Group>' headings, each followed by "
-        f"'- ' bullets at column 0, Group one of {', '.join(DEFAULT_SUBSECTIONS)} "
+        f"'- ' (or '* ') bullets at column 0, Group one of {', '.join(DEFAULT_SUBSECTIONS)} "
         f"(see {FRAGMENTS_DIR}/{FRAGMENT_README})."
     )
 

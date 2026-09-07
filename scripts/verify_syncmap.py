@@ -251,6 +251,17 @@ def _is_changelog_fragment(path: str) -> bool:
     return path.startswith(FRAGMENTS_DIR + "/") and path.endswith(".md") and path != f"{FRAGMENTS_DIR}/README.md"
 
 
+def drop_absent_fragments(changed_paths: list[str], root: Path) -> list[str]:
+    """``changed_paths`` minus fragment paths that no longer exist under ``root``.
+
+    ``git diff --name-only`` lists deleted files too, and a deleted fragment is
+    not a record of anything — only a fragment present in the working tree
+    satisfies :func:`check_changelog`. Non-fragment paths pass through
+    untouched: a deleted user-visible file is still a user-visible change.
+    """
+    return [p for p in changed_paths if not _is_changelog_fragment(p) or (root / p).is_file()]
+
+
 def check_changelog(
     *,
     base_changelog: str,
@@ -259,6 +270,9 @@ def check_changelog(
     version_bumped: bool,
 ) -> list[Finding]:
     """A user-visible change must add a ``changelog.d/<slug>.md`` fragment.
+
+    Callers pass ``changed_paths`` through :func:`drop_absent_fragments` first,
+    so a fragment listed here is one that exists in the tree, not a deletion.
 
     A new bullet written directly under ``## [Unreleased]`` still satisfies
     this local check (it is the pre-#2295 shape and this guard should not be
@@ -641,7 +655,7 @@ def collect_findings(base: str) -> list[Finding]:
         findings += check_changelog(
             base_changelog=_git_or_empty("show", f"{base}:{CHANGELOG_PATH}"),
             head_changelog=changelog_file.read_text(encoding="utf-8"),
-            changed_paths=changed_paths,
+            changed_paths=drop_absent_fragments(changed_paths, REPO_ROOT),
             version_bumped=_version_bumped(base),
         )
     findings += check_scope_flags(added, sources)

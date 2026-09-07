@@ -107,20 +107,16 @@ jobs:
     # shards. pytest-split balances the groups by `.test_durations`; tests
     # without timing data receive the mean duration.
     #
-    # 2 -> 4 groups because this job, not the 8 main shards, is the critical
-    # path: measured over four consecutive `integration` runs the shards came
-    # in at 11-17 min while both test-pg jobs sat at 26-34 min, so every CI
-    # cycle in the repo waited on test-pg regardless of how fast the rest was.
-    # The split is nearly free to widen — a job's step timings show 26.3 of its
-    # 27 min is the pytest run itself (checkout/setup-python/uv are cached to
-    # ~0.1 min), and the committed durations cut 4 ways at 11.2 min each.
-    #
-    # 4 -> 8 groups (#2295): still the critical path at 4. Over three
-    # consecutive PR runs the four test-pg jobs took 22-27 min each while the
-    # eight main shards took 16-20 min, so every CI cycle waited 5-7 min on
-    # this job alone. The committed durations hold 57 min of db_pg test time
-    # against 102 min for the rest; 8 ways puts both jobs at ~7-13 min of
-    # tests and the main shards become the (shorter) long pole.
+    # The width follows one rule: this job must not be the critical path of a
+    # CI run. It has been widened twice on that evidence (2 -> 4: two test-pg
+    # jobs at 26-34 min against main shards at 11-17; 4 -> 8 in #2295: four
+    # jobs at 22-27 min against main shards at 16-20, i.e. 5-7 min of every
+    # run spent waiting on this job alone). Widening is nearly free — a job's
+    # step timings show all but ~0.1 min is the pytest run itself
+    # (checkout/setup-python/uv are cached) — and the committed durations hold
+    # 57 min of db_pg test time against 102 min for the rest, so 8 ways puts
+    # both jobs at roughly 7-13 min of tests with the main shards as the
+    # (shorter) long pole. If test-pg is the slowest job again, widen it again.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

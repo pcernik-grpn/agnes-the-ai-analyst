@@ -22,6 +22,7 @@ from scripts.verify_syncmap import (
     BLOCKING,
     WARN,
     check_changelog,
+    drop_absent_fragments,
     check_entity_scoped_authz,
     check_remote_attach,
     check_resource_type_registry,
@@ -259,6 +260,15 @@ def test_changelog_passes_when_a_fragment_was_added():
         version_bumped=False,
     )
     assert findings == []
+
+
+def test_drop_absent_fragments_keeps_only_fragments_present_in_the_tree(tmp_path):
+    """`git diff --name-only` lists deletions too; a deleted fragment must not
+    count as the PR's changelog entry. Non-fragment paths pass through."""
+    (tmp_path / "changelog.d").mkdir()
+    (tmp_path / "changelog.d" / "kept.md").write_text("### Added\n- x\n", encoding="utf-8")
+    paths = ["app/api/foo.py", "changelog.d/kept.md", "changelog.d/deleted.md", "src/gone.py"]
+    assert drop_absent_fragments(paths, tmp_path) == ["app/api/foo.py", "changelog.d/kept.md", "src/gone.py"]
 
 
 def test_changelog_readme_in_changelog_d_is_not_a_fragment():
