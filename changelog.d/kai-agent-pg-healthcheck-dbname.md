@@ -1,0 +1,2 @@
+### Fixed
+- **The kai-agent Postgres side-car no longer logs `FATAL: database "kai" does not exist` every 5 seconds.** Its compose healthcheck ran `pg_isready -U kai` without `-d`, so libpq defaulted the database name to the role name; the side-car's database is `kai_agent`. The probe still reported healthy (the server answered), but every tick left a FATAL line in the container log and in whatever ships it (17k lines/day per VM). The healthcheck now names the database. Rendered by the startup script, so it reaches a running VM on the next recreate.
