@@ -1,0 +1,76 @@
+name: Devin clean verdict approves org members' PRs
+
+# Why (#2295): `main`'s ruleset requires one approving review before a PR can
+# enter the merge queue, and the queue evaluates that rule as ITSELF — a
+# ruleset bypass actor's own PR is refused just the same ("At least 1
+# approving review is required by reviewers with write access"). The rule
+# exists to gate outside collaborators, who have write access here. Devin
+# reviews every PR but only ever COMMENTS, and its app has no write access,
+# so its verdict never counted. This workflow makes it count, for org members:
+#
+#   author is an org member (or the daily release-cut PR, the org's own
+#   automation) AND Devin's latest verdict is clean  ->  approve
+#   Devin's latest verdict lists issues              ->  dismiss our approval
+#
+# An outside collaborator's PR (author_association COLLABORATOR) gets nothing
+# here and still needs a human approval. The gate for members therefore reads:
+# CI green + Devin clean = the author can queue. Pair with the ruleset's
+# "dismiss stale reviews on push", so every push needs a fresh clean pass.
+#
+# Safety: `pull_request_review` runs this file from the base branch and never
+# checks out PR code; payload values reach the shell via environment variables
+# only. Approvals come from the Actions token (repo setting "Allow GitHub
+# Actions to create and approve pull requests" must stay on).
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: devin-clean-approves-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    if: >
+      github.event.review.user.login == 'devin-ai-integration[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && (
+        contains(fromJSON('["MEMBER","OWNER"]'), github.event.pull_request.author_association)
+        || (github.event.pull_request.user.login == 'github-actions[bot]'
+            && startsWith(github.event.pull_request.head.ref, 'release-cut/'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mirror Devin's verdict into an approval (or dismiss ours)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          VERDICT: ${{ github.event.review.body }}
+        run: |
+          set -euo pipefail
+          first_line=$(printf '%s\n' "$VERDICT" | sed -n '1p')
+          echo "Devin: $first_line"
+
+          ours=$(gh api "repos/$REPO/pulls/$PR/reviews" \
+                   --jq '[.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED")] | last | .id // empty')
+
+          if printf '%s' "$first_line" | grep -Eq 'Devin Review: No Issues Found|found 0 (new )?potential issues'; then
+            if [ -n "$ours" ]; then echo "already approved (review $ours)"; exit 0; fi
+            gh pr review "$PR" --repo "$REPO" --approve --body \
+              "Approved on Devin's clean verdict for an organization member's pull request (see .github/workflows/devin-clean-approves.yml). This approval is dismissed if a later Devin review finds issues or the branch is pushed to."
+            echo "approved"
+          elif printf '%s' "$first_line" | grep -Eq 'found [1-9][0-9]* (new )?potential issue'; then
+            if [ -z "$ours" ]; then echo "issues found; nothing of ours to dismiss"; exit 0; fi
+            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$ours/dismissals" \
+              -f message="Dismissed: Devin's latest review lists issues. It re-approves once a clean verdict lands." \
+              -f event="DISMISS" >/dev/null
+            echo "dismissed review $ours"
+          else
+            echo "not a verdict line; nothing to do"
+          fi
