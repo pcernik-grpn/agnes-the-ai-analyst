@@ -31,8 +31,10 @@ spelled out in the failure message:
 - Only `### Added` / `### Changed` / `### Fixed` / `### Removed` /
   `### Internal` headings, each at most once per fragment; no other heading
   level.
-- Every group has at least one `- ` bullet at column 0. Bullets are spliced
-  into `CHANGELOG.md` verbatim, so write them in the finished style.
+- Every group has at least one bullet at column 0: `- ` (the house style) or
+  `* ` — the marker must be followed by a space, `-not a bullet` is prose.
+  Bullets are spliced into `CHANGELOG.md` verbatim, so write them in the
+  finished style.
 - Breaking changes start with `**BREAKING**`.
 - Never write a pending bullet under `## [Unreleased]` in `CHANGELOG.md`
   itself. That section is assembled at the cut; the guard rejects inline
