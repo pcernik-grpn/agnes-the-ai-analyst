@@ -338,10 +338,14 @@ class FakeSourceConnectionsRepo:
     """Stands in for ``source_connections_repo()`` — just enough of the
     contract for the crawl's own reads/writes: ``.get()`` returns the SAME
     connection dict every call (by reference, so a ``config_patch`` is
-    immediately visible to the next ``.get()``), and ``.config_patch()``
+    immediately visible to the next ``.get()``), ``.config_patch()``
     merges the patch's TOP-LEVEL keys into ``config`` the same shallow way
     both real repos do — no new store, the same JSON column
-    ``config.scopes``/``config.extraction`` already live on.
+    ``config.scopes``/``config.extraction`` already live on — and
+    ``.clear_stop_requested_if_unchanged()`` mirrors the real repos' own
+    compare-and-delete guard (``src/repositories/source_connections.py``),
+    so a fake-backed test can exercise the SAME atomicity `_clear_stale_
+    stop` relies on.
     """
 
     def __init__(self, connection: Dict[str, Any]) -> None:
@@ -359,6 +363,18 @@ class FakeSourceConnectionsRepo:
         config.update(patch)
         self.connection["config"] = config
         return self.connection
+
+    def clear_stop_requested_if_unchanged(self, connection_id: str, expected_stop_at: str) -> bool:
+        if connection_id != self.connection.get("id"):
+            return False
+        config = dict(self.connection.get("config") or {})
+        extraction = dict(config.get("extraction") or {})
+        if extraction.get("stop_requested_at") != expected_stop_at:
+            return False
+        extraction.pop("stop_requested_at", None)
+        config["extraction"] = extraction
+        self.connection["config"] = config
+        return True
 
 
 def _run(
@@ -7275,6 +7291,34 @@ class TestStopSignalStore:
 
         assert "stop_requested_at" not in connection["config"]["extraction"]
 
+    def test_clear_stale_stop_never_clobbers_a_flag_that_changed_between_read_and_clear(self, monkeypatch):
+        """The atomicity finding: if something else (`request_stop`)
+        commits a FRESH flag in the window between `_clear_stale_stop`'s
+        own outer read/decision and its call into the atomic clear, that
+        clear must be a no-op against the now-current value — never blindly
+        replace it with the (by then stale) snapshot this function decided
+        to clear. Simulated at exactly that call boundary: the atomic
+        method re-reads truth from the live store at call time (what makes
+        the real repos' own re-read-under-lock safe), not from a snapshot
+        `_clear_stale_stop` already committed to. Exercised even with
+        `not_after=None` (the unconditional-clear path): the compare-and-
+        delete guard is unconditional too, not tied to the staleness check.
+        """
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "old"}}}
+        repo = FakeSourceConnectionsRepo(connection)
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: repo)
+        real_clear = repo.clear_stop_requested_if_unchanged
+
+        def clear_after_a_concurrent_request_stop_lands(connection_id, expected_stop_at):
+            connection["config"]["extraction"]["stop_requested_at"] = "fresh"
+            return real_clear(connection_id, expected_stop_at)
+
+        monkeypatch.setattr(repo, "clear_stop_requested_if_unchanged", clear_after_a_concurrent_request_stop_lands)
+
+        crawler._clear_stale_stop("conn1")  # not_after=None: decides "old" looks stale, attempts to clear it
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "fresh"
+
     def test_clear_stale_stop_with_not_after_preserves_a_flag_written_later(self, monkeypatch):
         """The race: a stop written AFTER `not_after` (this run's own
         trigger) must survive the clear so the run's own cooperative-stop
@@ -7286,19 +7330,35 @@ class TestStopSignalStore:
 
         assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
 
-    def test_clear_stale_stop_with_not_after_preserves_a_flag_on_a_tie(self, monkeypatch):
-        """`_now_iso()` only carries second precision, so a stop and a job's
-        microsecond-precision `created_at` can land in the SAME second even
-        though the stop happened strictly after — a tie (once both are
-        truncated to whole seconds) must resolve to "preserve", not "stale",
-        or a stop landing moments after its own trigger's enqueue would be
-        silently wiped."""
+    def test_clear_stale_stop_with_not_after_preserves_a_flag_on_an_exact_tie(self, monkeypatch):
+        """Defense in depth for a value that predates `request_stop`'s move
+        to microsecond precision (a hand-written fixture, an older
+        persisted flag): an EXACT tie must resolve to "preserve", not
+        "stale" — two genuine writes essentially never land on the same
+        microsecond, so this only ever matters for a coarser legacy value."""
         connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:00+00:00"}}}
         monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
 
-        crawler._clear_stale_stop("conn1", not_after=datetime(2026, 9, 6, 18, 0, 0, 900000, tzinfo=timezone.utc))
+        crawler._clear_stale_stop("conn1", not_after=datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc))
 
         assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:00+00:00"
+
+    def test_a_same_second_retrigger_still_clears_a_stale_flag_at_microsecond_precision(self, monkeypatch):
+        """The exact scenario `request_stop`'s move to microsecond precision
+        exists for: a cancel and the very next trigger can land in the SAME
+        wall-clock SECOND, no artificial backdating — the incident this PR
+        fixes. Second-level precision alone cannot order two timestamps
+        that close together, which is what let a stale flag survive a
+        retrigger issued moments later; microsecond precision can."""
+        connection = {"id": "conn1", "config": {}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler.request_stop("conn1")  # the previous run's cancel
+        not_after = datetime.now(timezone.utc)  # this trigger's own job, created a moment later
+
+        crawler._clear_stale_stop("conn1", not_after=not_after)
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
 
     def test_clear_stale_stop_accepts_a_naive_datetime_not_after_as_utc(self, monkeypatch):
         """A DuckDB-backed job row's own ``created_at`` comes back naive

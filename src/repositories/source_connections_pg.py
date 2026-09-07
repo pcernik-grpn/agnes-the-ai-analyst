@@ -188,6 +188,41 @@ class SourceConnectionsPgRepository:
             )
         return self._decode(dict(updated) if updated else None)
 
+    def clear_stop_requested_if_unchanged(self, connection_id: str, expected_stop_at: str) -> bool:
+        """Mirrors the DuckDB sibling — see its docstring for the race this
+        closes (a `request_stop` committing a FRESH flag between a
+        caller's earlier read and this call). The row lock (`SELECT ...
+        FOR UPDATE`) inside this same transaction is what makes the
+        re-read and the conditional write atomic against a concurrent
+        writer — Postgres needs no separate retry loop here either, same
+        as `config_patch`.
+        """
+        with self._engine.begin() as cx:
+            row = cx.execute(
+                sa.text("SELECT config FROM source_connections WHERE id = :id FOR UPDATE"),
+                {"id": connection_id},
+            ).first()
+            if row is None:
+                return False
+            current = row[0]
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except (json.JSONDecodeError, TypeError):
+                    current = {}
+            elif not isinstance(current, dict):
+                current = {}
+            extraction = dict(current.get("extraction") or {})
+            if extraction.get("stop_requested_at") != expected_stop_at:
+                return False
+            extraction.pop("stop_requested_at", None)
+            merged = {**current, "extraction": extraction}
+            cx.execute(
+                sa.text("UPDATE source_connections SET config = :c WHERE id = :id"),
+                {"c": json.dumps(merged), "id": connection_id},
+            )
+        return True
+
     def delete(self, connection_id: str) -> None:
         with self._engine.begin() as cx:
             cx.execute(

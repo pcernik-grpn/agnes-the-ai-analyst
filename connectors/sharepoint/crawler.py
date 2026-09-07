@@ -600,32 +600,34 @@ def request_stop(connection_id: str) -> str:
     :func:`_clear_stale_stop` clears it unconsumed — a stop meant for a run
     that already finished (or never started) must never reach forward and
     kill a future, unrelated one.
+
+    Deliberately FULL (microsecond) precision, unlike ``_now_iso()``'s
+    second-truncated stamp everywhere else in this module: this value is
+    compared against a triggering job's ``created_at`` to decide staleness
+    (:func:`_clear_stale_stop`), and a same-second cancel-then-retrigger —
+    exactly the incident this mechanism exists for — would otherwise tie
+    with second-level precision, indistinguishable from "requested before
+    the trigger" no matter which side of that second it actually landed on.
     """
     from src.repositories import source_connections_repo
 
     repo = source_connections_repo()
     row = repo.get(connection_id) or {}
     extraction = dict((row.get("config") or {}).get("extraction") or {})
-    stamp = _now_iso()
+    stamp = datetime.now(timezone.utc).isoformat()
     extraction[STOP_REQUESTED_AT_KEY] = stamp
     repo.config_patch(connection_id, {"extraction": extraction})
     return stamp
 
 
 def _parse_stop_timestamp(value: Any) -> datetime:
-    """Normalizes a stop-flag stamp (``_now_iso()``'s string) or a job row's
-    ``created_at`` (a ``datetime`` — naive on DuckDB, aware on Postgres) to
-    one comparable instant, truncated to whole seconds — ``_now_iso()``
-    itself only ever carries second precision (``timespec="seconds"``), so
-    comparing it as-is against a job row's microsecond-precision
-    ``created_at`` would make a stop written a few hundred milliseconds
-    AFTER a job's own enqueue look like it landed BEFORE it. A naive value
-    is always treated as UTC — the only timezone anything in this module
-    ever writes."""
+    """Normalizes a stop-flag stamp (``request_stop()``'s microsecond-
+    precision string, or an older/hand-written second-precision one) or a
+    job row's ``created_at`` (a ``datetime`` — naive on DuckDB, aware on
+    Postgres) to one comparable instant. A naive value is always treated
+    as UTC — the only timezone anything in this module ever writes."""
     dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.replace(microsecond=0)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def _clear_stale_stop(connection_id: str, *, not_after: Optional[Any] = None) -> None:
@@ -644,25 +646,34 @@ def _clear_stale_stop(connection_id: str, *, not_after: Optional[Any] = None) ->
     ``not_after`` was written once this run's own trigger was already in
     motion — e.g. an admin pressing Stop while a large site was still being
     planned — and must still reach the run it was aimed at, never be wiped
-    by that same run's own start-up. A tie (both truncated to the same
-    second) is treated as "at or after", not "stale" — the safer of the two
-    guesses when precision alone can't tell them apart, since a spurious
-    stop is trivially re-triggered but a silently-lost stop looks like
-    nothing happened. Such a flag is left in place, uncleared, for the
+    by that same run's own start-up. A tie is treated as "at or after", not
+    "stale" — defense in depth for a value that predates ``request_stop``'s
+    own move to microsecond precision (a hand-written fixture, an older
+    persisted flag); two genuine writes essentially never land on the exact
+    same microsecond. Such a flag is left in place, uncleared, for the
     run's own cooperative-stop checks to honor. ``None`` (no anchor
     available — a payload built outside the worker) falls back to the
     unconditional clear this function always did.
+
+    The clear itself is an ATOMIC compare-and-delete
+    (``clear_stop_requested_if_unchanged``), not a read-then-``config_
+    patch`` of a precomputed snapshot: a `request_stop` that commits a
+    FRESH flag between this function's own read (above) and the clear
+    below is re-checked, under the repo's own lock, against the value
+    actually decided to be stale — and left untouched if it no longer
+    matches, rather than being silently overwritten by that snapshot.
     """
     from src.repositories import source_connections_repo
 
     repo = source_connections_repo()
     row = repo.get(connection_id) or {}
-    extraction = dict((row.get("config") or {}).get("extraction") or {})
+    extraction = (row.get("config") or {}).get("extraction") or {}
     stamp = extraction.get(STOP_REQUESTED_AT_KEY)
-    if stamp and not_after is not None and _parse_stop_timestamp(stamp) >= _parse_stop_timestamp(not_after):
+    if not stamp:
         return
-    if extraction.pop(STOP_REQUESTED_AT_KEY, None) is not None:
-        repo.config_patch(connection_id, {"extraction": extraction})
+    if not_after is not None and _parse_stop_timestamp(stamp) >= _parse_stop_timestamp(not_after):
+        return
+    repo.clear_stop_requested_if_unchanged(connection_id, stamp)
 
 
 def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> None:

@@ -166,3 +166,58 @@ def test_config_patch_preserves_concurrently_written_other_key(repo):
     row = repo.config_patch("c1", {"acl_sync_last_run": {"ok": True}})
     assert row["config"]["acl_sweep_last_full"] == "2026-08-30T00:00:00+00:00"
     assert row["config"]["acl_sync_last_run"] == {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# clear_stop_requested_if_unchanged — the compare-and-delete counterpart to
+# connectors.sharepoint.crawler.request_stop's write (2026-09-06 incident:
+# `_clear_stale_stop`'s own read-then-config_patch could clobber a FRESH
+# stop request committed in between).
+# ---------------------------------------------------------------------------
+
+
+def test_clear_stop_requested_if_unchanged_clears_a_matching_flag(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"extraction": {"stop_requested_at": "t1"}})
+
+    cleared = repo.clear_stop_requested_if_unchanged("c1", "t1")
+
+    assert cleared is True
+    assert "stop_requested_at" not in repo.get("c1")["config"]["extraction"]
+
+
+def test_clear_stop_requested_if_unchanged_preserves_a_fresher_flag(repo):
+    # The exact race the finding names: something else (`request_stop`)
+    # commits a NEW flag after the caller read "t1" but before this call —
+    # the stale "t1" snapshot must never win over the current "t2".
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"extraction": {"stop_requested_at": "t1"}})
+    repo.config_patch("c1", {"extraction": {"stop_requested_at": "t2"}})
+
+    cleared = repo.clear_stop_requested_if_unchanged("c1", "t1")
+
+    assert cleared is False
+    assert repo.get("c1")["config"]["extraction"]["stop_requested_at"] == "t2"
+
+
+def test_clear_stop_requested_if_unchanged_preserves_sibling_extraction_keys(repo):
+    repo.create(
+        id="c1",
+        name="a",
+        source_type="sharepoint",
+        config={"extraction": {"stop_requested_at": "t1", "last_run_at": "t0"}},
+    )
+
+    repo.clear_stop_requested_if_unchanged("c1", "t1")
+
+    extraction = repo.get("c1")["config"]["extraction"]
+    assert "stop_requested_at" not in extraction
+    assert extraction["last_run_at"] == "t0"
+
+
+def test_clear_stop_requested_if_unchanged_is_a_noop_when_nothing_is_set(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={})
+
+    assert repo.clear_stop_requested_if_unchanged("c1", "t1") is False
+
+
+def test_clear_stop_requested_if_unchanged_unknown_id_returns_false(repo):
+    assert repo.clear_stop_requested_if_unchanged("nope", "t1") is False
