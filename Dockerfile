@@ -155,7 +155,14 @@ ARG EXTRA_EXTRAS=""
 # an image that can serve the connector but not convert a document would
 # turn every containerized deploy's first crawl into a typed refusal an
 # operator can do nothing about without a rebuild.
-RUN uv pip install --system --no-cache ".[server,slack-socket,telegram,extraction${EXTRA_EXTRAS}]"
+#
+# The set is installed FROM uv.lock (scripts/ci/install-from-lock.sh: `uv export
+# --frozen` → `uv pip install`), the same pinned set CI tested — not re-resolved
+# from pyproject.toml's ranges at build time, which is how a fresh upstream
+# release used to reach the image untested. The lock is kept in step with
+# pyproject.toml by CI's blocking `lock-check` job. The comma-list ARG is
+# spliced in as extra positional extras; the script skips empty tokens.
+RUN scripts/ci/install-from-lock.sh --no-dev server slack-socket telegram extraction $(printf '%s' "$EXTRA_EXTRAS" | tr ',' ' ')
 
 # Run as non-root user for container hardening (C13).
 # uid/gid pinned to 999 so host-side chown in startup-script.sh.tpl can match

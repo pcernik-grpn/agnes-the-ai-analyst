@@ -78,7 +78,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev,server,extraction]"
+        run: scripts/ci/install-from-lock.sh dev server extraction
 
       - name: Run tests (shard ${{ matrix.group }}/8)
         # pytest-split shards the suite across 8 parallel jobs, balanced by
@@ -135,7 +135,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev,server,extraction]"
+        run: scripts/ci/install-from-lock.sh dev server extraction
 
       - name: Run Postgres contract tests (shard ${{ matrix.group }}/8)
         run: pytest tests/db_pg/ -v --tb=short -n auto --splits 8 --group ${{ matrix.group }}
@@ -145,8 +145,23 @@ jobs:
   # Single required status check. Branch protection requires `test`, but the
   # matrices above publish `test-shard (1..8)` and `test-pg (1..8)` — this job
   # aggregates them into one `test` result so no branch-protection change is needed.
+  lock-check:
+    # `uv.lock` is what the image and every job above install from
+    # (scripts/ci/install-from-lock.sh), so a pyproject.toml edit that was not
+    # re-locked would ship a dependency set nobody tested — and the lock had
+    # quietly fallen six releases behind before this gate existed. Blocking:
+    # the `test` rollup below needs it. Fix is `uv lock` + commit the result.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+
   test:
-    needs: [test-shard, test-pg]
+    needs: [test-shard, test-pg, lock-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -160,7 +175,11 @@ jobs:
             echo "::error::test-pg result was '${{ needs.test-pg.result }}' — Postgres contract tests failed"
             exit 1
           fi
-          echo "All 8 test shards and all 8 Postgres contract shards passed."
+          if [ "${{ needs.lock-check.result }}" != "success" ]; then
+            echo "::error::lock-check result was '${{ needs.lock-check.result }}' — uv.lock is behind pyproject.toml; run 'uv lock' and commit it"
+            exit 1
+          fi
+          echo "All 8 test shards, all 8 Postgres contract shards and the uv.lock check passed."
 
   lint:
     # Advisory only (continue-on-error) — ruff + mypy surface issues but
@@ -304,7 +323,7 @@ jobs:
           df -h /
 
       - name: Install dependencies with the heavy extras
-        run: uv pip install --system ".[dev,server,docling,embeddings]"
+        run: scripts/ci/install-from-lock.sh dev server docling embeddings
 
       - name: Assert the extras are actually active
         # The gated tests SKIP when an extra is missing, so a failed install
@@ -341,7 +360,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev,server]"
+        run: scripts/ci/install-from-lock.sh dev server
 
       - name: Start services
         run: |

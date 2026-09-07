@@ -46,7 +46,10 @@ logic.
 `changelog.d/` fragment** (see the Changelog discipline section above).
 The version bump + CHANGELOG rename is cut once a day by
 `.github/workflows/daily-cut.yml`, which opens a PR labeled `release-cut` for
-a human to review and merge. It never merges or tags anything itself.
+a human to review and merge. It never merges or tags anything itself. After
+the bump it runs `uv lock`, so `uv.lock`'s own version line follows
+`pyproject.toml` — the image installs from the lock behind CI's blocking
+`lock-check`, and a cut PR that skipped this would fail its own checks.
 
 This replaces the old rule ("the release-cut ships in the same PR that earns
 the version"), which made whichever PR happened to land last-with-content in

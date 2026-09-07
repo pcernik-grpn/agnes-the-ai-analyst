@@ -1,0 +1,104 @@
+"""``uv.lock`` is what ships — the pins that keep it that way.
+
+Before this, the lock was committed but nothing read it: the image and every
+CI job re-resolved ``pyproject.toml``'s ranges at build time, the daily release
+cut bumped the version without re-locking, and any ``uv run``/``uv sync`` in a
+worktree rewrote the stale lock — the dirty ``uv.lock`` on nearly every PR.
+Now the image and CI install from the lock through one script, CI blocks a
+lock that is behind pyproject, the cut re-locks, and the hooks run ``--frozen``.
+Each pin below names the regression it stops.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "ci" / "install-from-lock.sh"
+DOCKERFILE = ROOT / "Dockerfile"
+CI = ROOT / ".github" / "workflows" / "ci.yml"
+DAILY_CUT = ROOT / ".github" / "workflows" / "daily-cut.yml"
+WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+HOOKS = [ROOT / "scripts" / "post-edit-quality.sh", ROOT / "scripts" / "typecheck-core.sh"]
+
+
+def _read(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
+
+
+class TestOneInstallPath:
+    def test_the_script_installs_from_the_lock_without_touching_it(self):
+        s = _read(SCRIPT)
+        assert "uv export --frozen --no-emit-project" in s, (
+            "--frozen: never rewrite the lock; --no-emit-project: the project goes on top"
+        )
+        assert "uv pip install --system --no-cache -r" in s
+        assert "uv pip install --system --no-cache --no-deps ." in s, (
+            "the project itself, with its deps already pinned-installed"
+        )
+        assert os.access(SCRIPT, os.X_OK), "the Dockerfile and workflows exec it directly"
+
+    def test_the_image_installs_through_the_script_not_the_ranges(self):
+        d = _read(DOCKERFILE)
+        assert "scripts/ci/install-from-lock.sh --no-dev server slack-socket telegram extraction" in d
+        assert 'uv pip install --system --no-cache ".[' not in d, "range-resolving install is back in the image"
+        assert "$(printf '%s' \"$EXTRA_EXTRAS\" | tr ',' ' ')" in d, (
+            "the rich-image ARG must still splice in (image-rich.yml passes ',docling,embeddings')"
+        )
+
+    def test_no_workflow_resolves_from_the_ranges(self):
+        offenders = [w.name for w in WORKFLOWS if re.search(r'uv pip install --system "?\.\[', _read(w))]
+        assert offenders == [], (
+            f"workflows re-resolving pyproject ranges instead of installing from the lock: {offenders}"
+        )
+        users = [w.name for w in WORKFLOWS if "scripts/ci/install-from-lock.sh" in _read(w)]
+        assert {"ci.yml", "keboola-deploy.yml", "update-test-durations.yml"} <= set(users), users
+
+
+class TestTheLockCannotFallBehind:
+    def test_ci_blocks_on_uv_lock_check(self):
+        ci = _read(CI)
+        assert "\n  lock-check:\n" in ci
+        assert "run: uv lock --check" in ci
+        rollup = ci[ci.index("\n  test:\n") : ci.index("\n  lint:\n")]
+        assert "lock-check" in rollup.split("needs:")[1].split("\n")[0], (
+            "the `test` rollup is the required check — lock-check must gate through it"
+        )
+        assert "needs.lock-check.result" in rollup
+
+    def test_the_daily_cut_relocks_and_ships_the_lock(self):
+        dc = _read(DAILY_CUT)
+        assert "run: uv lock\n" in dc, (
+            "the cut bumps pyproject's version; without a re-lock its own PR fails lock-check"
+        )
+        assert "git add uv.lock" in dc
+        assert dc.index("run: uv lock\n") < dc.index("git add CHANGELOG.md"), "re-lock before the commit"
+
+    def test_hooks_never_rewrite_the_lock(self):
+        for h in HOOKS:
+            s = _read(h)
+            assert "uv run --frozen" in s, h.name
+            assert re.search(r"uv run (?!--frozen)", s) is None, f"{h.name}: an unfrozen `uv run` re-locks a stale lock"
+
+    def test_the_lock_records_the_current_project_version(self):
+        """The class of drift the cut used to leave behind (0.95.0 in the lock,
+        0.101.0 in pyproject) — checkable without uv."""
+        version = re.search(r'^version\s*=\s*"([^"]+)"', _read(ROOT / "pyproject.toml"), re.MULTILINE).group(1)
+        lock = _read(ROOT / "uv.lock")
+        m = re.search(r'\[\[package\]\]\nname = "agnes-the-ai-analyst"\nversion = "([^"]+)"', lock)
+        assert m, "the project entry is missing from uv.lock"
+        assert m.group(1) == version, f"uv.lock records {m.group(1)}, pyproject.toml says {version} — run `uv lock`"
+
+    def test_the_lock_is_in_sync_with_pyproject(self):
+        """The real check, when uv is available (CI's test jobs have it)."""
+        uv = shutil.which("uv")
+        if not uv:
+            pytest.skip("uv not on PATH")
+        out = subprocess.run([uv, "lock", "--check"], cwd=ROOT, capture_output=True, text=True, check=False)
+        assert out.returncode == 0, f"uv.lock is behind pyproject.toml — run `uv lock` and commit it:\n{out.stderr}"

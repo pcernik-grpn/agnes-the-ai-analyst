@@ -178,6 +178,9 @@ Table definitions: DuckDB `table_registry` table in `system.duckdb`.
 # Setup
 python3 -m venv .venv && source .venv/bin/activate
 uv pip install ".[dev,server]"
+# Changed a dependency in pyproject.toml? Re-lock and commit uv.lock — the
+# image and CI install from the lock and CI's lock-check is blocking.
+uv lock
 
 # Run FastAPI locally
 uvicorn app.main:app --reload
