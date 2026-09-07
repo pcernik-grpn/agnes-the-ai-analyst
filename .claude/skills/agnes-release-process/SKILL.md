@@ -90,7 +90,10 @@ Since 2026-09-07 a GitHub merge queue on `main` lands ready PRs — the
 hand-driven merge trains are retired. Queue a PR with
 `gh pr merge <N> --merge --auto` (or "Merge when ready"); the
 queue tests `main` + the queued PRs once on the `merge_group` event and merges.
-`main` no longer requires an up-to-date branch, so never merge `main` into a PR
+Entry needs one approving review, evaluated by the queue (bypass does not
+apply): for an organization member's PR a clean Devin verdict supplies it
+automatically; an outside collaborator's PR and the cut PR need a human
+approval. `main` no longer requires an up-to-date branch, so never merge `main` into a PR
 because `main` moved. The cut PR rides the same queue: queue it after the
 feature PRs you want in that version; a fragment merged later rides the next
 cut. If a cut PR conflicts with `main`, close it and re-dispatch

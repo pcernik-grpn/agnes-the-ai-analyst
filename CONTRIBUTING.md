@@ -18,9 +18,15 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 
 What merges a ready (non-draft) PR is GitHub's **merge queue** on `main`
 (since 2026-09-07; `docs/RELEASING.md` → *Landing PRs through the merge
-queue*), and what decides who may queue is the ruleset: one approving review
-plus an extra approval for unattributed changes, which the core team bypasses —
-so PRs routinely land with `reviewDecision: REVIEW_REQUIRED` still set. What
+queue*), and what decides whether a PR may *enter* the queue is the ruleset's
+one-approval rule, evaluated by the queue itself — ruleset bypass does not
+apply inside the queue, so a bypass actor's own unreviewed PR is refused like
+anyone else's. For an organization member's PR that approval comes from a
+clean Devin verdict (`.github/workflows/devin-clean-approves.yml` approves on
+"No Issues Found" and dismisses its approval when a later verdict lists
+issues), so the gate reads **CI green + Devin clean = the author queues**. An
+outside collaborator's PR and the daily release-cut PR need a human approval.
+Every push dismisses approvals until Devin has cleared the new head. What
 follows from that, for an agent or a person:
 
 - **To land a ready PR, queue it:** `gh pr merge <N> --merge --auto` (or "Merge when ready" in the UI). The queue builds `main`
@@ -33,9 +39,10 @@ follows from that, for an agent or a person:
   the merged result. Sync before a build wave, before review, and when a
   reviewer asks for it — not on every `main` move.
 - **Waiting on a gate is a `BLOCKER` with an owner, not a wait.** Name the gate
-  and the person who can open it — for the review rule, someone with ruleset
-  bypass — in the PR or the issue, and re-ping that person every two hours
-  until it moves. Two long autonomous runs lost 18 h and 33 h each modelling
+  and who opens it — for a member's PR that is Devin's verdict (fix what it
+  flagged, or wait for the re-review after a push); for an outside
+  collaborator's or the cut PR, a named human approver — in the PR or the
+  issue, and re-ping that person every two hours until it moves. Two long autonomous runs lost 18 h and 33 h each modelling
   "needs an approving review" for a badge that was never the gate (#2295).
 - **Un-draft only when you would merge as-is** (`CLAUDE.md`: "ready for review"
   means "ready to merge") and name a reviewer at un-draft time, so the blocker

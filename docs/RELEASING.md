@@ -77,7 +77,7 @@ a day.
 Since 2026-09-07 `main` has a GitHub **merge queue** (ruleset *Merge queue on
 main*: merge-commit method, `ALLGREEN` grouping, up to five entries per group,
 60 min check timeout; the queue ruleset has no bypass actors, so nobody merges
-around it — the *review* ruleset's core-team bypass below is a different rule)
+around it)
 and its "require branch up to date" rule is off. This is the automated form of the merge train that used to land
 most of `main` as `Train N: #…`; the hand-driven train is retired.
 
@@ -88,10 +88,15 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
   before it lands. A group in which one entry fails is re-formed without it.
 - **Do not update a PR's branch because `main` moved.** BEHIND is the normal
   state between queue runs; the queue tests the combination.
-- **The review ruleset gates who may queue**, not the queue itself: one
-  approving review plus an extra approval for unattributed changes, bypassed
-  by the core team. A blocked PR names the person with bypass who will queue
-  it.
+- **One approving review gates entry to the queue**, evaluated by the queue
+  itself — ruleset bypass does not apply inside it. For an organization
+  member's PR a clean Devin verdict supplies that approval
+  (`.github/workflows/devin-clean-approves.yml`: approves on "No Issues
+  Found", dismisses its approval when a later verdict lists issues), and the
+  ruleset dismisses approvals on every push, so the gate is CI green + Devin
+  clean. An outside collaborator's PR needs a human approval; so does the cut
+  PR (its commits are `github-actions[bot]`'s own, which the bridge cannot
+  self-approve). A blocked PR names that approver.
 - **The cut PR rides the same queue.** Queue it after the feature PRs you
   want in that version have landed. A fragment merged after the cut PR opened
   is a new file under `changelog.d/` and does not collide with the cut branch;
@@ -232,7 +237,10 @@ writes that field, there is no drift to reconcile and no need to cross-check
   occur. Kept because PRs #273, #281, #285, #286 in the history reference it.
 - **Required checks** (per branch protection): `test` + `docker-build` only.
   Other workflows (`cli-wheel-clean-install`, `build-and-push`,
-  `Release`-pipeline, Devin Review) are advisory — green/red doesn't gate merge.
+  `Release`-pipeline) are advisory — green/red doesn't gate merge. Devin Review
+  is not a required check either, but its clean verdict is what supplies the
+  approving review an organization member's PR needs to enter the queue (see
+  § Landing PRs through the merge queue).
 - **`enforce_admins: true`** in branch protection means `--admin` flag on
   `gh pr merge` does NOT bypass. Don't try; just fix the underlying block.
 - **A cut PR's CI needs one click before it can merge.** See § A cut PR
