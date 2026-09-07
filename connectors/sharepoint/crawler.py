@@ -612,20 +612,89 @@ def request_stop(connection_id: str) -> str:
     return stamp
 
 
-def _clear_stale_stop(connection_id: str) -> None:
+def _parse_stop_timestamp(value: Any) -> datetime:
+    """Normalizes a stop-flag stamp (``_now_iso()``'s string) or a job row's
+    ``created_at`` (a ``datetime`` — naive on DuckDB, aware on Postgres) to
+    one comparable instant, truncated to whole seconds — ``_now_iso()``
+    itself only ever carries second precision (``timespec="seconds"``), so
+    comparing it as-is against a job row's microsecond-precision
+    ``created_at`` would make a stop written a few hundred milliseconds
+    AFTER a job's own enqueue look like it landed BEFORE it. A naive value
+    is always treated as UTC — the only timezone anything in this module
+    ever writes."""
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.replace(microsecond=0)
+
+
+def _clear_stale_stop(connection_id: str, *, not_after: Optional[Any] = None) -> None:
     """Clear any stop flag left over from a PREVIOUS run, at the START of
     THIS one. A stop requested for a run that already finished, failed, or
     never started must not be honored by the next, unrelated run — this is
     what keeps the flag from reaching forward past the run it was meant to
     stop.
+
+    ``not_after`` — this run's own trigger timestamp, when known (see
+    :func:`_clear_stale_stop_for_trigger`, which resolves it from the
+    triggering job's ``created_at``) — is what keeps this safe to call even
+    though ENQUEUEING a run and actually STARTING it are two different
+    moments, sometimes minutes apart (a large site's shard-planning Graph
+    calls, a busy job queue): a flag whose OWN timestamp is AT OR AFTER
+    ``not_after`` was written once this run's own trigger was already in
+    motion — e.g. an admin pressing Stop while a large site was still being
+    planned — and must still reach the run it was aimed at, never be wiped
+    by that same run's own start-up. A tie (both truncated to the same
+    second) is treated as "at or after", not "stale" — the safer of the two
+    guesses when precision alone can't tell them apart, since a spurious
+    stop is trivially re-triggered but a silently-lost stop looks like
+    nothing happened. Such a flag is left in place, uncleared, for the
+    run's own cooperative-stop checks to honor. ``None`` (no anchor
+    available — a payload built outside the worker) falls back to the
+    unconditional clear this function always did.
     """
     from src.repositories import source_connections_repo
 
     repo = source_connections_repo()
     row = repo.get(connection_id) or {}
     extraction = dict((row.get("config") or {}).get("extraction") or {})
+    stamp = extraction.get(STOP_REQUESTED_AT_KEY)
+    if stamp and not_after is not None and _parse_stop_timestamp(stamp) >= _parse_stop_timestamp(not_after):
+        return
     if extraction.pop(STOP_REQUESTED_AT_KEY, None) is not None:
         repo.config_patch(connection_id, {"extraction": extraction})
+
+
+def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> None:
+    """The single call site for :func:`_clear_stale_stop`, made once per
+    TOP-LEVEL trigger (:func:`run_builtin_crawl`) — covering both the inline
+    crawl and the auto-parallel planner's sharded path alike, since both
+    reach this connection's stop flag through the SAME key.
+
+    Resolves ``not_after`` from the triggering job's own ``created_at`` —
+    ``job_id`` is only ever populated when this run was actually dispatched
+    through the worker (see ``app/worker/kinds.py::_payload_for_handler``);
+    a payload built outside it (a test, a manual replay) has no anchor and
+    falls back to :func:`_clear_stale_stop`'s unconditional clear. Best
+    effort throughout: neither the job lookup nor the clear itself may ever
+    block the run they are trying to let start cleanly.
+    """
+    not_after = None
+    if job_id:
+        try:
+            from src.repositories import jobs_repo
+
+            job_row = jobs_repo().get(job_id)
+            if job_row:
+                not_after = job_row.get("created_at")
+        except Exception as exc:  # noqa: BLE001 — never load-bearing
+            logger.debug(
+                "sharepoint crawl: could not resolve job %s's created_at for %s: %s", job_id, connection_id, exc
+            )
+    try:
+        _clear_stale_stop(connection_id, not_after=not_after)
+    except Exception as exc:  # noqa: BLE001 — never load-bearing
+        logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
 
 
 def _stop_requested(connection_id: str) -> Optional[str]:
@@ -6533,26 +6602,15 @@ async def _run_crawl_async(
     force_reprocess: bool = False,
     retry_failed: bool = False,
     retry_empty: bool = False,
-    clear_stale_stop: bool = True,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
-    # A stop requested for a PREVIOUS run (already finished, failed, or one
-    # that never actually started) must never reach forward and kill this
-    # one — clear it unconsumed, at the very start, before anything else.
-    # Best-effort: a repo hiccup here must not block the run it is trying to
-    # let start cleanly.
-    #
-    # ``clear_stale_stop=False`` (2026-09-03 auto-parallel-crawl design §4.3)
-    # is a SHARD CHILD's own call: the cooperative stop flag is connection-
-    # wide, and clearing it here would erase a stop an admin requested WHILE
-    # this connection's parent run was busy planning/enqueuing siblings —
-    # only the PARENT (planner) run owns this clear, once, per top-level
-    # trigger.
-    if clear_stale_stop:
-        try:
-            _clear_stale_stop(connection_id)
-        except Exception as exc:  # noqa: BLE001 — never load-bearing
-            logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
+    # The stale-stop clear used to happen HERE, but that only ever covered
+    # the inline path — a large site's auto-parallel planner (2026-09-03
+    # design §4.3) never calls this function at all, so its own trigger
+    # never cleared anything. It now happens exactly ONCE, in
+    # `run_builtin_crawl` (`_clear_stale_stop_for_trigger`), before the
+    # inline-vs-sharded decision is even made, so both paths are covered by
+    # the same call — never repeated here.
     stop_watcher = _StopWatcher(connection_id)
     scopes = _confirmed_scopes(connection)
     if only_scope_ids:
@@ -7133,6 +7191,13 @@ def run_builtin_crawl(payload: dict) -> dict:
 
     if payload.get("resync"):
         _apply_resync(str(connection_id), job_id=payload.get("job_id"))
+
+    # Exactly ONCE per top-level trigger (before the inline-vs-sharded
+    # decision, so both branches of `_plan_or_run_inline` are covered by the
+    # same call): clear a stop flag that predates THIS run's own dispatch —
+    # see `_clear_stale_stop_for_trigger` for how it tells "stale" apart
+    # from "requested while this run was still starting".
+    _clear_stale_stop_for_trigger(str(connection_id), payload.get("job_id"))
 
     try:
         return asyncio.run(_plan_or_run_inline(connection, payload))
@@ -7736,12 +7801,12 @@ async def _run_shard_crawl_async(
     shard's ``targets``, with its OWN per-delta-unit state rows (never the
     connection-level one) and its OWN ``extraction_runs`` row.
 
-    Never clears the connection-wide cooperative-stop flag (``clear_stale_
-    stop`` stays at its default in the sense that this function never even
-    calls :func:`_clear_stale_stop` — only the PARENT planner run does,
-    once, per top-level trigger) and never sweeps stale ``running`` rows
-    for the connection (:class:`_RunRecorder`'s ``sweep_stale=False`` — a
-    sibling shard's still-``running`` row is a peer, not an orphan).
+    Never clears the connection-wide cooperative-stop flag — this function
+    never calls :func:`_clear_stale_stop` — and never sweeps stale
+    ``running`` rows for the connection (:class:`_RunRecorder`'s
+    ``sweep_stale=False`` — a sibling shard's still-``running`` row is a
+    peer, not an orphan). Only ``run_builtin_crawl`` clears it, once, per
+    top-level trigger, before this shard (or any sibling) is even planned.
     """
     connection_id = str(connection["id"])
     scope_id = str(shard.get("scope_id") or "")
