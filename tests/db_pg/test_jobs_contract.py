@@ -297,6 +297,28 @@ def test_list_by_idempotency_prefix_treats_wildcard_characters_in_the_prefix_lit
     assert {j["idempotency_key"] for j in matches} == {"corpus-extraction-shard:conn_1:1"}
 
 
+def test_idx_jobs_idem_pattern_exists_for_locale_independent_prefix_scans(pg_engine_with_schema):
+    """2026-09-07 review finding: a plain B-tree index (``idx_jobs_idem``)
+    only gets Postgres's internal ``LIKE 'prefix%'``-to-range rewrite under
+    a "C" locale database — verified live against the test database, which
+    happens to be "C"/"C.UTF-8". A production instance created with a
+    locale-aware collation (e.g. ``en_US.UTF-8``) would silently fall back
+    to a sequential scan for the exact same query as job history grows.
+    ``idx_jobs_idem_pattern`` (migration 0112) is the standard Postgres fix:
+    a ``text_pattern_ops`` partial index, which pattern-matching operators
+    use regardless of the column's collation."""
+    import sqlalchemy as sa
+
+    with pg_engine_with_schema.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT indexdef FROM pg_indexes WHERE tablename = 'jobs' AND indexname = 'idx_jobs_idem_pattern'")
+        ).fetchone()
+
+    assert row is not None, "idx_jobs_idem_pattern is missing — did migration 0112 run?"
+    assert "text_pattern_ops" in row[0]
+    assert "idempotency_key" in row[0]
+
+
 def test_counts_by_kind_groups_queued_and_running_per_kind(repo):
     repo.enqueue("corpus-extraction", {})
     repo.enqueue("corpus-extraction", {})

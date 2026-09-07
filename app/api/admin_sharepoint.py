@@ -4364,10 +4364,32 @@ def _trigger_shard_rerun(
     synchronously within the request instead of through the worker), so
     this is the unconditional-clear form — same as any other trigger path
     with nothing to anchor a race window against.
-    """
-    from connectors.sharepoint.crawler import _clear_stale_stop_for_trigger, _enqueue_shard_plan, load_state
 
-    _clear_stale_stop_for_trigger(connection_id, None)
+    ``409 extraction_already_running`` when the connection still has
+    QUEUED/RUNNING ``corpus-extraction-shard`` jobs from a PREVIOUS
+    cancelled run (``_clear_stale_stop_for_trigger`` raises ``_Previous
+    RunStillDraining`` rather than let this rerun proceed): those old
+    children's idempotency keys would otherwise collide with THIS rerun's
+    own, silently aliasing its "new" jobs onto them and leaving the fresh
+    parent row this call is about to open with no children that can ever
+    complete it. The caller sees the SAME error shape :func:`trigger_
+    extraction`'s own liveness gate already returns above, and retries
+    once the fleet view shows nothing queued or running for this shard set.
+    """
+    from connectors.sharepoint.crawler import (
+        _clear_stale_stop_for_trigger,
+        _enqueue_shard_plan,
+        _PreviousRunStillDraining,
+        load_state,
+    )
+
+    try:
+        _clear_stale_stop_for_trigger(connection_id, None)
+    except _PreviousRunStillDraining as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "message": str(exc)},
+        ) from exc
 
     state = load_state(connection_id)
     persisted_shards = ((state.get("shard_plan") or {}).get("shards")) or []

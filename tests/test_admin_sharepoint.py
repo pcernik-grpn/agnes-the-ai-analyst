@@ -3307,6 +3307,9 @@ class TestExtractionTriggerShardRerun:
                 self.enqueued.append(row)
                 return row
 
+            def list_by_idempotency_prefix(self, prefix, *, statuses=None):
+                return []  # no live shard children from any prior run
+
         jobs = FakeJobsRepo()
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
 
@@ -3445,6 +3448,84 @@ class TestExtractionTriggerShardRerun:
 
         row = source_connections_repo().get(conn_id)
         assert "stop_requested_at" not in (row["config"].get("extraction") or {})
+
+    def test_a_shard_rerun_is_refused_with_409_while_a_previous_runs_shard_children_are_still_live(
+        self, seeded_app, monkeypatch
+    ):
+        """A cancel closes the top-level run row immediately without waiting
+        for its shard children to notice — so a rerun through this entry
+        point must refuse outright (409) while any of that connection's own
+        shard jobs are still queued/running, exactly like the ordinary
+        trigger path. Enqueuing a fresh parent anyway would collide on the
+        deterministic per-shard idempotency key and strand the new parent
+        forever."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+            def abandon_stale_running(self, connection_id):
+                return []
+
+            def start(self, *, connection_id, job_id=None, phase="crawl", **shard_kwargs):
+                raise AssertionError("must not start a new run while a previous run's shards are still live")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+
+        class FakeJobsRepo:
+            def __init__(self):
+                self.enqueued = []
+
+            def enqueue(self, kind, payload, *, priority=0, run_after=None, max_attempts=3, idempotency_key=None):
+                raise AssertionError("must not enqueue a new shard job while a previous run's shards are still live")
+
+            def list(self, *, status, kind, limit=200):
+                return []
+
+            def list_by_idempotency_prefix(self, prefix, *, statuses=None):
+                return [{"id": "job-old-shard-1", "kind": "corpus-extraction-shard", "status": "running"}]
+
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: FakeJobsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-rerun-still-draining")
+
+        from connectors.sharepoint.crawler import request_stop, save_state
+
+        request_stop(conn_id)  # the previous run's cancel
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "part 1/1",
+            "expected": 10,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}],
+        }
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {"parent_run_id": "er_old_parent", "shards_total": 1, "shards": [shard]},
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "extraction_already_running"
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert (row["config"].get("extraction") or {}).get("stop_requested_at")  # flag preserved, not cleared
 
 
 class TestRetryEmptyExtraction:

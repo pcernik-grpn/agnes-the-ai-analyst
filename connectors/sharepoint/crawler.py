@@ -608,15 +608,22 @@ def request_stop(connection_id: str) -> str:
     exactly the incident this mechanism exists for — would otherwise tie
     with second-level precision, indistinguishable from "requested before
     the trigger" no matter which side of that second it actually landed on.
+
+    Writes through :meth:`SourceConnectionsRepository.merge_extraction`
+    rather than a plain ``get()`` + ``config_patch()`` pair: a 2026-09-07
+    finding on an earlier version of this function found that a concurrent
+    dispatch-bookkeeping write (``app/api/admin_sharepoint.py::
+    _record_extraction_dispatch``, itself already using this same atomic
+    merge) could commit its own ``last_run_at``/``last_job_id`` between
+    this function's read and its write, and this function's own
+    already-computed ``extraction`` snapshot would then silently drop
+    them. Merging inside one transaction, re-reading fresh, means the two
+    writers can never clobber each other's key regardless of ordering.
     """
     from src.repositories import source_connections_repo
 
-    repo = source_connections_repo()
-    row = repo.get(connection_id) or {}
-    extraction = dict((row.get("config") or {}).get("extraction") or {})
     stamp = datetime.now(timezone.utc).isoformat()
-    extraction[STOP_REQUESTED_AT_KEY] = stamp
-    repo.config_patch(connection_id, {"extraction": extraction})
+    source_connections_repo().merge_extraction(connection_id, {STOP_REQUESTED_AT_KEY: stamp})
     return stamp
 
 
@@ -712,22 +719,46 @@ def _shard_children_still_live(connection_id: str) -> bool:
     return any(job.get("kind") == _SHARD_JOB_KIND for job in jobs)
 
 
+class _PreviousRunStillDraining(CrawlError):
+    """Raised by :func:`_clear_stale_stop_for_trigger` to refuse an ENTIRE
+    trigger — never merely skip the clear — while a previous sharded run's
+    cancelled children are still queued or running for this connection.
+
+    2026-09-07 finding on the first version of this guard: merely leaving
+    the stop flag in place while letting THIS trigger's own plan get
+    created anyway is not enough. A fresh shard plan's children share the
+    SAME deterministic idempotency-key namespace as the OLD parent's
+    still-live ones (``corpus-extraction-shard:{connection_id}:{index}``),
+    so ``jobs_repo().enqueue()``'s own dedup silently aliases each "new"
+    child onto the matching OLD one — the NEW parent row this trigger just
+    opened then never receives a single completion and stays ``running``
+    forever, blocking every trigger after it too (the SAME liveness check
+    would now see ITS OWN stranded children and refuse indefinitely).
+    Refusing before ANY parent row or shard plan is created is what avoids
+    that: the caller sees a clean failure (the job fails and can be
+    retried, or the HTTP caller gets a 409) instead of a silently stranded
+    run, and a retry once the old children have actually drained succeeds
+    normally.
+    """
+
+
 def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> None:
     """The single call site for :func:`_clear_stale_stop`, made once per
     TOP-LEVEL trigger (:func:`run_builtin_crawl`) — covering both the inline
     crawl and the auto-parallel planner's sharded path alike, since both
     reach this connection's stop flag through the SAME key.
 
-    Refuses to clear at all while :func:`_shard_children_still_live` says a
-    PREVIOUS sharded run's children are still draining: erasing their only
-    stop signal to let THIS trigger's own children run would silently
-    un-cancel that other work. This trigger's own children will then also
-    observe the (still-set, genuinely not-yet-stale) flag and stop
-    immediately too — the same no-op outcome the flag existed to produce
-    before this fix, but only in this one narrow overlap window, and only
-    until the old children finish; the next trigger, once they have,
-    clears cleanly. Never un-cancelling already-stopped work is worth that
-    one wasted retry.
+    Raises :class:`_PreviousRunStillDraining` — refusing the WHOLE trigger,
+    caught by ``run_builtin_crawl``'s worker-level caller (the job fails,
+    normal retry/backoff applies) and by ``_trigger_shard_rerun``'s HTTP
+    caller (translated to a 409) — whenever :func:`_shard_children_still_
+    live` cannot affirmatively confirm there are NO queued/running
+    ``corpus-extraction-shard`` jobs left for this connection: either it
+    found some (a previous run's cancelled children still draining), or
+    the check itself failed and liveness is simply unknown. Both cases
+    get the SAME refusal — see :class:`_PreviousRunStillDraining` for why
+    merely preserving the flag while letting this trigger proceed anyway
+    is not sufficient, and why "unknown" cannot be treated as "clear".
 
     Otherwise resolves ``not_after`` from the triggering job's own
     ``created_at`` — ``job_id`` is only ever populated when this run was
@@ -736,40 +767,27 @@ def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> 
     replay) has no anchor and falls back to :func:`_clear_stale_stop`'s
     unconditional clear.
 
-    "Unknown" always means PRESERVE, never "guess it's safe to clear" — a
-    2026-09-07 finding on the previous version of this function, which
-    collapsed a FAILED shard-liveness check or job lookup into the exact
-    same ``not_after=None`` path a genuinely job-id-less caller gets,
-    silently erasing a fresh stop the caller's own ``job_id`` proves an
-    anchor was expected for. Concretely: a repo hiccup checking for live
-    shard children, or a ``job_id`` that was GIVEN but fails to resolve
-    (the lookup raises, or the row is gone), now leaves the flag exactly
-    as it found it — the run this trigger is starting may stop on a flag
-    that turns out to have been stale, but that costs one no-op retry,
-    never a silently un-cancelled or silently ignored stop. Only a
+    A ``job_id`` that fails to resolve (the lookup raises, or the row is
+    gone) also PRESERVES the flag rather than guessing it is safe to clear
+    — a 2026-09-07 finding on an earlier version of this function, which
+    collapsed that case into the exact same ``not_after=None`` path a
+    genuinely job-id-less caller gets, silently erasing a fresh stop the
+    caller's own ``job_id`` proves an anchor was expected for. Only a
     caller that never had a ``job_id`` to begin with — nothing to fail to
     resolve — takes the unconditional-clear path.
     """
     try:
         still_live = _shard_children_still_live(connection_id)
-    except Exception as exc:  # noqa: BLE001
-        # Unknown whether children are still live — treat that exactly like
-        # "yes": leaving a possibly-already-stale flag in place costs one
-        # no-op retry; wrongly clearing it could un-cancel real work.
-        logger.warning(
-            "sharepoint crawl: could not check for live shard children for %s: %s — leaving any stop flag in "
-            "place rather than risking an un-cancel",
-            connection_id,
-            exc,
-        )
-        return
+    except Exception as exc:
+        raise _PreviousRunStillDraining(
+            f"could not verify connection {connection_id!r} has no live shard children from a previous "
+            f"cancelled run (jobs repo error: {exc}) — refusing this trigger rather than risk a stranded parent"
+        ) from exc
     if still_live:
-        logger.info(
-            "sharepoint crawl: connection %s still has live shard children from a cancelled run — "
-            "leaving the stop flag in place for them; retry once they finish",
-            connection_id,
+        raise _PreviousRunStillDraining(
+            f"connection {connection_id!r} still has live shard children from a cancelled run — refusing this "
+            "trigger until they finish; retry once none of this connection's shards are queued or running"
         )
-        return
 
     if job_id is None:
         try:
