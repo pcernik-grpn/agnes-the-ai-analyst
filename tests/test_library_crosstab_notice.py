@@ -63,6 +63,12 @@ const crosstab = {{
   querySelector: (sel) => (sel === '[data-crosstab-text]' ? crosstab._text : crosstab._jump),
 }};
 
+// LIB_FACETS as the page declares it: one `toggle` facet with a bar control.
+const LIB_FACETS = [
+  {{ key: 'stack', attr: 'data-stack', label: 'Agents use it', toggle: true, control: '#lib-stack-toggle' }},
+  {{ key: 'requirement', attr: 'data-requirement', label: 'Access' }},
+];
+
 const document = {{
   getElementById: (id) => {{
     if (id === 'lib-crosstab') return crosstab;

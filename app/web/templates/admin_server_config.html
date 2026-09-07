@@ -522,7 +522,14 @@
     <div class="section-actions">
       <button type="button" class="btn btn-primary" id="sso-save-btn">Save SSO config</button>
       <button type="button" class="btn btn-secondary" id="sso-test-btn">Test config</button>
-      <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test" target="_blank" rel="noopener">Test sign-in</a>
+      {# The wrapper exists to carry the reason. `pointer-events: none` is what
+         makes `aria-disabled` bite on an anchor, and it also takes the element
+         out of hit-testing entirely — so a `title` on the <a> itself can never
+         be shown, which would disable the control AND hide why. The span is not
+         disabled, so it still receives the hover and the tooltip lands. #}
+      <span id="sso-test-signin-wrap" style="display: inline-flex;">
+        <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test" target="_blank" rel="noopener">Test sign-in</a>
+      </span>
       <button type="button" class="btn btn-secondary" id="sso-clear-secret-btn">Clear secret</button>
       <button type="button" class="btn btn-secondary" id="sso-delete-btn">Delete config</button>
       <span id="sso-test-result" hidden style="margin-left: 8px; font-size: 13px;"></span>
@@ -2305,10 +2312,13 @@ async function ssoLoad() {
          with 501. Same reason as the healthy-path branch below: an anchor needs
          the attribute, not the property. */
       const ssoTestUnsupported = document.getElementById("sso-test-signin-link");
+      const ssoTestUnsupportedWrap = document.getElementById("sso-test-signin-wrap");
       if (ssoTestUnsupported) {
         ssoTestUnsupported.setAttribute("aria-disabled", "true");
         ssoTestUnsupported.setAttribute("tabindex", "-1");
-        ssoTestUnsupported.setAttribute("title", "SSO requires the Postgres app-state backend.");
+      }
+      if (ssoTestUnsupportedWrap) {
+        ssoTestUnsupportedWrap.setAttribute("title", "SSO requires the Postgres app-state backend.");
       }
       return;
     }
@@ -2339,15 +2349,22 @@ async function ssoLoad() {
        `ds.button` macro emits it, and style-custom.css now gives it
        `pointer-events: none`), and `tabindex` keeps the keyboard out of what
        the pointer can no longer reach. */
+    /* Deliberately keyed on `configured && has_client_secret`, NOT on
+       `enabled`: test mode is designed to work BEFORE you switch SSO on
+       ("works pre-enable and outside the allowlist", `providers/sso.py:522`) —
+       testing a config you have not enabled yet is the whole point of it. What
+       it genuinely cannot do is test a config that does not exist. */
     const ssoTest = document.getElementById("sso-test-signin-link");
+    const ssoTestWrap = document.getElementById("sso-test-signin-wrap");
     const ssoTestable = !!(s.configured && s.has_client_secret);
     ssoTest.setAttribute("aria-disabled", ssoTestable ? "false" : "true");
     if (ssoTestable) {
       ssoTest.removeAttribute("tabindex");
-      ssoTest.removeAttribute("title");
+      ssoTestWrap.removeAttribute("title");
     } else {
       ssoTest.setAttribute("tabindex", "-1");
-      ssoTest.setAttribute("title", "Save an SSO config with a client secret first.");
+      /* On the WRAPPER, never the anchor — see the comment beside the markup. */
+      ssoTestWrap.setAttribute("title", "Save an SSO config with a client secret first.");
     }
   } catch (e) {
     el.className = "";

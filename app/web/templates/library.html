@@ -4013,11 +4013,18 @@
     //: Two spellings of "a filter is on", and reading only the first one meant
     //: the notice stayed silent for the facet most likely to hide rows.
     //: Menu facets are checkboxes; a `toggle` facet declared with a `control`
-    //: (LIB_FACETS' `stack` → `#lib-stack-toggle`) rides the bar as a button
-    //: and carries its state in `aria-pressed`, never in the menu.
+    //: rides the BAR as a button and carries its state in `aria-pressed`,
+    //: never in the menu.
+    //:
+    //: Derived from LIB_FACETS rather than naming `#lib-stack-toggle` here.
+    //: Hard-coding it would put the list of bar controls in two places and
+    //: leave this blind again the next time one is added — which is precisely
+    //: the bug being fixed, one level down.
+    const barControlOn = LIB_FACETS.some(f =>
+      f.control && document.querySelector(f.control + '[aria-pressed="true"]'));
     const filtered = !!(
       document.querySelector('#lib-filter-menu input[data-facet]:checked')
-      || document.querySelector('#lib-stack-toggle[aria-pressed="true"]')
+      || barControlOn
     );
     const box = document.getElementById('lib-noresults');
     const thisTabEmpty = box && !box.hidden;

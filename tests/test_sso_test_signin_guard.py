@@ -109,3 +109,49 @@ class TestBothDisableBranchesReachTheAnchor:
         should be deleted rather than left asserting a shape that moved."""
         src = self._src()
         assert re.search(rf'<a[^>]*id="{LINK_ID}"', src), "no longer an anchor — revisit this file"
+
+class TestTheReasonStaysReachable:
+    """The trap this fix walked into once already.
+
+    `pointer-events: none` is what makes `aria-disabled` bite on an anchor, and
+    it also removes the element from hit-testing entirely — verified in
+    Chromium: `document.elementFromPoint` over the link does not return the
+    link, and Playwright refuses to hover it. So a `title` on the <a> itself
+    can NEVER be displayed, and the first cut of this fix put it there: the
+    control became inert and its explanation became invisible, on a ticket
+    whose whole theme is that every refusal carries its exit.
+
+    The wrapper is not disabled, so it still takes the hover.
+    """
+
+    def _src(self) -> str:
+        return TEMPLATE.read_text(encoding="utf-8")
+
+    def test_a_wrapper_exists_to_carry_the_reason(self):
+        src = self._src()
+        assert 'id="sso-test-signin-wrap"' in src
+        # And it really does wrap the link, rather than sitting beside it.
+        i = src.index('id="sso-test-signin-wrap"')
+        j = src.index(f'id="{LINK_ID}"')
+        k = src.index("</span>", i)
+        assert i < j < k, "the wrapper must enclose the anchor"
+
+    def test_the_title_is_never_set_on_the_anchor(self):
+        """An anchor that cannot be hovered cannot show a tooltip."""
+        src = self._src()
+        assert 'ssoTest.setAttribute("title"' not in src
+        assert 'ssoTestUnsupported.setAttribute("title"' not in src
+
+    def test_both_branches_set_it_on_the_wrapper(self):
+        src = self._src()
+        assert 'ssoTestWrap.setAttribute("title"' in src
+        assert 'ssoTestUnsupportedWrap.setAttribute("title"' in src
+
+    def test_the_gate_is_not_keyed_on_enabled(self):
+        """Test mode is designed to work BEFORE SSO is switched on
+        (`providers/sso.py:522` — "works pre-enable and outside the
+        allowlist"), so gating on `enabled` would remove the control's only
+        purpose: checking a config you have not turned on yet."""
+        src = self._src()
+        assert "s.configured && s.has_client_secret" in src
+        assert "s.enabled &&" not in src.split("ssoTestable")[0][-400:]
