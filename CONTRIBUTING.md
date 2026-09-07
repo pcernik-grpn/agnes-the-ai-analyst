@@ -12,7 +12,7 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
    customer-specific deployments, project IDs, internal hostnames, or
    cross-references to private repos in code, config, comments, docs, or commits.
 4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
-5. Add a CHANGELOG fragment (`changelog.d/<slug>.md`, see `changelog.d/README.md`) for any user-visible behavior change. Never write into `CHANGELOG.md` itself.
+5. Add a CHANGELOG fragment (`changelog.d/<slug>.md`, see `changelog.d/README.md`) for any user-visible behavior change. A feature/fix PR never edits `CHANGELOG.md` itself — only the daily release-cut PR does, when it folds the fragments in.
 
 ## Landing a PR — the train is the gate, not the review badge
 
