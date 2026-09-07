@@ -87,7 +87,7 @@ how to treat WARN findings, when to add a new check) is
 
 ### Test lanes — what to run locally, and what CI runs
 
-**The full suite is CI's job, not yours.** It is ~24 000 tests: 12 parallel jobs
+**The full suite is CI's job, not yours.** It is ~24 000 tests: 16 parallel jobs
 of ~15 minutes each in CI, and 10:28 locally. Running it before every push — then
 again after each review round — is where a two-line fix turns into a two-hour
 merge, and it buys nothing CI is not about to compute anyway. The pre-push gate
@@ -119,15 +119,17 @@ repository factory, `tests/conftest.py` or `app/main.py` — the merge magnets t
 selector refuses to guess about. Everything else: push, and read CI.
 
 **A PR that gets no CI is not reviewable, whatever it targets.** `ci.yml`'s
-`pull_request` trigger therefore carries no `branches:` filter — a PR into a
-stack base (`mf/semantic-layer-v0`, a `claude/*` branch, anything) runs the
-same suite as one into `main`. This is worth stating because the failure mode
-is silent: with a filter, GitHub fires no workflow at all and the PR shows a
-**green rollup that asserted nothing**, which reads exactly like a passing run.
-When you check a PR's status, confirm the check NAMES are present
-(`test-shard (1..8)`, `test-pg (1..4)`) — "no red" is not the same as "tested".
-Stack bases are also unprotected, so `gh pr merge --auto` on one merges
-immediately rather than waiting for anything.
+`pull_request` trigger runs only for PRs into `main` and `integration` — the
+filter was removed once (67c80b378) and deliberately re-added (ce4f16cb2) to
+keep the suite off PRs into a stack base such as `mf/semantic-layer-v0`. So a
+PR into a stack base or a `claude/*` branch gets **no workflow run at all**
+and shows a **green rollup that asserted nothing**, which reads exactly like a
+passing run. Stack work that needs CI targets `integration`, or lives on a
+`feature/**` branch (the `push` trigger covers those). When you check a PR's
+status, confirm the check NAMES are present (`test-shard (1..8)`,
+`test-pg (1..8)`) — "no red" is not the same as "tested". Stack bases are
+also unprotected, so `gh pr merge --auto` on one merges immediately rather
+than waiting for anything.
 
 ## Sync-map
 

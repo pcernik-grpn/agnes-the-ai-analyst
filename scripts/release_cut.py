@@ -379,7 +379,7 @@ def parse_fragment(name: str, text: str) -> dict[str, list[str]]:
             body.pop(0)
         while body and not body[-1].strip():
             body.pop()
-        if not _bullets_in([line + "\n" for line in body]):
+        if not any(line.startswith(("- ", "* ")) for line in body):
             raise FragmentFormatError(f"{where}: '### {group}' has no bullet. {_fragment_fix_hint(name)}")
     return groups
 

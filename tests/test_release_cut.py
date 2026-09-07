@@ -578,6 +578,7 @@ def test_parse_fragment_returns_groups_with_raw_body_lines():
         ("- a bullet with no heading\n", "text before the first"),
         ("### Security\n- x\n", "unknown group"),
         ("### Added\n\n", "has no bullet"),
+        ("### Added\n-not a bullet\n", "has no bullet"),
         ("## [Unreleased]\n### Added\n- x\n", "only '### <Group>'"),
         ("### Added\n- x\n### Added\n- y\n", "appears twice"),
         ("### Added\n<<<<<<< HEAD\n- x\n", "conflict marker"),

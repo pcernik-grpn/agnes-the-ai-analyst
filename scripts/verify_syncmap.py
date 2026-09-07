@@ -251,15 +251,37 @@ def _is_changelog_fragment(path: str) -> bool:
     return path.startswith(FRAGMENTS_DIR + "/") and path.endswith(".md") and path != f"{FRAGMENTS_DIR}/README.md"
 
 
-def drop_absent_fragments(changed_paths: list[str], root: Path) -> list[str]:
-    """``changed_paths`` minus fragment paths that no longer exist under ``root``.
+def fragment_bullets(text: str) -> list[str]:
+    """Normalised column-0 bullets of one ``changelog.d/`` fragment.
 
-    ``git diff --name-only`` lists deleted files too, and a deleted fragment is
-    not a record of anything — only a fragment present in the working tree
-    satisfies :func:`check_changelog`. Non-fragment paths pass through
-    untouched: a deleted user-visible file is still a user-visible change.
+    Same normalisation as :func:`unreleased_bullets`, so re-wrapping or
+    re-indenting an existing bullet is not a new one.
     """
-    return [p for p in changed_paths if not _is_changelog_fragment(p) or (root / p).is_file()]
+    bullets: list[str] = []
+    for raw in text.splitlines():
+        if not raw or raw[0] not in "-*":
+            continue
+        stripped = raw.strip()
+        body = stripped[1:].strip()
+        if not body or set(stripped) <= {"-", "*", " "}:
+            continue
+        bullets.append("- " + " ".join(body.split()))
+    return bullets
+
+
+def new_fragment_bullets(fragments_before: dict[str, str], fragments_after: dict[str, str]) -> bool:
+    """Did any fragment GAIN a bullet between base and head?
+
+    ``git diff --name-only`` lists added, modified and deleted files alike, so
+    the path alone proves nothing: a deleted fragment has no bullets after, a
+    typo-only edit changes a bullet's text (and counts, as it does for an
+    inline bullet), a re-wrap does not. An added file's bullets are all new.
+    """
+    for path, after in fragments_after.items():
+        before = set(fragment_bullets(fragments_before.get(path, "")))
+        if any(bullet not in before for bullet in fragment_bullets(after)):
+            return True
+    return False
 
 
 def check_changelog(
@@ -268,11 +290,15 @@ def check_changelog(
     head_changelog: str,
     changed_paths: list[str],
     version_bumped: bool,
+    fragments_before: dict[str, str] | None = None,
+    fragments_after: dict[str, str] | None = None,
 ) -> list[Finding]:
     """A user-visible change must add a ``changelog.d/<slug>.md`` fragment.
 
-    Callers pass ``changed_paths`` through :func:`drop_absent_fragments` first,
-    so a fragment listed here is one that exists in the tree, not a deletion.
+    ``fragments_before`` / ``fragments_after`` map each changed fragment path
+    to its text at the base and in the working tree (``""`` when absent on
+    that side); the check passes only when a fragment gained a bullet — see
+    :func:`new_fragment_bullets`. Touching a fragment's path is not enough.
 
     A new bullet written directly under ``## [Unreleased]`` still satisfies
     this local check (it is the pre-#2295 shape and this guard should not be
@@ -286,7 +312,7 @@ def check_changelog(
         return []
     if not any(_is_user_visible(p) for p in changed_paths):
         return []
-    if any(_is_changelog_fragment(p) for p in changed_paths):
+    if new_fragment_bullets(fragments_before or {}, fragments_after or {}):
         return []
 
     before = unreleased_bullets(base_changelog)
@@ -647,6 +673,12 @@ def collect_findings(base: str) -> list[Finding]:
 
     resource_types_file = REPO_ROOT / RESOURCE_TYPES_PATH
     changelog_file = REPO_ROOT / CHANGELOG_PATH
+    fragment_paths = [p for p in changed_paths if _is_changelog_fragment(p)]
+    fragments_before = {p: _git_or_empty("show", f"{base}:{p}") for p in fragment_paths}
+    fragments_after = {
+        p: (REPO_ROOT / p).read_text(encoding="utf-8", errors="ignore") if (REPO_ROOT / p).is_file() else ""
+        for p in fragment_paths
+    }
 
     findings: list[Finding] = []
     if resource_types_file.is_file():
@@ -655,7 +687,9 @@ def collect_findings(base: str) -> list[Finding]:
         findings += check_changelog(
             base_changelog=_git_or_empty("show", f"{base}:{CHANGELOG_PATH}"),
             head_changelog=changelog_file.read_text(encoding="utf-8"),
-            changed_paths=drop_absent_fragments(changed_paths, REPO_ROOT),
+            changed_paths=changed_paths,
+            fragments_before=fragments_before,
+            fragments_after=fragments_after,
             version_bumped=_version_bumped(base),
         )
     findings += check_scope_flags(added, sources)

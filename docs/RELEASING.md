@@ -41,9 +41,9 @@ logic.
 
 ## Release-cut is a dedicated cut PR — non-negotiable
 
-**Feature PRs never bump `pyproject.toml`, rename `## [Unreleased]`, or touch
-`server.json`'s version field. They only ever add a bullet under
-`## [Unreleased]`** (see the Changelog discipline section above — unchanged).
+**Feature PRs never bump `pyproject.toml`, rename `## [Unreleased]`, edit
+`CHANGELOG.md`, or touch `server.json`'s version field. They only ever add a
+`changelog.d/` fragment** (see the Changelog discipline section above).
 The version bump + CHANGELOG rename is cut once a day by
 `.github/workflows/daily-cut.yml`, which opens a PR labeled `release-cut` for
 a human to review and merge. It never merges or tags anything itself.
@@ -61,12 +61,12 @@ a day.
 ### The three version segments
 
 - **Minor (`X.Y+1.0`) — the daily batch.** `daily-cut.yml`'s default and its
-  scheduled (cron) run always use this. Every bullet accumulated under
-  `[Unreleased]` since the last cut ships together.
+  scheduled (cron) run always use this. Every fragment accumulated under
+  `changelog.d/` since the last cut ships together.
 - **Patch (`X.Y.Z+1`) — emergency hotfix only.** Dispatch `daily-cut.yml`
   manually with `bump: patch` (`gh workflow run daily-cut.yml -f bump=patch`)
-  to ship immediately, outside the daily cadence. It still ships the
-  *entire* current `[Unreleased]` content — if unrelated in-flight work has
+  to ship immediately, outside the daily cadence. It still ships *every*
+  pending fragment — if unrelated in-flight work has
   already merged, prefer waiting for the next scheduled minor cut instead.
 - **Major (`X+1.0.0`) — milestone, human decision.** Dispatch with `bump:
   major` only when the team has actually decided this cut is a milestone
@@ -131,6 +131,7 @@ from an environment that can push branches but can't dispatch a workflow:
 python3 scripts/release_cut.py --bump patch   # or --bump minor / --bump major
 git checkout -b release-cut/v<version>
 git add CHANGELOG.md pyproject.toml server.json
+git add -A changelog.d   # the cut deleted the shipped fragments — stage the deletions
 git commit -m "release: <version>"
 git push -u origin HEAD
 gh pr create --label release-cut --title "release: <version>" --body "..."
@@ -138,8 +139,8 @@ gh pr create --label release-cut --title "release: <version>" --body "..."
 
 `--dry-run --json` prints the computed plan (next version, the bullets it
 would ship) without writing anything — use it to sanity-check before
-committing. An empty `[Unreleased]` is a no-op (exit 0, nothing written), so
-running it speculatively is always safe.
+committing. Nothing pending (no fragment, empty `[Unreleased]`) is a no-op
+(exit 0, nothing written), so running it speculatively is always safe.
 
 ## Release workflow — concrete recipe
 

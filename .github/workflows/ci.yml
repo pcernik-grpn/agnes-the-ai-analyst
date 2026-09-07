@@ -143,7 +143,7 @@ jobs:
           TESTING: "1"
 
   # Single required status check. Branch protection requires `test`, but the
-  # matrices above publish `test-shard (1..8)` and `test-pg (1..4)` — this job
+  # matrices above publish `test-shard (1..8)` and `test-pg (1..8)` — this job
   # aggregates them into one `test` result so no branch-protection change is needed.
   test:
     needs: [test-shard, test-pg]
@@ -160,7 +160,7 @@ jobs:
             echo "::error::test-pg result was '${{ needs.test-pg.result }}' — Postgres contract tests failed"
             exit 1
           fi
-          echo "All 8 test shards and both Postgres contract shards passed."
+          echo "All 8 test shards and all 8 Postgres contract shards passed."
 
   lint:
     # Advisory only (continue-on-error) — ruff + mypy surface issues but

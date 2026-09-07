@@ -47,8 +47,12 @@ Triggered by the user / main agent saying "review the release-cut PR" or
      an emergency hotfix; `major` only on explicit user confirmation this is
      a milestone.
    - Run `python3 scripts/release_cut.py --bump <kind>` for real (writes
-     `CHANGELOG.md`, `pyproject.toml`, `server.json`).
-   - `git checkout -b release-cut/v<version>`, commit as `release: <version>`,
+     `CHANGELOG.md`, `pyproject.toml`, `server.json` and deletes the shipped
+     `changelog.d/` fragments).
+   - `git checkout -b release-cut/v<version>`, `git add -A changelog.d
+     CHANGELOG.md pyproject.toml server.json` (the fragment deletions must be
+     staged too, exactly as `daily-cut.yml` does — otherwise the next cut
+     republishes the same notes), commit as `release: <version>`,
      push, and `gh pr create --label release-cut --title "release: <version>"`
      with a body listing the shipped bullets (from the dry-run output).
    - **Report:** print the version, the branch/PR, and tell the user: "cut PR

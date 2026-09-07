@@ -75,7 +75,7 @@ guard into decoration. Confirm on a clean tree (`git stash`) and note it.
 ## Gate 3 — the tests for the behavior you changed
 
 Two lanes, in order. **Neither of them is the full suite** — CI runs that on the
-push, across 12 parallel jobs, and running it locally as well is what turns a
+push, across 16 parallel jobs, and running it locally as well is what turns a
 two-line fix into a two-hour merge.
 
 ```bash
