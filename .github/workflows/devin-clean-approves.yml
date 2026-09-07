@@ -71,7 +71,7 @@ jobs:
 
           dismiss() {
             gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$ours_id/dismissals" \
-              -f message="$1" -f event="DISMISS" >/dev/null
+              -f message="$1" >/dev/null
             echo "dismissed review $ours_id ($1)"
           }
 
