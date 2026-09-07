@@ -281,7 +281,10 @@ def test_changelog_fragment_bullet_needs_the_marker_and_a_space():
     local pass here for a fragment CI's format guard rejects would mislead."""
     prose = {"changelog.d/prose.md": "### Added\n-not a bullet\n*nor this\n"}
     assert len(_check_with_fragments(["changelog.d/prose.md"], prose)) == 1
-    assert _check_with_fragments(["changelog.d/ok.md"], {"changelog.d/ok.md": "### Added\n* star bullets are fine\n"}) == []
+    assert (
+        _check_with_fragments(["changelog.d/ok.md"], {"changelog.d/ok.md": "### Added\n* star bullets are fine\n"})
+        == []
+    )
 
 
 def test_changelog_deleted_fragment_does_not_count():
