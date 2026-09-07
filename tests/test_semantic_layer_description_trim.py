@@ -69,10 +69,12 @@ class Desc {{
 
 class Item {{
   constructor(spec) {{
+    this._rich = !!spec.rich;
     this._row = spec.row === null ? null : new Desc(spec.row, spec.clipped);
     this._panel = spec.panel === null ? null : new Desc(spec.panel, false);
     if (this._panel) this._panel.hidden = null;   // untouched sentinel
   }}
+  hasAttribute(name) {{ return name === 'data-desc-rich' && this._rich; }}
   querySelector(sel) {{
     if (sel === '.sl-row__desc') return this._row;
     if (sel === '.sl-detail__desc') return this._panel;
@@ -151,3 +153,46 @@ def test_the_selector_matches_the_markup_the_template_renders():
     # And the markup really does carry it, so the pairing is checked from both
     # ends rather than agreeing with itself.
     assert '<div class="sl-item" data-tab="all_metrics"' in src
+
+def test_a_panel_with_markup_survives_an_identical_text_match():
+    """Devin's finding on #2334, and the trap `_definition_is_rich`'s docstring
+    already named: a link's visible text is the same in the row and the panel
+    ("See the policy…"), so hiding on a text match takes the link with it.
+
+    The server flags the row instead of the client diffing harder.
+    """
+    out = _run([{
+        "row": "See the refund policy.",
+        "panel": "See the refund policy.",
+        "clipped": False,
+        "rich": True,
+    }])
+    assert out[0]["hidden"] is None, "a rich panel must not be hidden"
+
+
+def test_the_flag_only_protects_rows_that_carry_it():
+    """The control: without it, this same shape is still de-duplicated, so the
+    guard above is not just switching the feature off."""
+    out = _run([{
+        "row": "See the refund policy.",
+        "panel": "See the refund policy.",
+        "clipped": False,
+        "rich": False,
+    }])
+    assert out[0]["hidden"] is True
+
+
+class TestTheServerComputesTheFlag:
+    """The client half is inert without the server half."""
+
+    def test_metric_rows_carry_description_rich(self):
+        src = Path("app/web/router.py").read_text(encoding="utf-8")
+        assert '"description_rich": _definition_is_rich(' in src
+
+    def test_the_template_emits_it_as_an_attribute(self):
+        src = TEMPLATE.read_text(encoding="utf-8")
+        assert 'data-desc-rich="1"' in src
+
+    def test_the_function_reads_that_attribute(self):
+        fn = _extract_function("trimRedundantDescriptions")
+        assert "data-desc-rich" in fn

@@ -527,8 +527,16 @@
          out of hit-testing entirely — so a `title` on the <a> itself can never
          be shown, which would disable the control AND hide why. The span is not
          disabled, so it still receives the hover and the tooltip lands. #}
-      <span id="sso-test-signin-wrap" style="display: inline-flex;">
-        <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test" target="_blank" rel="noopener">Test sign-in</a>
+      {# Rendered DISABLED and opened only once the config proves testable —
+         fail closed, the same rule the repo applies to a new parameter. Three
+         states were open before: the window between first paint and `ssoLoad`
+         resolving, a `/config` request that throws (the catch renders the error
+         badge and never returns to this control), and a 501 arriving late. All
+         three now leave it shut rather than live. #}
+      <span id="sso-test-signin-wrap" style="display: inline-flex;"
+            title="Checking the SSO configuration…">
+        <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test"
+           target="_blank" rel="noopener" aria-disabled="true" tabindex="-1">Test sign-in</a>
       </span>
       <button type="button" class="btn btn-secondary" id="sso-clear-secret-btn">Clear secret</button>
       <button type="button" class="btn btn-secondary" id="sso-delete-btn">Delete config</button>
@@ -2369,6 +2377,13 @@ async function ssoLoad() {
   } catch (e) {
     el.className = "";
     el.innerHTML = '<span class="badge badge--danger">Failed to load SSO config: ' + escHtml(e.message) + "</span>";
+    /* The control stays shut — it is rendered that way — but say WHY rather
+       than leave the reader with the "checking…" placeholder over a request
+       that already failed. */
+    const ssoTestUnknown = document.getElementById("sso-test-signin-wrap");
+    if (ssoTestUnknown) {
+      ssoTestUnknown.setAttribute("title", "Could not read the SSO configuration, so there is nothing to test.");
+    }
   }
 }
 

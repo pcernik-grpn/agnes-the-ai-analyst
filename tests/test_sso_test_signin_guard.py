@@ -155,3 +155,43 @@ class TestTheReasonStaysReachable:
         src = self._src()
         assert "s.configured && s.has_client_secret" in src
         assert "s.enabled &&" not in src.split("ssoTestable")[0][-400:]
+
+class TestItFailsClosed:
+    """Devin's finding on #2334. Three states were open before:
+
+    the window between first paint and `ssoLoad` resolving (it is called
+    un-awaited), a `/config` request that throws (the catch renders the error
+    badge and never returns to this control), and a 501 arriving late. The
+    control starts a REAL sign-in, so all three must leave it shut.
+    """
+
+    def _src(self) -> str:
+        return TEMPLATE.read_text(encoding="utf-8")
+
+    def test_the_markup_renders_it_disabled(self):
+        src = self._src()
+        i = src.index(f'id="{LINK_ID}"')
+        tag = src[i : src.index(">", i)]
+        assert 'aria-disabled="true"' in tag, tag
+        assert 'tabindex="-1"' in tag, tag
+
+    def test_the_wrapper_explains_the_initial_state(self):
+        src = self._src()
+        i = src.index('id="sso-test-signin-wrap"')
+        assert "title=" in src[i : i + 200]
+
+    def test_a_failed_config_read_says_so_rather_than_leaving_the_placeholder(self):
+        """It stays shut either way — it is rendered that way — but the reader
+        should not be left with "checking…" over a request that already
+        failed."""
+        src = self._src()
+        j = src.index("Failed to load SSO config")
+        assert "sso-test-signin-wrap" in src[j : j + 600]
+
+    def test_only_a_proven_config_opens_it(self):
+        """The one path that may enable it is the resolved, configured one."""
+        src = self._src()
+        assert 'ssoTest.removeAttribute("tabindex")' in src
+        # And that removal sits under the testable branch, not at the top.
+        k = src.index("const ssoTestable")
+        assert src.index('ssoTest.removeAttribute("tabindex")') > k

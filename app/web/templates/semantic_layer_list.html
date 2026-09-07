@@ -714,7 +714,8 @@
              data-ft="{{ ((m.name or '') ~ ' ' ~ (m.display_name or '') ~ ' ' ~ (m.description_text or '') ~ ' ' ~ ((m.synonyms or []) | join(' '))) | lower }}"
              data-model="{{ m.facet_model }}"
              data-domain="{{ m.facet_domain }}"
-             data-source="{{ m.facet_source }}">
+             data-source="{{ m.facet_source }}"
+             {% if m.description_rich %}data-desc-rich="1"{% endif %}>
           <button type="button" class="sl-row" aria-expanded="false">
             <span class="sl-row__dot"></span>
             <div class="sl-row__main">
@@ -954,6 +955,14 @@
             const row = item.querySelector('.sl-row__desc');
             const panel = item.querySelector('.sl-detail__desc');
             if (!row || !panel) return;
+            /* A panel carrying markup the row cannot show is never redundant,
+               however well the two texts match. The comparison below is on
+               TEXT, and a link reads the same either way — "See the policy…"
+               — so hiding on a text match would take the link with it. The
+               server flags this per row (`description_rich`, from the same
+               `_definition_is_rich` the glossary has used since its own
+               docstring warned about this exact diff). */
+            if (item.hasAttribute('data-desc-rich')) return;
             const norm = s => (s || '').replace(/\s+/g, ' ').trim();
             if (norm(panel.textContent) !== norm(row.textContent)) return;
             const clipped = row.scrollHeight > row.clientHeight + 1;
