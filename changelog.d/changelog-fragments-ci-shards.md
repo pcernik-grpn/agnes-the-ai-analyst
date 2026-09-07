@@ -1,0 +1,7 @@
+### Changed
+- **CHANGELOG entries are now one fragment file per PR under `changelog.d/`, folded into `CHANGELOG.md` by the daily release cut.** Every PR used to append to the single `## [Unreleased]` section, which conflicted on every `main` sync (34 of 37 merge conflicts across two long autonomous runs, #2295). A feature PR now adds `changelog.d/<slug>.md` (`### <Group>` headings + bullets, see `changelog.d/README.md`) and never edits `CHANGELOG.md`; `scripts/release_cut.py` merges the fragments into `[Unreleased]` right before the rename and deletes them, so the released file keeps its shape. `tests/test_changelog_integrity.py` validates every fragment on each push, rehearses the fold, and rejects inline bullets under `[Unreleased]`; `scripts/verify_syncmap.py` accepts a fragment as the record of a user-visible change.
+
+### Internal
+- CI also runs on the `merge_group` event (inert until a merge queue is enabled on `main`), so the hand-driven merge train can become a GitHub merge queue with a ruleset change alone (#2295).
+- CI: the `test-pg` job runs 8 shards instead of 4. At 4 it was the critical path of every run (22-27 min per shard against 16-20 min for the main shards); at 8 the main shards become the shorter long pole (#2295).
+- `ruff` is part of the `dev` extras (pinned exact), so a `uv pip install ".[dev,server]"` venv has the binary the post-edit quality hook expects; a fresh venv previously failed that hook on every edit (#2295).

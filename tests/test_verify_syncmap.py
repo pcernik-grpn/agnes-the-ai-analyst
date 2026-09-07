@@ -21,6 +21,7 @@ import pytest
 from scripts.verify_syncmap import (
     BLOCKING,
     WARN,
+    _is_changelog_fragment,
     check_changelog,
     check_entity_scoped_authz,
     check_remote_attach,
@@ -248,6 +249,75 @@ def test_changelog_passes_when_a_new_bullet_was_added():
         version_bumped=False,
     )
     assert findings == []
+
+
+_FRAG = "### Added\n- a new user-visible thing\n"
+
+
+def _check_with_fragments(changed: list[str], added: dict[str, str]):
+    """``changed`` = every fragment path git lists (added, modified or deleted);
+    ``added`` = only the NEW files, path -> working-tree text."""
+    return check_changelog(
+        base_changelog=_CL_EMPTY,
+        head_changelog=_CL_EMPTY,
+        changed_paths=["app/api/foo.py", *changed],
+        version_bumped=False,
+        added_fragments=added,
+    )
+
+
+def test_changelog_passes_when_a_fragment_was_added():
+    """The post-#2295 shape: CHANGELOG.md untouched, one NEW changelog.d/ file."""
+    assert _check_with_fragments(["changelog.d/foo-endpoint.md"], {"changelog.d/foo-endpoint.md": _FRAG}) == []
+
+
+def test_changelog_added_fragment_without_a_bullet_does_not_count():
+    findings = _check_with_fragments(["changelog.d/empty.md"], {"changelog.d/empty.md": "### Added\n"})
+    assert len(findings) == 1
+
+
+def test_changelog_fragment_bullet_needs_the_marker_and_a_space():
+    """Same contract as release_cut.parse_fragment: `-not a bullet` is prose. A
+    local pass here for a fragment CI's format guard rejects would mislead."""
+    prose = {"changelog.d/prose.md": "### Added\n-not a bullet\n*nor this\n"}
+    assert len(_check_with_fragments(["changelog.d/prose.md"], prose)) == 1
+    assert (
+        _check_with_fragments(["changelog.d/ok.md"], {"changelog.d/ok.md": "### Added\n* star bullets are fine\n"})
+        == []
+    )
+
+
+def test_changelog_deleted_fragment_does_not_count():
+    """`git diff --name-only` lists deletions too; a deleted fragment is no entry."""
+    findings = _check_with_fragments(["changelog.d/old.md"], {})
+    assert len(findings) == 1
+    assert "changelog.d/<slug>.md" in findings[0].message
+
+
+def test_changelog_modified_fragment_does_not_count_even_when_it_grows():
+    """Appending to a fragment that already exists at the base is the shared-file
+    edit that recreated the CHANGELOG conflict on every merge — one file per
+    PR is enforced, not just documented (changelog.d/README.md)."""
+    findings = _check_with_fragments(["changelog.d/theirs.md"], {})
+    assert len(findings) == 1
+    assert "appending to another PR's fragment does not count" in findings[0].message
+
+
+def test_changelog_fragment_path_alone_is_not_enough():
+    """The path list is not evidence — only the fragment texts are."""
+    findings = check_changelog(
+        base_changelog=_CL_EMPTY,
+        head_changelog=_CL_EMPTY,
+        changed_paths=["app/api/foo.py", "changelog.d/foo-endpoint.md"],
+        version_bumped=False,
+    )
+    assert len(findings) == 1
+
+
+def test_changelog_readme_in_changelog_d_is_not_a_fragment():
+    assert _is_changelog_fragment("changelog.d/foo.md") is True
+    assert _is_changelog_fragment("changelog.d/README.md") is False
+    assert _is_changelog_fragment("docs/changelog.d/foo.md") is False
 
 
 def test_changelog_ignores_test_docs_and_tooling_only_changes():

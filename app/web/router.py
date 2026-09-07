@@ -5226,6 +5226,15 @@ async def semantic_layer_list(
                 **m,
                 "description_html": render_safe(m.get("description"), html_source=stores_html(m)),
                 "description_text": render_plain(m.get("description"), html_source=stores_html(m)),
+                #: Whether the panel's copy carries markup the row's plain
+                #: preview cannot show. `trimRedundantDescriptions` hides a
+                #: panel that only repeats the row, and it compares TEXT — so
+                #: without this a description whose markdown is a link would
+                #: match ("See the policy…" either way) and the link would be
+                #: hidden with it. `_definition_is_rich`'s own docstring names
+                #: that trap; the glossary side has carried the flag since, and
+                #: this is the metric half it was missing.
+                "description_rich": _definition_is_rich(render_safe(m.get("description"), html_source=stores_html(m))),
                 "sql_variants": _variants(m.get("sql_variants")),
                 "model_href": document_hrefs.get(m.get("id")),
             }
@@ -11326,14 +11335,26 @@ def _shares_owned_by(owner_id: str) -> dict:
             # collection link in a person's Shares section 404'd. A
             # collection without a slug gets no link rather than a broken
             # one (the template renders the name plain when href is None).
-            items.append({"kind": "collection", "id": c["id"], "name": c.get("name") or c["id"],
-                          "href": f"/library/{c['slug']}" if c.get("slug") else None})
+            items.append(
+                {
+                    "kind": "collection",
+                    "id": c["id"],
+                    "name": c.get("name") or c["id"],
+                    "href": f"/library/{c['slug']}" if c.get("slug") else None,
+                }
+            )
 
     by_kind = {k: grants.list_all(resource_type=k) for k in ("agent", "collection")}
     # Resolve who granted, once: ids to names (the Library records the sharer's
     # id), emails pass through.
-    ids = sorted({str(g.get("assigned_by")) for rows in by_kind.values() for g in rows
-                  if g.get("assigned_by") and "@" not in str(g.get("assigned_by"))})
+    ids = sorted(
+        {
+            str(g.get("assigned_by"))
+            for rows in by_kind.values()
+            for g in rows
+            if g.get("assigned_by") and "@" not in str(g.get("assigned_by"))
+        }
+    )
     who: dict[str, str] = {}
     if ids:
         try:
@@ -11348,21 +11369,27 @@ def _shares_owned_by(owner_id: str) -> dict:
             if g.get("resource_id") != it["id"]:
                 continue
             by = str(g.get("assigned_by") or "")
-            it["grants"].append({
-                "group_id": g.get("group_id"),
-                "group": groups.get(g.get("group_id"), g.get("group_id")),
-                "by_owner": by == owner_id,
-                "by": who.get(by, by.split("@")[0] if "@" in by else by),
-                "requirement": g.get("requirement") or "available",
-            })
+            it["grants"].append(
+                {
+                    "group_id": g.get("group_id"),
+                    "group": groups.get(g.get("group_id"), g.get("group_id")),
+                    "by_owner": by == owner_id,
+                    "by": who.get(by, by.split("@")[0] if "@" in by else by),
+                    "requirement": g.get("requirement") or "available",
+                }
+            )
         it["grants"].sort(key=lambda x: str(x["group"]).lower())
     items.sort(key=lambda x: (x["kind"], str(x["name"]).lower()))
     # Keyed `owned`, not `items`: in a Jinja template `shares.items` resolves
     # to the DICT's .items method before any key of that name, and `|length`
     # on a bound method is a TypeError at render time — which Jinja's compile
     # step cannot see. Found by rendering the page, not by compiling it.
-    return {"owned": items, "shared": sum(1 for it in items if it["grants"]),
-            "kinds_covered": ["agents", "collections"], "kinds_missing": ["data apps", "skills"]}
+    return {
+        "owned": items,
+        "shared": sum(1 for it in items if it["grants"]),
+        "kinds_covered": ["agents", "collections"],
+        "kinds_missing": ["data apps", "skills"],
+    }
 
 
 @router.get("/admin/usage")

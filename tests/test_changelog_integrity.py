@@ -70,14 +70,20 @@ from pathlib import Path
 import pytest
 
 from scripts.release_cut import (
+    FRAGMENTS_DIR,
     DuplicateHeadingError,
+    FragmentFormatError,
     _unreleased_bounds,
     assert_no_duplicate_headings,
     cut_changelog,
     find_version_headings,
+    merge_fragments,
+    parse_fragment,
     parse_version,
+    read_fragments,
     read_released_checksum,
     released_region_sha256,
+    unreleased_bullets,
     write_released_checksum,
 )
 
@@ -741,3 +747,75 @@ def test_a_bullet_that_merely_mentions_markers_is_not_flagged() -> None:
         1,
     )
     assert_no_conflict_markers(prose)
+
+
+# --- eighth guard: changelog.d/ fragments fold, and [Unreleased] itself stays empty (#2295) ---
+#
+# Pending entries no longer live under ``## [Unreleased]``: every PR ships one
+# fragment file under ``changelog.d/`` and the daily cut folds them in (see
+# ``changelog.d/README.md``). That removes the one merge conflict that fired on
+# every ``main`` sync — and moves the failure surface to the fragments, which
+# these guards therefore check on every push, on the PR that adds one, not at
+# 05:00 UTC in the cut with nobody watching.
+
+FRAGMENTS_PATH = Path(__file__).resolve().parents[1] / FRAGMENTS_DIR
+
+
+def _live_fragments() -> dict[str, str]:
+    return read_fragments(FRAGMENTS_PATH)
+
+
+def test_every_fragment_is_well_formed() -> None:
+    """Each ``changelog.d/*.md`` (README excepted) parses: known ``### <Group>``
+    headings, at least one bullet under each, no conflict markers. The error
+    names the file, the line and the fix."""
+    for name, text in _live_fragments().items():
+        try:
+            parse_fragment(name, text)
+        except FragmentFormatError as exc:
+            pytest.fail(str(exc))
+
+
+def test_nothing_but_markdown_fragments_and_the_readme_live_in_changelog_d() -> None:
+    """A file the cut would silently skip is a bullet that never ships."""
+    strays = sorted(p.name for p in FRAGMENTS_PATH.iterdir() if not p.is_file() or p.suffix != ".md")
+    assert not strays, (
+        f"changelog.d/ holds non-fragment entries {strays} — a fragment is a *.md file "
+        f"(see changelog.d/README.md); move or delete anything else."
+    )
+
+
+def test_fragments_fold_into_the_live_changelog_cleanly(changelog_text: str) -> None:
+    """Rehearse the cut: fold every live fragment into ``[Unreleased]`` and run
+    the shape guards on the result. Two PRs shipping the same bullet in two
+    fragments show up here, on the PR that adds the second one."""
+    merged = merge_fragments(changelog_text, _live_fragments())
+    assert_single_unreleased(merged)
+    assert_no_duplicate_headings(merged)
+    assert_versions_strictly_descending(merged)
+    assert_no_duplicate_unreleased_subsections(merged)
+    assert_no_duplicate_unreleased_bullets(merged)
+    assert_no_conflict_markers(merged)
+
+
+def test_unreleased_carries_no_inline_bullets(changelog_text: str) -> None:
+    """``## [Unreleased]`` is assembled by the cut, never written by a PR.
+
+    An inline bullet is the pre-#2295 habit coming back — and with it the
+    conflict on every merge, since every PR would again edit the same lines.
+    The fix is mechanical and named here so an agent can apply it unaided."""
+    inline = unreleased_bullets(changelog_text)
+    assert not inline, (
+        f"CHANGELOG.md has {len(inline)} bullet(s) written directly under '## [Unreleased]' "
+        f"(first: {inline[0][:80]}…). Pending entries live in changelog.d/<slug>.md — move the "
+        f"bullet(s) into a fragment under their '### <Group>' heading and leave the [Unreleased] "
+        f"groups empty (see changelog.d/README.md)."
+    )
+
+
+def test_a_fragment_that_duplicates_an_inline_bullet_is_caught() -> None:
+    """The rehearsal above is what notices a fragment re-adding a bullet
+    ``[Unreleased]`` (or another fragment) already carries."""
+    merged = merge_fragments(_GOOD, {"dup.md": "### Fixed\n- a pending change\n"})
+    with pytest.raises(AssertionError, match="more than once"):
+        assert_no_duplicate_unreleased_bullets(merged)
