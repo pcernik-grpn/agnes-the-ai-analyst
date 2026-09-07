@@ -85,6 +85,9 @@ jobs:
           git checkout -b "$BRANCH"
           git add CHANGELOG.md pyproject.toml
           if [ -f server.json ]; then git add server.json; fi
+          # The cut folded every changelog.d/ fragment into CHANGELOG.md and
+          # deleted the files — stage those deletions too.
+          if [ -d changelog.d ]; then git add -A changelog.d; fi
           git commit -m "release: ${VERSION}"
           # Force push: the branch name is deterministic (release-cut/vX.Y.Z)
           # and the branch is workflow-owned — nobody else ever commits to it.
@@ -113,7 +116,7 @@ jobs:
           BULLET_COUNT=$(jq -r '.bullets | length' /tmp/plan.json)
 
           {
-            echo "Automated daily batch cut. Ships every bullet merged into \`[Unreleased]\` since the last cut (**${BULLET_COUNT}** in this batch):"
+            echo "Automated daily batch cut. Ships every \`changelog.d/\` fragment and \`[Unreleased]\` bullet merged since the last cut (**${BULLET_COUNT}** bullet(s) in this batch):"
             echo
             jq -r '.bullets[]' /tmp/plan.json | awk -v LIMIT=55000 '
               function flush() {

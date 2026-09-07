@@ -12,7 +12,31 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
    customer-specific deployments, project IDs, internal hostnames, or
    cross-references to private repos in code, config, comments, docs, or commits.
 4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
-5. Add a `## [Unreleased]` CHANGELOG bullet for any user-visible behavior change.
+5. Add a CHANGELOG fragment (`changelog.d/<slug>.md`, see `changelog.d/README.md`) for any user-visible behavior change. A feature/fix PR never edits `CHANGELOG.md` itself — only the daily release-cut PR does, when it folds the fragments in.
+
+## Landing a PR — the train is the gate, not the review badge
+
+What merges a ready (non-draft) PR is a **merge train** driven by a person
+with ruleset bypass, not GitHub's review state (`docs/RELEASING.md` → *The
+train-driver role*). `main`'s active ruleset asks for one approving review
+plus an extra approval for unattributed changes, but the core team bypasses
+it — which is why PRs routinely land with `reviewDecision: REVIEW_REQUIRED`
+still set. What follows from that, for an agent or a person:
+
+- **A PR sitting `BEHIND` between trains is normal.** Do not merge `main` into
+  it because `main` moved; the train re-verifies the merged tree. Sync before a
+  build wave, before review, and when the driver asks — not once per train.
+- **Waiting on a gate is a `BLOCKER` with an owner, not a wait.** Name the gate
+  and the person who can open it, in the PR or the issue, and re-ping that
+  person every two hours until it moves. Two long autonomous runs lost 18 h and
+  33 h each modelling "needs an approving review" for a badge that was never
+  the gate (#2295).
+- **Un-draft only when you would merge as-is** (`CLAUDE.md`: "ready for review"
+  means "ready to merge") and name a reviewer at un-draft time, so the blocker
+  has an owner from the first minute.
+- **`ci.yml` already runs on `merge_group`**, so a GitHub merge queue can
+  replace the hand-driven train the day the team enables it on `main`. The
+  queue tests the merged result once, then lands it.
 
 ## Testing conventions
 
@@ -63,11 +87,20 @@ how to treat WARN findings, when to add a new check) is
 
 ### Test lanes — what to run locally, and what CI runs
 
-**The full suite is CI's job, not yours.** It is ~24 000 tests: 12 parallel jobs
+**The full suite is CI's job, not yours.** It is ~24 000 tests: 16 parallel jobs
 of ~15 minutes each in CI, and 10:28 locally. Running it before every push — then
 again after each review round — is where a two-line fix turns into a two-hour
 merge, and it buys nothing CI is not about to compute anyway. The pre-push gate
 goes from 12:25 to 2:57 measured on the same machine.
+
+**One full lane per machine, ever.** CPU is budgeted per host, not per session:
+five parallel builders each running a `fast` lane on one 12-core laptop measured
+load 18-20, a 17-second test file taking over ten minutes, one builder
+watchdog-killed and a false red pushed and retracted (#2295). Parallel agents on
+one host run `--lane impacted` only; the host's one `fast` lane runs once, before
+the push. Under load a single failure is unproven until it reproduces on an idle
+machine — never push or report a red you have not reproduced. And do not re-run
+a lane because `main` moved: CI is about to test that head anyway.
 
 | Lane | Command | What it is |
 |---|---|---|
@@ -86,15 +119,17 @@ repository factory, `tests/conftest.py` or `app/main.py` — the merge magnets t
 selector refuses to guess about. Everything else: push, and read CI.
 
 **A PR that gets no CI is not reviewable, whatever it targets.** `ci.yml`'s
-`pull_request` trigger therefore carries no `branches:` filter — a PR into a
-stack base (`mf/semantic-layer-v0`, a `claude/*` branch, anything) runs the
-same suite as one into `main`. This is worth stating because the failure mode
-is silent: with a filter, GitHub fires no workflow at all and the PR shows a
-**green rollup that asserted nothing**, which reads exactly like a passing run.
-When you check a PR's status, confirm the check NAMES are present
-(`test-shard (1..8)`, `test-pg (1..4)`) — "no red" is not the same as "tested".
-Stack bases are also unprotected, so `gh pr merge --auto` on one merges
-immediately rather than waiting for anything.
+`pull_request` trigger runs only for PRs into `main` and `integration` — the
+filter was removed once (67c80b378) and deliberately re-added (ce4f16cb2) to
+keep the suite off PRs into a stack base such as `mf/semantic-layer-v0`. So a
+PR into a stack base or a `claude/*` branch gets **no workflow run at all**
+and shows a **green rollup that asserted nothing**, which reads exactly like a
+passing run. Stack work that needs CI targets `integration`, or lives on a
+`feature/**` branch (the `push` trigger covers those). When you check a PR's
+status, confirm the check NAMES are present (`test-shard (1..8)`,
+`test-pg (1..8)`) — "no red" is not the same as "tested". Stack bases are
+also unprotected, so `gh pr merge --auto` on one merges immediately rather
+than waiting for anything.
 
 ## Sync-map
 
@@ -118,8 +153,8 @@ mirror is missing.
 | New `GET` or WebSocket route | declare it in `READ_POSTURE` / `WS_POSTURE` the same way. A read gets a real action when it returns data content, secrets/tokens, another user's data, or the audit trail itself; everything else is `"exempt:<reason>"` | BLOCKING | `tests/test_audit_read_posture.py` |
 | New surface emitting a claim, quote, or claim-derived attr (search result, chat answer, export, digest, …) | read through `src/repositories/facts_pg.py`'s visibility helpers (`_visibility_predicate`/`_audience_context`) — a PR adding one without touching that module is a blocking review finding | BLOCKING | partial (`tests/db_pg/test_facts_read_pg.py`, `tests/db_pg/test_facts_audience.py` pin the helpers' own behavior; no static ratchet catches a new caller that bypasses them) |
 | New audit action string | an entry in `src/audit_events.py`'s `CATALOG` (or a prefix in `DYNAMIC_ACTION_PREFIXES`), and the write goes through `src.audit_helpers.log_safe` — never `audit_repo().log()` directly outside the repo layer | BLOCKING | `tests/test_audit_catalog.py` |
-| User-visible behavior change | `## [Unreleased]` bullet in `CHANGELOG.md` — never a version bump; that is the dedicated cut PR's job, see `docs/RELEASING.md` | BLOCKING | `scripts/verify_syncmap.py` (skipped on a release-cut) |
-| A merge that touches `CHANGELOG.md` (esp. merging `main` into a long-lived branch) | the released region stays byte-identical — your bullet belongs under `[Unreleased]`, never inside a shipped section. The baseline is `pyproject.toml`'s `[tool.agnes] released_changelog_sha256`, re-stamped only by a real cut; `--rebaseline` is for a deliberate, reviewed edit to shipped notes, not for clearing the guard | BLOCKING | `tests/test_changelog_integrity.py::test_released_region_matches_the_stored_checksum` |
+| User-visible behavior change | a CHANGELOG fragment `changelog.d/<slug>.md` (format: `changelog.d/README.md`) — never an inline `[Unreleased]` bullet, never a version bump; the dedicated cut PR folds the fragments in, see `docs/RELEASING.md` | BLOCKING | `scripts/verify_syncmap.py` (skipped on a release-cut) + `tests/test_changelog_integrity.py` (fragment shape, fold rehearsal, no inline bullets) |
+| A merge that touches `CHANGELOG.md` (esp. merging `main` into a long-lived branch) | the released region stays byte-identical — your bullet belongs in a `changelog.d/` fragment, never inside a shipped section. The baseline is `pyproject.toml`'s `[tool.agnes] released_changelog_sha256`, re-stamped only by a real cut; `--rebaseline` is for a deliberate, reviewed edit to shipped notes, not for clearing the guard | BLOCKING | `tests/test_changelog_integrity.py::test_released_region_matches_the_stored_checksum` |
 | New connector extractor | `_meta` table contract (`table_name, description, rows, size_bytes, extracted_at, query_mode`); see `connectors/keboola/extractor.py` as canonical example | BLOCKING | partial |
 | `query_mode='remote'` table | `_remote_attach` row in `extract.duckdb` | BLOCKING | `scripts/verify_syncmap.py` (connector must mention `_remote_attach`) |
 | New or changed parquet-writing module outside `connectors/*/extractor.py` (a connector's transform/incremental/parquet-io module, or `src/ingest/tabular.py`) | (a) publish through `src/parquet_publish.py`'s atomic-publish protocol (`atomic_publish`, or the `atomic_publish_temp_path` + `atomic_publish_finalize` pair for a write too spread out to nest in one `with`) — never a direct `pq.write_table`/`df.to_parquet`/DuckDB `COPY … TO … (FORMAT PARQUET)` onto the destination, because the orchestrator's MD5 hasher, a master DuckDB view's glob, and `agnes pull` all treat that path as already-complete and will hash/serve/ship it mid-write; (b) stay matched by the architecture-gate globs in `.claude/agents/agnes-reviewer-architecture.md` and the routing table in `.claude/commands/agnes-review.md`, so `agnes-reviewer-architecture` actually fires on it | BLOCKING | `tests/test_review_gate_coverage.py` (census of parquet-write call shapes ⊆ gate globs) |
@@ -130,7 +165,7 @@ mirror is missing.
 | New/changed CLI or MCP read/find command | command-UX standard (`.claude/skills/agnes-conventions/references/command-ux.md`): default scope = auto/everywhere, origin labeled, `--scope` (never a new boolean scope flag), positional term + `--limit` + `--json`, "not found" hints the next step | BLOCKING | `scripts/verify_syncmap.py` (new boolean scope flag only — the rest is review) |
 | New MCP foundation tool | defined in `app/api/mcp/foundation_tools.py` + name appended to `FOUNDATION_TOOL_NAMES` — never hand-added to a single transport module | BLOCKING | `tests/test_mcp_tool_parity.py` |
 | New user-visible switch (feature flag, theme, layout, mode) | an entry in `app.switches.SWITCHES` + a row in `docs/feature-flags.md` (see that doc's "How to add a switch") — never a hand-rolled `os.environ.get(...)` / `get_value(...)` pair | BLOCKING | `tests/test_switches.py` (registry integrity) + `tests/test_admin_configure_api.py` (editable-section derivation) |
-| Feature/fix PR | never a version bump, `server.json` edit, or `[Unreleased]` rename — the daily `release-cut`-labeled PR (`.github/workflows/daily-cut.yml`) owns the cut, once a day, per `docs/RELEASING.md` | BLOCKING | `scripts/verify_syncmap.py` (a version bump suppresses the CHANGELOG-bullet check, so a feature PR sneaking one in evades that guard — review catches it) |
+| Feature/fix PR | never a version bump, `server.json` edit, `CHANGELOG.md` edit, or `[Unreleased]` rename — the daily `release-cut`-labeled PR (`.github/workflows/daily-cut.yml`) owns the cut, once a day, per `docs/RELEASING.md` | BLOCKING | `scripts/verify_syncmap.py` (a version bump suppresses the CHANGELOG-bullet check, so a feature PR sneaking one in evades that guard — review catches it) |
 | Prompt rule edited in `app/initial_workspace_default/CLAUDE.md` (chat-sandbox-only bundled fallback) | mirror the same section in `config/claude_md_template.txt` (server-rendered — `WorkdirManager.run_init` overwrites the bundled file with this on the sandbox's common path, `is_sandbox=True`; `agnes init` on a laptop also renders this template via `GET /api/welcome`, but with `is_sandbox=False`, so a section whose wording differs by surface must branch on `is_sandbox` rather than stay literally identical — see the "Charts" section for the pattern) | BLOCKING | `tests/test_chat_answer_provenance_and_charts.py::test_the_say_where_it_came_from_section_does_not_drift` (surface-invariant sections) + `::test_the_charts_sandbox_wording_does_not_drift` + `::test_the_file_handover_wording_does_not_drift` (surface-dependent sections — pin the bundled file against the template's `is_sandbox=True` *render*, not its raw source) |
 
 ### Parity enforcement reality

@@ -24,7 +24,7 @@ advisory. Every check below is mechanically decidable from the diff, so it
 belongs in the edit loop instead:
 
 * ``ResourceType`` member without a ``ResourceTypeSpec`` in ``RESOURCE_TYPES``
-* user-visible change without a ``## [Unreleased]`` CHANGELOG bullet
+* user-visible change without a ``changelog.d/`` CHANGELOG fragment
 * a NEW boolean scope flag in a CLI command (command-UX standard)
 * ``query_mode='remote'`` in a connector without a ``_remote_attach`` row
 * (WARN) a new entity-scoped endpoint carrying authn but no authz dependency
@@ -59,6 +59,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 RESOURCE_TYPES_PATH = "app/resource_types.py"
 CHANGELOG_PATH = "CHANGELOG.md"
+FRAGMENTS_DIR = "changelog.d"
 
 # Trees whose change is user-visible for CHANGELOG purposes. `tests/`, `docs/`,
 # `scripts/`, `.claude/` and any Markdown are deliberately outside.
@@ -245,14 +246,62 @@ def _is_user_visible(path: str) -> bool:
     return path.startswith(_VISIBLE_PREFIXES)
 
 
+def _is_changelog_fragment(path: str) -> bool:
+    """A per-PR CHANGELOG fragment (``changelog.d/<slug>.md``, README excluded)."""
+    return path.startswith(FRAGMENTS_DIR + "/") and path.endswith(".md") and path != f"{FRAGMENTS_DIR}/README.md"
+
+
+def fragment_bullets(text: str) -> list[str]:
+    """Normalised bullets of one ``changelog.d/`` fragment.
+
+    Same contract as ``scripts/release_cut.py::parse_fragment``: a bullet is
+    ``- `` or ``* `` at column 0 — ``-not a bullet`` is prose, and counting it
+    here would report a local pass for a fragment CI's format guard rejects.
+    Normalisation matches :func:`unreleased_bullets`, so re-wrapping or
+    re-indenting an existing bullet is not a new one.
+    """
+    bullets: list[str] = []
+    for raw in text.splitlines():
+        if not raw.startswith(("- ", "* ")):
+            continue
+        body = raw[2:].strip()
+        if body:
+            bullets.append("- " + " ".join(body.split()))
+    return bullets
+
+
+def has_new_fragment(added_fragments: dict[str, str]) -> bool:
+    """Does the PR add at least one fragment file that carries a bullet?
+
+    Only a file NEW in the PR counts. Appending to a fragment that already
+    exists at the base is exactly the shared-file edit that recreated the
+    ``CHANGELOG.md`` conflict on every merge — two PRs growing one fragment
+    collide the same way — so ``changelog.d/README.md``'s "one file per PR"
+    is enforced here, not merely documented. A deleted or re-wrapped fragment
+    is not in ``added_fragments`` at all.
+    """
+    return any(fragment_bullets(text) for text in added_fragments.values())
+
+
 def check_changelog(
     *,
     base_changelog: str,
     head_changelog: str,
     changed_paths: list[str],
     version_bumped: bool,
+    added_fragments: dict[str, str] | None = None,
 ) -> list[Finding]:
-    """A user-visible change must add a ``## [Unreleased]`` bullet.
+    """A user-visible change must add a ``changelog.d/<slug>.md`` fragment.
+
+    ``added_fragments`` maps each fragment path that is NEW in the PR (absent
+    at the base) to its working-tree text; the check passes only when one of
+    them carries a bullet — see :func:`has_new_fragment`. A modified or
+    deleted fragment, or a fragment path in ``changed_paths``, is not enough.
+
+    A new bullet written directly under ``## [Unreleased]`` still satisfies
+    this local check (it is the pre-#2295 shape and this guard should not be
+    the one to explain the migration); ``tests/test_changelog_integrity.py``
+    rejects it in CI with the exact fix.
 
     Skipped on a release-cut (version bump), where ``[Unreleased]`` legitimately
     empties out as its content moves under the new version heading.
@@ -260,6 +309,8 @@ def check_changelog(
     if version_bumped:
         return []
     if not any(_is_user_visible(p) for p in changed_paths):
+        return []
+    if has_new_fragment(added_fragments or {}):
         return []
 
     before = unreleased_bullets(base_changelog)
@@ -273,13 +324,15 @@ def check_changelog(
             file=CHANGELOG_PATH,
             line=1,
             severity=BLOCKING,
-            rule="User-visible behavior change → `## [Unreleased]` bullet",
+            rule="User-visible behavior change → `changelog.d/<slug>.md` fragment",
             message=(
                 f"{len(touched)} user-visible file(s) changed (e.g. {touched[0]}) "
-                f"but no new bullet appeared under [Unreleased]. Add one under "
-                f"Added/Changed/Fixed/Removed/Internal — same PR, no follow-ups."
+                f"but no NEW CHANGELOG fragment was added. Create {FRAGMENTS_DIR}/<slug>.md with a "
+                f"'### Added|Changed|Fixed|Removed|Internal' heading and a bullet "
+                f"(see {FRAGMENTS_DIR}/README.md) — same PR, no follow-ups; appending to "
+                f"another PR's fragment does not count."
             ),
-            mirror=f"{CHANGELOG_PATH} → ## [Unreleased]",
+            mirror=f"{FRAGMENTS_DIR}/<slug>.md",
         )
     ]
 
@@ -619,6 +672,12 @@ def collect_findings(base: str) -> list[Finding]:
 
     resource_types_file = REPO_ROOT / RESOURCE_TYPES_PATH
     changelog_file = REPO_ROOT / CHANGELOG_PATH
+    added_paths = set(_git_or_empty("diff", "--name-only", "--diff-filter=A", base).splitlines()) | set(untracked)
+    added_fragments = {
+        p: (REPO_ROOT / p).read_text(encoding="utf-8", errors="ignore")
+        for p in sorted(added_paths)
+        if _is_changelog_fragment(p) and (REPO_ROOT / p).is_file()
+    }
 
     findings: list[Finding] = []
     if resource_types_file.is_file():
@@ -628,6 +687,7 @@ def collect_findings(base: str) -> list[Finding]:
             base_changelog=_git_or_empty("show", f"{base}:{CHANGELOG_PATH}"),
             head_changelog=changelog_file.read_text(encoding="utf-8"),
             changed_paths=changed_paths,
+            added_fragments=added_fragments,
             version_bumped=_version_bumped(base),
         )
     findings += check_scope_flags(added, sources)
