@@ -1538,6 +1538,13 @@ def test_reachable_states_matches_what_the_proxy_actually_serves(client_granted,
     ``running`` is left to ``test_running_app_is_proxied``: proving it here
     would need the mocked upstream, and it is the one state that was never
     in doubt.
+
+    Scope: this pins the STATE dimension only. ``proxy_env`` turns
+    ``allow_same_origin`` on, so the state-independent gate that runs first
+    (``_same_origin_serving_refused``) never fires here — ``reachable`` answers
+    that one through ``hosted_serving_possible()``, pinned by
+    ``tests/test_web_data_apps.py::test_detail_page_does_not_link_the_url_when_the_deployment_cannot_serve_apps``.
+    (Devin Review on #2336.)
     """
     from app.api.data_apps import REACHABLE_STATES
 
