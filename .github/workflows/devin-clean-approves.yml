@@ -8,14 +8,16 @@ name: Devin clean verdict approves org members' PRs
 # reviews every PR but only ever COMMENTS, and its app has no write access,
 # so its verdict never counted. This workflow makes it count, for org members:
 #
-#   author is an org member (or the daily release-cut PR, the org's own
-#   automation) AND Devin's latest verdict is clean  ->  approve
-#   Devin's latest verdict lists issues              ->  dismiss our approval
+#   author is an org member AND Devin's latest verdict is clean -> approve
+#   Devin's latest verdict lists issues                         -> dismiss ours
 #
 # An outside collaborator's PR (author_association COLLABORATOR) gets nothing
-# here and still needs a human approval. The gate for members therefore reads:
-# CI green + Devin clean = the author can queue. Pair with the ruleset's
-# "dismiss stale reviews on push", so every push needs a fresh clean pass.
+# here and still needs a human approval. So does the daily release-cut PR: it
+# is authored by github-actions[bot], the same identity this workflow approves
+# with, and GitHub refuses self-approval — the person who merges the cut
+# approves it, one click. The gate for members therefore reads: CI green +
+# Devin clean = the author can queue. Pair with the ruleset's "dismiss stale
+# reviews on push", so every push needs a fresh clean pass.
 #
 # Safety: `pull_request_review` runs this file from the base branch and never
 # checks out PR code; payload values reach the shell via environment variables
@@ -38,11 +40,7 @@ jobs:
     if: >
       github.event.review.user.login == 'devin-ai-integration[bot]'
       && github.event.pull_request.head.repo.full_name == github.repository
-      && (
-        contains(fromJSON('["MEMBER","OWNER"]'), github.event.pull_request.author_association)
-        || (github.event.pull_request.user.login == 'github-actions[bot]'
-            && startsWith(github.event.pull_request.head.ref, 'release-cut/'))
-      )
+      && contains(fromJSON('["MEMBER","OWNER"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -57,8 +55,11 @@ jobs:
           first_line=$(printf '%s\n' "$VERDICT" | sed -n '1p')
           echo "Devin: $first_line"
 
-          ours=$(gh api "repos/$REPO/pulls/$PR/reviews" \
-                   --jq '[.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED")] | last | .id // empty')
+          # --paginate --slurp: the reviews endpoint pages at 30, and a PR Devin
+          # re-reviews on every push exceeds that easily; our approval may sit on
+          # any page, and missing it would leave a stale approval alive.
+          ours=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+                   --jq 'add | [.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED")] | last | .id // empty')
 
           if printf '%s' "$first_line" | grep -Eq 'Devin Review: No Issues Found|found 0 (new )?potential issues'; then
             if [ -n "$ours" ]; then echo "already approved (review $ours)"; exit 0; fi
