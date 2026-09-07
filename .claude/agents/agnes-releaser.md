@@ -34,8 +34,8 @@ Triggered by the user / main agent saying "review the release-cut PR" or
      released section.
    - No OTHER open PR still carries an un-shipped fragment that
      should have been merged before this cut was opened (if one does, flag
-     it — the train-driver should flush the queue first per
-     `Skill(agnes-release-process)`).
+     it — queue those PRs first, or accept that the fragment rides the next
+     day's cut; per `Skill(agnes-release-process)`).
    Report Done/Missing per check. **Do not merge it** — tell the user it is
    ready for their review.
 

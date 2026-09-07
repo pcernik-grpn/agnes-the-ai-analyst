@@ -72,31 +72,38 @@ a day.
   major` only when the team has actually decided this cut is a milestone
   boundary; never automatic.
 
-### The train-driver role
+### Landing PRs through the merge queue
 
-A human (or an agent session acting for one) merges the ready PR queue
-completely *first*, then reviews and merges the cut PR — in that order. Once
-a cut PR is open, treat it as a short lock on `main`: merging more feature
-PRs while it sits open means `main`'s `[Unreleased]` keeps growing
-underneath a cut branch that already snapshotted an older state of that same
-section, and merging the stale cut PR on top risks the same kind of
-same-region collision this workflow exists to avoid. `daily-cut.yml` won't
-open a second cut PR while one is already open (it checks for an open PR
-carrying the `release-cut` label first), so the practical rule is: **flush
-the queue, then merge the cut PR, in that order, before resuming feature
-merges.** If the cut PR ends up showing a merge conflict against a newer
-`main` (the queue wasn't fully flushed before someone merged past it), close
-it and re-dispatch `daily-cut.yml` rather than resolving the conflict by
-hand — a hand-resolved overlap on `[Unreleased]` is exactly the collision
-class this exists to prevent. Bullets that land after a cut PR opened simply
-ride into the next day's cut; that is expected, not a bug. Since fragments
-(#2295) a PR merged past an open cut PR adds a *new* file under `changelog.d/`
-rather than editing `[Unreleased]`, so it no longer collides with the cut
-branch at all — the flush-first rule now only keeps a bullet from waiting a
-day, it no longer guards a conflict. `ci.yml` also runs on the `merge_group`
-event, so this role can become a GitHub merge queue (a ruleset rule on `main`,
-no workflow change): the queue tests the merged result once and lands it — the
-automated form of the train.
+Since 2026-09-07 `main` has a GitHub **merge queue** (ruleset *Merge queue on
+main*: merge-commit method, `ALLGREEN` grouping, up to five entries per group,
+60 min check timeout, no bypass actors) and its "require branch up to date"
+rule is off. This is the automated form of the merge train that used to land
+most of `main` as `Train N: #…`; the hand-driven train is retired.
+
+- **Queue a ready PR** with `gh pr merge <N> --merge --auto --delete-branch`
+  or "Merge when ready" in the UI. The queue creates a temporary branch with
+  `main` + the queued PRs, `ci.yml` runs on that `merge_group` event, and the
+  required checks (`test`, `docker-build`) must pass on the merged result
+  before it lands. A group in which one entry fails is re-formed without it.
+- **Do not update a PR's branch because `main` moved.** BEHIND is the normal
+  state between queue runs; the queue tests the combination.
+- **The review ruleset gates who may queue**, not the queue itself: one
+  approving review plus an extra approval for unattributed changes, bypassed
+  by the core team. A blocked PR names the person with bypass who will queue
+  it.
+- **The cut PR rides the same queue.** Queue it after the feature PRs you
+  want in that version have landed. A fragment merged after the cut PR opened
+  is a new file under `changelog.d/` and does not collide with the cut branch;
+  it rides the next day's cut. A cut PR that *does* conflict with `main` (one
+  cut before fragments existed, or a hand-edited `CHANGELOG.md`) is closed and
+  `daily-cut.yml` re-dispatched — never hand-resolved, since a hand-resolved
+  cut is exactly the collision class the cut PR exists to prevent.
+  `daily-cut.yml` will not open a second cut PR while one is open (it checks
+  for the `release-cut` label first).
+- **Changing the queue's behaviour** (merge method, group size, timeout) is a
+  ruleset edit (`gh api repos/<owner>/<repo>/rulesets/<id>`), not a per-PR
+  flag; `--merge` on the `gh` command line only has to be *a* method so `gh`
+  runs non-interactively.
 
 ### Post-merge: tag + Release
 
@@ -170,12 +177,14 @@ cd agnes-<topic> && git checkout -b zs/<branch-name>
 #    subprocess timeout) are OK to ignore; verify by reverting your
 #    diff and reproducing on bare main.
 
-# 6. Push branch + open PR + enable auto-merge SQUASH:
+# 6. Push branch + open PR + queue it (the merge queue lands it once the
+#    required checks pass on main + this PR; the queue's own merge method
+#    applies, see § Landing PRs through the merge queue):
 #    git push -u origin HEAD
 #    gh pr create --repo keboola/agnes-the-ai-analyst \
 #      --head <branch> --title "<...>" --body "<...>"
 #    gh pr merge <N> --repo keboola/agnes-the-ai-analyst \
-#      --squash --auto --delete-branch
+#      --merge --auto --delete-branch
 ```
 
 That's it for a feature PR — no version bump, no tag, no Release. The cut
@@ -301,11 +310,11 @@ re-run click, not a second push.
 
 - **Force-pushed and lost auto-merge?** GitHub *usually* preserves auto-merge
   across force-pushes for the same PR; if it cleared, just re-run
-  `gh pr merge <N> --squash --auto --delete-branch`.
+  `gh pr merge <N> --merge --auto --delete-branch` to re-queue it.
 - **A cut PR went stale (merge conflict against a newer `main`)?** The queue
   wasn't fully flushed before something else merged past it — close the
   stale cut PR and re-dispatch `daily-cut.yml` rather than resolving the
-  conflict by hand (see § The train-driver role above). Closing the PR
+  conflict by hand (see § Landing PRs through the merge queue above). Closing the PR
   leaves its `release-cut/vX.Y.Z` branch behind on the remote; there is
   nothing to clean up first — the branch is workflow-owned, and the
   re-dispatch force-pushes over it when it computes the same version.
