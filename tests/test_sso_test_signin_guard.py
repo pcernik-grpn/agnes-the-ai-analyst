@@ -69,7 +69,11 @@ class TestTheSharedDisabledRuleStopsAnAnchor:
         """`btn-disabled` was toggled by JS and defined by nothing. If it comes
         back, it comes back inert."""
         css = _css_without_comments()
-        assert "btn-disabled" not in css, "define it or do not toggle it"
+        # The exact selector, not the substring: `.ds-disabled-wrap` is a real
+        # class and contained the old name until it was renamed to the house
+        # `ds-` prefix. A substring check made this test fail on a legitimate
+        # neighbour, which is a test being too loose rather than a defect.
+        assert not re.search(r"\.btn-disabled\b", css), "define it or do not toggle it"
 
 
 class TestBothDisableBranchesReachTheAnchor:

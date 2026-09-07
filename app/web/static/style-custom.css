@@ -6897,3 +6897,10 @@ details.section-card > summary {
     .cld-trust-sep { display: none; }
 }
 
+
+/* The hoverable shell `ds.button` puts around a DISABLED LINK. The anchor
+   inside is `pointer-events: none` (that is what makes `aria-disabled` bite on
+   an <a>), which also takes it out of hit-testing — so the reason the control
+   is off has to live out here or it can never be shown. Inline-flex so the
+   wrapper is exactly the button's own box and nothing shifts. */
+.ds-disabled-wrap { display: inline-flex; }
