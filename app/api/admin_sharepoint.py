@@ -4375,6 +4375,13 @@ def _trigger_shard_rerun(
     complete it. The caller sees the SAME error shape :func:`trigger_
     extraction`'s own liveness gate already returns above, and retries
     once the fleet view shows nothing queued or running for this shard set.
+
+    Shard-index validation (a persisted plan exists, every requested index
+    is in range) runs BEFORE the clear-or-refuse call below, not after: a
+    2026-09-07 finding on an earlier version of this function had it clear
+    (or 409-refuse) first, so a request that goes on to 404/400 on bad
+    input still mutated the connection's stop flag as a side effect of a
+    call that does no actual work.
     """
     from connectors.sharepoint.crawler import (
         _clear_stale_stop_for_trigger,
@@ -4382,14 +4389,6 @@ def _trigger_shard_rerun(
         _PreviousRunStillDraining,
         load_state,
     )
-
-    try:
-        _clear_stale_stop_for_trigger(connection_id, None)
-    except _PreviousRunStillDraining as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "extraction_already_running", "message": str(exc)},
-        ) from exc
 
     state = load_state(connection_id)
     persisted_shards = ((state.get("shard_plan") or {}).get("shards")) or []
@@ -4408,6 +4407,18 @@ def _trigger_shard_rerun(
     # Stored WITHOUT their own 1-based index (see `_enqueue_shard_plan`) —
     # re-derive it positionally, the same way that call originally assigned it.
     named = [shard for i, shard in enumerate(persisted_shards, start=1) if i in wanted]
+
+    # Validated above BEFORE this mutates any state: an invalid request
+    # (no persisted plan, an out-of-range index) must 404/400 as a pure
+    # read, never clear the stop flag as a side effect of a call that goes
+    # on to do nothing.
+    try:
+        _clear_stale_stop_for_trigger(connection_id, None)
+    except _PreviousRunStillDraining as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "message": str(exc)},
+        ) from exc
 
     rerun_payload: Dict[str, Any] = {"connection_id": connection_id}
     if options.force_reprocess:

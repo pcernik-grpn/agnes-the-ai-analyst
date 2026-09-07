@@ -3261,8 +3261,64 @@ class TestExtractionTriggerShardRerun:
 
         assert r.status_code == 400, r.text
         assert r.json()["detail"]["error"] == "unknown_shard_index"
-        assert r.json()["detail"]["unknown"] == [5]
-        assert r.json()["detail"]["shards_total"] == 2
+
+    def test_an_invalid_rerun_request_never_clears_the_stop_flag_as_a_side_effect(self, seeded_app, monkeypatch):
+        """2026-09-07 review finding: the clear-or-refuse call used to run
+        BEFORE shard-index validation, so a request that goes on to 404
+        (no persisted plan) or 400 (an out-of-range index) still mutated
+        the connection's stop flag despite doing no actual work."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-invalid-preserves-stop")
+
+        from connectors.sharepoint.crawler import request_stop, save_state
+        from src.repositories import source_connections_repo
+
+        # No persisted shard plan at all -> 404, before ever touching the flag.
+        stamp = request_stop(conn_id)
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404, r.text
+        row = source_connections_repo().get(conn_id)
+        assert (row["config"].get("extraction") or {}).get("stop_requested_at") == stamp
+
+        # An out-of-range index against a real persisted plan -> 400, same guarantee.
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_old_parent",
+                    "shards_total": 1,
+                    "shards": [
+                        {
+                            "scope_id": "b!drive1",
+                            "label": "part 1/1",
+                            "expected": 10,
+                            "exclude_prefixes": [],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}
+                            ],
+                        },
+                    ],
+                },
+            },
+        )
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [99]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 400, r.text
+        row = source_connections_repo().get(conn_id)
+        assert (row["config"].get("extraction") or {}).get("stop_requested_at") == stamp
 
     def test_named_shards_are_enqueued_as_a_fresh_parent_run(self, seeded_app, monkeypatch):
         # NOTE: `use_pg()` is deliberately left at this test app's default

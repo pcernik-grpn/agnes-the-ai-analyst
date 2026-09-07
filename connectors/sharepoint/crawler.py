@@ -749,9 +749,13 @@ def _clear_stale_stop_for_trigger(connection_id: str, job_id: Optional[str]) -> 
     reach this connection's stop flag through the SAME key.
 
     Raises :class:`_PreviousRunStillDraining` — refusing the WHOLE trigger,
-    caught by ``run_builtin_crawl``'s worker-level caller (the job fails,
-    normal retry/backoff applies) and by ``_trigger_shard_rerun``'s HTTP
-    caller (translated to a 409) — whenever :func:`_shard_children_still_
+    caught by ``run_builtin_crawl``'s worker-level caller (the ``corpus-
+    extraction`` job fails outright — this kind registers ``retry_in_
+    seconds=None``, same as any other crawl failure, so there is NO
+    automatic backoff retry here; an operator must manually retrigger once
+    the fleet view shows nothing queued or running for this connection) and
+    by ``_trigger_shard_rerun``'s HTTP caller (translated to a 409) —
+    whenever :func:`_shard_children_still_
     live` cannot affirmatively confirm there are NO queued/running
     ``corpus-extraction-shard`` jobs left for this connection: either it
     found some (a previous run's cancelled children still draining), or
