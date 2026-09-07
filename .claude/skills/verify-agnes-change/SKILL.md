@@ -36,7 +36,7 @@ python3 scripts/verify_syncmap.py
 ```
 
 Covers the `CONTRIBUTING.md` sync-map rows that have **no CI guard**: an
-unregistered `ResourceType`, a missing `## [Unreleased]` CHANGELOG bullet, a new
+unregistered `ResourceType`, a missing `changelog.d/` CHANGELOG fragment, a new
 boolean scope flag, `query_mode='remote'` without `_remote_attach`, and (as a
 WARN) a new entity-scoped endpoint with no authz dependency.
 
@@ -75,7 +75,7 @@ guard into decoration. Confirm on a clean tree (`git stash`) and note it.
 ## Gate 3 — the tests for the behavior you changed
 
 Two lanes, in order. **Neither of them is the full suite** — CI runs that on the
-push, across 12 parallel jobs, and running it locally as well is what turns a
+push, across 16 parallel jobs, and running it locally as well is what turns a
 two-line fix into a two-hour merge.
 
 ```bash

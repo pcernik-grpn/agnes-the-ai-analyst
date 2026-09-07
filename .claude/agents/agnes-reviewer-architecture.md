@@ -60,7 +60,7 @@ If missing: `BROKEN: remote_attach_incomplete`.
 
 If `src/db.py` bumps the version constant, verify:
 - A migration step `vN-1 → vN` exists in the same diff.
-- `CHANGELOG.md` has a bullet under `Internal` naming the new version.
+- The PR's `changelog.d/` fragment has a bullet under `### Internal` naming the new version.
 - Any doc that references "schema v" mentions the new version.
 
 If any missing: `BROKEN: schema_migration_incomplete`.

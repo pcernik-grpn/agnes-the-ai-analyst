@@ -62,7 +62,7 @@ For each remote-mode table in `_meta`, the extractor writes a row in
    `source_type` values to follow the pattern).
 5. Add a fixture-based test that runs the extractor against a fixture
    upstream and asserts `_meta` is complete.
-6. CHANGELOG bullet under `Added` per `agnes-release-process`.
+6. CHANGELOG fragment (`changelog.d/<slug>.md`, `### Added`) per `agnes-release-process`.
 
 ## Stable infrastructure — do NOT modify
 

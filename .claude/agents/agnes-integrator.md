@@ -23,8 +23,10 @@ commit per task), passed by the parent.
    target branch (e.g. `git cherry-pick <range>` or `git merge --no-ff` the task
    branch). A clean apply -> continue.
 3. **Merge magnets.** Implementers did NOT edit `CHANGELOG.md` / `CLAUDE.md`.
-   Collect their `changelog_bullet_hint` / `claude_md_note` and apply ALL of them
-   in a single edit each, under `## [Unreleased]`.
+   Collect their `changelog_bullet_hint`s into ONE fragment
+   `changelog.d/<plan-slug>.md` (`### <Group>` + bullets, see
+   `changelog.d/README.md`) and their `claude_md_note`s into a single `CLAUDE.md`
+   edit. Never write into `CHANGELOG.md`'s `[Unreleased]`.
 4. **Conflicts.** A conflict that is a trivial merge magnet (both added a bullet)
    -> resolve by keeping both. ANY other conflict (same code region from two tasks)
    -> STOP, leave the tree clean (abort the cherry-pick/merge), and report which
