@@ -92,9 +92,10 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
   itself — ruleset bypass does not apply inside it. For an organization
   member's PR a clean Devin verdict supplies that approval
   (`.github/workflows/devin-clean-approves.yml`, added in #2339: approves on "No Issues
-  Found", dismisses its approval when a later verdict lists issues), and the
-  ruleset dismisses approvals on every push, so the gate is CI green + Devin
-  clean. An outside collaborator's PR needs a human approval; so does the cut
+  Found", dismisses its approval when a later verdict lists issues), so the
+  gate is CI green + Devin clean. The approval persists across later pushes,
+  as a human's does under this ruleset — Devin re-reviews only some pushes,
+  so pinning approval to one commit would strand most PRs. An outside collaborator's PR needs a human approval; so does the cut
   PR (its commits are `github-actions[bot]`'s own, which the bridge cannot
   self-approve). A blocked PR names that approver.
 - **The cut PR rides the same queue.** Queue it after the feature PRs you
@@ -212,8 +213,9 @@ writes that field, there is no drift to reconcile and no need to cross-check
   evaluated by the queue itself, so nobody's bypass helps and GitHub still
   forbids self-approval. For an organization member's PR the approval comes
   from Devin's clean verdict (`.github/workflows/devin-clean-approves.yml`,
-  added in #2339): fix what Devin flagged, push, wait for the re-review. Every
-  push dismisses approvals until Devin has cleared the new head. An outside
+  added in #2339): fix what Devin flagged, push, wait for the re-review. The
+  approval persists across later pushes and falls only to a later Devin
+  review that lists issues. An outside
   collaborator's PR and the cut PR need a person other than the author to
   approve (`gh pr review <N> --approve`).
 - **Other people's PRs you're taking over**: dismiss any prior

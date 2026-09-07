@@ -26,8 +26,9 @@ clean Devin verdict (`.github/workflows/devin-clean-approves.yml`, added in #233
 "No Issues Found" and dismisses its approval when a later verdict lists
 issues), so the gate reads **CI green + Devin clean = the author queues**. An
 outside collaborator's PR and the daily release-cut PR need a human approval.
-Every push dismisses approvals until Devin has cleared the new head. What
-follows from that, for an agent or a person:
+Like a human's approval under this ruleset, Devin's persists across later
+pushes (Devin re-reviews only some of them) and falls to a later Devin review
+that lists issues. What follows from that, for an agent or a person:
 
 - **To land a ready PR, queue it:** `gh pr merge <N> --merge --auto` (or "Merge when ready" in the UI). The queue builds `main`
   plus your PR plus whatever else is queued, runs the required checks on that
