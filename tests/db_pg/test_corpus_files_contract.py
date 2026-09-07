@@ -679,6 +679,55 @@ def test_match_filenames_matches_any_of_several_needles(repo):
     assert {r["filename"] for r in results} == {"Alpha.pdf", "Beta.pdf"}
 
 
+def test_match_filenames_extra_file_ids_reaches_a_file_outside_corpus_scope(repo):
+    """A per-file grant (``document_links.resolve_document_url``'s
+    ``extra_file_ids``) must surface a file whose own corpus is NOT in
+    ``corpus_ids`` — the whole point of the parameter."""
+    fid = repo.add(
+        corpus_id="col_private",
+        filename="Shared.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    results = repo.match_filenames(["col_a"], ["shared"], extra_file_ids=[fid], limit=20)
+    assert {r["id"] for r in results} == {fid}
+
+
+def test_match_filenames_extra_file_ids_does_not_widen_beyond_the_named_files(repo):
+    """A file in an out-of-scope corpus, NOT named in ``extra_file_ids``,
+    must still never surface — the parameter grants specific files, not
+    their whole corpus."""
+    repo.add(
+        corpus_id="col_private",
+        filename="NotGranted.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    results = repo.match_filenames(["col_a"], ["notgranted"], extra_file_ids=["some-other-file-id"], limit=20)
+    assert results == []
+
+
+def test_match_filenames_empty_corpus_list_with_extra_file_ids_still_matches(repo):
+    """``corpus_ids=[]`` alone means "nothing" (see the empty-scope test
+    above), but paired with ``extra_file_ids`` it must not short-circuit —
+    a caller with zero collection access but one per-file grant is exactly
+    the case this exists for."""
+    fid = repo.add(
+        corpus_id="col_private",
+        filename="Shared.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    results = repo.match_filenames([], ["shared"], extra_file_ids=[fid], limit=20)
+    assert {r["id"] for r in results} == {fid}
+
+
 def test_match_filenames_respects_limit(repo):
     for i in range(5):
         repo.add(

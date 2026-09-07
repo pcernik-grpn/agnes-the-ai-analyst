@@ -249,10 +249,12 @@ class CorpusFilesRepository:
         corpus_ids: list[str] | None,
         needles: list[str],
         *,
+        extra_file_ids: list[str] | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Files whose ``filename`` or ``path`` contains any of ``needles``
-        (case-insensitive substring), scoped to ``corpus_ids``.
+        (case-insensitive substring), scoped to ``corpus_ids`` plus,
+        individually, ``extra_file_ids``.
 
         The RBAC-scoped counterpart to :meth:`search_across_corpora`: that
         method deliberately searches every corpus (an admin-only picker
@@ -263,11 +265,20 @@ class CorpusFilesRepository:
         is written by the model, not chosen from a list, so the scope has to
         be enforced in the query rather than trusted from the caller.
 
+        ``extra_file_ids`` covers a file granted individually — reachable at
+        ``/library/{slug}/f/{file_id}`` (``library_file_detail``'s own
+        ``can_parent OR file_granted`` check) even when its PARENT collection
+        is not itself in ``corpus_ids``. Without this, a citation naming a
+        per-file-shared document could never resolve: the collection-only
+        scope this method started with was narrower than the page it links
+        to, so a legitimate link was silently suppressed rather than shown.
+
         ``corpus_ids=None`` means "no restriction" (an admin, who already
         sees every collection — mirrors ``accessible_collection_ids``'s own
-        ``None`` convention); ``corpus_ids=[]`` returns ``[]`` outright rather
-        than running a query that, on some engines, could vacuously match
-        every row with no ``corpus_id`` to compare against.
+        ``None`` convention) — ``extra_file_ids`` is redundant there and
+        ignored. ``corpus_ids=[]`` with no ``extra_file_ids`` returns ``[]``
+        outright rather than running a query that, on some engines, could
+        vacuously match every row with no ``corpus_id`` to compare against.
 
         Returns candidate ROWS, not a decision — a substring hit is not the
         same claim as an equality match. The caller (``resolve_document_url``)
@@ -277,14 +288,21 @@ class CorpusFilesRepository:
         """
         if not needles:
             return []
-        if corpus_ids is not None and not corpus_ids:
+        if corpus_ids is not None and not corpus_ids and not extra_file_ids:
             return []
         where: list[str] = []
         params: list[Any] = []
         if corpus_ids is not None:
+            scope_clauses = []
             placeholders = ", ".join("?" for _ in corpus_ids)
-            where.append(f"corpus_id IN ({placeholders})")
-            params.extend(corpus_ids)
+            if corpus_ids:
+                scope_clauses.append(f"corpus_id IN ({placeholders})")
+                params.extend(corpus_ids)
+            if extra_file_ids:
+                id_placeholders = ", ".join("?" for _ in extra_file_ids)
+                scope_clauses.append(f"id IN ({id_placeholders})")
+                params.extend(extra_file_ids)
+            where.append("(" + " OR ".join(scope_clauses) + ")")
         like_clauses = []
         for n in needles:
             like_clauses.append("(LOWER(filename) LIKE LOWER(?) ESCAPE '\\' OR LOWER(path) LIKE LOWER(?) ESCAPE '\\')")

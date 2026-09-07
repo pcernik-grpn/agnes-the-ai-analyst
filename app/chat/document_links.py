@@ -60,19 +60,37 @@ def resolve_document_url(ref: str, user: Any) -> str | None:
     if not ref:
         return None
 
-    from app.auth.access import accessible_collection_ids
-    from src.repositories import corpus_files_repo, file_corpora_repo
+    from app.auth.access import PRINCIPAL_TYPES, accessible_collection_ids
+    from app.resource_types import ResourceType
+    from src.repositories import corpus_files_repo, file_corpora_repo, resource_grants_repo
 
     allowed = accessible_collection_ids(user)
     corpus_ids = None if allowed is None else list(allowed)
-    if corpus_ids is not None and not corpus_ids:
+
+    # A file shared out of its collection (per-file grant) is reachable at
+    # its own `/library/{slug}/f/{file_id}` page — `library_file_detail`'s
+    # `can_parent OR file_granted` check — even when the PARENT collection is
+    # not itself in `corpus_ids`. Without folding that same grant in here,
+    # this resolver's scope would be narrower than the page it links to: a
+    # legitimate citation would silently stay unlinked rather than resolve.
+    # Skipped for admins (corpus_ids is None already covers everything) and
+    # for a restricted Principal (no per-user grant identity to look up —
+    # its authority is the collection-level intersection alone, same as
+    # `accessible_collection_ids`'s own ownership-union skip).
+    extra_file_ids: list[str] | None = None
+    if corpus_ids is not None and not isinstance(user, PRINCIPAL_TYPES):
+        user_id = user.get("id") if hasattr(user, "get") else None
+        if user_id:
+            extra_file_ids = resource_grants_repo().list_resource_ids_for_user(user_id, ResourceType.CORPUS_FILE.value)
+
+    if corpus_ids is not None and not corpus_ids and not extra_file_ids:
         return None
 
     needles = _document_needles(ref.lower())
     if not needles:
         return None
 
-    rows = corpus_files_repo().match_filenames(corpus_ids, needles, limit=20)
+    rows = corpus_files_repo().match_filenames(corpus_ids, needles, extra_file_ids=extra_file_ids, limit=20)
     if not rows:
         return None
 

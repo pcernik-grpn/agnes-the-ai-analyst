@@ -93,6 +93,29 @@ def test_an_inaccessible_file_never_resolves(e2e_env):
     assert resolve_document_url("Q3_Board_Review.pdf", {"id": "u1"}) is None
 
 
+def test_a_per_file_grant_resolves_even_without_collection_access(e2e_env):
+    """`library_file_detail` opens a file for `can_parent OR file_granted` —
+    a per-file grant reaches the page even when the caller has no access to
+    the parent collection at all. Resolution must use the same authorization
+    model, or a citation naming that same file would silently stay unlinked
+    even though the reader can already open it directly."""
+    from app.resource_types import ResourceType
+    from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo
+
+    cid = _make_collection(owner="someone_else", slug="shared-out-docs")
+    fid = _add_file(cid, "Onboarding.pdf")
+
+    # Sanity: without the per-file grant, u2 cannot reach it — same as
+    # test_an_inaccessible_file_never_resolves.
+    assert resolve_document_url("Onboarding.pdf", {"id": "u2"}) is None
+
+    group = user_groups_repo().create(name="onboarding-readers")
+    user_group_members_repo().add_member("u2", group["id"], source="test")
+    resource_grants_repo().create(group["id"], ResourceType.CORPUS_FILE.value, fid, assigned_by="test")
+
+    assert resolve_document_url("Onboarding.pdf", {"id": "u2"}) == f"/library/shared-out-docs/f/{fid}"
+
+
 def test_owning_the_collection_is_enough_without_a_group_grant(e2e_env):
     """`accessible_collection_ids` already treats ownership as access (an
     upload is private to its creator) — resolution rides the same rule."""

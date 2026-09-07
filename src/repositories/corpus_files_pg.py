@@ -268,19 +268,27 @@ class CorpusFilesPgRepository:
         corpus_ids: list[str] | None,
         needles: list[str],
         *,
+        extra_file_ids: list[str] | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Mirrors the DuckDB sibling — see its docstring for the RBAC
-        rationale and the ``corpus_ids=None``/``[]`` conventions."""
+        rationale, the ``extra_file_ids`` (per-file grant) case, and the
+        ``corpus_ids=None``/``[]`` conventions."""
         if not needles:
             return []
-        if corpus_ids is not None and not corpus_ids:
+        if corpus_ids is not None and not corpus_ids and not extra_file_ids:
             return []
         where: list[str] = []
         params: dict[str, Any] = {}
         if corpus_ids is not None:
-            where.append("corpus_id = ANY(:corpus_ids)")
-            params["corpus_ids"] = list(corpus_ids)
+            scope_clauses = []
+            if corpus_ids:
+                scope_clauses.append("corpus_id = ANY(:corpus_ids)")
+                params["corpus_ids"] = list(corpus_ids)
+            if extra_file_ids:
+                scope_clauses.append("id = ANY(:extra_file_ids)")
+                params["extra_file_ids"] = list(extra_file_ids)
+            where.append("(" + " OR ".join(scope_clauses) + ")")
         like_clauses = []
         for i, n in enumerate(needles):
             key = f"n{i}"
