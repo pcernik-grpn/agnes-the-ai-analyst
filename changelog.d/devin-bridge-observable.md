@@ -1,0 +1,2 @@
+### Internal
+- The Devin approval bridge (`devin-clean-approves.yml`) now decides everything in its shell step and logs the payload values it decided on, after its first version silently skipped Devin's own review events through a job-level `if`. It excludes outside collaborators by `author_association` instead of allow-listing members, and gains a `workflow_dispatch` catch-up mode that evaluates Devin's latest verdict for a given PR, since Devin does not re-review a merge of `main` into a branch (#2295).
