@@ -1,0 +1,2 @@
+### Internal
+- The Devin approval bridge also approves an organization member's pull request whose latest Devin verdict listed issues when every Devin review thread on it is resolved and the branch has moved past the reviewed commit: Devin does not re-review a diff it considers already reviewed, so "found N potential issues" otherwise stayed its last word forever after the fixes landed. Verdicts of the "N security issues" kind never clear this way, since their findings have no thread on GitHub to resolve (#2295).
