@@ -15,7 +15,6 @@ import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
-
 # ---------------------------------------------------------------------------
 # 1. Migration — v75 columns + backfill
 # ---------------------------------------------------------------------------
@@ -31,8 +30,7 @@ def test_fresh_db_has_v75_columns(tmp_path, monkeypatch):
         cols = {
             r[0]
             for r in conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'instance_templates'"
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'instance_templates'"
             ).fetchall()
         }
         assert {"source_mode", "git_path", "base_sha"} <= cols
@@ -57,9 +55,7 @@ def test_v74_upgrades_to_v75_preserving_content(tmp_path):
         "CREATE TABLE instance_templates (key VARCHAR PRIMARY KEY, content TEXT, "
         "previous_content TEXT, updated_at TIMESTAMP, updated_by VARCHAR)"
     )
-    conn.execute(
-        "INSERT INTO instance_templates (key, content) VALUES ('claude_md', 'KEEP ME')"
-    )
+    conn.execute("INSERT INTO instance_templates (key, content) VALUES ('claude_md', 'KEEP ME')")
 
     from src.db import _v74_to_v75
 
@@ -139,8 +135,8 @@ def test_build_zip_editor_override_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     _make_iwt_clone(tmp_path, claude_md="FROM CLONE")
 
-    from src.repositories import claude_md_template_repo
     import src.initial_workspace as iw
+    from src.repositories import claude_md_template_repo
 
     # bypass validate_template_tree + force the snapshot to our clone dir
     monkeypatch.setattr(iw, "validate_template_tree", lambda *a, **k: None)
@@ -165,8 +161,8 @@ def test_build_zip_git_mode_uses_clone(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     _make_iwt_clone(tmp_path, claude_md="FROM CLONE")
 
-    from src.repositories import claude_md_template_repo
     import src.initial_workspace as iw
+    from src.repositories import claude_md_template_repo
 
     monkeypatch.setattr(iw, "validate_template_tree", lambda *a, **k: None)
 
@@ -270,9 +266,7 @@ def test_resolve_prompt_rejects_path_traversal(tmp_path, monkeypatch):
     repo.bind_git("../outside_secret.env", base_sha="x", updated_by="a@x.com")
 
     content, mode = iw.resolve_prompt("workspace", None)
-    assert content is None and mode == "git", (
-        "a git_path escaping the IWT root must fall back, not read the file"
-    )
+    assert content is None and mode == "git", "a git_path escaping the IWT root must fall back, not read the file"
 
 
 def test_resolve_seed_file_rejects_path_traversal(monkeypatch, tmp_path: Path):
@@ -382,6 +376,38 @@ def test_bind_git_rejects_token_placeholder_for_install(admin_client, monkeypatc
     )
     assert r.status_code == 400, r.text
     assert "{token}" in r.json()["detail"]
+
+    r = client.post(
+        "/api/admin/prompts/install/bind-git",
+        headers=_hdr(token),
+        json={"git_path": "install-prompt/clean.md.tmpl"},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_bind_git_rejects_bare_server_url_placeholder_for_install(admin_client, monkeypatch):
+    """Same trap as the `{token}` guard above, for `{server_url}`: git-bound
+    content never passes the editor save guard, so bind-git itself must
+    reject an install file carrying the un-substitutable single-brace
+    placeholder."""
+    client, token = admin_client
+    import src.initial_workspace as iw
+
+    monkeypatch.setattr(iw, "is_configured", lambda: True)
+
+    seed = {
+        "install-prompt/legacy.md.tmpl": "Server: {server_url}\ncurl -fsSL {server_url}/cli/download",
+        "install-prompt/clean.md.tmpl": "Server: {{ server.url }}\ncurl -fsSL {{ server.url }}/cli/download",
+    }
+    monkeypatch.setattr(iw, "resolve_seed_file", lambda rel: (seed[rel], "iwt") if rel in seed else None)
+
+    r = client.post(
+        "/api/admin/prompts/install/bind-git",
+        headers=_hdr(token),
+        json={"git_path": "install-prompt/legacy.md.tmpl"},
+    )
+    assert r.status_code == 400, r.text
+    assert "{server_url}" in r.json()["detail"]
 
     r = client.post(
         "/api/admin/prompts/install/bind-git",
@@ -666,9 +692,7 @@ def test_prompt_repo_ignores_duckdb_conn_on_postgres(monkeypatch):
 
     conn = _duckdb.connect(":memory:")
     try:
-        assert iw._prompt_repo("workspace", conn) is sentinel, (
-            "PG backend + DuckDB conn must route through the factory"
-        )
+        assert iw._prompt_repo("workspace", conn) is sentinel, "PG backend + DuckDB conn must route through the factory"
     finally:
         conn.close()
 
@@ -722,6 +746,38 @@ def test_install_prompt_save_rejects_token_placeholder():
     _validate_template("install", "Set up.\nagnes init --token-file ~/.agnes/token\n")
 
 
+def test_install_prompt_save_rejects_bare_server_url_placeholder():
+    """`{server_url}` (single brace) is the live-default's placeholder,
+    substituted by a `str.replace` pass OUTSIDE Jinja
+    (compute_default_agent_prompt / _claude_setup_instructions.jinja). An
+    override renders through Jinja2 instead, which only processes `{{ }}` —
+    an admin who seeds the editor from the live default and saves it
+    verbatim would ship a prompt where `{server_url}` reaches the install
+    agent as literal, unsubstituted text (no server to contact). The
+    save-time validator must reject it with actionable guidance.
+    """
+    from fastapi import HTTPException
+
+    from app.api.prompts import _validate_template
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_template("install", "Server: {server_url}\ncurl -fsSL {server_url}/cli/download\n")
+    assert exc_info.value.status_code == 400
+    assert "{server_url}" in str(exc_info.value.detail)
+    assert "{{ server.url }}" in str(exc_info.value.detail)
+
+    # The correctly-escaped Jinja form stays saveable.
+    _validate_template("install", "Server: {{ server.url }}\ncurl -fsSL {{ server.url }}/cli/download\n")
+
+    # The bare-placeholder regex itself must not false-positive on a
+    # no-space double-brace `{{server_url}}` (valid Jinja syntax, even
+    # though it names the wrong/undefined variable — a separate concern the
+    # render-time UndefinedError already catches on its own).
+    from app.api.prompts import _BARE_SERVER_URL_RE
+
+    assert not _BARE_SERVER_URL_RE.search("{{server_url}}")
+
+
 # ---------------------------------------------------------------------------
 # facts-extraction: the third managed prompt (owner requirement 2026-09-01)
 # ---------------------------------------------------------------------------
@@ -767,7 +823,7 @@ def test_facts_extraction_preview_is_the_content_itself():
     the model is actually sent."""
     import asyncio
 
-    from app.api.prompts import preview_prompt, PreviewRequest
+    from app.api.prompts import PreviewRequest, preview_prompt
 
     body = PreviewRequest(content='Rule 1: emit {"id": "x"}.')
     result = asyncio.run(preview_prompt("facts-extraction", body, request=None, user={}, conn=None))
