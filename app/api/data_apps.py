@@ -381,21 +381,42 @@ def same_origin_serving_allowed() -> bool:
     return bool(switch_value("data_apps_allow_same_origin"))
 
 
+def hosted_serving_possible() -> bool:
+    """Whether this deployment can serve a hosted app to a browser AT ALL,
+    independent of any one app's state.
+
+    ``data_apps_proxy._same_origin_serving_refused`` runs BEFORE the per-state
+    branches, so with neither an isolated origin nor the operator's same-origin
+    opt-in it refuses a ``running`` app exactly as readily as a sleeping one:
+    every request lands on the main origin and gets the 403 "cannot be served
+    here" page. An instance with ``subdomain_base`` set is fine, because that is
+    the host ``_app_url`` then hands out — the click arrives on the subdomain.
+
+    (The proxy also lets a ``data-app-preview:<slug>`` token through, but that
+    is the in-chat preview iframe minting its own short-TTL token, not anything
+    a link on a page can carry — so it has no bearing on whether offering that
+    link is honest.)
+
+    Two callers, one definition: :func:`same_origin_serving_warning` reports
+    this at startup, and ``_serialize``'s ``reachable`` uses it so the UI never
+    offers a link the gate would refuse (Devin Review on #2336).
+    """
+    if same_origin_serving_allowed():
+        return True
+    return bool((_effective_config().get("subdomain_base") or "").strip())
+
+
 def same_origin_serving_warning() -> Optional[str]:
     """A startup warning when hosted apps are enabled but will be refused at
     serve time for lack of an isolated origin, else ``None``.
 
-    Fires when ``data_apps.enabled`` is on, ``allow_same_origin`` is off, and
-    no ``subdomain_base`` is configured — the deployment has no way to serve a
-    hosted app (every request lands on the main origin and is refused by
-    ``data_apps_proxy._same_origin_serving_refused``). Kept pure so it is
-    unit-testable; the app lifespan logs it (`app/main.py`).
+    Fires when ``data_apps.enabled`` is on and :func:`hosted_serving_possible`
+    is false. Kept pure so it is unit-testable; the app lifespan logs it
+    (`app/main.py`).
     """
     if not feature_enabled("data_apps", "enabled", env_var="AGNES_DATA_APPS_ENABLED", default=False):
         return None
-    if same_origin_serving_allowed():
-        return None
-    if (_effective_config().get("subdomain_base") or "").strip():
+    if hosted_serving_possible():
         return None
     return (
         "data_apps.enabled is on but hosted apps will NOT be served: same-origin "
@@ -482,6 +503,23 @@ def _app_url(slug: str, cfg: dict) -> str:
     return f"/apps/{slug}/"
 
 
+#: App states the ingress proxy will actually serve a viewer from — straight
+#: through (``running``) or via the holding page while the container comes up
+#: (``sleeping`` wakes on request, ``deploying`` is already on its way). Every
+#: other state answers 409 there and can only be left by a redeploy, which is
+#: owner/Admin-only — so a viewer offered a link to one has nothing to click
+#: and no way to fix it.
+#:
+#: Mirrors the branch table in ``app/api/data_apps_proxy.py::proxy_app``, and
+#: is pinned against it by
+#: ``tests/test_data_apps_proxy.py::test_reachable_states_matches_what_the_proxy_actually_serves``.
+#: The UI reads this through ``_serialize``'s ``reachable`` rather than
+#: restating it: both app templates used to test ``state == 'running'`` alone,
+#: so a sleeping app — the one non-running state a viewer CAN wake — rendered a
+#: dead ``<code>`` instead of a link.
+REACHABLE_STATES: frozenset[str] = frozenset({"running", "sleeping", "deploying"})
+
+
 def _serialize(row: dict, cfg: Optional[dict] = None) -> dict:
     cfg = cfg if cfg is not None else _effective_config()
     out = {k: v for k, v in row.items() if k not in ("secrets_enc", "service_token_id")}
@@ -492,6 +530,16 @@ def _serialize(row: dict, cfg: Optional[dict] = None) -> dict:
     # override the synced description without the next sync clobbering it.
     out["url"] = (row.get("external_url") or "") if kind == "linked" else _app_url(row["slug"], cfg)
     out["effective_description"] = row.get("description_override") or row.get("description") or ""
+    # Whether offering this app's URL as a link is honest. A linked app opens at
+    # its external URL and is never proxied by us, so its reachability is not
+    # ours to judge. A hosted app has to clear BOTH of the proxy's gates: the
+    # deployment must be able to serve hosted apps at all
+    # (`hosted_serving_possible`, checked first there and state-independent),
+    # and this app's own state must be one the proxy serves from
+    # (REACHABLE_STATES).
+    out["reachable"] = (
+        True if kind == "linked" else (row.get("state") in REACHABLE_STATES and hosted_serving_possible())
+    )
     return out
 
 

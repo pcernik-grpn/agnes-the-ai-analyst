@@ -50,7 +50,7 @@
           </td>
           <td>{% if a.kind == 'linked' %}<span class="muted">Keboola</span>{% else %}{{ a.owner_email }}{% endif %}</td>
           <td>
-            {% if a.kind == 'linked' or a.state == 'running' %}
+            {% if a.reachable %}
             <a href="{{ a.url }}" target="_blank" rel="noopener">Open ↗</a>
             {% else %}
             <span class="muted">not running</span>

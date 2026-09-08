@@ -430,3 +430,74 @@ def test_app_publishing_calls_real_access_endpoints():
     # It is the ONE caller that designates its tool as the data-app lister —
     # without the flag the server never projects a targeted run.
     assert "lister: true" in src
+
+
+# ---------------------------------------------------------------------------
+# URL clickability on the detail page — must follow what the proxy would serve
+# ---------------------------------------------------------------------------
+#
+# Only the DETAIL page is exercised here, deliberately. The Library's
+# Artifacts band is the live inventory surface (`/apps` 302s into it whenever
+# the feature is on and the caller has a visible app row), and its rows link to
+# `/apps/detail/<slug>` (`app/web/router.py::library_page`) — so the detail
+# page's URL field is the only place a viewer is offered the app itself.
+# `data_apps.html` keeps the same corrected condition for consistency, but it
+# renders its table only on the fallback path the redirect leaves behind (the
+# caller has nothing visible), where there is no row to assert on.
+#
+# `reachable` answers TWO gates the proxy applies in order, so both are pinned:
+# whether the deployment can serve hosted apps at all, and whether this app's
+# state is one the proxy serves from.
+
+
+def _set_data_apps_config(data_dir, **overrides):
+    """Rewrite the `data_apps` overlay `web_env` wrote and drop the cached
+    config, so a test can vary the serving configuration."""
+    import app.instance_config as instance_config
+
+    cfg = {"enabled": True, **overrides}
+    (data_dir / "state" / "instance.yaml").write_text(yaml.dump({"data_apps": cfg}))
+    instance_config._instance_config = None
+
+
+@pytest.mark.parametrize("state", ["running", "sleeping", "deploying"])
+def test_detail_page_links_the_url_when_the_proxy_would_serve_it(web_env, state):
+    """A sleeping app wakes on request for anyone allowed to view it
+    (``data_apps_proxy.proxy_app``: ``sleeping`` triggers a wake and answers
+    the holding page, ``deploying`` answers it outright), so its URL has to be
+    a link. The page used to test ``state == 'running'`` alone, which left a
+    granted viewer nothing to click on the very states that would have worked
+    — and no way out, since the endpoint that restarts an app is
+    owner/Admin-only.
+    """
+    _set_data_apps_config(web_env["data_dir"], allow_same_origin=True)
+    _create_app_row(slug="wake1", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/wake1", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/wake1/"' in resp.text
+
+
+@pytest.mark.parametrize("state", ["created", "stopped", "error"])
+def test_detail_page_does_not_link_the_url_when_the_proxy_would_refuse(web_env, state):
+    _set_data_apps_config(web_env["data_dir"], allow_same_origin=True)
+    _create_app_row(slug="dead1", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/dead1", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/dead1/"' not in resp.text
+    assert "<code>/apps/dead1/</code>" in resp.text
+
+
+@pytest.mark.parametrize("state", ["running", "sleeping"])
+def test_detail_page_does_not_link_the_url_when_the_deployment_cannot_serve_apps(web_env, state):
+    """``_same_origin_serving_refused`` runs BEFORE the state branches, so on a
+    deployment with neither ``subdomain_base`` nor ``allow_same_origin`` every
+    hosted app is refused with a 403 page — a ``running`` one exactly as
+    readily as a sleeping one. Offering the link there is a lie regardless of
+    state, and this is the configuration ``web_env`` leaves in place by
+    default. (Devin Review on #2336.)
+    """
+    _create_app_row(slug="noserve", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/noserve", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/noserve/"' not in resp.text
+    assert "<code>/apps/noserve/</code>" in resp.text
