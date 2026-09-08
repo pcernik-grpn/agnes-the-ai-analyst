@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import random
+import time
 import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
@@ -71,6 +72,8 @@ from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_sessi
 from app.auth.jwt import create_access_token
 from app.chat.turn_usage import add_turn_usage
 from src.observability import otel as _otel
+from src.observability.llm_context import LlmCallContext
+from src.observability.llm_record import LlmCallRecord, build_record
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
     access_token_repo,
@@ -879,34 +882,105 @@ def _completion_request_hints(raw_body: bytes, vertex_target: Any) -> "tuple[Opt
     return model, stream
 
 
+def _completion_context(
+    row: Dict[str, Any],
+    *,
+    agent_row: Optional[Dict[str, Any]],
+    caller_user_id: Optional[str],
+) -> LlmCallContext:
+    """The labels for one brokered completion: what work it is, whose it is.
+
+    Everything the broker knows first-hand from the ticket it just
+    validated — no session read, no email. The identity is the resolved
+    user id (never the address, spec 3.6) and the bound agent's id when
+    there is one; an agent-less session is labelled all the same, because a
+    call nobody can attribute is exactly the one a cost report must not
+    lose.
+    """
+    return LlmCallContext(
+        workload="chat",
+        purpose="completion",
+        session_id=row.get("session_id"),
+        user_id=caller_user_id,
+        agent_id=agent_row.get("id") if agent_row else None,
+    )
+
+
+def _record_completion(
+    *,
+    context: LlmCallContext,
+    span: Any,
+    upstream: str,
+    model_requested: Optional[str],
+    usage: Optional[Dict[str, Any]],
+    status_code: Optional[int],
+    latency_ms: Optional[int],
+    summary: "_otel.CompletionSummary",
+    error: Optional[BaseException] = None,
+) -> Optional[LlmCallRecord]:
+    """Build, price and buffer the ``llm_calls`` row for one completion.
+
+    Runs for EVERY completion — export on or off, agent-bound or not, and
+    for a failure too (a zero-cost error row, never a gap in the ledger).
+    The span's ids go on the row when a span was opened, so the row and the
+    exported span describe the same call. Returns the record so the caller
+    can finish the span with the price it just computed; returns ``None``
+    if anything went wrong, because a measurement never costs a forward.
+    """
+    try:
+        trace_id, span_id = _otel.span_ids(span) if span is not None else (None, None)
+        failed = error is not None or (status_code is not None and status_code >= 400)
+        record = build_record(
+            kind="completion",
+            context=context,
+            provider="gcp.vertex_ai" if upstream == "vertex" else "anthropic",
+            upstream=upstream,
+            model_requested=model_requested,
+            model_response=(usage or {}).get("model") or summary.model,
+            usage=usage,
+            latency_ms=latency_ms,
+            status="error" if failed else "ok",
+            error_type=(type(error).__name__ if error is not None else (str(status_code) if failed else None)),
+            http_status=status_code,
+            prompt_chars=summary.prompt_chars,
+            completion_chars=summary.completion_chars,
+            stop_reason=summary.stop_reason,
+            stream_complete=summary.stream_complete,
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+        usage_accumulator.add_call(record.to_row())
+        return record
+    except Exception:  # noqa: BLE001 - a measurement never costs a forward
+        logger.debug("broker: could not record the completion", exc_info=True)
+        return None
+
+
 async def _start_otel_completion_span(
     *,
     row: Dict[str, Any],
     raw_body: bytes,
     vertex_target: Any,
     upstream: str,
-    agent_row: Optional[Dict[str, Any]],
-    caller_user_id: Optional[str],
-    session: Any,
+    context: LlmCallContext,
+    parent_context: Any = None,
 ) -> Any:
-    """Open the broker's completion span. The session row is read only when
-    export is on (the caller checks) and not already in hand — one extra
-    read per completion, off the event loop, never on the path when tracing
-    is off. Identity is a label here, never a reason to fail the call."""
+    """Open the broker's completion span, labelled by the call context the
+    caller already built. No session read on this path: identity comes from
+    the ticket's own resolution, so tracing costs no extra query — and never
+    the user's email, which is personal data with no join value off-instance
+    (spec 3.6). ``parent_context`` is the chat turn's span when one is known."""
     model, stream = _completion_request_hints(raw_body, vertex_target)
-    if session is None:
-        try:
-            session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
-        except Exception:  # noqa: BLE001
-            session = None
     return _otel.start_completion_span(
         upstream=upstream,
         model=model,
         stream=stream,
         session_id=row.get("session_id"),
         ticket_scope=row.get("scope"),
-        user_id=caller_user_id,
-        agent_id=agent_row.get("id") if agent_row else None,
+        user_id=context.user_id,
+        agent_id=context.agent_id,
+        context=context,
+        parent_context=parent_context,
     )
 
 
@@ -1047,10 +1121,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # traffic is the busy path, so it keeps paying nothing. Offloaded because a
     # synchronous DB read must not run on the event loop.
     # Found by Devin Review on this PR.
-    otel_session = None
+    llm_scope_session = None
     if row.get("scope") == "llm":
-        otel_session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
-        if otel_session is None:
+        llm_scope_session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
+        if llm_scope_session is None:
             raise HTTPException(status_code=401, detail="ticket_session_gone")
     raw_body = await request.body()
     headers = {
@@ -1309,21 +1383,34 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # here, after every gate that could refuse the call, and closed where
     # the forward ends — in the stream's ``finally`` or after the buffered
     # read below — so its duration is the upstream's, not the gates'.
+    #
+    # The call's LABELS, on the other hand, are built for every completion
+    # whether or not the export is on: the `llm_calls` ledger row below is
+    # written either way (spec 3.1), and it is the on-instance record — the
+    # OTLP span is the optional copy of it, not the other way round.
+    upstream_label = "dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic")
+    completion_context: Optional[LlmCallContext] = None
+    requested_model: Optional[str] = None
+    if is_completion:
+        completion_context = _completion_context(row, agent_row=agent_row, caller_user_id=caller_user_id)
+        requested_model, _requested_stream = _completion_request_hints(raw_body, vertex_target)
     otel_span = None
-    if is_completion and _otel.is_enabled():
+    if completion_context is not None and _otel.is_enabled():
         try:
             otel_span = await _start_otel_completion_span(
                 row=row,
                 raw_body=raw_body,
                 vertex_target=vertex_target,
-                upstream="dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic"),
-                agent_row=agent_row,
-                caller_user_id=caller_user_id,
-                session=otel_session,
+                upstream=upstream_label,
+                context=completion_context,
             )
         except Exception:  # noqa: BLE001 - a measurement must never cost a forward
             logger.debug("broker: could not open the completion span", exc_info=True)
             otel_span = None
+    # The clock the record's `latency_ms` reads: wall time from just before
+    # the upstream request to the end of the forward (stream end or buffered
+    # read), so it measures the provider, not this instance's own gates.
+    forward_started = time.monotonic()
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
     # Retry loop for upstream rate limiting. A provider 429 (a Vertex
     # per-minute token/request quota is the usual one) means the request was
@@ -1379,6 +1466,25 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             except Exception:
                 # Audit logging must never break the deny path itself.
                 pass
+            # The same record every other outcome gets: a call that never
+            # reached the provider is a zero-cost error row, and its span is
+            # finished here rather than abandoned mid-flight (an unended span
+            # is never exported at all, so this branch used to drop the whole
+            # completion from the trace as well as from the ledger).
+            if completion_context is not None:
+                _record_completion(
+                    context=completion_context,
+                    span=otel_span,
+                    upstream=upstream_label,
+                    model_requested=requested_model,
+                    usage=None,
+                    status_code=None,
+                    latency_ms=int((time.monotonic() - forward_started) * 1000),
+                    summary=_otel.CompletionSummary(),
+                    error=exc,
+                )
+            if otel_span is not None:
+                _otel.end_completion_span(otel_span, error=exc)
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1389,6 +1495,21 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             ) from exc
         except BaseException as _exc:
             await client.aclose()
+            if completion_context is not None:
+                # A call that never returned is still a call: a zero-cost
+                # error row, so a burst of them shows up in the ledger
+                # instead of looking like traffic that simply stopped.
+                _record_completion(
+                    context=completion_context,
+                    span=otel_span,
+                    upstream=upstream_label,
+                    model_requested=requested_model,
+                    usage=None,
+                    status_code=None,
+                    latency_ms=int((time.monotonic() - forward_started) * 1000),
+                    summary=_otel.CompletionSummary(),
+                    error=_exc,
+                )
             if otel_span is not None:
                 _otel.end_completion_span(otel_span, error=_exc)
             raise
@@ -1409,6 +1530,21 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             await asyncio.sleep(delay)
         except BaseException as _exc:
             await client.aclose()
+            if completion_context is not None:
+                # A call that never returned is still a call: a zero-cost
+                # error row, so a burst of them shows up in the ledger
+                # instead of looking like traffic that simply stopped.
+                _record_completion(
+                    context=completion_context,
+                    span=otel_span,
+                    upstream=upstream_label,
+                    model_requested=requested_model,
+                    usage=None,
+                    status_code=None,
+                    latency_ms=int((time.monotonic() - forward_started) * 1000),
+                    summary=_otel.CompletionSummary(),
+                    error=_exc,
+                )
             if otel_span is not None:
                 _otel.end_completion_span(otel_span, error=_exc)
             raise
@@ -1458,11 +1594,15 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
         state = {"overflow": False}
+        # Mirror the passthrough bytes when SOMETHING downstream reads them:
+        # the budget ledger, the span, or the call record (which is built for
+        # every completion, export on or off).
+        mirror_body = collect_usage or otel_span is not None or completion_context is not None
 
         async def _passthrough():
             try:
                 async for chunk in resp.aiter_bytes():
-                    if (collect_usage or otel_span is not None) and not state["overflow"]:
+                    if mirror_body and not state["overflow"]:
                         if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
                             collected.extend(chunk)
                         else:
@@ -1471,6 +1611,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             finally:
                 await resp.aclose()
                 await client.aclose()
+                body = bytes(collected)
+                # Parsed ONCE for all three consumers below (budget ledger,
+                # call record, span) — the same figures, by construction.
+                usage = None if state["overflow"] else parse_usage(body, ctype)
                 if collect_usage:
                     try:
                         if state["overflow"]:
@@ -1480,7 +1624,6 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                                 _SSE_USAGE_COLLECT_MAX_BYTES,
                             )
                         else:
-                            usage = parse_usage(bytes(collected), ctype)
                             if usage and agent_row is not None:
                                 usage_accumulator.add(
                                     {
@@ -1500,15 +1643,36 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                             "llm usage recording failed for agent %s (stream already forwarded)",
                             agent_row.get("id"),
                         )
+                summary = None
+                record = None
+                if completion_context is not None:
+                    summary = _otel.describe_completion(
+                        request_body=raw_body,
+                        response_body=body,
+                        content_type=ctype,
+                        response_truncated=state["overflow"],
+                    )
+                    record = _record_completion(
+                        context=completion_context,
+                        span=otel_span,
+                        upstream=upstream_label,
+                        model_requested=requested_model,
+                        usage=usage,
+                        status_code=resp.status_code,
+                        latency_ms=int((time.monotonic() - forward_started) * 1000),
+                        summary=summary,
+                    )
                 if otel_span is not None:
                     _otel.end_completion_span(
                         otel_span,
                         status_code=resp.status_code,
-                        usage=None if state["overflow"] else parse_usage(bytes(collected), ctype),
+                        usage=usage,
                         request_body=raw_body,
-                        response_body=bytes(collected),
+                        response_body=body,
                         content_type=ctype,
                         response_truncated=state["overflow"],
+                        summary=summary,
+                        cost_usd=record.cost_usd if record is not None else None,
                     )
 
         return StreamingResponse(
@@ -1541,9 +1705,11 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # than written here. Must never break the response path: any parse/add
     # failure is caught and logged, not raised.
     turn_session_id = row.get("session_id") if is_completion else None
+    # Parsed ONCE for all three consumers below (budget ledger, call record,
+    # span) — the same figures, by construction.
+    usage = parse_usage(resp.content, ctype) if resp.status_code == 200 else None
     if (agent_row is not None or turn_session_id is not None) and resp.status_code == 200:
         try:
-            usage = parse_usage(resp.content, resp.headers.get("content-type", ""))
             if usage and turn_session_id:
                 add_turn_usage(turn_session_id, usage)
             if usage and agent_row is not None:
@@ -1562,14 +1728,34 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             logger.exception(
                 "llm usage recording failed for agent %s (response already forwarded)", agent_row.get("id")
             )
+    summary = None
+    record = None
+    if completion_context is not None:
+        summary = _otel.describe_completion(
+            request_body=raw_body,
+            response_body=resp.content,
+            content_type=ctype,
+        )
+        record = _record_completion(
+            context=completion_context,
+            span=otel_span,
+            upstream=upstream_label,
+            model_requested=requested_model,
+            usage=usage,
+            status_code=resp.status_code,
+            latency_ms=int((time.monotonic() - forward_started) * 1000),
+            summary=summary,
+        )
     if otel_span is not None:
         _otel.end_completion_span(
             otel_span,
             status_code=resp.status_code,
-            usage=parse_usage(resp.content, ctype) if resp.status_code == 200 else None,
+            usage=usage,
             request_body=raw_body,
             response_body=resp.content,
             content_type=ctype,
+            summary=summary,
+            cost_usd=record.cost_usd if record is not None else None,
         )
 
     return _to_response(resp, budget_headers)

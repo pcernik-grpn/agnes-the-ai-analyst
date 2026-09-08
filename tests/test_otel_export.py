@@ -532,6 +532,10 @@ def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_
     assert attrs["agnes.response_bytes"] > 0
     assert attrs["agnes.ticket_scope"] == "llm"
     assert attrs["agnes.session_id"] == session.id
+    # Identity minimisation (spec 3.6): the session row is no longer read on
+    # the span path at all, and the address never leaves the instance — this
+    # session has no bound agent, so the id fields are simply absent too.
+    assert "agnes.user_email" not in attrs
     assert attrs["gen_ai.response.model"] == "claude-stream"
     assert attrs["gen_ai.usage.input_tokens"] == 20
     assert attrs["gen_ai.usage.output_tokens"] == 4  # the stream's final (max) figure, not a sum
