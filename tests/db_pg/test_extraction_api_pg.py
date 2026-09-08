@@ -751,9 +751,7 @@ def test_fleet_row_cost_sums_crawl_run_and_facts_ingest_without_double_counting(
     assert row["cost_status"] == "priced"
 
 
-def test_fleet_total_de_duplicates_a_run_shared_by_two_connections_own_collections(
-    tmp_path, monkeypatch, pg_engine
-):
+def test_fleet_total_de_duplicates_a_run_shared_by_two_connections_own_collections(tmp_path, monkeypatch, pg_engine):
     """The exact configuration the whole cost-truth fix came from: a site
     split into siblings (`POST .../split/apply`) — or a bulk-add's shared-
     collection option — can legitimately route more than one connection's
@@ -1285,6 +1283,67 @@ def test_cancel_works_even_with_no_owning_job(tmp_path, monkeypatch, pg_engine):
     r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
     assert r.status_code == 200, r.text
     assert r.json()["outcome"] == "interrupted"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-06 production incident, against the REAL Postgres repos: cancelling
+# one run sets the connection-wide `stop_requested_at` (above); a fresh
+# trigger right after must not inherit it. `tests/test_sharepoint_crawler.py`
+# covers `_clear_stale_stop_for_trigger`'s own comparison logic against
+# fakes — these prove it against the actual row shapes (a real `datetime` in
+# `jobs.created_at`) those fakes stand in for.
+# ---------------------------------------------------------------------------
+
+
+def test_a_trigger_right_after_a_cancel_clears_the_stale_stop_flag(tmp_path, monkeypatch, pg_engine):
+    """The regression: cancel closes a run (setting the stop flag), then a
+    fresh trigger's own job is enqueued strictly after — that flag must not
+    survive into the new run."""
+    from connectors.sharepoint.crawler import _clear_stale_stop_for_trigger, _stop_requested
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-trigger-after-cancel")
+
+    run_id = _repo().start(connection_id=conn_id)
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    assert _stop_requested(conn_id) is not None
+
+    # Backdate the flag itself — same idiom as other tests in this suite
+    # that simulate elapsed time without sleeping (see
+    # `tests/test_admin_extraction.py::TestFactsPendingDocumentsCache`) —
+    # so this reads as what the incident actually was: a cancel well
+    # BEFORE the fresh trigger below, not a same-second coincidence.
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().config_patch(conn_id, {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}})
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
+
+    _clear_stale_stop_for_trigger(conn_id, job["id"])
+
+    assert _stop_requested(conn_id) is None
+
+
+def test_a_stop_requested_after_the_triggering_job_still_survives_the_clear(tmp_path, monkeypatch, pg_engine):
+    """The race: a stop written AFTER the triggering job's own `created_at`
+    (an admin's Stop click landing while that job was still starting) must
+    not be wiped by that same job's own start-up clear."""
+    from connectors.sharepoint.crawler import _clear_stale_stop_for_trigger, _stop_requested, request_stop
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-trigger-race")
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
+    stamp = request_stop(conn_id)  # strictly after job["created_at"]
+
+    _clear_stale_stop_for_trigger(conn_id, job["id"])
+
+    assert _stop_requested(conn_id) == stamp
 
 
 def test_cancel_stops_the_heartbeat_loop_via_the_cleared_lease(tmp_path, monkeypatch, pg_engine):
@@ -2021,9 +2080,7 @@ def test_breakdown_needs_review_is_its_own_column_and_counts_as_accounted_for(tm
 
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
     conn_id = _connection(client, token)
-    source_connections_repo().update(
-        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_nr"}]}
-    )
+    source_connections_repo().update(conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_nr"}]})
     files_repo = corpus_files_repo()
     fid = files_repo.add(
         corpus_id="col_nr",

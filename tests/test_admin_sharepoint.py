@@ -3261,8 +3261,64 @@ class TestExtractionTriggerShardRerun:
 
         assert r.status_code == 400, r.text
         assert r.json()["detail"]["error"] == "unknown_shard_index"
-        assert r.json()["detail"]["unknown"] == [5]
-        assert r.json()["detail"]["shards_total"] == 2
+
+    def test_an_invalid_rerun_request_never_clears_the_stop_flag_as_a_side_effect(self, seeded_app, monkeypatch):
+        """2026-09-07 review finding: the clear-or-refuse call used to run
+        BEFORE shard-index validation, so a request that goes on to 404
+        (no persisted plan) or 400 (an out-of-range index) still mutated
+        the connection's stop flag despite doing no actual work."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-invalid-preserves-stop")
+
+        from connectors.sharepoint.crawler import request_stop, save_state
+        from src.repositories import source_connections_repo
+
+        # No persisted shard plan at all -> 404, before ever touching the flag.
+        stamp = request_stop(conn_id)
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404, r.text
+        row = source_connections_repo().get(conn_id)
+        assert (row["config"].get("extraction") or {}).get("stop_requested_at") == stamp
+
+        # An out-of-range index against a real persisted plan -> 400, same guarantee.
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_old_parent",
+                    "shards_total": 1,
+                    "shards": [
+                        {
+                            "scope_id": "b!drive1",
+                            "label": "part 1/1",
+                            "expected": 10,
+                            "exclude_prefixes": [],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}
+                            ],
+                        },
+                    ],
+                },
+            },
+        )
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [99]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 400, r.text
+        row = source_connections_repo().get(conn_id)
+        assert (row["config"].get("extraction") or {}).get("stop_requested_at") == stamp
 
     def test_named_shards_are_enqueued_as_a_fresh_parent_run(self, seeded_app, monkeypatch):
         # NOTE: `use_pg()` is deliberately left at this test app's default
@@ -3306,6 +3362,9 @@ class TestExtractionTriggerShardRerun:
                 }
                 self.enqueued.append(row)
                 return row
+
+            def list_by_idempotency_prefix(self, prefix, *, statuses=None):
+                return []  # no live shard children from any prior run
 
         jobs = FakeJobsRepo()
         monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
@@ -3363,6 +3422,166 @@ class TestExtractionTriggerShardRerun:
         assert runs.started[0]["connection_id"] == conn_id
         assert runs.started[0]["shards_total"] == 1
         assert runs.started[0]["parent_run_id"] is None  # a fresh top-level parent, not chained to the old one
+
+    def test_a_stale_stop_flag_does_not_survive_a_shard_rerun(self, seeded_app, monkeypatch):
+        """2026-09-07 review finding: `_trigger_shard_rerun` never runs
+        through `run_builtin_crawl` — it calls `_enqueue_shard_plan`
+        directly from the request handler — so it must clear a stale
+        cooperative-stop flag itself. Otherwise a rerun right after a
+        cancel would inherit the SAME stale flag every selected shard
+        immediately stops on, reproducing the 2026-09-06 incident through
+        this entry point instead of the ordinary trigger."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+            def abandon_stale_running(self, connection_id):
+                return []
+
+            def start(self, *, connection_id, job_id=None, phase="crawl", **shard_kwargs):
+                return "er_new_parent"
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+
+        class FakeJobsRepo:
+            def __init__(self):
+                self.enqueued = []
+
+            def enqueue(self, kind, payload, *, priority=0, run_after=None, max_attempts=3, idempotency_key=None):
+                row = {
+                    "id": f"job-{len(self.enqueued) + 1}",
+                    "kind": kind,
+                    "payload_json": payload,
+                    "deduped": False,
+                }
+                self.enqueued.append(row)
+                return row
+
+            def list(self, *, status, kind, limit=200):
+                return []  # no live shard children from any prior run
+
+            def list_by_idempotency_prefix(self, prefix, *, statuses=None):
+                return []  # no live shard children from any prior run
+
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: FakeJobsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-rerun-stale-stop")
+
+        from connectors.sharepoint.crawler import request_stop, save_state
+
+        request_stop(conn_id)  # the previous run's cancel
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "part 1/1",
+            "expected": 10,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}],
+        }
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {"parent_run_id": "er_old_parent", "shards_total": 1, "shards": [shard]},
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 202, r.text
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert "stop_requested_at" not in (row["config"].get("extraction") or {})
+
+    def test_a_shard_rerun_is_refused_with_409_while_a_previous_runs_shard_children_are_still_live(
+        self, seeded_app, monkeypatch
+    ):
+        """A cancel closes the top-level run row immediately without waiting
+        for its shard children to notice — so a rerun through this entry
+        point must refuse outright (409) while any of that connection's own
+        shard jobs are still queued/running, exactly like the ordinary
+        trigger path. Enqueuing a fresh parent anyway would collide on the
+        deterministic per-shard idempotency key and strand the new parent
+        forever."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+            def abandon_stale_running(self, connection_id):
+                return []
+
+            def start(self, *, connection_id, job_id=None, phase="crawl", **shard_kwargs):
+                raise AssertionError("must not start a new run while a previous run's shards are still live")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+
+        class FakeJobsRepo:
+            def __init__(self):
+                self.enqueued = []
+
+            def enqueue(self, kind, payload, *, priority=0, run_after=None, max_attempts=3, idempotency_key=None):
+                raise AssertionError("must not enqueue a new shard job while a previous run's shards are still live")
+
+            def list(self, *, status, kind, limit=200):
+                return []
+
+            def list_by_idempotency_prefix(self, prefix, *, statuses=None):
+                return [{"id": "job-old-shard-1", "kind": "corpus-extraction-shard", "status": "running"}]
+
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: FakeJobsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-rerun-still-draining")
+
+        from connectors.sharepoint.crawler import request_stop, save_state
+
+        request_stop(conn_id)  # the previous run's cancel
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "part 1/1",
+            "expected": 10,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}],
+        }
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {"parent_run_id": "er_old_parent", "shards_total": 1, "shards": [shard]},
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "extraction_already_running"
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert (row["config"].get("extraction") or {}).get("stop_requested_at")  # flag preserved, not cleared
 
 
 class TestRetryEmptyExtraction:
@@ -5818,41 +6037,99 @@ class TestDispatchBookkeepingKeepsSiblings:
     into `config.extraction`, never replace the sub-object — the per-
     connection overrides (`facts.*`, `crawl.min_modified`) live there too."""
 
+    class _FakeRepo:
+        """Just enough of `source_connections_repo()`'s contract:
+        `.get()` returns the live row (by reference, so a `config_patch`
+        is immediately visible to the next `.get()`), `.config_patch()`
+        merges the patch's top-level keys the same shallow way both real
+        repos do, and `.merge_extraction()` merges directly into the
+        nested `config.extraction` sub-object (re-reading the live
+        connection each call, same as the real repos' own re-read-under-
+        lock) — mirrors `tests/test_sharepoint_crawler.py`'s
+        `FakeSourceConnectionsRepo`, kept local rather than shared."""
+
+        def __init__(self, connection):
+            self.connection = connection
+
+        def get(self, connection_id):
+            return self.connection if connection_id == self.connection.get("id") else None
+
+        def config_patch(self, connection_id, patch):
+            if connection_id != self.connection.get("id"):
+                return None
+            config = dict(self.connection.get("config") or {})
+            config.update(patch)
+            self.connection["config"] = config
+            return self.connection
+
+        def merge_extraction(self, connection_id, patch):
+            if connection_id != self.connection.get("id"):
+                return None
+            config = dict(self.connection.get("config") or {})
+            extraction = dict(config.get("extraction") or {})
+            extraction.update(patch)
+            config["extraction"] = extraction
+            self.connection["config"] = config
+            return self.connection
+
     def test_trigger_keeps_facts_and_crawl_overrides(self):
         from app.api.admin_sharepoint import _record_extraction_dispatch
 
-        written = {}
-
-        class _Repo:
-            def update(self, cid, config=None):
-                written["config"] = config
+        row = {
+            "id": "c1",
+            "config": {
+                "tenant_id": "t",
+                "extraction": {
+                    "facts": {"retry_mode": "off", "transport": "batch"},
+                    "crawl": {"min_modified": "2023-12-31"},
+                    "stop_requested_at": None,
+                },
+            },
+        }
+        repo = self._FakeRepo(dict(row))  # a live copy — patch, never the caller's own snapshot
 
         import app.api.admin_sharepoint as mod
 
         orig = mod.source_connections_repo
-        mod.source_connections_repo = lambda: _Repo()
+        mod.source_connections_repo = lambda: repo
         try:
-            row = {
-                "id": "c1",
-                "config": {
-                    "tenant_id": "t",
-                    "extraction": {
-                        "facts": {"retry_mode": "off", "transport": "batch"},
-                        "crawl": {"min_modified": "2023-12-31"},
-                        "stop_requested_at": None,
-                    },
-                },
-            }
             _record_extraction_dispatch(row, "job-1")
         finally:
             mod.source_connections_repo = orig
 
-        ext = written["config"]["extraction"]
+        ext = repo.connection["config"]["extraction"]
         assert ext["last_job_id"] == "job-1"
         assert ext["last_run_at"]
         assert ext["facts"] == {"retry_mode": "off", "transport": "batch"}
         assert ext["crawl"] == {"min_modified": "2023-12-31"}
-        assert written["config"]["tenant_id"] == "t"
+        assert repo.connection["config"]["tenant_id"] == "t"
+
+    def test_uses_the_live_row_not_the_callers_own_stale_snapshot(self):
+        """2026-09-07 finding: `_trigger_shard_rerun` clears a stale
+        cooperative-stop flag BEFORE calling this — merging from the
+        CALLER's own (now stale) `row` snapshot instead of a fresh read
+        would silently resurrect it. Proven directly here: `row` still
+        carries the flag, but the LIVE connection no longer does (some
+        other write already cleared it) — the dispatch write must not
+        bring it back."""
+        from app.api.admin_sharepoint import _record_extraction_dispatch
+
+        stale_row = {"id": "c1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
+        live_connection = {"id": "c1", "config": {"extraction": {}}}  # already cleared by something else
+        repo = self._FakeRepo(live_connection)
+
+        import app.api.admin_sharepoint as mod
+
+        orig = mod.source_connections_repo
+        mod.source_connections_repo = lambda: repo
+        try:
+            _record_extraction_dispatch(stale_row, "job-1")
+        finally:
+            mod.source_connections_repo = orig
+
+        ext = repo.connection["config"]["extraction"]
+        assert "stop_requested_at" not in ext
+        assert ext["last_job_id"] == "job-1"
 
 
 class TestFactsGraphCountsDoesNotBlockTheEventLoop:

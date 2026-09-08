@@ -1254,26 +1254,37 @@ def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
     same JSON column. Called by BOTH the manual trigger and the sweep, so
     either path resets the "next due" clock — a manual run moments before
     the schedule would fire must not also queue a second run a tick later.
+
+    Writing a NEW key here (or in any other function in this module)? Add
+    it to ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`` above IN THE SAME
+    CHANGE — the generic connection editor's carry-forward (``app/api/
+    admin_source_connections.py::update_connection``) only preserves keys
+    listed there, and the ratchet test (``tests/
+    test_sharepoint_config_carry_forward_ratchet.py``) will fail otherwise.
+
+    Uses ``merge_extraction`` — ONE atomic, re-read-under-lock merge
+    straight into ``config.extraction`` — NEVER the caller's own ``row``
+    as the merge base, and never a separate read-then-``config_patch``
+    pair either: ``row`` is whatever the caller fetched at the START of
+    its own handler, and this is sometimes called AFTER that same handler
+    has already done its own write to ``config.extraction`` — a
+    selected-shard rerun clears a stale cooperative-stop flag
+    (``connectors.sharepoint.crawler._clear_stale_stop_for_trigger``)
+    before calling this. A prior version of this function did ``repo.
+    get()`` THEN ``repo.config_patch(..., {"extraction": extraction})`` —
+    still a plain read-then-write two calls apart, with a real window for
+    a `request_stop` to commit a fresh flag in between that the second
+    call's already-computed snapshot would silently overwrite (2026-09-07
+    finding, on top of the first one this docstring already described).
+    ``merge_extraction`` closes both in one step: the read, the merge, and
+    the write happen in the SAME transaction/lock the real repos already
+    use for exactly this class of race.
     """
-    config = dict(row.get("config") or {})
-    # Writing a NEW key here (or in any other function in this module)?
-    # Add it to SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS above IN THE SAME
-    # CHANGE — the generic connection editor's carry-forward
-    # (app/api/admin_source_connections.py::update_connection) only
-    # preserves keys listed there, and the ratchet test
-    # (tests/test_sharepoint_config_carry_forward_ratchet.py) will fail
-    # otherwise.
-    # MERGE into the existing sub-object, never replace it: `config.extraction`
-    # also carries the per-connection overrides an admin set moments earlier
-    # (`facts.retry_mode` / `facts.transport`, `crawl.min_modified`, the Stop
-    # control's `stop_requested_at`). Replacing the dict here wiped them at
-    # the exact moment the crawl started (observed live 2026-09-02: a crawl
-    # triggered right after a `min_modified` PATCH ran unfiltered).
-    extraction = dict(config.get("extraction") or {})
-    extraction["last_run_at"] = datetime.now(timezone.utc).isoformat()
-    extraction["last_job_id"] = job_id
-    config["extraction"] = extraction
-    source_connections_repo().update(row["id"], config=config)
+    extraction_patch = {
+        "last_run_at": datetime.now(timezone.utc).isoformat(),
+        "last_job_id": job_id,
+    }
+    source_connections_repo().merge_extraction(row["id"], extraction_patch)
 
 
 def _extraction_schedule_config() -> Optional[str]:
@@ -4343,8 +4354,41 @@ def _trigger_shard_rerun(
     planner itself uses, over a FILTERED shard list. Opens a fresh parent
     run scoped to only these shards; never re-plans (a genuine re-plan is
     what an ordinary trigger, or ``resync``, already does).
+
+    This entry point never runs through ``run_builtin_crawl`` — it calls
+    ``_enqueue_shard_plan`` directly from the request handler — so it must
+    clear a stale cooperative-stop flag itself; otherwise a rerun right
+    after a cancel would inherit the SAME stale flag every selected shard
+    immediately stops on. No ``job_id`` anchor exists here (there is no
+    top-level ``corpus-extraction`` job behind this call, dispatched
+    synchronously within the request instead of through the worker), so
+    this is the unconditional-clear form — same as any other trigger path
+    with nothing to anchor a race window against.
+
+    ``409 extraction_already_running`` when the connection still has
+    QUEUED/RUNNING ``corpus-extraction-shard`` jobs from a PREVIOUS
+    cancelled run (``_clear_stale_stop_for_trigger`` raises ``_Previous
+    RunStillDraining`` rather than let this rerun proceed): those old
+    children's idempotency keys would otherwise collide with THIS rerun's
+    own, silently aliasing its "new" jobs onto them and leaving the fresh
+    parent row this call is about to open with no children that can ever
+    complete it. The caller sees the SAME error shape :func:`trigger_
+    extraction`'s own liveness gate already returns above, and retries
+    once the fleet view shows nothing queued or running for this shard set.
+
+    Shard-index validation (a persisted plan exists, every requested index
+    is in range) runs BEFORE the clear-or-refuse call below, not after: a
+    2026-09-07 finding on an earlier version of this function had it clear
+    (or 409-refuse) first, so a request that goes on to 404/400 on bad
+    input still mutated the connection's stop flag as a side effect of a
+    call that does no actual work.
     """
-    from connectors.sharepoint.crawler import _enqueue_shard_plan, load_state
+    from connectors.sharepoint.crawler import (
+        _clear_stale_stop_for_trigger,
+        _enqueue_shard_plan,
+        _PreviousRunStillDraining,
+        load_state,
+    )
 
     state = load_state(connection_id)
     persisted_shards = ((state.get("shard_plan") or {}).get("shards")) or []
@@ -4363,6 +4407,18 @@ def _trigger_shard_rerun(
     # Stored WITHOUT their own 1-based index (see `_enqueue_shard_plan`) —
     # re-derive it positionally, the same way that call originally assigned it.
     named = [shard for i, shard in enumerate(persisted_shards, start=1) if i in wanted]
+
+    # Validated above BEFORE this mutates any state: an invalid request
+    # (no persisted plan, an out-of-range index) must 404/400 as a pure
+    # read, never clear the stop flag as a side effect of a call that goes
+    # on to do nothing.
+    try:
+        _clear_stale_stop_for_trigger(connection_id, None)
+    except _PreviousRunStillDraining as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "message": str(exc)},
+        ) from exc
 
     rerun_payload: Dict[str, Any] = {"connection_id": connection_id}
     if options.force_reprocess:

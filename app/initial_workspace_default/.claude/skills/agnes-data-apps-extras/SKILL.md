@@ -18,16 +18,33 @@ If you haven't loaded `dataapp-development` yet, load it now. If you're
 unsure which deployment path applies, see `references/path-d.md` — Agnes is
 detected by the presence of the `data_app_*` MCP tools.
 
-## 0. The app has to exist before it can have a draft
+## 0. Create the app, then its draft, before anything is deployed
 
-For a NEW app, call `data_app_create(slug, name, description)` first. A draft
-is a sibling row on an existing app's repo, so `data_app_create_draft` against
-a slug that was never created returns `404 data_app_not_found` — watched live,
-that is exactly where a run stops, retrying the draft call and getting the same
-404. Order: `data_app_create` → seed the repo (§1) → `data_app_create_draft`
-only when you want an iteration branch off a *deployed* app.
+For a NEW app the order is fixed, and every step is a precondition of the
+next — watched live, skipping either of the first two stops the run:
 
-For an app that already exists, skip this and go straight to §1.
+1. `data_app_create(slug, name, description)` — the registry row and its
+   empty repo. `data_app_create_draft` against a slug that was never created
+   returns `404 data_app_not_found` (a run used to stall here, retrying the
+   draft call and getting the same 404).
+2. Seed the repo: clone through the relay (§0b), copy the scaffold (§1),
+   commit, push to `main`.
+3. `data_app_create_draft(slug)` — a draft is a sibling row pinned to a
+   branch of the same repo. **Every dev deploy needs one, including the very
+   first**: `data_app_deploy(<slug>, mode="dev")` on the prod row fails with
+   `400 dev_requires_draft` (watched live: the agent deployed the prod slug
+   in dev mode, got the 400, and only then created the draft).
+4. `data_app_deploy(<draft_slug>, mode="dev")`, then the preview cadence
+   in §3.
+
+Never deploy the prod row (`data_app_deploy(slug)` with no `mode`) before the
+user has picked "Publish" — that is the promote flow
+(`references/promote-flow.md`), not the first deploy.
+
+For an app that already exists, skip step 1. If its repo has no `main`
+commit yet (created, never seeded), complete step 2 before step 3 —
+`data_app_create_draft` refuses a repo without `main`
+(`parent_has_no_main`). Otherwise, if it has no open draft, start at step 3.
 
 ## 0b. Cloning the repo: use the relay, not the credential URL
 

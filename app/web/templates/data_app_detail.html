@@ -119,7 +119,7 @@
     <div class="dda-fact">
       <span class="label">URL</span>
       <span class="value">
-        {% if app.kind == 'linked' or app.state == 'running' %}
+        {% if app.reachable %}
         <a href="{{ app.url }}" target="_blank" rel="noopener">{{ app.url }} ↗</a>
         {% else %}
         <code>{{ app.url }}</code>

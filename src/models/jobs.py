@@ -58,4 +58,15 @@ class Job(Base):
             unique=True,
             postgresql_where=text("idempotency_key IS NOT NULL AND status IN ('queued', 'running')"),
         ),
+        # A LIKE-prefix-search partner to idx_jobs_idem above — see
+        # migrations/versions/0112_jobs_idem_pattern_index.py for why a
+        # plain B-tree index alone isn't enough for
+        # JobsPgRepository.list_by_idempotency_prefix() outside a "C"
+        # locale database.
+        Index(
+            "idx_jobs_idem_pattern",
+            "idempotency_key",
+            postgresql_ops={"idempotency_key": "text_pattern_ops"},
+            postgresql_where=text("idempotency_key IS NOT NULL AND status IN ('queued', 'running')"),
+        ),
     )
