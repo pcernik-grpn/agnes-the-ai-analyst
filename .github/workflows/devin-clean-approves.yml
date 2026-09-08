@@ -37,8 +37,21 @@ name: Devin clean verdict approves org members' PRs
 # OFF. Every decision is logged per PR, so a run that does nothing says why.
 #
 # Safety: nothing is checked out; the step only calls the GitHub API.
-# Approvals come from the Actions token (repo setting "Allow GitHub Actions
-# to create and approve pull requests" must stay on).
+#
+# Who may hold the approving credential is the whole game. `workflow_dispatch`
+# can be pointed at ANY ref, and a guard inside this file cannot stop someone
+# dispatching a modified copy from their own branch — so the credential must
+# live where a branch cannot reach it. The job runs in the `devin-bridge`
+# environment and approves with `secrets.DEVIN_BRIDGE_TOKEN`; once that
+# environment's deployment-branch policy is "main only" and the token is a
+# dedicated bot account with write access (an environment secret is only
+# released to jobs on allowed branches), a copy on any other ref gets neither
+# the environment nor the token. Until those are configured the step falls
+# back to the Actions token and only the runtime ref guard below applies —
+# and in that state the repo setting "Allow GitHub Actions to create and
+# approve pull requests" is what lets ANY same-repository workflow approve,
+# this one included. Configure the environment + secret, then turn that
+# setting off.
 
 on:
   schedule:
@@ -63,15 +76,30 @@ jobs:
   bridge:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Deployment-branch policy "main only" on this environment is what makes a
+    # branch-dispatched copy fail before it runs; the secret below is released
+    # only to jobs that got the environment.
+    environment: devin-bridge
     steps:
       - name: Approve org members' PRs on Devin's clean verdict, dismiss on issues
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.DEVIN_BRIDGE_TOKEN || github.token }}
+          TOKEN_KIND: ${{ secrets.DEVIN_BRIDGE_TOKEN && 'dedicated bot token' || 'Actions token (fallback; configure DEVIN_BRIDGE_TOKEN)' }}
           REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           ONLY_PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
           owner=${REPO%/*}; name=${REPO#*/}
+          echo "credential: $TOKEN_KIND"
+
+          # Runtime guard: this file must be the default branch's copy. (Belt;
+          # the environment's branch policy is the braces — see the header.)
+          default_branch=${DEFAULT_BRANCH:-$(gh api "repos/$REPO" --jq '.default_branch')}
+          if [ "$REF" != "refs/heads/$default_branch" ]; then
+            echo "refusing to run from $REF; only refs/heads/$default_branch may approve"; exit 1
+          fi
 
           # Everyone with access who is NOT an organization member.
           outside=$(gh api --paginate "repos/$REPO/collaborators?affiliation=outside&per_page=100" --jq '.[].login' | sort -u)
@@ -80,11 +108,9 @@ jobs:
           # The PR set: one PR when dispatched with a number, else EVERY open PR
           # (paginated — a list capped at 100 would silently skip the rest).
           # GraphQL logins carry no "[bot]" suffix; __typename tells User from Bot.
-          # `reviews(last: 100)` is only used to find Devin's LATEST verdict, which
-          # is by construction among the newest reviews; the workflow's own
-          # approval is looked up separately with full REST pagination below.
-          fields='number isDraft headRefOid author { login __typename } headRepository { nameWithOwner }
-                  reviews(last: 100) { nodes { body author { login } } }'
+          # Reviews are NOT fetched here: per candidate PR they come from the REST
+          # endpoint, paginated, so no window can hide a verdict or an approval.
+          fields='number isDraft headRefOid author { login __typename } headRepository { nameWithOwner }'
           # One compact JSON object per line (`@json`); `gh api --jq` prints strings raw.
           if [ -n "$ONLY_PR" ]; then
             prs=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$ONLY_PR" -f query="
@@ -101,6 +127,8 @@ jobs:
               --jq '.data.repository.pullRequests.nodes[] | @json')
           fi
           echo "open PRs considered: $(printf '%s\n' "$prs" | grep -c . || true)"
+          me=$(gh api user --jq '.login' 2>/dev/null || echo "github-actions[bot]")
+          echo "approving as: $me"
 
           clean_re='Devin Review: No Issues Found|found 0 (new )?potential issues'
           issues_re='found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'
@@ -122,15 +150,17 @@ jobs:
             fi
             # Same-repository branch (needs write) and not an outside collaborator => organization member.
 
-            verdict=$(jq -r --arg re "$verdict_re" '[.reviews.nodes[]
-                | select(.author.login == "devin-ai-integration") | .body // ""
+            # Every review of this PR, one JSON object per line, all pages.
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" --jq '.[] | @json')
+            verdict=$(printf '%s\n' "$reviews" | jq -rs --arg re "$verdict_re" '[.[]
+                | select(.user.login == "devin-ai-integration[bot]") | .body // ""
                 | select(test("This report is out of date") | not)
-                | select(test($re))] | last // ""' <<<"$pr")
-            # Our own active approval, over ALL reviews (REST, paginated): an old
-            # approval must never hide behind 100 newer reviews and outlive a
-            # later issue verdict.
-            ours=$(gh api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" \
-                     --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id' | tail -1)
+                | select(test($re))] | last // ""')
+            # Our own active approval (whichever identity approves: the bot token's
+            # login or github-actions[bot]); an old one must never outlive a later
+            # issue verdict, so it is looked up over all pages, never a window.
+            ours=$(printf '%s\n' "$reviews" | jq -rs --arg me "$me" '[.[]
+                | select(.state == "APPROVED" and (.user.login == $me or .user.login == "github-actions[bot]")) | .id] | last // ""')
             headline=$(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)
 
             if printf '%s' "$verdict" | grep -Eq "$issues_re"; then
