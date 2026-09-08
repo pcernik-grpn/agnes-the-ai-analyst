@@ -8487,6 +8487,15 @@ class TestStalePersistedPlanNeverReusedAcrossTheRemainderScopeFix(TestShardScope
         assert first["mode"] == "sharded"
         graph_calls_after_first = len(seen)
 
+        # These planner tests never run the children themselves, so the first
+        # trigger's shard jobs stay "queued" in the fake repo. Finish them, as
+        # the real queue does between two runs. Written inline rather than
+        # through a helper: the drain guard that makes this load-bearing
+        # arrives on a sibling branch, and this test has to pass with and
+        # without it.
+        for job in jobs.enqueued:
+            job["status"] = "done"
+
         second = _run(_connection([_drive_scope()]), monkeypatch)
 
         assert second["mode"] == "sharded"
