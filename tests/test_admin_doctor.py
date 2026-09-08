@@ -274,10 +274,15 @@ class TestAgentScope:
 
 
 class TestBranding:
-    def test_default_brand_is_info(self, seeded_app, monkeypatch):
+    def test_neither_knob_customized_is_error(self, seeded_app, monkeypatch):
+        # #2329: customizing neither instance.brand nor instance.name is
+        # precisely the unattributed state an install agent reads as
+        # impersonation risk — it must be caught, not skipped as "info".
         monkeypatch.delenv("AGNES_INSTANCE_BRAND", raising=False)
         report = _run(seeded_app["client"], seeded_app["admin_token"])
-        assert _check(report, "branding")["status"] == "info"
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
 
     def test_brand_set_but_default_title_is_error(self, seeded_app, monkeypatch):
         import app.web.router as web_router
@@ -287,7 +292,7 @@ class TestBranding:
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         check = _check(report, "branding")
         assert check["status"] == "error"
-        assert "instance.name" in check["detail"]
+        assert "operator identity" in check["detail"]
 
     def test_brand_set_with_named_instance_is_ok(self, seeded_app, monkeypatch):
         import app.web.router as web_router

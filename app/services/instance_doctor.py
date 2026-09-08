@@ -47,7 +47,7 @@ import importlib.util
 import logging
 import os
 import re
-from typing import Callable, Optional
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ def check_login_door() -> dict:
     return _row("login-door", "error", f"NO usable login door — {extra}{hint}")
 
 
-def check_email_delivery(email_to: Optional[str] = None) -> dict:
+def check_email_delivery(email_to: str | None = None) -> dict:
     """The send path can really deliver — optionally proven with a real message.
 
     A 200 from the send endpoints proves nothing: the magic-link flow hides
@@ -259,15 +259,18 @@ def check_agent_scope() -> dict:
 
 
 async def check_branding(app) -> dict:
-    """When ``instance.brand`` is customized, the rendered login title follows."""
-    from app.instance_config import get_instance_brand
+    """Renders the real ``/login`` page and flags a title that still reads as
+    a generic default — the state that leaves an install agent with no
+    operator identity to verify (#2329) and stalls the install outright.
 
-    brand = get_instance_brand()
-    if brand == "Agnes":
-        return _row("branding", "info", "instance.brand is not customized (default product name) — nothing to verify")
-
+    Previously gated on ``instance.brand`` being customized before checking
+    at all, but the title this inspects reads ``instance.name`` — a
+    different knob — so an instance that customized *neither* (precisely the
+    state that produces the failure) was never checked. Runs unconditionally
+    now; the title check itself is what decides ok/error.
+    """
     # Render the REAL page through the full stack — the failure this catches
-    # is precisely "the config is set but the page still shows the default".
+    # is precisely "the config is unset and the page shows the default".
     import httpx
 
     transport = httpx.ASGITransport(app=app)
@@ -276,7 +279,7 @@ async def check_branding(app) -> dict:
     if resp.status_code != 200:
         return _row("branding", "error", f"could not render /login to verify branding (HTTP {resp.status_code})")
 
-    match = re.search(r"<title>(.*?)</title>", resp.text, re.S)
+    match = re.search(r"<title>(.*?)</title>", resp.text, re.DOTALL)
     title = match.group(1).strip() if match else ""
     leaked = [d for d in ("AI Harness", "Data Analyst Portal") if d in title]
     if re.search(r"\bAgnes\b", title):
@@ -285,9 +288,10 @@ async def check_branding(app) -> dict:
         return _row(
             "branding",
             "error",
-            f"instance.brand is {brand!r} but the rendered login page title is {title!r} — still a "
-            "default. The login title reads instance.name (a different knob than instance.brand); "
-            "set instance.name in instance.yaml to the customer-facing name as well.",
+            f"the rendered login page title is {title!r} — still a generic default with no operator "
+            "identity. Set instance.name (and optionally instance.brand) in instance.yaml: an install "
+            "agent verifying this instance before trusting it treats an unattributed login page as "
+            "impersonation risk and may refuse to proceed.",
         )
     return _row("branding", "ok", f"login page title renders as {title!r}")
 
@@ -371,7 +375,7 @@ def _isolated(name: str, fn: Callable[[], dict]) -> dict:
     """Run one check; a crashing resolver reports itself instead of dying."""
     try:
         return fn()
-    except Exception as e:  # noqa: BLE001 — the whole point is containment
+    except Exception as e:
         logger.exception("new-instance doctor check %s crashed", name)
         return _row(name, "error", f"check crashed: {e}")
 
@@ -385,7 +389,7 @@ def aggregate_status(checks: list[dict]) -> str:
     return "ok"
 
 
-async def run_new_instance_doctor(app, email_to: Optional[str] = None) -> dict:
+async def run_new_instance_doctor(app, email_to: str | None = None) -> dict:
     """All six checks, blocking work off the event loop, one report."""
     from anyio import to_thread
 
@@ -401,7 +405,7 @@ async def run_new_instance_doctor(app, email_to: Optional[str] = None) -> dict:
         checks.append(await to_thread.run_sync(_isolated, name, fn))
     try:
         checks.append(await check_branding(app))
-    except Exception as e:  # noqa: BLE001 — same containment as _isolated
+    except Exception as e:
         logger.exception("new-instance doctor check branding crashed")
         checks.append(_row("branding", "error", f"check crashed: {e}"))
     return {"status": aggregate_status(checks), "checks": checks}
