@@ -8487,15 +8487,6 @@ class TestStalePersistedPlanNeverReusedAcrossTheRemainderScopeFix(TestShardScope
         assert first["mode"] == "sharded"
         graph_calls_after_first = len(seen)
 
-        # The first run's own shard children are still queued in the fake jobs
-        # repo. `_clear_stale_stop_for_trigger` refuses a trigger while a
-        # connection has live children (they have no stop signal but the
-        # connection-wide flag, and their idempotency keys would collide with
-        # the new plan's). Finish them, which is what the real queue does
-        # between two runs, so this test exercises plan REUSE rather than that
-        # refusal.
-        self._complete_all_shard_jobs(jobs)
-
         second = _run(_connection([_drive_scope()]), monkeypatch)
 
         assert second["mode"] == "sharded"
