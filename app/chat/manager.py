@@ -11,9 +11,8 @@ import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 from uuid import uuid4
 
 # `runner` is imported for the stdin-protocol constants it defines (the
@@ -22,6 +21,7 @@ from uuid import uuid4
 from app.chat import agent_profile, inbound, routing, runner
 from app.chat.audit import hash_args, write_audit
 from app.chat.config import ChatConfig
+from app.chat.document_links import attach_document_urls
 from app.chat.frame_seq import stamp_frame
 from app.chat.message_parts import build_message_parts, parts_to_tool_calls, parts_to_tool_results
 from app.chat.persistence import ChatRepository
@@ -69,11 +69,11 @@ logger = logging.getLogger(__name__)
 # get_current_chat_loop())``, never a fresh ``asyncio.run()`` in that
 # thread — a new loop would break the manager's existing locks/tasks/sinks,
 # which are asyncio primitives bound to the loop that created them.
-_current_manager: Optional["ChatManager"] = None
-_current_loop: Optional[asyncio.AbstractEventLoop] = None
+_current_manager: ChatManager | None = None
+_current_loop: asyncio.AbstractEventLoop | None = None
 
 
-def set_current_chat_manager(manager: Optional["ChatManager"]) -> None:
+def set_current_chat_manager(manager: ChatManager | None) -> None:
     global _current_manager, _current_loop
     _current_manager = manager
     try:
@@ -86,11 +86,11 @@ def set_current_chat_manager(manager: Optional["ChatManager"]) -> None:
         _current_loop = None
 
 
-def get_current_chat_manager() -> Optional["ChatManager"]:
+def get_current_chat_manager() -> ChatManager | None:
     return _current_manager
 
 
-def get_current_chat_loop() -> Optional[asyncio.AbstractEventLoop]:
+def get_current_chat_loop() -> asyncio.AbstractEventLoop | None:
     return _current_loop
 
 
@@ -184,7 +184,7 @@ def _msg_claim_key(chat_id: str, client_msg_id: str) -> str:
     return f"chat-msg-claim:{chat_id}:{client_msg_id}"
 
 
-async def claim_user_message(chat_id: str, client_msg_id: Optional[str]) -> bool:
+async def claim_user_message(chat_id: str, client_msg_id: str | None) -> bool:
     """Claim the right to PERSIST one submit. ``True`` = go ahead (#1973).
 
     ``lease_acquire`` is an atomic set-if-absent on both backends (redis
@@ -221,7 +221,7 @@ async def claim_user_message(chat_id: str, client_msg_id: Optional[str]) -> bool
         return True
 
 
-async def release_user_message_claim(chat_id: str, client_msg_id: Optional[str]) -> None:
+async def release_user_message_claim(chat_id: str, client_msg_id: str | None) -> None:
     """Give a won claim back, for a persist that then failed.
 
     Without this, an ``append_message`` that raises would leave the submit
@@ -290,7 +290,7 @@ def agnes_server_url() -> str:
     return url.rstrip("/")
 
 
-def engine_session_id(config) -> Optional[str]:
+def engine_session_id(config) -> str | None:
     """A caller-owned session id when the configured provider is the embedded
     kai-agent engine, else None (repo generates its usual ``chat_<hex>``).
 
@@ -363,7 +363,7 @@ class LiveSession:
     chat_id: str
     user_email: str
     state: SessionState
-    handle: Optional[SandboxHandle]
+    handle: SandboxHandle | None
     started_at: datetime
     last_activity: datetime
     # Surface the session was created on (web / slack_dm / slack_thread) —
@@ -376,13 +376,13 @@ class LiveSession:
     # Latest pump-subprocess-to-ws task. Each crash respawn replaces this
     # (and removes the previous one from `tasks`) so the per-session task
     # list does not grow unboundedly across crashes.
-    current_pump: Optional[asyncio.Task] = None
+    current_pump: asyncio.Task | None = None
     # Latest crash-respawn wait task (_wait_for_exit_and_respawn). A co-session
     # leave (_respawn_co_runner) cancels this BEFORE killing the old handle and
     # starts a fresh one bound to the new session_dir — otherwise the running
     # wait task would observe the intentional kill as a crash and respawn a
     # second time (double-respawn race).
-    current_wait: Optional[asyncio.Task] = None
+    current_wait: asyncio.Task | None = None
     # Set to True once an auto-title task has been scheduled for this
     # session — guarantees we only fire Haiku once per live session
     # even if the user sends a second turn while the first one is
@@ -391,7 +391,7 @@ class LiveSession:
     # Output sinks the runner's frames fan out to. One SinkEntry per
     # attached principal (web WS or SlackSinkBridge). The primary sink is
     # seated by attach(); add_sink() appends late joiners (co-drive, 5b).
-    sinks: list["SinkEntry"] = field(default_factory=list)
+    sinks: list[SinkEntry] = field(default_factory=list)
     # Frames of the in-progress turn (token/tool_call/...), replayed to
     # late-seated sinks and persisted as an interrupted message on forced
     # death. Cleared when the turn's assistant_message lands.
@@ -423,9 +423,9 @@ class LiveSession:
     #: the NEXT user turn starts (``_deliver_local_user_message``).
     delegated_this_turn: bool = False
     # Linger task: fires _linger_then_pause after the last sink detaches.
-    linger_task: Optional[asyncio.Task] = None
+    linger_task: asyncio.Task | None = None
     # Session workdir; set at spawn/resume so helpers can access it.
-    session_dir: Optional[Path] = None
+    session_dir: Path | None = None
     # Active-time accounting for max_session_seconds (Task 9).
     # active_since: monotonic timestamp when this spawn/resume made the session
     # ACTIVE. Pause folds (now - active_since) into active_seconds_accum and
@@ -490,7 +490,7 @@ class LiveSession:
     # gateway while this session happens to be PAUSED is still noticed and
     # triggers a resume, mirroring send_user_message's direct-call path.
     # Cancelled only in kill().
-    inbound_task: Optional[asyncio.Task] = None
+    inbound_task: asyncio.Task | None = None
     # Highest inbound-stream seq already delivered to this session's runner
     # (wave-2F task 4) — the ordering/dedup cursor for
     # ChatManager._inbound_consumer_loop. Lives on the LiveSession object
@@ -543,7 +543,7 @@ def _record_approval_on_tool_call(turn_buffer: list, frame: dict) -> None:
             return
 
 
-def _approval_attended(live: "LiveSession") -> bool:
+def _approval_attended(live: LiveSession) -> bool:
     """True when some attached sink can actually answer an approval request.
 
     Attendance is a property of the sinks attached RIGHT NOW, not of the
@@ -579,7 +579,7 @@ class ChatManager:
         self._repo = repo
         self._config = config
         self._live: dict[str, LiveSession] = {}
-        self._idle_task: Optional[asyncio.Task] = None
+        self._idle_task: asyncio.Task | None = None
         # Per-user message-rate window (chat-msgs:...) and daily token spend
         # (chat-tokens:...) now live in the coordination backend (see
         # _msg_window_key / _daily_token_keys below) instead of process-local
@@ -678,7 +678,7 @@ class ChatManager:
         # distinct sessions have ever been attached on this process,"
         # which bounds worst-case memory instead of chasing full
         # eviction-time safety with no clean way to prove it.
-        self._session_locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+        self._session_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         # #1973: (chat_id, client_msg_id) pairs already ACCEPTED (persisted)
         # by send_user_message, oldest-first, trimmed at
         # `_ACCEPTED_MSG_IDS_MAX_ENTRIES`. An entry is written only after the
@@ -686,7 +686,7 @@ class ChatManager:
         # retrying a send that raised while the sandbox was still booting
         # while still making a genuine re-delivery of the same submit a no-op.
         # Process-local by design — see send_user_message's docstring.
-        self._accepted_msg_ids: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+        self._accepted_msg_ids: OrderedDict[tuple[str, str], None] = OrderedDict()
         # Track C7 (@delegation MVP): chat_id -> delegation_depth for a
         # child session `handle_delegation` has just created via
         # `create_session` but not yet `attach()`ed. Consumed (popped) by
@@ -719,7 +719,7 @@ class ChatManager:
         just needs to comfortably outlive the window" reasoning as
         ``_msg_window_key``'s 2h TTL on an hour bucket.
         """
-        date_bucket = datetime.now(timezone.utc).strftime("%Y%m%d")
+        date_bucket = datetime.now(UTC).strftime("%Y%m%d")
         return (
             f"chat-tokens:{user_email}:{date_bucket}:in",
             f"chat-tokens:{user_email}:{date_bucket}:out",
@@ -764,9 +764,9 @@ class ChatManager:
     def _record_daily_tokens(
         self,
         user_email: str,
-        tokens_in: Optional[int],
-        tokens_out: Optional[int],
-        cache_creation_tokens: Optional[int] = None,
+        tokens_in: int | None,
+        tokens_out: int | None,
+        cache_creation_tokens: int | None = None,
     ) -> None:
         """Add one completed turn's token delta to `user_email`'s running
         daily counters (see ``_daily_token_totals``).
@@ -832,7 +832,7 @@ class ChatManager:
         try:
             if not use_pg():
                 return
-            user_id: Optional[str] = None
+            user_id: str | None = None
             with contextlib.suppress(Exception):
                 # Identity is best-effort: a turn from an address with no
                 # `users` row is still worth measuring, just unattributed.
@@ -858,7 +858,7 @@ class ChatManager:
                         "output_tokens": int(frame.get("tokens_out") or 0),
                         "cache_read_tokens": int(frame.get("cache_read_tokens") or 0),
                         "cache_creation_tokens": int(frame.get("cache_creation_tokens") or 0),
-                        "occurred_at": datetime.now(timezone.utc),
+                        "occurred_at": datetime.now(UTC),
                     }
                 ]
             )
@@ -928,7 +928,7 @@ class ChatManager:
         "soft guardrail, briefly looser after a backend hiccup" story as
         ``_daily_token_totals``.
         """
-        hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        hour_bucket = datetime.now(UTC).strftime("%Y%m%d%H")
         return f"chat-msgs:{sender}:{hour_bucket}"
 
     # --- public API used by app/api/chat.py and services/slack_bot/ -------
@@ -938,12 +938,12 @@ class ChatManager:
         *,
         user_email: str,
         surface: Surface,
-        slack_channel_id: Optional[str] = None,
-        slack_thread_ts: Optional[str] = None,
-        title: Optional[str] = None,
-        profile: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        preview_skill: Optional[dict] = None,
+        slack_channel_id: str | None = None,
+        slack_thread_ts: str | None = None,
+        title: str | None = None,
+        profile: str | None = None,
+        agent_id: str | None = None,
+        preview_skill: dict | None = None,
     ) -> ChatSession:
         if not self._config.enabled:
             raise RuntimeError("chat.enabled is false")
@@ -1061,7 +1061,7 @@ class ChatManager:
     def list_live(self) -> list[LiveSession]:
         return list(self._live.values())
 
-    def get_live(self, chat_id: str) -> Optional[LiveSession]:
+    def get_live(self, chat_id: str) -> LiveSession | None:
         """The live session for ``chat_id`` in THIS process, or ``None`` —
         public accessor for callers outside ``app.chat`` (e.g.
         ``app.api.agent_delegation``) that need a single session's
@@ -1273,7 +1273,7 @@ class ChatManager:
             live = await self._spawn_live(session)
             await self._seat_sink(live, ws, is_primary=is_primary)
 
-    async def _seat_sink(self, live: "LiveSession", ws, *, is_primary: bool) -> None:
+    async def _seat_sink(self, live: LiveSession, ws, *, is_primary: bool) -> None:
         """Replay the in-progress turn buffer to ws, append to sinks, send ready.
 
         Deliberately does NOT replay persisted history: the web client loads
@@ -1317,7 +1317,7 @@ class ChatManager:
         # here instead of leaving a spinner nothing will ever clear.
         await ws.send_json(stamp_frame(live.chat_id, {"type": "ready", "turn_in_flight": live.turn_in_flight}))
 
-    def _load_agent_row(self, agent_id: Optional[str]) -> Optional[dict]:
+    def _load_agent_row(self, agent_id: str | None) -> dict | None:
         """Best-effort load of an `agents` row for spawn-time profile
         resolution (Task 7). Returns ``None`` on a missing id, a missing
         row, or any repo error — a lookup failure must never block a chat
@@ -1333,7 +1333,7 @@ class ChatManager:
             logger.exception("agent row lookup failed for agent_id=%s — spawn continues without it", agent_id)
             return None
 
-    async def _spawn_live(self, session: "ChatSession") -> "LiveSession":
+    async def _spawn_live(self, session: ChatSession) -> LiveSession:
         """Spawn a fresh sandbox, register refs, start pump/wait tasks.
 
         Returns the new LiveSession registered in self._live. Does NOT await
@@ -1417,8 +1417,8 @@ class ChatManager:
                 user_email=session.user_email,
                 state=SessionState.ACTIVE,
                 handle=handle,
-                started_at=datetime.now(timezone.utc),
-                last_activity=datetime.now(timezone.utc),
+                started_at=datetime.now(UTC),
+                last_activity=datetime.now(UTC),
                 surface=getattr(session.surface, "value", str(session.surface)),
                 sinks=[],
                 participant_emails=emails,
@@ -1482,7 +1482,7 @@ class ChatManager:
 
     # --- detach / linger / pause --------------------------------------------
 
-    async def _replay_pending_approvals_to(self, live: "LiveSession", sink) -> None:
+    async def _replay_pending_approvals_to(self, live: LiveSession, sink) -> None:
         """Send every still-unanswered approval card to a newly seated sink.
 
         One rule for all three attach paths — ``_seat_sink``, ``add_sink`` and
@@ -1506,7 +1506,7 @@ class ChatManager:
             with contextlib.suppress(Exception):
                 await sink.send_json({**frame, "attended": attended})
 
-    async def _renotify_unattended_approvals(self, live: "LiveSession") -> None:
+    async def _renotify_unattended_approvals(self, live: LiveSession) -> None:
         """Re-derive attendance for every pending card and nudge if it lapsed.
 
         The post-broadcast correction only covers the pump iteration that
@@ -1547,7 +1547,7 @@ class ChatManager:
         """Whether ``client_msg_id`` was already accepted for ``chat_id``."""
         return (chat_id, client_msg_id) in self._accepted_msg_ids
 
-    def _note_accepted(self, chat_id: str, client_msg_id: Optional[str]) -> None:
+    def _note_accepted(self, chat_id: str, client_msg_id: str | None) -> None:
         """Record an accepted submit so a re-delivery of it is dropped.
 
         No-op without an id — every pre-#1973 caller (Slack, headless, the
@@ -1578,7 +1578,7 @@ class ChatManager:
         live = self._live.get(chat_id)
         return bool(live is not None and live.turn_in_flight)
 
-    def turn_buffer_min_seq(self, chat_id: str) -> Optional[int]:
+    def turn_buffer_min_seq(self, chat_id: str) -> int | None:
         """Lowest ``seq`` currently held in ``chat_id``'s in-flight turn
         buffer (see ``LiveSession.turn_buffer`` / ``_seat_sink``), or
         ``None`` if the session isn't live or has no in-flight turn.
@@ -1597,19 +1597,19 @@ class ChatManager:
         seqs = [f["seq"] for f in live.turn_buffer if isinstance(f.get("seq"), int)]
         return min(seqs) if seqs else None
 
-    def _cancel_linger(self, live: "LiveSession") -> None:
+    def _cancel_linger(self, live: LiveSession) -> None:
         if live.linger_task is not None and not live.linger_task.done():
             live.linger_task.cancel()
         live.linger_task = None
 
-    def _on_all_sinks_gone(self, live: "LiveSession") -> None:
+    def _on_all_sinks_gone(self, live: LiveSession) -> None:
         if self._config.on_detach == "kill":
             asyncio.create_task(self.kill(live.chat_id, reason="ws_disconnect"))
             return
         self._cancel_linger(live)
         live.linger_task = asyncio.create_task(self._linger_then_pause(live))
 
-    async def _linger_then_pause(self, live: "LiveSession") -> None:
+    async def _linger_then_pause(self, live: LiveSession) -> None:
         # Wait for any in-flight turn to complete first. The spin must
         # also bail if the runner died (3× crash → SessionState.DEAD)
         # without ever emitting a `done` frame to clear `turn_in_flight`:
@@ -1641,7 +1641,7 @@ class ChatManager:
             return  # a sink came back, or state already changed
         await self._pause_live(live)
 
-    async def _pause_live(self, live: "LiveSession") -> None:
+    async def _pause_live(self, live: LiveSession) -> None:
         """Snapshot the sandbox and mark the session PAUSED.
 
         Sets state=PAUSED FIRST so _wait_for_exit_and_respawn (which holds
@@ -1675,9 +1675,9 @@ class ChatManager:
             await self.kill(live.chat_id, reason="pause_failed")
             return
         await self._install_runner(live, None)
-        self._repo.set_sandbox_paused_at(live.chat_id, datetime.now(timezone.utc))
+        self._repo.set_sandbox_paused_at(live.chat_id, datetime.now(UTC))
 
-    def _is_current_protocol(self, session: "ChatSession") -> bool:
+    def _is_current_protocol(self, session: ChatSession) -> bool:
         """True when ``session``'s runner is safe to reconnect via
         ``provider.resume()`` rather than force-respawned (AC-G-resume-legacy).
 
@@ -1694,7 +1694,7 @@ class ChatManager:
             return True
         return (session.relay_protocol_version or 0) >= RELAY_PROTOCOL_VERSION
 
-    async def _resume_live(self, live: "LiveSession") -> None:
+    async def _resume_live(self, live: LiveSession) -> None:
         """Resume a PAUSED in-memory session by reconnecting the sandbox.
 
         Concurrency: this method is reachable from THREE concurrent call
@@ -1791,7 +1791,7 @@ class ChatManager:
             # turn is not replayed.
             self._retry_auto_title_if_untitled(live)
 
-    async def _destroy_old_sandbox(self, session: "ChatSession") -> None:
+    async def _destroy_old_sandbox(self, session: ChatSession) -> None:
         """Best-effort teardown of a session's paused sandbox before its
         refs are cleared. Never raises — a destroy failure must not block the
         fresh spawn, but skipping it entirely leaks a billable microVM (§11)."""
@@ -1803,7 +1803,7 @@ class ChatManager:
         except Exception:
             logger.warning("failed to destroy old sandbox %s for %s (continuing)", sandbox_id, session.id)
 
-    async def _resume_from_row(self, session: "ChatSession") -> Optional["LiveSession"]:
+    async def _resume_from_row(self, session: ChatSession) -> LiveSession | None:
         """Post-restart resume: no LiveSession in memory, but repo row has refs.
 
         Returns a new LiveSession on success, None on failure (refs cleared).
@@ -1865,8 +1865,8 @@ class ChatManager:
             user_email=session.user_email,
             state=SessionState.ACTIVE,
             handle=handle,
-            started_at=datetime.now(timezone.utc),
-            last_activity=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
+            last_activity=datetime.now(UTC),
             surface=getattr(session.surface, "value", str(session.surface)),
             sinks=[],
             session_dir=session_dir,
@@ -1893,7 +1893,7 @@ class ChatManager:
         live.inbound_task = asyncio.create_task(self._inbound_consumer_loop(live))
         return live
 
-    async def _respawn_fresh(self, live: "LiveSession") -> None:
+    async def _respawn_fresh(self, live: LiveSession) -> None:
         """Spawn a new sandbox for an existing LiveSession and replay history.
 
         Factored from _wait_for_exit_and_respawn's crash-respawn block so
@@ -1964,7 +1964,7 @@ class ChatManager:
 
     # --- cross-gateway claim-then-respawn takeover (wave-2F task 5) --------
 
-    async def _takeover_foreign_session(self, chat_id: str, owner: str) -> "LiveSession":
+    async def _takeover_foreign_session(self, chat_id: str, owner: str) -> LiveSession:
         """Take over a session another gateway's routing lease currently
         claims, when a WS connect lands on THIS gateway instead.
 
@@ -2074,8 +2074,8 @@ class ChatManager:
             user_email=session.user_email,
             state=SessionState.NEW,
             handle=None,
-            started_at=datetime.now(timezone.utc),
-            last_activity=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
+            last_activity=datetime.now(UTC),
             surface=getattr(session.surface, "value", str(session.surface)),
             sinks=[],
             participant_emails=emails,
@@ -2096,7 +2096,7 @@ class ChatManager:
         live.inbound_task = asyncio.create_task(self._inbound_consumer_loop(live))
         return live
 
-    async def _teardown_lost_ownership(self, chat_id: str, live: "LiveSession") -> None:
+    async def _teardown_lost_ownership(self, chat_id: str, live: LiveSession) -> None:
         """Stop serving ``chat_id`` locally after this gateway's routing
         lease was lost to a takeover elsewhere (wave-2F task 5).
 
@@ -2189,7 +2189,7 @@ class ChatManager:
     _RESTORE_MSG_CHAR_CAP = 4000
     _RESTORE_TOTAL_CHAR_CAP = 24000
 
-    def _build_restore_context(self, session: "ChatSession") -> Optional[str]:
+    def _build_restore_context(self, session: ChatSession) -> str | None:
         """Markdown transcript of the persisted conversation for a FRESH sandbox.
 
         Uploaded at spawn (``_spawn_runner``) and appended to the agent's
@@ -2215,7 +2215,7 @@ class ChatManager:
         msgs = self._repo.list_recent_messages(session.id)
         if not msgs:
             return None
-        allowed: Optional[set[str]] = None
+        allowed: set[str] | None = None
         if session.is_co_session:
             parts = self._repo.get_session_participants(session.id)
             allowed = {p.user_email for p in parts if p.left_at is None}
@@ -2255,7 +2255,7 @@ class ChatManager:
         )
         return header + "\n\n".join(blocks) + "\n"
 
-    async def _redeliver_pending_question(self, live: "LiveSession") -> None:
+    async def _redeliver_pending_question(self, live: LiveSession) -> None:
         """Re-deliver the trailing UNANSWERED user turn to a fresh runner.
 
         ``send_user_message`` persists the user turn BEFORE delivering it, so
@@ -2292,7 +2292,7 @@ class ChatManager:
         await self._deliver_local_user_message(live, last.content)
 
     async def _spawn_runner(self, session: ChatSession, session_dir: Path):
-        from app.auth.access import mint_session_jwt, mint_co_session_jwt
+        from app.auth.access import mint_co_session_jwt, mint_session_jwt
 
         if session.is_co_session:
             # SR-5: NO seed fallback for co-sessions. A mint failure re-raises
@@ -2421,7 +2421,7 @@ class ChatManager:
 
         return _stage
 
-    async def _stage_boot_files(self, handle, session: "ChatSession") -> None:
+    async def _stage_boot_files(self, handle, session: ChatSession) -> None:
         """Stage the restore-context transcript and the agnes CLI wheel.
 
         Neither is workspace sync, so both run for EVERY provider — a
@@ -2468,7 +2468,7 @@ class ChatManager:
                 session.id,
             )
 
-    def _provider_resume_env(self, session: "ChatSession") -> dict:
+    def _provider_resume_env(self, session: ChatSession) -> dict:
         """The env a provider's ``resume()`` receives: session identity plus
         the operator knobs a rebuilt handle must not lose.
 
@@ -2504,7 +2504,7 @@ class ChatManager:
             return
         ticket_repo().revoke_session(chat_id)
 
-    async def _push_ticket_frame(self, live: "LiveSession") -> None:
+    async def _push_ticket_frame(self, live: LiveSession) -> None:
         """Mint fresh main+mcp+data_apps broker tickets and push them to the
         sandbox's in-process relay over stdin (chat sandbox secret broker,
         2026-07-14; ``data_apps`` scope added wave 3B 2026-07-24).
@@ -2554,7 +2554,7 @@ class ChatManager:
                 frame = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            live.last_activity = datetime.now(timezone.utc)
+            live.last_activity = datetime.now(UTC)
             if frame.get("type") in ("approval_request", "question_request"):
                 # Stamped BEFORE the fan-out so every sink sees the same
                 # envelope (frame_seq contract) and a push-only sink can tell
@@ -2617,6 +2617,18 @@ class ChatManager:
                     frame.get("tool_calls"),
                     parts_to_tool_results(frame.get("parts")),
                 ).to_dict()
+                # A `document:` claim's ref is a filename, not a stable id
+                # (see app/chat/document_links.py) — resolving it to a real
+                # `/library/{slug}/f/{file_id}` link needs a DB lookup scoped
+                # to what THIS session's owner can access, so it happens here
+                # rather than inside the pure `sources_verdict` computation.
+                # Skipped entirely when there is no document claim to resolve
+                # (`attach_document_urls`'s own guard) and again here when the
+                # owner row is gone (a deleted account mid-session).
+                if any(c.get("kind") == "document" for c in frame["sources"].get("claims", [])):
+                    owner = users_repo().get_by_email(live.user_email)
+                    if owner:
+                        attach_document_urls(frame["sources"], owner)
             await self._broadcast(live, frame)
             ftype = frame.get("type")
             # Accumulate in-flight turn frames for mid-turn replay and partial
@@ -2728,7 +2740,7 @@ class ChatManager:
     # Turn-end artifact harvest (#2268)
     # ------------------------------------------------------------------
 
-    def _schedule_artifact_harvest(self, live: "LiveSession") -> None:
+    def _schedule_artifact_harvest(self, live: LiveSession) -> None:
         """Fire this turn's artifact harvest as a background task.
 
         OFF the pump task on purpose: the pump is what drains the runner's
@@ -2764,7 +2776,7 @@ class ChatManager:
 
         task.add_done_callback(_forget)
 
-    async def _harvest_turn_artifacts(self, live: "LiveSession") -> None:
+    async def _harvest_turn_artifacts(self, live: LiveSession) -> None:
         """Copy the files this session wrote to ``outputs/`` out of the
         sandbox and into the object store + ``agent_artifacts`` (#2268).
 
@@ -2831,7 +2843,7 @@ class ChatManager:
         except Exception:
             logger.exception("artifact harvest failed for %s — the turn is unaffected", live.chat_id)
 
-    async def _artifact_files_handle(self, live: "LiveSession"):
+    async def _artifact_files_handle(self, live: LiveSession):
         """The sandbox file API the harvest reads ``outputs/`` through, or
         ``None`` when this session has none.
 
@@ -3084,7 +3096,7 @@ class ChatManager:
         """
         emit_chat_message_event(chat_id=chat_id, surface=surface, sender=sender)
 
-    async def _enforce_sender_limits(self, sender: str, chat_id: str, live: Optional["LiveSession"]) -> None:
+    async def _enforce_sender_limits(self, sender: str, chat_id: str, live: LiveSession | None) -> None:
         """Sender-keyed daily-budget / per-session-token / rate-limit gate
         shared by both send_user_message's direct-owner path and the
         forward-to-owner path (wave-2F task 4, ``_forward_inbound_message``).
@@ -3123,7 +3135,7 @@ class ChatManager:
             on_limit = _notify
         await enforce_sender_limits(self._repo, self._config, sender, chat_id, on_limit=on_limit)
 
-    async def _deliver_local_user_message(self, live: "LiveSession", text: str) -> None:
+    async def _deliver_local_user_message(self, live: LiveSession, text: str) -> None:
         """Write ``text`` as a ``user_msg`` stdin frame to ``live``'s runner
         and update local turn-state.
 
@@ -3140,7 +3152,7 @@ class ChatManager:
             await live.handle.stdin.drain()
         live.turn_buffer.clear()
         live.turn_in_flight = True
-        live.last_activity = datetime.now(timezone.utc)
+        live.last_activity = datetime.now(UTC)
         live.state = SessionState.ACTIVE
         # Track C7: a fresh turn gets its own one-delegation budget.
         live.delegated_this_turn = False
@@ -3167,7 +3179,7 @@ class ChatManager:
         request_id: str,
         decision: str,
         *,
-        sender_email: Optional[str] = None,
+        sender_email: str | None = None,
     ) -> None:
         """Route a user's approval decision to ``chat_id``'s runner.
 
@@ -3226,7 +3238,7 @@ class ChatManager:
             chat_id,
         )
 
-    async def _install_runner(self, live: "LiveSession", handle) -> None:
+    async def _install_runner(self, live: LiveSession, handle) -> None:
         """Point the session at a new runner process (or at none).
 
         Always retires ``pending_approvals``: a request_id belongs to the
@@ -3269,7 +3281,7 @@ class ChatManager:
                 },
             )
 
-    async def _resolve_if_unattended(self, live: "LiveSession", frame: dict) -> None:
+    async def _resolve_if_unattended(self, live: LiveSession, frame: dict) -> None:
         """Answer an ``approval_request`` that nobody can ever answer.
 
         Called only for a request no attached sink can respond to (``frame
@@ -3319,7 +3331,7 @@ class ChatManager:
         else:
             await self._deliver_local_approval(live, request_id, runner.UNATTENDED)
 
-    async def _deliver_local_approval(self, live: "LiveSession", request_id: str, decision: str) -> None:
+    async def _deliver_local_approval(self, live: LiveSession, request_id: str, decision: str) -> None:
         payload = json.dumps({"type": "approval_decision", "request_id": request_id, "decision": decision}) + "\n"
         try:
             async with live._stdin_lock:
@@ -3338,10 +3350,10 @@ class ChatManager:
                 exc_info=True,
             )
             return
-        live.last_activity = datetime.now(timezone.utc)
+        live.last_activity = datetime.now(UTC)
 
     @staticmethod
-    def _harden_question_answers(answers) -> "Optional[dict]":
+    def _harden_question_answers(answers) -> dict | None:
         """Coerce a client-supplied answers payload to a bounded str→str dict,
         or ``None`` when nothing usable survives. The runner's QuestionGate
         revalidates with the same rules; hardening here as well keeps junk
@@ -3365,9 +3377,9 @@ class ChatManager:
         chat_id: str,
         request_id: str,
         *,
-        answers: "Optional[dict]" = None,
+        answers: dict | None = None,
         dismissed: bool = False,
-        sender_email: Optional[str] = None,
+        sender_email: str | None = None,
     ) -> None:
         """Route a user's answer to a pending AskUserQuestion card to
         ``chat_id``'s runner.
@@ -3432,10 +3444,10 @@ class ChatManager:
 
     async def _deliver_local_question(
         self,
-        live: "LiveSession",
+        live: LiveSession,
         request_id: str,
         *,
-        answers: "Optional[dict]" = None,
+        answers: dict | None = None,
         dismissed: bool = False,
         unattended: bool = False,
     ) -> None:
@@ -3464,7 +3476,7 @@ class ChatManager:
                 exc_info=True,
             )
             return
-        live.last_activity = datetime.now(timezone.utc)
+        live.last_activity = datetime.now(UTC)
 
     async def handle_delegation(
         self,
@@ -3568,7 +3580,7 @@ class ChatManager:
 
         from app.api.broker_agent_policy import check_budget
 
-        year_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        year_month = datetime.now(UTC).strftime("%Y-%m")
         month_total = llm_usage_repo().usage_breakdown_for_month(target["id"], year_month)["total_tokens"]
         if check_budget(target, month_total) == "budget_exhausted":
             write_audit(
@@ -3649,7 +3661,7 @@ class ChatManager:
             "message": None,
         }
 
-    async def _ensure_slack_sink(self, live: "LiveSession", slack_origin: dict) -> None:
+    async def _ensure_slack_sink(self, live: LiveSession, slack_origin: dict) -> None:
         """Make sure ``live`` has a ``SlackSinkBridge`` for the Slack
         channel in ``slack_origin`` (``{"channel": ..., "thread_ts": ...}``),
         creating and seating one if missing.
@@ -3708,9 +3720,9 @@ class ChatManager:
         chat_id: str,
         text: str,
         *,
-        sender_email: Optional[str],
-        slack_origin: Optional[dict] = None,
-        client_msg_id: Optional[str] = None,
+        sender_email: str | None,
+        slack_origin: dict | None = None,
+        client_msg_id: str | None = None,
     ) -> None:
         """Hand a user message to whichever gateway actually owns
         ``chat_id`` (wave-2F task 4) instead of delivering it locally.
@@ -3749,7 +3761,7 @@ class ChatManager:
             client_msg_id=client_msg_id,
         )
 
-    async def _inbound_consumer_loop(self, live: "LiveSession") -> None:
+    async def _inbound_consumer_loop(self, live: LiveSession) -> None:
         """Feed ``chat-in:{chat_id}`` stream entries into this (owning)
         gateway's local runner stdin, in seq order, deduped by inbound seq
         (wave-2F task 4).
@@ -3908,7 +3920,7 @@ class ChatManager:
                 wake.clear()
                 try:
                     await asyncio.wait_for(wake.wait(), timeout=_INBOUND_POLL_INTERVAL_SEC)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         except asyncio.CancelledError:
             raise
@@ -3924,9 +3936,9 @@ class ChatManager:
         chat_id: str,
         text: str,
         *,
-        sender_email: Optional[str] = None,
-        slack_origin: Optional[dict] = None,
-        client_msg_id: Optional[str] = None,
+        sender_email: str | None = None,
+        slack_origin: dict | None = None,
+        client_msg_id: str | None = None,
     ) -> None:
         """Deliver ``text`` to ``chat_id``'s runner, forwarding to the owning
         gateway if this process doesn't host the session (wave-2F task 4).
@@ -4278,7 +4290,7 @@ class ChatManager:
         async with self._get_session_lock(chat_id):
             await self._kill_locked(chat_id, reason=reason)
 
-    def _partial_save(self, live: "LiveSession", *, reason: str) -> None:
+    def _partial_save(self, live: LiveSession, *, reason: str) -> None:
         """Persist an interrupted turn so a torn-down session never dead-ends.
 
         #1973: a turn killed mid-flight used to be saved only when it had
@@ -4344,9 +4356,8 @@ class ChatManager:
         try:
             session_for_preview = self._repo.get_session(chat_id)
             if session_for_preview is not None:
-                from src.repositories import users_repo
-
                 from app.api.data_apps import revoke_preview_tokens_for_user
+                from src.repositories import users_repo
 
                 owner = users_repo().get_by_email(session_for_preview.user_email)
                 if owner:
@@ -4517,7 +4528,7 @@ class ChatManager:
                 # leaving it untitled for the rest of its live span.
                 live.auto_title_started = False
                 return
-            title: Optional[str] = None
+            title: str | None = None
             try:
                 title = await generate_title(
                     first_user,
@@ -4788,7 +4799,7 @@ class ChatManager:
         Returns True when a slot was actually freed. Never raises.
         """
         try:
-            paused = self._repo.list_paused_sessions(paused_before=datetime.now(timezone.utc))
+            paused = self._repo.list_paused_sessions(paused_before=datetime.now(UTC))
         except Exception:
             logger.exception("capacity reclaim: listing paused sessions failed")
             return False
@@ -4915,7 +4926,7 @@ class ChatManager:
         """
         idle_cutoff = self._config.idle_ttl_seconds
         max_active = self._config.max_session_seconds
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         now_mono = time.monotonic()
 
         await self._renew_routing_leases()
@@ -5185,7 +5196,7 @@ def _seed_daily_tokens_from_db_if_needed(
     ``CoordinationUnavailable`` handling (already in
     ``daily_token_totals``) or the next call retry.
     """
-    date_bucket = datetime.now(timezone.utc).strftime("%Y%m%d")
+    date_bucket = datetime.now(UTC).strftime("%Y%m%d")
     seeded_marker_key = f"chat-tokens-seeded:{user_email}:{date_bucket}"
     seed_lease_name = f"chat-tokens-seed:{user_email}:{date_bucket}"
     try:
@@ -5358,7 +5369,7 @@ def emit_chat_message_event(*, chat_id: str, surface: str, sender: str) -> None:
     (see that method's docstring). Best-effort by contract: telemetry must
     never block or fail a send."""
     try:
-        user_id: Optional[str] = None
+        user_id: str | None = None
         try:
             row = users_repo().get_by_email(sender)
             user_id = (row or {}).get("id")
@@ -5411,9 +5422,9 @@ def resolve_or_create_slack_session(
     *,
     user_email: str,
     surface: Surface,
-    slack_channel_id: Optional[str],
-    slack_thread_ts: Optional[str] = None,
-    agent_id: Optional[str] = None,
+    slack_channel_id: str | None,
+    slack_thread_ts: str | None = None,
+    agent_id: str | None = None,
 ) -> ChatSession:
     """Producer-side counterpart of ``ChatManager.create_session`` for the
     Slack surfaces, for processes with NO ChatManager (api role).
@@ -5464,9 +5475,9 @@ async def produce_inbound_user_message(
     chat_id: str,
     text: str,
     *,
-    sender_email: Optional[str] = None,
-    slack_origin: Optional[dict] = None,
-    client_msg_id: Optional[str] = None,
+    sender_email: str | None = None,
+    slack_origin: dict | None = None,
+    client_msg_id: str | None = None,
 ) -> None:
     """Thin-producer forward: enforce limits, persist the user message, emit
     telemetry, and publish to the ``chat-in:{chat_id}`` stream — the
