@@ -522,7 +522,22 @@
     <div class="section-actions">
       <button type="button" class="btn btn-primary" id="sso-save-btn">Save SSO config</button>
       <button type="button" class="btn btn-secondary" id="sso-test-btn">Test config</button>
-      <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test" target="_blank" rel="noopener">Test sign-in</a>
+      {# The wrapper exists to carry the reason. `pointer-events: none` is what
+         makes `aria-disabled` bite on an anchor, and it also takes the element
+         out of hit-testing entirely — so a `title` on the <a> itself can never
+         be shown, which would disable the control AND hide why. The span is not
+         disabled, so it still receives the hover and the tooltip lands. #}
+      {# Rendered DISABLED and opened only once the config proves testable —
+         fail closed, the same rule the repo applies to a new parameter. Three
+         states were open before: the window between first paint and `ssoLoad`
+         resolving, a `/config` request that throws (the catch renders the error
+         badge and never returns to this control), and a 501 arriving late. All
+         three now leave it shut rather than live. #}
+      <span id="sso-test-signin-wrap" style="display: inline-flex;"
+            title="Checking the SSO configuration…">
+        <a class="btn btn-secondary" id="sso-test-signin-link" href="/auth/sso/login?mode=test"
+           target="_blank" rel="noopener" aria-disabled="true" tabindex="-1">Test sign-in</a>
+      </span>
       <button type="button" class="btn btn-secondary" id="sso-clear-secret-btn">Clear secret</button>
       <button type="button" class="btn btn-secondary" id="sso-delete-btn">Delete config</button>
       <span id="sso-test-result" hidden style="margin-left: 8px; font-size: 13px;"></span>
@@ -2299,6 +2314,20 @@ async function ssoLoad() {
       el.className = "";
       el.innerHTML = '<span class="badge badge--warn">Requires the Postgres app-state backend</span>';
       document.querySelectorAll("#sso-section input, #sso-section button").forEach((n) => { n.disabled = true; });
+      /* The selector above reaches inputs and buttons; Test sign-in is an <a>
+         and survived it, so on a DuckDB instance the one control that starts a
+         real sign-in stayed live inside a section the server had just refused
+         with 501. Same reason as the healthy-path branch below: an anchor needs
+         the attribute, not the property. */
+      const ssoTestUnsupported = document.getElementById("sso-test-signin-link");
+      const ssoTestUnsupportedWrap = document.getElementById("sso-test-signin-wrap");
+      if (ssoTestUnsupported) {
+        ssoTestUnsupported.setAttribute("aria-disabled", "true");
+        ssoTestUnsupported.setAttribute("tabindex", "-1");
+      }
+      if (ssoTestUnsupportedWrap) {
+        ssoTestUnsupportedWrap.setAttribute("title", "SSO requires the Postgres app-state backend.");
+      }
       return;
     }
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -2318,12 +2347,43 @@ async function ssoLoad() {
       document.getElementById("sso-domains").value = (s.allowed_email_domains || []).join(", ");
       document.getElementById("sso-enabled").checked = !!s.enabled;
     }
-    document.getElementById("sso-test-signin-link").classList.toggle(
-      "btn-disabled", !(s.configured && s.has_client_secret)
-    );
+    /* Test sign-in starts a REAL sign-in against the stored config, so it has
+       to be genuinely unreachable when there is no config to test. It is an
+       <a>, not a <button>: `disabled` does nothing to an anchor, and the
+       `btn-disabled` class this used to toggle is defined by no stylesheet in
+       the repo — so the control stayed live and clickable on an unconfigured
+       or vault-less instance, which is exactly the "the guard was written
+       once" shape. `aria-disabled` is the canonical spelling here (the
+       `ds.button` macro emits it, and style-custom.css now gives it
+       `pointer-events: none`), and `tabindex` keeps the keyboard out of what
+       the pointer can no longer reach. */
+    /* Deliberately keyed on `configured && has_client_secret`, NOT on
+       `enabled`: test mode is designed to work BEFORE you switch SSO on
+       ("works pre-enable and outside the allowlist", `providers/sso.py:522`) —
+       testing a config you have not enabled yet is the whole point of it. What
+       it genuinely cannot do is test a config that does not exist. */
+    const ssoTest = document.getElementById("sso-test-signin-link");
+    const ssoTestWrap = document.getElementById("sso-test-signin-wrap");
+    const ssoTestable = !!(s.configured && s.has_client_secret);
+    ssoTest.setAttribute("aria-disabled", ssoTestable ? "false" : "true");
+    if (ssoTestable) {
+      ssoTest.removeAttribute("tabindex");
+      ssoTestWrap.removeAttribute("title");
+    } else {
+      ssoTest.setAttribute("tabindex", "-1");
+      /* On the WRAPPER, never the anchor — see the comment beside the markup. */
+      ssoTestWrap.setAttribute("title", "Save an SSO config with a client secret first.");
+    }
   } catch (e) {
     el.className = "";
     el.innerHTML = '<span class="badge badge--danger">Failed to load SSO config: ' + escHtml(e.message) + "</span>";
+    /* The control stays shut — it is rendered that way — but say WHY rather
+       than leave the reader with the "checking…" placeholder over a request
+       that already failed. */
+    const ssoTestUnknown = document.getElementById("sso-test-signin-wrap");
+    if (ssoTestUnknown) {
+      ssoTestUnknown.setAttribute("title", "Could not read the SSO configuration, so there is nothing to test.");
+    }
   }
 }
 
