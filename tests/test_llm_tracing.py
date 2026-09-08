@@ -245,3 +245,44 @@ def test_record_generation_carries_a_reported_error_without_raising(caplog):
         )
     (record,) = _records(caplog)
     assert record.is_error is True and record.error_type == "overloaded_error"
+
+
+def test_the_capture_holds_the_texts_for_the_span_but_the_log_line_stays_sizes_only(caplog):
+    """The span emitter is the only consumer of the text, and only under the
+    content-export policy; the structured log record never carries it."""
+
+    class _Msg:
+        content = "the answer is 42"
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = None
+        model = "gpt-x"
+
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="openai", model="gpt-x") as trace:
+            trace.set_input("patient Nováková asks")
+            trace.set_output_from_openai(_Resp())
+            assert trace.prompt_text == "patient Nováková asks"
+            assert trace.completion_text == "the answer is 42"
+
+    (record,) = _records(caplog)
+    assert record.prompt_chars == len("patient Nováková asks")
+    assert record.completion_chars == len("the answer is 42")
+    assert "Nováková" not in str(record.__dict__)
+
+
+def test_a_non_string_prompt_leaves_no_text_to_export(caplog):
+    """A messages list is measured, never reconstructed into an export text —
+    the span's content events carry only the text shapes the capture can
+    vouch for."""
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="anthropic", model="claude-x") as trace:
+            trace.set_input([{"role": "user", "content": "hi"}])
+            trace.set_output({"blocks": 2})
+            assert trace.prompt_text is None and trace.completion_text is None
+            assert trace.prompt_chars and trace.completion_chars

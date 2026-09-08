@@ -10,10 +10,13 @@ Every field the record carries about *who* ran the call and *for what*
 comes from the ambient :mod:`src.observability.llm_context` — a call site
 labels its work once and every generation underneath inherits the label.
 
-Prompts and completions are deliberately not recorded — in this product they
-routinely carry customer data, and a log pipeline is the wrong place to hold
-it. Their *sizes* are recorded, because a size is the part that explains a
-cost or a latency.
+Prompts and completions are deliberately not recorded in the log record or
+the ledger row — in this product they routinely carry customer data, and a
+log pipeline is the wrong place to hold it. Their *sizes* are recorded,
+because a size is the part that explains a cost or a latency. The capture
+keeps the texts in memory for one consumer only: the OTLP span, which emits
+them as content events if — and only if — the instance's recorded
+content-export policy allows it (:mod:`src.observability.content_policy`).
 
 Nothing in here may break the call it wraps: every accessor on a provider
 response is defensive, and a failure inside the instrumentation is logged and
@@ -69,6 +72,12 @@ class _Capture:
         self.completion_chars: int | None = None
         self.model_response: str | None = None
         self.stop_reason: str | None = None
+        #: The texts themselves, held in memory for the span exporter only.
+        #: They never reach the log record or the ledger row (both carry
+        #: sizes), and they leave the process only when the content-export
+        #: policy allows it — see src/observability/content_policy.py.
+        self.prompt_text: str | None = None
+        self.completion_text: str | None = None
         self.extra: dict[str, Any] = {}
 
     @staticmethod
@@ -82,9 +91,11 @@ class _Capture:
 
     def set_input(self, prompt: Any) -> None:
         self.prompt_chars = self._size(prompt)
+        self.prompt_text = prompt if isinstance(prompt, str) else None
 
     def set_output(self, output: Any) -> None:
         self.completion_chars = self._size(output)
+        self.completion_text = output if isinstance(output, str) else None
 
     def set_tokens(
         self,
@@ -119,6 +130,7 @@ class _Capture:
             ]
             if texts:
                 self.completion_chars = sum(len(t) for t in texts)
+                self.completion_text = "".join(texts)
         except Exception:  # noqa: BLE001 - see the class docstring
             logger.debug("llm tracing: unreadable anthropic response shape", exc_info=True)
 
@@ -131,7 +143,9 @@ class _Capture:
             choices = getattr(response, "choices", None) or []
             if choices:
                 message = getattr(choices[0], "message", None)
-                self.completion_chars = self._size(getattr(message, "content", None))
+                content = getattr(message, "content", None)
+                self.completion_chars = self._size(content)
+                self.completion_text = content if isinstance(content, str) else None
                 self.stop_reason = getattr(choices[0], "finish_reason", None) or None
         except Exception:  # noqa: BLE001 - see the class docstring
             logger.debug("llm tracing: unreadable openai response shape", exc_info=True)
@@ -235,6 +249,10 @@ def trace_generation(
             completion_chars=capture.completion_chars,
             error_type=error_type,
             user_id=context.user_id,
+            # Text, not sizes — the span emitter drops or pseudonymises it
+            # per the content-export policy; nothing here decides that.
+            prompt_text=capture.prompt_text,
+            completion_text=capture.completion_text,
         )
         if record is not None:
             record_call(record)

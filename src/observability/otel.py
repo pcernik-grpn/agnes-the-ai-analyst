@@ -18,10 +18,14 @@ What is exported, and why it lives here:
   job, subject) and its identity, which is ``agnes.user_id`` and the agent
   id. The user's EMAIL is deliberately not exported: it is personal data
   with no join value off-instance, where the stable id is the key.
-  Prompt and completion content is exported ONLY when
-  ``AGNES_OTEL_CAPTURE_CONTENT`` is set: in this product it routinely
-  carries customer data, so the default is the same as for logs — sizes and
-  counts, never the text. When it is on, the text rides two span EVENTS
+  Prompt and completion content is exported ONLY under the instance's
+  recorded content-export policy (``observability.content_export`` —
+  :mod:`src.observability.content_policy`; ``AGNES_OTEL_CAPTURE_CONTENT``
+  is a deprecated alias that no longer enables anything on its own): in
+  this product content routinely carries customer data, so the default is
+  the same as for logs — sizes and counts, never the text. Under
+  ``pseudonymized`` the text passes the instance anonymizer first. When it
+  is on, the text rides two span EVENTS
   (``gen_ai.content.prompt`` / ``gen_ai.content.completion``), never span
   attributes: a collector stores attributes as one JSON object with keys in
   alphabetical order, and a prompt that is hundreds of KiB pushes every key
@@ -282,7 +286,13 @@ def shutdown_otel(timeout_ms: int = 5000) -> None:
 
 
 def capture_content_enabled() -> bool:
-    return os.environ.get(CAPTURE_CONTENT_VAR, "").strip().lower() in ("1", "true", "yes", "on")
+    """Content leaves the instance only under a recorded policy
+    (``observability.content_export`` — src/observability/content_policy.py:
+    mode + placement + basis + approver). ``AGNES_OTEL_CAPTURE_CONTENT`` is a
+    deprecated alias that no longer enables anything on its own."""
+    from src.observability.content_policy import content_export_mode
+
+    return content_export_mode() != "off"
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +394,29 @@ def _set_cost(span: Any, cost_usd: Optional[float]) -> None:
         span.set_attribute("agnes.cost_usd", float(cost_usd))
 
 
+def _add_generation_content_events(span: Any, prompt_text: Optional[str], completion_text: Optional[str]) -> None:
+    """The two content events for a server-side generation, in the same GenAI
+    message shape (``[{role, parts}]``) the completion spans use, so one
+    collector query reads both. Each text goes through the policy's
+    ``export_text`` and the shared per-event cap."""
+    from src.observability.content_policy import export_text
+
+    truncated = False
+    for text_value, role, event_name, attribute in (
+        (prompt_text, "user", PROMPT_EVENT, "gen_ai.prompt"),
+        (completion_text, "assistant", COMPLETION_EVENT, "gen_ai.completion"),
+    ):
+        if not isinstance(text_value, str):
+            continue
+        exported = export_text(text_value)
+        payload = json.dumps([{"role": role, "parts": [{"type": "text", "content": exported}]}], ensure_ascii=False)
+        text, cut = truncate_content(payload)
+        truncated = truncated or cut
+        span.add_event(event_name, {attribute: text})
+    if truncated:
+        span.set_attribute("agnes.content_truncated", True)
+
+
 def end_generation_span(
     span: Any,
     *,
@@ -396,9 +429,15 @@ def end_generation_span(
     completion_chars: Optional[int] = None,
     error_type: Optional[str] = None,
     user_id: Optional[str] = None,
+    prompt_text: Optional[str] = None,
+    completion_text: Optional[str] = None,
 ) -> None:
     """Finish a generation span with the counts ``trace_generation`` collected.
-    Sizes, never text: these calls run over documents and query results."""
+
+    Sizes always; the TEXT only under the recorded content-export policy
+    (:func:`capture_content_enabled`) and then on the same two events a
+    completion span uses — a builder turn and a brokered chat turn answer
+    "what did the model actually see" the same way, or neither does."""
     try:
         if not span.is_recording():
             return
@@ -415,6 +454,8 @@ def end_generation_span(
         _set_cost(span, cost_usd)
         if user_id:
             span.set_attribute("agnes.user_id", user_id)
+        if capture_content_enabled():
+            _add_generation_content_events(span, prompt_text, completion_text)
         if error_type:
             span.set_attribute("error.type", error_type)
             span.set_status(StatusCode.ERROR, error_type)
@@ -569,13 +610,19 @@ def end_completion_span(  # noqa: C901
             # attribute object stays small and parseable however long the
             # conversation is, and each side of the exchange is its own
             # record a collector can map, cap or drop independently.
+            # Every text passes the policy's ``export_text`` first: under
+            # ``pseudonymized`` that is the instance anonymizer, and a
+            # pseudonymisation that cannot run withholds the text rather than
+            # falling back to the raw exchange.
+            from src.observability.content_policy import export_text
+
             truncated = False
             if described.prompt_json is not None:
-                text, cut = truncate_content(described.prompt_json)
+                text, cut = truncate_content(export_text(described.prompt_json))
                 truncated = truncated or cut
                 span.add_event(PROMPT_EVENT, {"gen_ai.prompt": text})
             if described.completion_json is not None:
-                text, cut = truncate_content(described.completion_json)
+                text, cut = truncate_content(export_text(described.completion_json))
                 truncated = truncated or cut
                 span.add_event(COMPLETION_EVENT, {"gen_ai.completion": text})
             if truncated:

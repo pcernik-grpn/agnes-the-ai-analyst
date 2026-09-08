@@ -402,6 +402,26 @@ auth:
 #   sampling:
 #     chat.tool_call: 0.1   # keep 1 in 10 chat tool-call rows
 
+# --- Observability: content export policy (LLM observability design, 2026-09-08) ---
+# Prompt and completion TEXT leaves this instance (on OTLP spans, and through
+# the embedded engine's telemetry relay) only under a recorded decision. Sizes
+# and token counts are always exported; text never is unless `mode` is set AND
+# the consent fields below are filled in — a mode without a basis is treated as
+# `off` and logged at startup. `AGNES_OTEL_CAPTURE_CONTENT` is deprecated and
+# no longer enables content on its own. The effective policy is written to the
+# audit trail once per start (`observability.content_export`).
+# observability:
+#   content_export:
+#     mode: off             # off | pseudonymized | full
+#                           # pseudonymized = every exported text goes through
+#                           # this instance's anonymizer first (stable
+#                           # EMAIL_<hmac>/PERSON_<hmac> tokens, never the value)
+#     placement: operator   # operator | third_party — who runs the collector
+#                           # (T1 vs T2 in docs/observability.md)
+#     basis: ""             # the contract clause / DPA reference / "internal dev instance" that permits it
+#     approved_by: ""       # a person, never blank unless mode is off
+#     approved_at: ""       # ISO date
+
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY
 # key below defaults to 0 = keep forever = the daily retention-prune

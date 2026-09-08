@@ -15,11 +15,14 @@ Uses ``asyncio.run`` like ``tests/test_broker_routes.py``.
 from __future__ import annotations
 
 import asyncio
+import gzip
 
 import httpx
 import pytest
 
+from src.observability import content_policy as cp
 from src.repositories import ticket_repo
+from tests.test_otlp_scrub import _attrs, _span, _trace_batch
 
 ENDPOINT = "https://collector.example/otlp/proj/source"
 
@@ -77,7 +80,19 @@ def otlp_broker(e2e_env, shared_app, monkeypatch):
     return shared_app
 
 
-def _post(app, tok, signal, body=b"\x0a\x03abc", headers=None):
+@pytest.fixture
+def content_full(monkeypatch):
+    """A complete policy record with ``mode: full`` — the only mode in which
+    the relay forwards a batch byte-for-byte."""
+    monkeypatch.setattr(cp, "content_export_mode", lambda: "full")
+
+
+def _post(app, tok, signal, body=None, headers=None):
+    # Default body: a REAL trace batch. Under the default policy (`off`) the
+    # relay decodes what it forwards, so a junk placeholder would now be a
+    # 400 and every plumbing test would be testing the refusal instead.
+    body = _trace_batch() if body is None else body
+
     async def _run():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -91,14 +106,17 @@ def _post(app, tok, signal, body=b"\x0a\x03abc", headers=None):
 
 
 def test_forwards_a_batch_with_the_operator_credential_injected(otlp_broker):
+    """Metrics carry no content, so they are the signal where the forward is
+    still byte-for-byte in every mode — the credential swap is what this
+    test is about (traces/logs go through the content policy below)."""
     tok = ticket_repo().mint("chat_otlp", "kai_otlp", ttl_seconds=60)
     r = _post(
-        otlp_broker, tok, "traces", body=b"\x0a\x05hello", headers={"content-encoding": "gzip", "x-api-key": "dummy"}
+        otlp_broker, tok, "metrics", body=b"\x0a\x05hello", headers={"content-encoding": "gzip", "x-api-key": "dummy"}
     )
     assert r.status_code == 200, r.text
     assert r.content == b"\x0a\x00"  # the collector's OTLP success response, as-is
     sent = _FakeCollectorClient.captured
-    assert sent["url"] == ENDPOINT + "/v1/traces"
+    assert sent["url"] == ENDPOINT + "/v1/metrics"
     assert sent["content"] == b"\x0a\x05hello"
     lowered = {k.lower(): v for k, v in sent["headers"].items()}
     assert lowered["authorization"] == "Bearer s3cr3t"  # percent-decoded, injected server-side
@@ -108,8 +126,9 @@ def test_forwards_a_batch_with_the_operator_credential_injected(otlp_broker):
     assert "x-api-key" not in lowered  # the sandbox's dummy credential never reaches the collector
 
 
-@pytest.mark.parametrize("signal", ["metrics", "logs"])
-def test_all_three_signals_route_to_their_own_path(otlp_broker, signal):
+@pytest.mark.parametrize("signal", ["traces", "metrics", "logs"])
+def test_all_three_signals_route_to_their_own_path(otlp_broker, signal, content_full):
+    # Under `full` all three forward; the per-mode behaviour is below.
     tok = ticket_repo().mint("chat_otlp_sig", "kai_otlp", ttl_seconds=60)
     assert _post(otlp_broker, tok, signal).status_code == 200
     assert _FakeCollectorClient.captured["url"] == f"{ENDPOINT}/v1/{signal}"
@@ -182,6 +201,83 @@ def test_declared_oversized_batch_is_refused_before_it_is_read(otlp_broker):
 
     r = asyncio.run(_run())
     assert r.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# The relay under the content-export policy (spec 3.6) — the sandbox's own
+# spans carry prompts, and they obey the same record the app's spans do.
+# ---------------------------------------------------------------------------
+
+
+def test_traces_are_stripped_under_off(otlp_broker):
+    tok = ticket_repo().mint("chat_otlp_off_mode", "kai_otlp", ttl_seconds=60)
+    r = _post(otlp_broker, tok, "traces", body=_trace_batch())
+    assert r.status_code == 200, r.text
+
+    forwarded = _span(_FakeCollectorClient.captured["content"])
+    attrs = _attrs(forwarded.attributes)
+    assert "gen_ai.prompt" not in attrs
+    assert attrs["agnes.content_stripped"].bool_value is True
+    # The structural span still reaches the collector.
+    assert forwarded.name == "turn" and attrs["agnes.turn_id"].string_value == "t1"
+    assert b"jane@example.com" not in _FakeCollectorClient.captured["content"]
+
+
+def test_traces_are_pseudonymized_under_that_mode(otlp_broker, monkeypatch):
+    monkeypatch.setattr(cp, "content_export_mode", lambda: "pseudonymized")
+    monkeypatch.setattr(cp, "_pseudonym_key", lambda: b"k")
+    tok = ticket_repo().mint("chat_otlp_pseudo", "kai_otlp", ttl_seconds=60)
+    assert _post(otlp_broker, tok, "traces", body=_trace_batch()).status_code == 200
+
+    prompt = _attrs(_span(_FakeCollectorClient.captured["content"]).attributes)["gen_ai.prompt"].string_value
+    assert "jane@example.com" not in prompt and "EMAIL_" in prompt
+
+
+def test_traces_forward_unchanged_under_full(otlp_broker, content_full):
+    body = _trace_batch()
+    tok = ticket_repo().mint("chat_otlp_full", "kai_otlp", ttl_seconds=60)
+    r = _post(otlp_broker, tok, "traces", body=body, headers={"content-encoding": "gzip"})
+    assert r.status_code == 200
+
+    sent = _FakeCollectorClient.captured
+    assert sent["content"] == body
+    assert {k.lower(): v for k, v in sent["headers"].items()}["content-encoding"] == "gzip"
+
+
+def test_logs_are_accepted_and_dropped_under_off(otlp_broker):
+    """A log body is free text with no structural half worth keeping, so the
+    batch is dropped — with a 2xx, so the sandbox's exporter does not retry
+    a decision the operator made."""
+    tok = ticket_repo().mint("chat_otlp_logs_off", "kai_otlp", ttl_seconds=60)
+    r = _post(otlp_broker, tok, "logs", body=b"anything at all")
+    assert r.status_code == 200
+    assert _FakeCollectorClient.captured == {}
+
+
+def test_undecodable_traces_batch_is_400(otlp_broker):
+    tok = ticket_repo().mint("chat_otlp_junk", "kai_otlp", ttl_seconds=60)
+    r = _post(otlp_broker, tok, "traces", body=b"\xff\xfe not a batch")
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "otlp_batch_undecodable"
+    assert _FakeCollectorClient.captured == {}  # never forwarded blind
+
+
+def test_gzip_batch_is_forwarded_uncompressed(otlp_broker):
+    tok = ticket_repo().mint("chat_otlp_gzip", "kai_otlp", ttl_seconds=60)
+    r = _post(otlp_broker, tok, "traces", body=gzip.compress(_trace_batch()), headers={"content-encoding": "gzip"})
+    assert r.status_code == 200
+
+    sent = _FakeCollectorClient.captured
+    assert "content-encoding" not in {k.lower() for k in sent["headers"]}
+    assert _span(sent["content"]).name == "turn"
+
+
+def test_metrics_are_never_decoded(otlp_broker):
+    """Metrics carry counts, not content: they are forwarded as sent even
+    when they are not parseable as anything the relay knows."""
+    tok = ticket_repo().mint("chat_otlp_metrics", "kai_otlp", ttl_seconds=60)
+    assert _post(otlp_broker, tok, "metrics", body=b"\xff\xfe junk").status_code == 200
+    assert _FakeCollectorClient.captured["content"] == b"\xff\xfe junk"
 
 
 def test_headers_parser_handles_the_baggage_form():
