@@ -199,8 +199,12 @@ jobs:
                 query($owner: String!, $name: String!, $number: Int!) {
                   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
                     reviewThreads(first: 100) { totalCount nodes { isResolved comments(first: 1) { nodes { author { login } } } } } } } }' \
-                --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-                       | select(.isResolved == false and .comments.nodes[0].author.login == "devin-ai-integration")] | length')
+                --jq '.data.repository.pullRequest.reviewThreads
+                      | if .totalCount > (.nodes | length) then "unknown (\(.totalCount) threads, only \(.nodes | length) fetched)"
+                        else ([.nodes[] | select(.isResolved == false
+                                 and (.comments.nodes[0].author.login | IN("devin-ai-integration", "devin-ai-integration[bot]")))] | length | tostring)
+                        end')
+              # GraphQL returns bot logins without the "[bot]" suffix; accept both spellings.
               if [ "$open_threads" = "0" ]; then
                 echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} — treating the findings as addressed"
                 verdict="Devin Review: No Issues Found (all findings resolved)"
