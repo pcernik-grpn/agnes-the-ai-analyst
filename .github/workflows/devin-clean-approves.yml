@@ -99,8 +99,11 @@ jobs:
           echo "credential: $TOKEN_KIND"
 
           # The dispatch input is free text; accept "123", " 123 " or "#123", refuse the rest
-          # with a clear message instead of a GraphQL type error.
-          ONLY_PR=${ONLY_PR//[[:space:]]/}; ONLY_PR=${ONLY_PR#\#}
+          # with a clear message instead of a GraphQL type error. Only LEADING and
+          # TRAILING whitespace is trimmed — "12 3" must fail, not become #123.
+          ONLY_PR="${ONLY_PR#"${ONLY_PR%%[![:space:]]*}"}"
+          ONLY_PR="${ONLY_PR%"${ONLY_PR##*[![:space:]]}"}"
+          ONLY_PR=${ONLY_PR#\#}
           if [ -n "$ONLY_PR" ] && ! [[ "$ONLY_PR" =~ ^[0-9]+$ ]]; then
             echo "input 'pr' must be a pull request number, got '$ONLY_PR'"; exit 1
           fi
