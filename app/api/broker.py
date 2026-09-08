@@ -905,7 +905,6 @@ async def _start_otel_completion_span(
         stream=stream,
         session_id=row.get("session_id"),
         ticket_scope=row.get("scope"),
-        user_email=getattr(session, "user_email", None),
         user_id=caller_user_id,
         agent_id=agent_row.get("id") if agent_row else None,
     )

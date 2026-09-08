@@ -13,8 +13,12 @@ What is exported, and why it lives here:
   (``app/api/broker.py``) — every chat surface, every engine, because every
   byte of a session's LLM traffic goes through that one route. The span
   carries the OTel GenAI attributes (model, the four token kinds, finish
-  reason) plus the Agnes identity of the call (session, user, agent, ticket
-  scope). Prompt and completion content is exported ONLY when
+  reason) plus the Agnes labels of the call — the call context
+  (``src/observability/llm_context.py``: workload, purpose, session, turn,
+  job, subject) and its identity, which is ``agnes.user_id`` and the agent
+  id. The user's EMAIL is deliberately not exported: it is personal data
+  with no join value off-instance, where the stable id is the key.
+  Prompt and completion content is exported ONLY when
   ``AGNES_OTEL_CAPTURE_CONTENT`` is set: in this product it routinely
   carries customer data, so the default is the same as for logs — sizes and
   counts, never the text. When it is on, the text rides two span EVENTS
@@ -50,6 +54,8 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, Mapping, Optional
 from urllib.parse import unquote
+
+from src.observability.llm_context import LlmCallContext
 
 try:
     from opentelemetry import trace
@@ -294,56 +300,87 @@ def start_completion_span(
     stream: bool,
     session_id: Optional[str],
     ticket_scope: Optional[str],
-    user_email: Optional[str] = None,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    context: Optional[LlmCallContext] = None,
+    parent_context: Any = None,
 ) -> Any:
     """Open the span for one brokered completion. ``upstream`` names where
     the request goes (``anthropic``, ``vertex``, ``dispatcher``); the GenAI
-    ``system`` is the provider whose API shape the call speaks."""
+    ``system`` is the provider whose API shape the call speaks.
+
+    ``context`` supplies the call's labels (workload, purpose, turn, job,
+    subject); the explicit ``session_id`` / ``user_id`` / ``agent_id``
+    arguments win over the context's when both are given, because the caller
+    holding the ticket knows those first-hand. ``parent_context`` is the OTel
+    ``Context`` to open under — the chat turn's span, which normally lives in
+    another process (see :func:`remote_parent_context`).
+    """
     system = "gcp.vertex_ai" if upstream == "vertex" else "anthropic"
-    attrs = _clean(
-        {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.system": system,
-            "gen_ai.request.model": model,
-            "agnes.kind": "completion",
-            "agnes.upstream": upstream,
-            "agnes.stream": stream,
-            "agnes.session_id": session_id,
-            "agnes.ticket_scope": ticket_scope,
-            "agnes.user_email": user_email,
-            "agnes.user_id": user_id,
-            "agnes.agent_id": agent_id,
-        }
-    )
+    # The context first, the caller's own values over it — but only the ones
+    # it actually has: cleaning BEFORE the merge is what keeps an absent
+    # explicit argument from blanking a label the context did carry.
+    attrs = {
+        **(context.span_attributes() if context else {}),
+        **_clean(
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.system": system,
+                "gen_ai.request.model": model,
+                "agnes.kind": "completion",
+                "agnes.upstream": upstream,
+                "agnes.stream": stream,
+                "agnes.session_id": session_id,
+                "agnes.ticket_scope": ticket_scope,
+                "agnes.user_id": user_id,
+                "agnes.agent_id": agent_id,
+            }
+        ),
+    }
     name = f"chat {model}" if model else "chat"
-    return _open_span(name, attrs)
+    return _open_span(name, attrs, parent_context=parent_context)
 
 
-def _open_span(name: str, attrs: Mapping[str, Any]) -> Any:
+def _open_span(name: str, attrs: Mapping[str, Any], *, kind: Any = None, parent_context: Any = None) -> Any:
     """``tracer().start_span`` that cannot raise: a span processor that
     fails on ``on_start`` costs the span, never the LLM call it observes."""
     if not _OTEL_API:
         return _NoopSpan()
     try:
-        return tracer().start_span(name, kind=SpanKind.CLIENT, attributes=dict(attrs))
+        return tracer().start_span(
+            name,
+            kind=kind or SpanKind.CLIENT,
+            attributes=dict(attrs),
+            context=parent_context,
+        )
     except Exception:  # noqa: BLE001 - see the module docstring
         logger.debug("otel: could not open span %s", name, exc_info=True)
         return _NoopSpan()
 
 
-def start_generation_span(*, provider: str, model: str) -> Any:
-    """Open the span for one server-side generation (``trace_generation``)."""
-    attrs = _clean(
-        {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.system": provider,
-            "gen_ai.request.model": model,
-            "agnes.kind": "generation",
-        }
-    )
+def start_generation_span(*, provider: str, model: str, context: Optional[LlmCallContext] = None) -> Any:
+    """Open the span for one server-side generation (``trace_generation``).
+    ``context`` labels it with workload / purpose / identity so a builder
+    turn, an extraction and an auto-title stop looking identical."""
+    attrs = {
+        **(context.span_attributes() if context else {}),
+        **_clean(
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.system": provider,
+                "gen_ai.request.model": model,
+                "agnes.kind": "generation",
+            }
+        ),
+    }
     return _open_span(f"chat {model}" if model else "chat", attrs)
+
+
+def _set_cost(span: Any, cost_usd: Optional[float]) -> None:
+    """``agnes.cost_usd`` — the price the producer computed, so a collector
+    never has to re-implement the price table."""
+    if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool):
+        span.set_attribute("agnes.cost_usd", float(cost_usd))
 
 
 def end_generation_span(
@@ -351,6 +388,9 @@ def end_generation_span(
     *,
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None,
+    cache_creation_tokens: Optional[int] = None,
+    cost_usd: Optional[float] = None,
     prompt_chars: Optional[int] = None,
     completion_chars: Optional[int] = None,
     error_type: Optional[str] = None,
@@ -364,11 +404,14 @@ def end_generation_span(
         for attr, value in (
             ("gen_ai.usage.input_tokens", input_tokens),
             ("gen_ai.usage.output_tokens", output_tokens),
+            ("gen_ai.usage.cache_read_input_tokens", cache_read_tokens),
+            ("gen_ai.usage.cache_creation_input_tokens", cache_creation_tokens),
             ("agnes.prompt_chars", prompt_chars),
             ("agnes.completion_chars", completion_chars),
         ):
             if isinstance(value, int) and not isinstance(value, bool):
                 span.set_attribute(attr, value)
+        _set_cost(span, cost_usd)
         if user_id:
             span.set_attribute("agnes.user_id", user_id)
         if error_type:
@@ -417,6 +460,7 @@ def end_completion_span(  # noqa: C901
     content_type: str = "",
     error: Optional[BaseException] = None,
     response_truncated: bool = False,
+    cost_usd: Optional[float] = None,
 ) -> None:
     """Finish a completion span with whatever the forward produced. Never
     raises — the response has already been (or is being) delivered."""
@@ -426,6 +470,7 @@ def end_completion_span(  # noqa: C901
         if status_code is not None:
             span.set_attribute("http.response.status_code", int(status_code))
         set_usage_attributes(span, usage)
+        _set_cost(span, cost_usd)
         summary: dict[str, Any] = {}
         if response_body is not None:
             # A completion the client walked away from (or that never got
@@ -485,6 +530,46 @@ def end_completion_span(  # noqa: C901
             span.end()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------------------
+# Span identity — the ids a ledger row carries, and the parent a span in
+# another process can be opened under
+# ---------------------------------------------------------------------------
+
+
+def span_ids(span: Any) -> tuple[Optional[str], Optional[str]]:
+    """``(trace_id, span_id)`` as lowercase hex for a recording span — the
+    ids a ledger row stores so it can be joined to the exported span.
+    ``(None, None)`` for a non-recording span (export off) or any failure."""
+    try:
+        if not span.is_recording():
+            return None, None
+        sc = span.get_span_context()
+        return format(sc.trace_id, "032x"), format(sc.span_id, "016x")
+    except Exception:  # noqa: BLE001 - see the module docstring
+        return None, None
+
+
+def remote_parent_context(trace_id_hex: Optional[str], span_id_hex: Optional[str]) -> Any:
+    """An OTel ``Context`` whose current span is a remote, sampled
+    ``NonRecordingSpan`` — the parent a completion span opens under when the
+    turn span lives in another process. ``None`` on bad input."""
+    if not _OTEL_API or not trace_id_hex or not span_id_hex:
+        return None
+    try:
+        from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+
+        sc = SpanContext(
+            trace_id=int(trace_id_hex, 16),
+            span_id=int(span_id_hex, 16),
+            is_remote=True,
+            trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        )
+        return trace.set_span_in_context(NonRecordingSpan(sc))
+    except Exception:  # noqa: BLE001 - see the module docstring
+        logger.debug("otel: could not build a remote parent context", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -670,8 +755,10 @@ __all__ = [
     "input_messages_from_request",
     "is_enabled",
     "parse_otlp_headers",
+    "remote_parent_context",
     "set_usage_attributes",
     "shutdown_otel",
+    "span_ids",
     "start_completion_span",
     "start_generation_span",
     "summarize_completion",
