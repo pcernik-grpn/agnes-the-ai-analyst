@@ -14,8 +14,10 @@ from sqlalchemy import exc as sa_exc
 
 from app.auth.access import require_resource_access
 from app.auth.dependencies import _get_db
+from app.chat.document_links import attach_document_urls
 from app.chat.frame_seq import stamp_frame
 from app.chat.manager import SENDER_LIMIT_REASONS, ChatManager, ConcurrencyCapHit, SessionNotFound
+from app.chat.message_parts import parts_to_tool_results
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.replay import GapReplayGate, replay_since
@@ -25,7 +27,6 @@ from app.chat.skills_catalog import (
     merged_commands,
     merged_skills,
 )
-from app.chat.message_parts import parts_to_tool_results
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
@@ -131,7 +132,7 @@ class CreateSessionBody(BaseModel):
     #: Nothing is persisted: it lives in memory for the life of the session,
     #: because a preview that outlived the tab would be a copy of unfinished
     #: work nobody asked us to keep.
-    preview_skill: "PreviewSkill | None" = None
+    preview_skill: PreviewSkill | None = None
 
 
 def _get_manager(request: Request) -> ChatManager:
@@ -629,6 +630,17 @@ async def reissue_ticket(
     }
 
 
+def _message_sources(m, user: dict) -> dict:
+    """The verdict for one assistant message, with a `document:` claim's
+    ``url`` resolved for THIS reader (see app/chat/document_links.py) — the
+    route is owner-only (a non-owner 404s above), so resolution is always
+    scoped to the same account the row belongs to."""
+    sources = sources_verdict(m.content or "", m.tool_calls, parts_to_tool_results(m.parts)).to_dict()
+    if any(c.get("kind") == "document" for c in sources.get("claims", [])):
+        attach_document_urls(sources, user)
+    return sources
+
+
 @router.get("/sessions/{chat_id}/messages")
 async def list_messages(
     chat_id: str,
@@ -671,11 +683,7 @@ async def list_messages(
             # the pair it needs is already here, so this costs no column, no
             # migration step and no DuckDB/Postgres parity surface — and a
             # better matcher improves history instead of only new answers.
-            **(
-                {"sources": sources_verdict(m.content or "", m.tool_calls, parts_to_tool_results(m.parts)).to_dict()}
-                if m.role == "assistant"
-                else {}
-            ),
+            **({"sources": _message_sources(m, user)} if m.role == "assistant" else {}),
         }
         for m in msgs
     ]

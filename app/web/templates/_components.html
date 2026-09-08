@@ -49,10 +49,24 @@
   {%- if icon_only %}{%- set _ = classes.append('btn--icon') -%}{%- endif -%}
   {%- if klass %}{%- set _ = classes.append(klass) -%}{%- endif -%}
   {%- set class_str = classes | join(' ') -%}
-  {%- if href -%}
+  {%- if href and disabled -%}
+    {#- A disabled LINK is wrapped, and its `attrs` go on the wrapper.
+        `aria-disabled` is advisory on an anchor, so `.btn[aria-disabled]`
+        carries `pointer-events: none` (style-custom.css) to make it bite —
+        and that also removes the anchor from hit-testing, so a `title` on it
+        can never be shown. Every current caller of this shape passes exactly
+        such a title (the reason the control is off), which would have gone
+        silently unreachable. The wrapper is not disabled, so it still takes
+        the hover; the anchor stays inoperable to pointer and keyboard alike. -#}
+    <span class="ds-disabled-wrap" {% if attrs %}{{ attrs | safe }}{% endif %}
+      ><a href="{{ href }}" class="{{ class_str }}"
+       {%- if id %} id="{{ id }}"{% endif %} aria-disabled="true" tabindex="-1">
+        {%- if caller %}{{ caller() }}{% else %}{{ label }}{% endif -%}
+      </a></span
+    >
+  {%- elif href -%}
     <a href="{{ href }}" class="{{ class_str }}"
        {%- if id %} id="{{ id }}"{% endif -%}
-       {%- if disabled %} aria-disabled="true" tabindex="-1"{% endif -%}
        {%- if attrs %} {{ attrs | safe }}{% endif -%}>
       {%- if caller %}{{ caller() }}{% else %}{{ label }}{% endif -%}
     </a>
