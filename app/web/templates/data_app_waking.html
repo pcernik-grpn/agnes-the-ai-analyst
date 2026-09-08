@@ -41,11 +41,17 @@
   const startedAt = Date.now();
   let errors = 0;
 
-  const stop = (text) => {
-    head.textContent = "⏳ Still starting…";
+  // The heading is the caller's, not this helper's: the page stops for two
+  // different kinds of reason, and one heading over both of them contradicts
+  // the message underneath it — "Still starting…" above "the app could not
+  // start" (Devin Review on #2336). Slow starts and an unanswerable poll are
+  // genuinely still starting; a terminal state is not.
+  const stop = (heading, text) => {
+    head.textContent = heading;
     msg.textContent = text;
     reload.hidden = false;
   };
+  const STILL_STARTING = "⏳ Still starting…";
 
   const poll = async () => {
     // Every request is bounded. Without the abort a stalled connection never
@@ -69,23 +75,23 @@
       // read a dead app as a slow one and sat out the whole grace under
       // "taking longer than usual". Nothing here will ever become ready.
       if (j.state === "error") {
-        stop("The app could not start. Reload to see its current status.");
+        stop("App failed to start", "Its last start attempt failed. Reload to see the current status — only its owner or an administrator can start it again.");
         return;
       }
       if (j.state && !REACHABLE_STATES.includes(j.state)) {
-        stop("The app is no longer starting. Reload to see its current status.");
+        stop("App is not running", "It is no longer starting. Reload to see the current status.");
         return;
       }
     } catch (e) {
       if (++errors >= ERROR_LIMIT) {
-        stop("This page can’t check the app’s status automatically on this deployment. The app was asked to start — reload to see whether it is up.");
+        stop(STILL_STARTING, "This page can’t check the app’s status automatically on this deployment. The app was asked to start — reload to see whether it is up.");
         return;
       }
     } finally {
       clearTimeout(cancel);
     }
     if (Date.now() - startedAt > GRACE_MS) {
-      stop("The app is taking longer than usual to start. Reload to check again.");
+      stop(STILL_STARTING, "The app is taking longer than usual to start. Reload to check again.");
       return;
     }
     setTimeout(poll, INTERVAL_MS);

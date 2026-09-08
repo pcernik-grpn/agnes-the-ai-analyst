@@ -496,6 +496,9 @@ def test_holding_page_bounds_each_readiness_request_and_counts_http_errors(
     assert "signal: ctl.signal" in r.text
     assert "if (!r.ok) throw" in r.text
     assert 'if (j.state === "error")' in r.text
+    # A terminal state must not be announced under the still-starting heading.
+    assert '"App failed to start"' in r.text
+    assert "Still starting" in r.text  # kept for the genuinely slow cases
 
 
 def test_holding_page_bounds_its_retry_on_the_servers_own_start_grace(
