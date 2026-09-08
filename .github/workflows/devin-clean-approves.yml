@@ -195,6 +195,14 @@ jobs:
             # and commits after the reviewed one. Not for security verdicts (no threads).
             if printf '%s' "$verdict" | grep -Eq 'found [1-9][0-9]* (new )?potential issue' \
                && [ -n "$verdict_sha" ] && [ "$verdict_sha" != "$head" ]; then
+              # "Moved past" means the head DESCENDS from the reviewed commit (compare
+              # status "ahead"). A rewound or rewritten branch ("behind", "diverged", or
+              # a commit GitHub no longer knows) proves nothing and keeps the findings open.
+              relation=$(gh api "repos/$REPO/compare/$verdict_sha...$head" --jq '.status' 2>/dev/null || echo "unknown")
+              if [ "$relation" != "ahead" ]; then
+                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; head ${head:0:9} is '$relation' relative to it, not ahead — findings stay open"
+                open_threads="n/a"
+              else
               open_threads=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$n" -f query='
                 query($owner: String!, $name: String!, $number: Int!) {
                   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
@@ -204,6 +212,7 @@ jobs:
                         else ([.nodes[] | select(.isResolved == false
                                  and (.comments.nodes[0].author.login | IN("devin-ai-integration", "devin-ai-integration[bot]")))] | length | tostring)
                         end')
+              fi
               # GraphQL returns bot logins without the "[bot]" suffix; accept both spellings.
               if [ "$open_threads" = "0" ]; then
                 echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} — treating the findings as addressed"
