@@ -251,11 +251,29 @@ class AnthropicExtractor:
         if response.stop_reason == "end_turn" and not response.content:
             raise LLMRefusalError(f"Model refused to generate response for schema {schema_name}")
 
-        # Parse JSON from response
+        # Parse JSON from the first TEXT block, not from content[0].
+        #
+        # A thinking-capable model (the Claude 5 family thinks adaptively — no
+        # `thinking` request parameter is involved) puts a `thinking` block
+        # first on the turns it decides to think. That block carries
+        # `.thinking`, never `.text`, so indexing position 0 raised
+        # AttributeError on those turns and only those: an intermittent
+        # "Failed to parse ... as JSON" that the retry loop re-raises at once,
+        # because it treats every non-truncation format error as permanent.
+        #
+        # Discriminated on `.text` alone, the way `app/chat/auto_title.py`
+        # already walks blocks: no non-text block type carries one (thinking
+        # has `.thinking`, redacted_thinking `.data`, tool_use `.input`), so
+        # this needs no `type` allowlist for a future block type to fall foul of.
+        text = next((t for b in (response.content or []) if (t := getattr(b, "text", None))), None)
+        if text is None:
+            raise LLMFormatError(
+                f"Anthropic response carried no text block for schema {schema_name} "
+                f"(blocks: {[getattr(b, 'type', '?') for b in (response.content or [])]})"
+            )
         try:
-            text = response.content[0].text
             return json.loads(text)
-        except (json.JSONDecodeError, IndexError, AttributeError) as e:
+        except json.JSONDecodeError as e:
             raise LLMFormatError(
                 f"Failed to parse Anthropic response as JSON for schema {schema_name} ({type(e).__name__})"
             ) from e
