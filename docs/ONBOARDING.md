@@ -99,15 +99,18 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 #   notification_channel_ids   = ["projects/<p>/notificationChannels/<id>"]
 #
 # Strongly recommended — set the customer's display name, not just the GCP-resource
-# slug above (prod_instance.branding.name -> instance.name): an instance that boots
-# with this unset renders "AI Harness" with no operator attribution on /login, which
-# the new-instance doctor's `branding` check flags as an error, and which an install
-# agent verifying the page before trusting it may read as impersonation and refuse
-# (#2329). Set `branding.copyright` alongside it for the /login "Operated by <this>"
-# line.
+# slug above (prod_instance.display_name -> instance.name; named display_name, not
+# name, because prod_instance.name is already the VM's own identity): an instance
+# that boots with this unset renders "AI Harness" with no operator attribution on
+# /login, which the new-instance doctor's `branding` check flags as an error, and
+# which an install agent verifying the page before trusting it may read as
+# impersonation and refuse (#2329). Set `copyright` alongside it for the /login
+# "Operated by <this>" line.
 #   prod_instance = {
+#     name          = "<customer>-prod"
 #     ...
-#     branding = { name = "<Customer> IQ", copyright = "<Customer>" }
+#     display_name  = "<Customer> IQ"
+#     copyright     = "<Customer>"
 #   }
 ```
 

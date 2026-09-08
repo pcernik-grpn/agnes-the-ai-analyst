@@ -321,7 +321,7 @@ variable "prod_instance" {
     # contract. Keep values generic here — nothing customer-specific belongs in
     # a module default or example (use example.com / <your-brand> placeholders).
     #
-    #   name        -> instance.name       (deployment display name: page titles,
+    #   display_name -> instance.name      (deployment display name: page titles,
     #                                       email subjects, and the /login <h1> +
     #                                       <title> an install agent reads to verify
     #                                       operator identity before trusting the
@@ -329,7 +329,10 @@ variable "prod_instance" {
     #                                       falls back to the generic "AI Harness"
     #                                       default, which the new-instance doctor's
     #                                       branding check now flags as an error
-    #                                       rather than skipping.)
+    #                                       rather than skipping. Named `display_name`
+    #                                       rather than `name` because this object
+    #                                       type already has a `name` attribute — the
+    #                                       VM's own identity, an unrelated value.)
     #   logo_svg    -> instance.logo_svg   (inline <svg> for header + /login brand slot)
     #   brand       -> instance.brand      (product name in analyst-facing copy)
     #   brand_short -> instance.brand_short (short form used mid-sentence)
@@ -338,13 +341,13 @@ variable "prod_instance" {
     #                                       also the /login "Operated by <this>" line)
     #   favicon     -> instance.favicon    (favicon href — static path, data: URI, or
     #                                       absolute URL; see get_instance_favicon())
-    name        = optional(string, "")
-    logo_svg    = optional(string, "")
-    brand       = optional(string, "")
-    brand_short = optional(string, "")
-    subtitle    = optional(string, "")
-    copyright   = optional(string, "")
-    favicon     = optional(string, "")
+    display_name = optional(string, "")
+    logo_svg     = optional(string, "")
+    brand        = optional(string, "")
+    brand_short  = optional(string, "")
+    subtitle     = optional(string, "")
+    copyright    = optional(string, "")
+    favicon      = optional(string, "")
 
     # theme_colors -> the top-level `theme:` block in instance.yaml. Known color
     # keys recolor the design-system --ds-* tokens (primary -> --ds-primary,
@@ -573,13 +576,14 @@ variable "dev_instances" {
     # byte-for-byte identical file; the app reads them back via
     # app/instance_config.py). MUST be declared on this object type: Terraform
     # silently drops attributes absent from the type, so a bare entry in a
-    # caller's dev_instances list would never reach the module.
-    name        = optional(string, "")
-    logo_svg    = optional(string, "")
-    brand       = optional(string, "")
-    brand_short = optional(string, "")
-    subtitle    = optional(string, "")
-    copyright   = optional(string, "")
+    # caller's dev_instances list would never reach the module. `display_name`
+    # (not `name` — this object type's `name` is already the VM's own identity).
+    display_name = optional(string, "")
+    logo_svg     = optional(string, "")
+    brand        = optional(string, "")
+    brand_short  = optional(string, "")
+    subtitle     = optional(string, "")
+    copyright    = optional(string, "")
     favicon     = optional(string, "")
     theme_colors = optional(object({
       primary        = optional(string)
