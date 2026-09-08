@@ -28,6 +28,9 @@
          "starting" stops being the explanation. #}
   const READINESS_URL = "{{ readiness_url }}";
   const GRACE_MS = {{ start_grace_seconds }} * 1000;
+  // The server's own set of states it would still serve from, handed over
+  // rather than restated — see REACHABLE_STATES in app/api/data_apps.py.
+  const REACHABLE_STATES = {{ reachable_states | tojson }};
   const INTERVAL_MS = 2000;
   const ERROR_LIMIT = 5;  // ~10s of a poll that cannot answer at all
   const REQUEST_TIMEOUT_MS = 5000;
@@ -61,6 +64,18 @@
       const j = await r.json();
       errors = 0;
       if (j.ready) { location.reload(); return; }
+      // A wake that FAILED writes `error` (`_run_wake_fn`), and the probe
+      // reports it — but `ready` is simply false, so without this the page
+      // read a dead app as a slow one and sat out the whole grace under
+      // "taking longer than usual". Nothing here will ever become ready.
+      if (j.state === "error") {
+        stop("The app could not start. Reload to see its current status.");
+        return;
+      }
+      if (j.state && !REACHABLE_STATES.includes(j.state)) {
+        stop("The app is no longer starting. Reload to see its current status.");
+        return;
+      }
     } catch (e) {
       if (++errors >= ERROR_LIMIT) {
         stop("This page can’t check the app’s status automatically on this deployment. The app was asked to start — reload to see whether it is up.");

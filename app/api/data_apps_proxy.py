@@ -58,6 +58,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.data_apps import (
     _PREVIEW_COOKIE_NAME,
+    REACHABLE_STATES,
     OwnerNotFoundError,
     _can_view,
     _feature_gate,
@@ -504,6 +505,13 @@ def _waking_response(request: Request, slug: str, accepts_json: bool, *, grace_s
             "slug": slug,
             "readiness_url": _readiness_poll_url(request, slug),
             "start_grace_seconds": max(0, int(grace_seconds)),
+            # The states this proxy would still serve from. The readiness
+            # probe returns the row's `state` alongside `ready`, so handing
+            # the page the same set the branch table uses lets it stop the
+            # moment a wake FAILS (`_run_wake_fn` writes `error`) instead of
+            # reading a dead app as a slow one and waiting out the whole
+            # grace under "taking longer than usual" (Devin Review on #2336).
+            "reachable_states": sorted(REACHABLE_STATES),
         },
         status_code=503,
     )

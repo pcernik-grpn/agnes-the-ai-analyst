@@ -438,6 +438,43 @@ def test_holding_page_gives_a_freshly_woken_app_the_whole_grace(client_granted, 
     assert _grace_ms_in(r.text) == 400
 
 
+def test_readiness_reports_a_failed_wake_as_error(client_granted, fake_runner):
+    """The contract the holding page stops on. A wake that fails writes
+    ``error`` (``_run_wake_fn``) and the probe reports it — but ``ready`` is
+    merely false, so a page reading only ``ready`` treats a dead app as a slow
+    one and sits out the whole grace (Devin Review on #2336). The state has to
+    be in the payload for the page to tell those apart.
+    """
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    conn = get_system_db()
+    try:
+        repo = DataAppsRepository(conn)
+        app_id = repo.create(slug="wakefail", name="WAKEFAIL", owner_user_id="owner1")
+        repo.set_state(app_id, "error", "boom")
+    finally:
+        conn.close()
+
+    r = client_granted.get("/api/data-apps/wakefail/readiness")
+    assert r.status_code == 200
+    assert r.json() == {"state": "error", "ready": False}
+
+
+def test_holding_page_carries_the_servers_reachable_states(client_granted, fake_runner, sleeping_app):
+    """The page decides "is this still coming up?" from the same set the proxy
+    serves from, handed over rather than restated — so a state the server has
+    given up on cannot read as "still starting" in the browser.
+    """
+    import json as _json
+
+    from app.api.data_apps import REACHABLE_STATES
+
+    r = client_granted.get(f"/apps/{sleeping_app}/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert f"const REACHABLE_STATES = {_json.dumps(sorted(REACHABLE_STATES))};" in r.text
+
+
 def test_holding_page_bounds_each_readiness_request_and_counts_http_errors(
     client_granted, fake_runner, sleeping_app
 ):
@@ -458,6 +495,7 @@ def test_holding_page_bounds_each_readiness_request_and_counts_http_errors(
     assert "AbortController" in r.text
     assert "signal: ctl.signal" in r.text
     assert "if (!r.ok) throw" in r.text
+    assert 'if (j.state === "error")' in r.text
 
 
 def test_holding_page_bounds_its_retry_on_the_servers_own_start_grace(
