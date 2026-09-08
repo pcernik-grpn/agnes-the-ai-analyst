@@ -4747,8 +4747,16 @@ a.news-cta:hover { background: #0056A3; }
     border-left-color: var(--ds-accent-danger-line);
 }
 
+/* `:disabled` is enough for a <button> — the browser refuses the activation
+   itself. `[aria-disabled]` is ADVISORY: it tells a screen reader the control
+   is off and stops nothing, so an <a class="btn"> painted at half opacity
+   still navigates on click. `pointer-events: none` is what makes the two
+   spellings mean the same thing, which is the whole point of them sharing a
+   rule. Pair it with `tabindex="-1"` at the call site (as `ds.button` does)
+   so the keyboard cannot reach what the pointer cannot. */
 .btn:disabled,
 .btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+.btn[aria-disabled="true"] { pointer-events: none; }
 
 .btn:focus { outline: none; }
 .btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
@@ -6889,3 +6897,10 @@ details.section-card > summary {
     .cld-trust-sep { display: none; }
 }
 
+
+/* The hoverable shell `ds.button` puts around a DISABLED LINK. The anchor
+   inside is `pointer-events: none` (that is what makes `aria-disabled` bite on
+   an <a>), which also takes it out of hit-testing — so the reason the control
+   is off has to live out here or it can never be shown. Inline-flex so the
+   wrapper is exactly the button's own box and nothing shifts. */
+.ds-disabled-wrap { display: inline-flex; }

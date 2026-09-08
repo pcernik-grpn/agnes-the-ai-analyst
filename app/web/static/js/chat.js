@@ -1334,23 +1334,35 @@ const _ASSUMPTION_ORIGIN_UNSTATED = {
  *  miss it. The term itself is what the tab's `?q=` filters on, which is what
  *  the prompt asks the agent to write on the line.
  *
- *  `document` stays a label too, and for the opposite reason to an
- *  assumption's: there IS a page, and the ref cannot name it. Document detail
- *  is `/library/{slug}/f/{file_id}` — a collection slug and a file id, while
- *  the prompt asks the agent for the filename or the fact-graph subject id it
- *  actually saw. Neither resolves, and the rule #1974 established is that a
- *  chip links where its ref identifies a page; a link built from a filename
- *  would land on a guess. Giving these chips somewhere real to go means
- *  teaching a surface to resolve a document by name, which is its own change.
+ *  `document` used to stay a label too, for the opposite reason to an
+ *  assumption's: there IS a page, and the ref alone cannot name it. Document
+ *  detail is `/library/{slug}/f/{file_id}` — a collection slug and a file id,
+ *  while the prompt asks the agent for the filename or the fact-graph subject
+ *  id it actually saw. Neither resolves client-side, so building a link here
+ *  the way `table`/`metric`/`glossary` do would land on a guess.
+ *
+ *  What changed: resolution moved server-side instead
+ *  (`app/chat/document_links.py`, wired into the same `sources_verdict` call
+ *  both `app/chat/manager.py` and `GET /sessions/{id}/messages` already make).
+ *  The server holds the one thing the client never will — the caller's RBAC
+ *  scope over collections — so it, not this function, decides whether a
+ *  citation resolves to exactly one accessible file and hands back a `url`
+ *  on the claim when it does. This function stays a dumb consumer: a
+ *  `document` claim links when the server already resolved it, and stays a
+ *  label — the same as an unresolved `table:` ref used to be impossible,
+ *  but a `document:` ref routinely is — when it did not.
  *
  *  Built with encodeURIComponent, never string-pasted: the ref is model output
- *  and lands in a URL. */
+ *  and lands in a URL. `claim.url`, by contrast, is server-built from a
+ *  repository row (a corpus id's slug, a `cf_*` id) and used as-is — nothing
+ *  the model wrote reaches it. */
 function _claimHref(claim) {
   const ref = (claim && claim.ref) || "";
   if (!ref) return "";
   if (claim.kind === "table") return `/catalog/t/${encodeURIComponent(ref)}`;
   if (claim.kind === "metric") return `/semantic-layer?tab=all_metrics&q=${encodeURIComponent(ref)}`;
   if (claim.kind === "glossary") return `/semantic-layer?tab=all_glossary&q=${encodeURIComponent(ref)}`;
+  if (claim.kind === "document" && claim.url) return claim.url;
   return "";
 }
 

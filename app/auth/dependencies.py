@@ -183,7 +183,22 @@ def _get_local_dev_user(conn: Optional[duckdb.DuckDBPyConnection] = None) -> Opt
     """Return the seeded dev user when LOCAL_DEV_MODE is on, else None.
 
     ``conn`` retained for signature compat; ignored — uses the factory.
+
+    The mode check is IN THE BODY, not left to the caller. It used to be only
+    in the docstring: the function looked the configured address up and
+    returned whatever it found, so on a deployment that happens to hold an
+    account at ``get_local_dev_email()`` it answered with a real principal
+    regardless of the mode. That was survivable while every caller sat inside
+    an ``if is_local_dev_mode():`` block, but since the view-as work
+    (``app/auth/view_as.py``) this function's answer decides whether a ticket
+    with no verifiable session behind it is accepted — so the guard belongs
+    where it cannot be forgotten. All three existing callers already gate on
+    the mode, which makes this a no-op for them and closes the gap for the
+    next one.
     """
+    if not is_local_dev_mode():
+        return None
+
     from src.repositories import users_repo
 
     # Folded AND stripped: startup seeds this account through normalize_email,
