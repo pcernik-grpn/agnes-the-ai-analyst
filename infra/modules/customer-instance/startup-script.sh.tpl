@@ -1848,7 +1848,7 @@ services:
     volumes:
       - /data/kai-agent-postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kai"]
+      test: ["CMD-SHELL", "pg_isready -U kai -d kai_agent"]
       interval: 5s
       timeout: 3s
       retries: 12
