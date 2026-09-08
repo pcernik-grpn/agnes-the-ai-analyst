@@ -421,3 +421,73 @@ def test_accumulator_flush_is_noop_when_empty(monkeypatch):
 def test_module_singleton_exists_and_is_flushable():
     assert isinstance(pol.usage_accumulator, pol.UsageAccumulator)
     pol.usage_accumulator.flush()  # must not raise even with an empty buffer
+
+
+# ---------------------------------------------------------------------------
+# UsageAccumulator.add_call — the llm_calls ledger rows riding the same buffer
+# ---------------------------------------------------------------------------
+
+
+def test_accumulator_add_call_is_skipped_on_duckdb(monkeypatch):
+    """``llm_calls`` is Postgres-only (A3): on DuckDB the row is dropped at
+    the door rather than buffered forever."""
+    monkeypatch.setattr(pol, "use_pg", lambda: False)
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    acc.add_call({"id": "c1"})
+    assert acc._call_rows == []
+
+
+def test_accumulator_flushes_call_rows_to_the_ledger(monkeypatch):
+    import src.repositories as repos
+
+    flushed: list[list[dict]] = []
+
+    class _Repo:
+        def insert_batch(self, rows):
+            flushed.append(list(rows))
+            return len(rows)
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr(repos, "llm_calls_repo", lambda: _Repo(), raising=False)
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: _Repo())
+    acc = pol.UsageAccumulator(flush_size=2, flush_interval_s=3600)
+    acc.add_call({"id": "c1"})
+    assert flushed == []
+    acc.add_call({"id": "c2"})
+    assert flushed == [[{"id": "c1"}, {"id": "c2"}]]
+
+
+def test_accumulator_drops_call_rows_when_the_ledger_is_missing(monkeypatch):
+    import src.repositories as repos
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.delattr(repos, "llm_calls_repo", raising=False)
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    acc.add_call({"id": "c1"})  # flushes immediately; AttributeError swallowed
+    assert acc._call_rows == []
+
+
+def test_accumulator_call_rows_do_not_disturb_the_usage_flush(monkeypatch):
+    """A buffered call row must not make an otherwise-empty usage flush write
+    an empty batch, nor keep the usage rows from reaching their own repo."""
+    import src.repositories as repos
+
+    fake_repo = _FakeLlmUsageRepo()
+    ledger: list[list[dict]] = []
+
+    class _Ledger:
+        def insert_batch(self, rows):
+            ledger.append(list(rows))
+            return len(rows)
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: fake_repo)
+    monkeypatch.setattr(pol, "coordination", lambda: _FakeCoordination())
+    monkeypatch.setattr(repos, "llm_calls_repo", lambda: _Ledger(), raising=False)
+
+    acc = pol.UsageAccumulator(flush_size=20, flush_interval_s=3600)
+    acc.add(_usage_row(1), budget_ttl_s=60)
+    acc.add_call({"id": "c1"})
+    acc.flush()
+    assert len(fake_repo.batches) == 1 and len(fake_repo.batches[0]) == 1
+    assert ledger == [[{"id": "c1"}]]

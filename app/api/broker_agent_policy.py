@@ -48,7 +48,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
-from src.repositories import llm_usage_repo
+from src.repositories import RequiresPostgresBackend, llm_usage_repo, use_pg
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +313,8 @@ def cached_month_total(agent_id: str, ttl_s: int = 60) -> int:
 
 class UsageAccumulator:
     """Batches ``llm_usage`` rows in memory and flushes them to
-    ``llm_usage_repo().insert_batch`` in bulk.
+    ``llm_usage_repo().insert_batch`` in bulk — and, on the same cadence,
+    the ``llm_calls`` ledger rows the broker builds beside them.
 
     The broker's hot path (every brokered LLM call) must never perform a
     synchronous single-row DB write — flush happens when the buffer
@@ -337,6 +338,7 @@ class UsageAccumulator:
         self._clock = clock
         self._lock = threading.Lock()
         self._rows: List[Dict[str, Any]] = []
+        self._call_rows: List[Dict[str, Any]] = []
         self._last_flush = clock()
 
     def add(self, row: Dict[str, Any], *, budget_ttl_s: int = 60) -> None:
@@ -345,6 +347,17 @@ class UsageAccumulator:
         with self._lock:
             self._rows.append(row)
         self._incr_budget_counter(row, budget_ttl_s)
+        self.maybe_flush()
+
+    def add_call(self, row: Dict[str, Any]) -> None:
+        """Buffer one ``llm_calls`` ledger row — the per-call record the
+        broker builds beside the ``llm_usage`` budget row. Same flush
+        cadence, same shutdown flush. Skipped outright on the frozen DuckDB
+        app-state backend: the table is Postgres-only."""
+        if not use_pg():
+            return
+        with self._lock:
+            self._call_rows.append(row)
         self.maybe_flush()
 
     @staticmethod
@@ -370,8 +383,9 @@ class UsageAccumulator:
 
     def maybe_flush(self) -> None:
         with self._lock:
-            due_by_size = len(self._rows) >= self._flush_size
-            due_by_age = bool(self._rows) and (self._clock() - self._last_flush) >= self._flush_interval_s
+            buffered = len(self._rows) + len(self._call_rows)
+            due_by_size = buffered >= self._flush_size
+            due_by_age = bool(buffered) and (self._clock() - self._last_flush) >= self._flush_interval_s
         if due_by_size or due_by_age:
             self.flush()
 
@@ -383,18 +397,29 @@ class UsageAccumulator:
         doesn't drop its tail of buffered rows."""
         with self._lock:
             rows, self._rows = self._rows, []
+            call_rows, self._call_rows = self._call_rows, []
             self._last_flush = self._clock()
-        if not rows:
-            return
-        try:
-            llm_usage_repo().insert_batch(rows)
-        except Exception:
-            # Usage metering is a best-effort budget guardrail, not a
-            # billing ledger of record (same posture as the daily chat
-            # token counters) — a write failure must not break the
-            # broker's response path, which has already completed by the
-            # time this runs.
-            logger.exception("llm_usage batch flush failed; %d usage rows dropped", len(rows))
+        if rows:
+            try:
+                llm_usage_repo().insert_batch(rows)
+            except Exception:
+                # Usage metering is a best-effort budget guardrail, not a
+                # billing ledger of record (same posture as the daily chat
+                # token counters) — a write failure must not break the
+                # broker's response path, which has already completed by the
+                # time this runs.
+                logger.exception("llm_usage batch flush failed; %d usage rows dropped", len(rows))
+        if call_rows:
+            try:
+                import src.repositories as repos
+
+                repos.llm_calls_repo().insert_batch(call_rows)
+            except (ImportError, AttributeError, RequiresPostgresBackend):
+                # The ledger is Postgres-only and lands with its own change;
+                # its absence is expected, not an incident.
+                logger.debug("llm_calls ledger unavailable; %d call rows dropped", len(call_rows))
+            except Exception:
+                logger.exception("llm_calls batch flush failed; %d call rows dropped", len(call_rows))
 
 
 usage_accumulator = UsageAccumulator()
