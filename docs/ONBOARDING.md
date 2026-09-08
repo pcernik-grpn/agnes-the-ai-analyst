@@ -97,6 +97,18 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 #   runtime_secrets            = ["keboola-storage-token"]  # empty if non-keboola data_source
 #   firewall_ssh_source_ranges = ["35.235.240.0/20"]        # IAP range; "0.0.0.0/0" if public SSH
 #   notification_channel_ids   = ["projects/<p>/notificationChannels/<id>"]
+#
+# Strongly recommended — set the customer's display name, not just the GCP-resource
+# slug above (prod_instance.branding.name -> instance.name): an instance that boots
+# with this unset renders "AI Harness" with no operator attribution on /login, which
+# the new-instance doctor's `branding` check flags as an error, and which an install
+# agent verifying the page before trusting it may read as impersonation and refuse
+# (#2329). Set `branding.copyright` alongside it for the /login "Operated by <this>"
+# line.
+#   prod_instance = {
+#     ...
+#     branding = { name = "<Customer> IQ", copyright = "<Customer>" }
+#   }
 ```
 
 See the [module README](https://github.com/keboola/agnes-the-ai-analyst/tree/main/infra/modules/customer-instance) for the full variable schema.

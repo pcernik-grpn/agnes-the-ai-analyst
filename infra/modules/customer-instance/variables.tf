@@ -321,13 +321,24 @@ variable "prod_instance" {
     # contract. Keep values generic here — nothing customer-specific belongs in
     # a module default or example (use example.com / <your-brand> placeholders).
     #
+    #   name        -> instance.name       (deployment display name: page titles,
+    #                                       email subjects, and the /login <h1> +
+    #                                       <title> an install agent reads to verify
+    #                                       operator identity before trusting the
+    #                                       instance — #2329. Left unset, the app
+    #                                       falls back to the generic "AI Harness"
+    #                                       default, which the new-instance doctor's
+    #                                       branding check now flags as an error
+    #                                       rather than skipping.)
     #   logo_svg    -> instance.logo_svg   (inline <svg> for header + /login brand slot)
     #   brand       -> instance.brand      (product name in analyst-facing copy)
     #   brand_short -> instance.brand_short (short form used mid-sentence)
     #   subtitle    -> instance.subtitle   (tagline shown under the instance name)
-    #   copyright   -> instance.copyright  (footer credit, rendered "Deployed by <this>")
+    #   copyright   -> instance.copyright  (footer credit, rendered "Deployed by <this>";
+    #                                       also the /login "Operated by <this>" line)
     #   favicon     -> instance.favicon    (favicon href — static path, data: URI, or
     #                                       absolute URL; see get_instance_favicon())
+    name        = optional(string, "")
     logo_svg    = optional(string, "")
     brand       = optional(string, "")
     brand_short = optional(string, "")
@@ -563,6 +574,7 @@ variable "dev_instances" {
     # app/instance_config.py). MUST be declared on this object type: Terraform
     # silently drops attributes absent from the type, so a bare entry in a
     # caller's dev_instances list would never reach the module.
+    name        = optional(string, "")
     logo_svg    = optional(string, "")
     brand       = optional(string, "")
     brand_short = optional(string, "")

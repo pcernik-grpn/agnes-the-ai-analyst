@@ -260,6 +260,7 @@ locals {
   instance_brand_scalars = {
     for inst in local.all_instances : inst.name => {
       for k, v in {
+        name        = try(inst.name, "")
         logo_svg    = try(inst.logo_svg, "")
         brand       = try(inst.brand, "")
         brand_short = try(inst.brand_short, "")
