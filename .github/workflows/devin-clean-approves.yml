@@ -113,9 +113,9 @@ jobs:
             verdict=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews?per_page=100" \
               --jq 'add | [.[] | select(.user.login == "devin-ai-integration[bot]") | .body
                       | select(test("This report is out of date") | not)
-                      | select(test("Devin Review: No Issues Found|found [0-9]+ (new )?potential issue"))]
+                      | select(test("Devin Review: No Issues Found|found [0-9]+ (new )?potential issue|Devin Review: [0-9]+ security issue"))]
                     | last // ""')
-            echo "latest verdict-bearing Devin review: $(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?' | head -1)"
+            echo "latest verdict-bearing Devin review: $(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)"
           fi
 
           # Our current approval, if any (paginate: the endpoint pages at 30).
@@ -127,7 +127,9 @@ jobs:
             echo "dismissed review $ours_id ($1)"
           }
 
-          if printf '%s' "$verdict" | grep -Eq 'found [1-9][0-9]* (new )?potential issue'; then
+          # "N security issues" is Devin's headline when the org setting hides the
+          # findings themselves from GitHub; the count still says the PR is not clean.
+          if printf '%s' "$verdict" | grep -Eq 'found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'; then
             if [ -n "$ours_id" ]; then
               dismiss "Dismissed: Devin's latest review lists issues. It re-approves once a clean verdict lands."
             else
