@@ -9,4 +9,7 @@
   `instance.copyright` when set, and the `branding` doctor check
   (`agnes doctor` / `/api/admin/doctor/new-instance`) now runs unconditionally
   instead of skipping whenever `instance.brand` was still default — the exact
-  state that let this go uncaught.
+  state that let this go uncaught. `instance.name`/`brand`/`brand_short`/
+  `subtitle`/`copyright`/`logo_svg`/`favicon` are now editable as ordinary
+  text fields on `/admin/server-config` (Instance section) — previously they
+  only round-tripped through hand-edited YAML.

@@ -13,10 +13,10 @@ import math
 import os
 import re
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Literal, NamedTuple, Optional
+from typing import Any, Literal, NamedTuple
 
 import duckdb
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -92,7 +92,7 @@ def _get_processor_run_lock(name: str) -> threading.Lock:
         return _processor_run_locks[name]
 
 
-def _session_processor_max_per_run() -> Optional[int]:
+def _session_processor_max_per_run() -> int | None:
     """Cap on sessions processed per `/run-session-processor` invocation.
 
     A burst of session closures landing in the same scheduler tick would
@@ -120,9 +120,9 @@ def _session_processor_max_per_run() -> Optional[int]:
 
 
 # SSRF protection: reject private/internal URLs for keboola_url
-import ipaddress as _ipaddress  # noqa: E402
-import socket as _socket  # noqa: E402
-from urllib.parse import urlparse as _urlparse  # noqa: E402
+import ipaddress as _ipaddress
+import socket as _socket
+from urllib.parse import urlparse as _urlparse
 
 
 def _validate_url_not_private(url: str, field_name: str = "url") -> None:
@@ -245,7 +245,7 @@ _URL_BEARING_FIELDS: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _validate_urls_in_patch(sections: Dict[str, Dict[str, Any]]) -> None:
+def _validate_urls_in_patch(sections: dict[str, dict[str, Any]]) -> None:
     """Apply SSRF protection to every URL-bearing field present in the patch.
 
     Walks each registered ``(section, *path, leaf)`` against the incoming
@@ -300,7 +300,7 @@ def _normalize_provider_names(value: Any) -> "list[str] | None":
     )
 
 
-def _validate_auth_providers_in_patch(sections: Dict[str, Dict[str, Any]]) -> None:
+def _validate_auth_providers_in_patch(sections: dict[str, dict[str, Any]]) -> None:
     """Refuse an auth-section overlay write that would name no usable sign-in
     method (Devin review on #1288): an empty or all-unknown ``auth.providers``,
     and — whenever the auth section is patched at all — an effective allowlist
@@ -423,7 +423,7 @@ def _validate_auth_providers_in_patch(sections: Dict[str, Dict[str, Any]]) -> No
         raise HTTPException(status_code=422, detail=detail)
 
 
-def _provider_available_after_save(name: str, auth_patch: Dict[str, Any], sections: Dict[str, Dict[str, Any]]) -> bool:
+def _provider_available_after_save(name: str, auth_patch: dict[str, Any], sections: dict[str, dict[str, Any]]) -> bool:
     """Whether ``name`` would be an offerable login method once this
     server-config save lands. ``password`` is always available; ``google`` /
     ``email`` are env-configured (untouched by an auth.providers patch), so
@@ -484,7 +484,7 @@ _LOCK_TTL_MIN = 60
 _LOCK_TTL_MAX = 7 * 24 * 3600  # 604800 — one week
 
 
-def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
+def _validate_materialize_section(sections: dict[str, dict[str, Any]]) -> None:
     """Validate the materialize section patch when present.
 
     Checks field-level constraints that the Pydantic envelope can't enforce
@@ -642,7 +642,7 @@ def _validate_vertex_region_model_matrix(region: str, model_in_patch: Any) -> No
     )
 
 
-def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
+def _validate_extraction_section(sections: dict[str, dict[str, Any]]) -> None:
     """Field-level constraints + the env-lock refusal for `extraction.*`
     (T3: admin-editable producer config).
 
@@ -844,7 +844,7 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 )
 
 
-def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
+def _apply_extraction_env_overrides(sections: dict[str, Any]) -> None:
     """Show the ACTUALLY-resolved value for a leaf a deploy-time env var
     pins (env-lock honesty) rather than whatever `instance.yaml` happens to
     hold underneath it.
@@ -860,7 +860,7 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
         return
 
 
-def _apply_extraction_env_locks(fields: Dict[str, Any]) -> None:
+def _apply_extraction_env_locks(fields: dict[str, Any]) -> None:
     """Patch `_KNOWN_FIELDS['extraction']`'s leaf specs (already deep-copied
     by `_known_fields_resolved`) with `env_var`/`env_locked` so the panel
     knows to render a pinned field read-only with "set by deployment
@@ -999,7 +999,7 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
 _EFFECT_RANK: dict[str, int] = {"live": 0, "restart": 1, "deploy": 2}
 
 
-def _switch_touched_by_patch(switch, patch: Dict[str, Any]) -> bool:
+def _switch_touched_by_patch(switch, patch: dict[str, Any]) -> bool:
     """True if `patch` (a single section's patch dict) sets the leaf this
     switch's `config_keys[1:]` path points at.
 
@@ -1015,7 +1015,7 @@ def _switch_touched_by_patch(switch, patch: Dict[str, Any]) -> bool:
     return True
 
 
-def _effect_for_section(section: str, patch: Dict[str, Any]) -> str:
+def _effect_for_section(section: str, patch: dict[str, Any]) -> str:
     """The strongest effect among `section`'s non-switch baseline and every
     switch under it that THIS patch actually touches.
 
@@ -1758,6 +1758,53 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "`instance.experience: redesign` preset defaults this to "
                 "`paper`."
             ),
+        },
+        # Deployment display name — page titles, email subjects, and the
+        # /login <h1> + <title> an install agent reads to verify operator
+        # identity before trusting the instance (#2329). Left unset, the app
+        # falls back to the generic "AI Harness" default, which the
+        # new-instance doctor's `branding` check now flags as an error
+        # rather than silently skipping. Resolved by
+        # `app/instance_config.py::get_instance_name()`.
+        "name": {
+            "kind": "string",
+            "hint": (
+                "Deployment display name (e.g. 'Acme Data Analyst'). Shown in page "
+                "titles, email subjects, and the /login heading — an install agent "
+                "verifying the login page before trusting it treats an unset name "
+                "as unattributed and may refuse to proceed. Distinct from `brand` "
+                "below (the product name) — this is the deploying organization."
+            ),
+        },
+        # Product-name brand string (distinct from `name` above — the
+        # deploying organization). Resolved by
+        # `app/instance_config.py::get_instance_brand()`.
+        "brand": {
+            "kind": "string",
+            "hint": "Product-name brand shown in analyst-facing copy (/home, /setup, /login). Defaults to 'Agnes'.",
+        },
+        "brand_short": {
+            "kind": "string",
+            "hint": "Short form of `brand` for mid-sentence use (e.g. brand 'Acme Data Analyst' -> short 'Acme'). Defaults to `brand`.",
+        },
+        "subtitle": {
+            "kind": "string",
+            "hint": "Tagline shown under the instance name.",
+        },
+        # Operator credit — distinct from the "Made by Keboola" OSS-authorship
+        # credit, which is fixed template copy. Feeds the shared footer
+        # ("Deployed by <this>") and the /login "Operated by <this>" line.
+        "copyright": {
+            "kind": "string",
+            "hint": "Operator/organization credit, e.g. 'Acme Corp'. Renders as 'Deployed by <this>' in the footer and 'Operated by <this>' on /login. Empty omits both lines (vendor-neutral default).",
+        },
+        "logo_svg": {
+            "kind": "string",
+            "hint": "Raw inline <svg> markup for the header + /login brand slot. Empty renders no logo.",
+        },
+        "favicon": {
+            "kind": "string",
+            "hint": "Favicon href — static path, data: URI, or absolute URL.",
         },
         # Operator-injected HTML/JS blocks rendered into base.html.
         # `kind: array` renders as a JSON textarea in the admin UI
@@ -2869,7 +2916,7 @@ def _strip_redacted_sentinels(value: Any, key_hint: str = "") -> Any:
     to scrub still can't corrupt secrets via this endpoint.
     """
     if isinstance(value, dict):
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         for k, v in value.items():
             if _is_secret_key(k) and isinstance(v, str) and v in _REDACTED_SENTINELS:
                 continue
@@ -2897,7 +2944,7 @@ def _redact(value: Any, key_hint: str = "") -> Any:
     return value
 
 
-def _diff_dicts(before: dict, after: dict, path: str = "") -> List[Dict[str, Any]]:
+def _diff_dicts(before: dict, after: dict, path: str = "") -> list[dict[str, Any]]:
     """Flat list of changed fields between two dicts.
 
     Output: [{"path": "email.smtp_host", "before": "...", "after": "..."}].
@@ -2914,7 +2961,7 @@ def _diff_dicts(before: dict, after: dict, path: str = "") -> List[Dict[str, Any
     keeps the audit row useful when an admin populates a section for the
     first time.
     """
-    changes: List[Dict[str, Any]] = []
+    changes: list[dict[str, Any]] = []
     keys = set(before.keys()) | set(after.keys())
     for key in sorted(keys):
         new_path = f"{path}.{key}" if path else key
@@ -3124,7 +3171,7 @@ def _export_scrub(
     *,
     free_form: bool = False,
     path: str = "",
-    omitted: Optional[List[str]] = None,
+    omitted: list[str] | None = None,
 ) -> Any:
     """Recursively drop secret-shaped values from an overlay subtree —
     dict VALUES keyed on their key name, list ITEMS on their shape alone
@@ -3156,7 +3203,7 @@ def _export_scrub(
     if omitted is None:
         omitted = []
     if isinstance(value, dict):
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         for k, v in value.items():
             child_path = f"{path}.{k}" if path else k
             if _looks_like_env_ref(v):
@@ -3174,7 +3221,7 @@ def _export_scrub(
             out[k] = _export_scrub(v, free_form=free_form, path=child_path, omitted=omitted)
         return out
     if isinstance(value, list):
-        out_list: List[Any] = []
+        out_list: list[Any] = []
         for i, item in enumerate(value):
             item_path = f"{path}[{i}]"
             if isinstance(item, (dict, list)):
@@ -3222,7 +3269,7 @@ _REPOINT_SAMPLE_SIZE = 5
 
 def _guard_connection_repoint(
     before: dict,
-    sections: Dict[str, Dict[str, Any]],
+    sections: dict[str, dict[str, Any]],
     confirmed: bool,
 ) -> None:
     """Refuse an unconfirmed change to *which upstream* a data source points at.
@@ -3307,7 +3354,7 @@ class ServerConfigUpdateRequest(BaseModel):
     already has registrations.
     """
 
-    sections: Dict[str, Dict[str, Any]] = Field(
+    sections: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
         description="Per-section patch dict (e.g. {'instance': {'name': 'X'}})",
     )
@@ -3336,7 +3383,7 @@ class ServerConfigUpdateRequest(BaseModel):
 #     the SA can read the data project but not bill against it.
 #   - max_bytes_per_materialize: cost guardrail for `query_mode='materialized'`
 #     (default 10 GiB; 0 disables; null falls through to the default).
-_BQ_OPTIONAL_FIELD_DEFAULTS: Dict[str, Any] = {
+_BQ_OPTIONAL_FIELD_DEFAULTS: dict[str, Any] = {
     # `billing_project` intentionally NOT seeded here. The empty-string
     # default would inject `billing_project: ""` into every GET payload,
     # which makes the JS `isUnset = (value === undefined)` check evaluate
@@ -3349,7 +3396,7 @@ _BQ_OPTIONAL_FIELD_DEFAULTS: Dict[str, Any] = {
 }
 
 
-def _ensure_bq_optional_fields(sections: Dict[str, Any]) -> None:
+def _ensure_bq_optional_fields(sections: dict[str, Any]) -> None:
     """In-place: add missing BQ optional fields to data_source.bigquery so the
     UI's JSON-textarea renders them as editable keys. Existing values are
     preserved — only absent keys are populated with their documented default.
@@ -3425,7 +3472,7 @@ def _known_fields_resolved() -> dict:
     return fields
 
 
-def _feature_flags_inventory() -> List[Dict[str, Any]]:
+def _feature_flags_inventory() -> list[dict[str, Any]]:
     """Read-only snapshot of every registered feature flag (#1022).
 
     ``source`` tells the operator where the effective value came from:
@@ -3464,7 +3511,7 @@ def _feature_flags_inventory() -> List[Dict[str, Any]]:
     else:
         exp_probe = get_value("instance", "experience", default=_UNSET)
         exp_source = "default" if exp_probe is _UNSET else "config"
-    out: List[Dict[str, Any]] = [
+    out: list[dict[str, Any]] = [
         {
             "name": "instance.experience",
             # String-valued row: value_label carries the resolved preset for
@@ -3727,7 +3774,7 @@ async def get_server_config_overlay(
     prompt-injected chat session, not an agent affordance.
     """
     raw = _load_raw_overlay()
-    omitted: List[str] = []
+    omitted: list[str] = []
     sections = {
         section: _export_scrub(
             raw[section],
@@ -3811,7 +3858,7 @@ async def update_server_config(
     # The client form does the same scrub, but an API caller round-tripping
     # the GET payload could otherwise overwrite real overlay secrets with
     # the placeholder shown in the form.
-    scrubbed_sections: Dict[str, Dict[str, Any]] = {
+    scrubbed_sections: dict[str, dict[str, Any]] = {
         section: _strip_redacted_sentinels(patch, section) for section, patch in request.sections.items()
     }
 
@@ -3877,7 +3924,7 @@ async def update_server_config(
         #      ${SMTP_PASSWORD}` into `smtp_password: hunter2` in the overlay.
         # By writing only the sections in `request.sections` we keep both the
         # static-evolution and the env-var-placeholder properties intact.
-        overlay_payload: Dict[str, Any] = {}
+        overlay_payload: dict[str, Any] = {}
         if config_path.exists():
             try:
                 overlay_payload = yaml.safe_load(config_path.read_text()) or {}
@@ -4038,7 +4085,7 @@ _SECRET_FIELDS: frozenset = frozenset(
 )
 
 
-def _sanitize_for_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_for_audit(payload: dict[str, Any]) -> dict[str, Any]:
     """Mask credential-bearing fields in a request payload before audit_log.
 
     Uses an explicit `_SECRET_FIELDS` allowlist (case-insensitive) instead
@@ -4048,7 +4095,7 @@ def _sanitize_for_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
     based regression would surface immediately, and a missing entry for a
     real new credential gets caught at code review of the audit path.
     """
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for k, v in payload.items():
         if k.lower() in _SECRET_FIELDS:
             out[k] = "***" if v not in (None, "") else "<empty>"
@@ -4117,7 +4164,7 @@ def _validate_keboola_filter_spec(sq: str) -> None:
 
 class RegisterTableRequest(BaseModel):
     name: str
-    folder: Optional[str] = None
+    folder: str | None = None
     sync_strategy: str = Field(
         default="full_refresh",
         description=(
@@ -4137,16 +4184,16 @@ class RegisterTableRequest(BaseModel):
     # `(session_id, event_date)`, browse rows on more). The frontend sends +
     # reads this as a list; backend stores it JSON-serialized in VARCHAR.
     # A bare string is accepted for backward compat — see _normalize_primary_key.
-    primary_key: Optional[List[str]] = None
-    description: Optional[str] = None
-    source_type: Optional[str] = None
-    bucket: Optional[str] = None
-    source_table: Optional[str] = None
+    primary_key: list[str] | None = None
+    description: str | None = None
+    source_type: str | None = None
+    bucket: str | None = None
+    source_table: str | None = None
     # Backs query_mode='materialized'. Stored verbatim in
     # table_registry.source_query (schema v20); the trigger pass runs it
     # through the DuckDB BQ extension via BqAccess and writes the result
     # to /data/extracts/bigquery/data/<id>.parquet.
-    source_query: Optional[str] = None
+    source_query: str | None = None
     query_mode: str = "local"
     defer_rebuild: bool = Field(
         default=False,
@@ -4160,7 +4207,7 @@ class RegisterTableRequest(BaseModel):
             "a single rebuild. No effect for non-BigQuery or materialized rows."
         ),
     )
-    sync_schedule: Optional[str] = None
+    sync_schedule: str | None = None
     profile_after_sync: bool = Field(
         default=True,
         deprecated=True,
@@ -4174,20 +4221,20 @@ class RegisterTableRequest(BaseModel):
     # only when paired with the matching sync_strategy. Per-strategy
     # required-field rules + conflict policy enforced in the model_validator
     # below.
-    incremental_window_days: Optional[int] = None
-    max_history_days: Optional[int] = None
-    incremental_column: Optional[str] = None
-    where_filters: Optional[List[Dict[str, Any]]] = None
-    partition_by: Optional[str] = None
-    partition_granularity: Optional[str] = None
-    initial_load_chunk_days: Optional[int] = None
+    incremental_window_days: int | None = None
+    max_history_days: int | None = None
+    incremental_column: str | None = None
+    where_filters: list[dict[str, Any]] | None = None
+    partition_by: str | None = None
+    partition_granularity: str | None = None
+    initial_load_chunk_days: int | None = None
     # v51 — fully-qualified BigQuery path. When set on a BigQuery row,
     # the extractor uses ``project.dataset.table`` from this field instead
     # of constructing the path from ``bucket`` + ``source_table`` against
     # the globally-attached project. Decouples UX/RBAC ``bucket`` label
     # from physical BQ dataset (issue #343). Format ``project.dataset.table``;
     # validated by ``connectors.bigquery.extractor.parse_bq_fqn``.
-    bq_fqn: Optional[str] = Field(
+    bq_fqn: str | None = Field(
         default=None,
         description=(
             "Fully-qualified BigQuery path (``project.dataset.table``). "
@@ -4215,7 +4262,7 @@ class RegisterTableRequest(BaseModel):
     # v79 — nullable FK to source_connections.id. NULL = use the instance-default
     # connection for the row's source_type (spec 2026-06-12). When provided,
     # the register-table handler validates the id exists before persisting.
-    connection_id: Optional[str] = Field(
+    connection_id: str | None = Field(
         default=None,
         description=(
             "Pin this table to a named source connection (source_connections.id). "
@@ -5027,7 +5074,7 @@ def _rebuild_snowflake_remote_extract() -> _SnowflakeRebuild:
     )
 
 
-def _rebuild_snowflake_remote_extract_bg(table_name: Optional[str] = None) -> None:
+def _rebuild_snowflake_remote_extract_bg(table_name: str | None = None) -> None:
     """Fire-and-forget wrapper used by ``update_table`` BackgroundTasks.
 
     ``table_name`` is the edited row's registry ``name``. Correcting a
@@ -5082,7 +5129,7 @@ _SOURCE_TYPES_INDEPENDENT_OF_DATA_SOURCE: frozenset[str] = frozenset(
 )
 
 
-def _validate_source_type_configured(source_type: Optional[str]) -> None:
+def _validate_source_type_configured(source_type: str | None) -> None:
     """Refuse register-table requests whose ``source_type`` isn't actually
     configured on this instance.
 
@@ -5170,23 +5217,23 @@ def _validate_source_type_configured(source_type: Optional[str]) -> None:
 
 
 class UpdateTableRequest(BaseModel):
-    name: Optional[str] = None
-    sync_strategy: Optional[str] = Field(
+    name: str | None = None
+    sync_strategy: str | None = Field(
         default=None,
         description=(
             "v26+: drives the Keboola extractor dispatcher. PUT-shape "
             "requires a value if sent. See RegisterTableRequest.sync_strategy."
         ),
     )
-    primary_key: Optional[List[str]] = None
-    description: Optional[str] = None
-    source_type: Optional[str] = None
-    bucket: Optional[str] = None
-    source_table: Optional[str] = None
-    source_query: Optional[str] = None
-    query_mode: Optional[str] = None
-    sync_schedule: Optional[str] = None
-    profile_after_sync: Optional[bool] = Field(
+    primary_key: list[str] | None = None
+    description: str | None = None
+    source_type: str | None = None
+    bucket: str | None = None
+    source_table: str | None = None
+    source_query: str | None = None
+    query_mode: str | None = None
+    sync_schedule: str | None = None
+    profile_after_sync: bool | None = Field(
         default=None,
         deprecated=True,
         description=("DEPRECATED: not consumed by the runtime. See RegisterTableRequest.profile_after_sync."),
@@ -5195,22 +5242,22 @@ class UpdateTableRequest(BaseModel):
     # handler overlays the body on the existing row and re-runs the
     # synthetic RegisterTableRequest validator on the merged record, so
     # cross-field invariants are checked against the post-update state.
-    incremental_window_days: Optional[int] = None
-    max_history_days: Optional[int] = None
-    incremental_column: Optional[str] = None
-    where_filters: Optional[List[Dict[str, Any]]] = None
-    partition_by: Optional[str] = None
-    partition_granularity: Optional[str] = None
-    initial_load_chunk_days: Optional[int] = None
+    incremental_window_days: int | None = None
+    max_history_days: int | None = None
+    incremental_column: str | None = None
+    where_filters: list[dict[str, Any]] | None = None
+    partition_by: str | None = None
+    partition_granularity: str | None = None
+    initial_load_chunk_days: int | None = None
     # v51 — see RegisterTableRequest.bq_fqn. PUT lets an admin add or
     # clear bq_fqn on an existing row (cleared via explicit `null`,
     # per the PUT shape contract documented on the handler below).
-    bq_fqn: Optional[str] = None
+    bq_fqn: str | None = None
     # v74 (#607) — distribution flag. PUT lets an admin toggle it on/off.
     # The query_mode='remote' conflict is enforced against the *merged*
     # record in the update_table handler (the PUT body alone may omit
     # query_mode, so it can't be validated here in isolation).
-    server_only: Optional[bool] = None
+    server_only: bool | None = None
     # v116 (table access policies design doc) — PUT lets an admin attach,
     # replace, or clear (explicit null) the SQL access policy on this row.
     # The feature flag gate, the SQL validator, and the distribution
@@ -5219,14 +5266,14 @@ class UpdateTableRequest(BaseModel):
     # fields (query_mode, server_only, physical source). Persisted through
     # table_registry_repo().set_access_policy()/.set_policy_mapping(), not
     # register() — see the strip-tuple comment in update_table below.
-    access_policy_sql: Optional[str] = None
-    access_policy_note: Optional[str] = None
-    policy_mapping: Optional[bool] = None
+    access_policy_sql: str | None = None
+    access_policy_note: str | None = None
+    policy_mapping: bool | None = None
     # v79 — see RegisterTableRequest.connection_id. PUT lets an admin pin (or
     # re-pin) an already-registered row to a named connection — including
     # fixing a row that was registered before this field existed and is
     # sitting on a NULL connection_id.
-    connection_id: Optional[str] = Field(
+    connection_id: str | None = Field(
         default=None,
         description=(
             "Pin this table to a named source connection (source_connections.id). "
@@ -5365,19 +5412,19 @@ class UpdateTableRequest(BaseModel):
 
 class ConfigureRequest(BaseModel):
     data_source: str  # "keboola" | "bigquery" | "local"
-    keboola_token: Optional[str] = None
-    keboola_url: Optional[str] = None
-    bigquery_project: Optional[str] = None
-    bigquery_location: Optional[str] = None
-    instance_name: Optional[str] = None
-    allowed_domain: Optional[str] = None
+    keboola_token: str | None = None
+    keboola_url: str | None = None
+    bigquery_project: str | None = None
+    bigquery_location: str | None = None
+    instance_name: str | None = None
+    allowed_domain: str | None = None
     confirm_connection_change: bool = False
 
 
 @router.get("/discover-tables")
 async def discover_tables(
     user: dict = Depends(require_admin),
-    dataset: Optional[str] = None,
+    dataset: str | None = None,
 ):
     """Discover available tables from the configured data source.
 
@@ -5397,10 +5444,9 @@ async def discover_tables(
         source_type = get_data_source_type()
 
         if source_type == "keboola":
+            from app.datasource_secrets import keboola_instance_token
             from app.instance_config import get_value
             from connectors.keboola.client import KeboolaClient
-
-            from app.datasource_secrets import keboola_instance_token
 
             url = get_value("data_source", "keboola", "stack_url", default="")
             token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
@@ -5424,7 +5470,7 @@ async def discover_tables(
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
 
 
-def _discover_bigquery(dataset: Optional[str]) -> Dict[str, Any]:
+def _discover_bigquery(dataset: str | None) -> dict[str, Any]:
     """List BQ datasets (when ``dataset`` is None) or tables-in-dataset.
 
     Routes through ``BqAccess.client()`` so config / auth / error
@@ -5548,7 +5594,7 @@ async def list_registry(
     # migration hasn't reached yet, or a fallback write for a table whose
     # `_meta.table_name` had no registry match — is picked up by name so it
     # doesn't silently vanish from this view.
-    state_by_key: Dict[str, Dict[str, Any]] = {}
+    state_by_key: dict[str, dict[str, Any]] = {}
     try:
         rows = sync_state_repo().get_all_states()
         for row in rows:
@@ -5620,7 +5666,7 @@ async def list_registry(
 _BQ_SYNC_REGISTER_TIMEOUT_S: float = 5.0
 
 
-def _materialize_bigquery_extract() -> Dict[str, Any]:
+def _materialize_bigquery_extract() -> dict[str, Any]:
     """Re-build the BigQuery extract.duckdb + master views.
 
     Wrapper used by both the synchronous (in-band) and async (BackgroundTask)
@@ -5717,7 +5763,7 @@ def _schedule_bq_materialize(background: BackgroundTasks) -> bool:
 
 def _run_bigquery_materialize_with_timeout(
     background: BackgroundTasks,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Try to materialize synchronously within the wall-clock budget.
 
     Returns a dict with:
@@ -5754,8 +5800,8 @@ def _run_bigquery_materialize_with_timeout(
         return {"status": "enqueued"}
 
     done = threading.Event()
-    err_holder: Dict[str, Any] = {}
-    result_holder: Dict[str, Any] = {}
+    err_holder: dict[str, Any] = {}
+    result_holder: dict[str, Any] = {}
 
     def _worker():
         try:
@@ -6290,7 +6336,7 @@ class PrecheckResponse(BaseModel):
     """
 
     ok: bool
-    table: Dict[str, Any]
+    table: dict[str, Any]
 
 
 @router.post("/register-table/precheck")
@@ -6388,8 +6434,8 @@ def register_table_precheck(
     # see it. Imports kept local to avoid pulling google-cloud-bigquery into
     # the import chain on non-BQ instances.
     try:
-        from google.api_core import exceptions as google_exc  # noqa: PLC0415
-        from google.cloud import bigquery  # noqa: PLC0415
+        from google.api_core import exceptions as google_exc
+        from google.cloud import bigquery
     except ImportError as e:
         raise HTTPException(
             status_code=500,
@@ -6464,7 +6510,7 @@ _SF_ATTACH_ALIAS = "sf"
 
 
 @lru_cache(maxsize=512)
-def _parse_sql_table_refs(sql: str, dialect: str) -> Optional[tuple]:
+def _parse_sql_table_refs(sql: str, dialect: str) -> tuple | None:
     """Every PHYSICAL table ``sql`` reads, as ``(catalog, db, name)`` triples
     lowercased — or ``None`` when ``sql`` does not parse as ``dialect``.
 
@@ -6505,7 +6551,7 @@ def _parse_sql_table_refs(sql: str, dialect: str) -> Optional[tuple]:
     return tuple(dict.fromkeys(refs))
 
 
-def _canonical_physical_identifiers(row: Dict[str, Any]) -> tuple:
+def _canonical_physical_identifiers(row: dict[str, Any]) -> tuple:
     """``({identifier: provenance}, unknown_signal_or_None)`` for ``row``.
 
     An identifier is ``(engine, connection_id, namespace, container, table)``,
@@ -6549,7 +6595,7 @@ def _canonical_physical_identifiers(row: Dict[str, Any]) -> tuple:
     if not engine:
         return {}, None
     connection_id = (row.get("connection_id") or "").strip().lower()
-    identifiers: Dict[tuple, str] = {}
+    identifiers: dict[tuple, str] = {}
 
     def _add(namespace: str, container: str, table: str, provenance: str) -> None:
         table_l = (table or "").strip().lower()
@@ -6619,20 +6665,18 @@ def _canonical_physical_identifiers(row: Dict[str, Any]) -> tuple:
         else:
             for catalog, db, name in refs:
                 namespace = catalog
-                if engine == "sf" and (not namespace or namespace == _SF_ATTACH_ALIAS):
-                    namespace = default_namespace
-                elif not namespace:
+                if engine == "sf" and (not namespace or namespace == _SF_ATTACH_ALIAS) or not namespace:
                     namespace = default_namespace
                 _add(namespace, db, name, "source_query")
     return identifiers, unknown
 
 
-def _policy_physical_source_signal_provenance(row: Dict[str, Any]) -> Dict[tuple, str]:
+def _policy_physical_source_signal_provenance(row: dict[str, Any]) -> dict[tuple, str]:
     """``_policy_physical_source_signals`` plus, per signal, the field it came
     from — the one extra fact the rejection message needs to name WHY two rows
     were judged the same physical source ("bq_fqn", "bucket/source_table",
     "source_query", "unparseable source_query")."""
-    signals: Dict[tuple, str] = {}
+    signals: dict[tuple, str] = {}
     for signal in _policy_physical_source_signals_legacy(row):
         signals[signal] = {
             "bq_fqn": "bq_fqn",
@@ -6647,7 +6691,7 @@ def _policy_physical_source_signal_provenance(row: Dict[str, Any]) -> Dict[tuple
     return signals
 
 
-def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
+def _policy_physical_source_signals(row: dict[str, Any]) -> set:
     """Every physical-source signal ``row`` (a ``table_registry`` record)
     carries — the ways a DIFFERENT registry row could resolve to the exact
     same underlying data (table access policies design doc §3.2, "the
@@ -6670,7 +6714,7 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     return set(_policy_physical_source_signal_provenance(row))
 
 
-def _policy_physical_source_signals_legacy(row: Dict[str, Any]) -> set:
+def _policy_physical_source_signals_legacy(row: dict[str, Any]) -> set:
     """The three representation signals (``bq_fqn``, ``bucket_table``,
     verbatim ``source_query``) this check shipped with. Still emitted: they
     cost nothing and cover shapes the canonical identifier deliberately does
@@ -6773,7 +6817,7 @@ def _phys_signals_conflict(a: tuple, b: tuple) -> bool:
     )
 
 
-def _physical_signal_match(signals_a, signals_b) -> Optional[tuple]:
+def _physical_signal_match(signals_a, signals_b) -> tuple | None:
     """The first ``(signal_a, signal_b)`` pair from the two sets that resolves
     to the same underlying data, or ``None``. Exact-match for
     ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go through
@@ -6831,8 +6875,8 @@ def _format_physical_signal(signal: tuple) -> str:
 
 def _describe_physical_match(
     match: tuple,
-    mine: Dict[tuple, str],
-    theirs: Dict[tuple, str],
+    mine: dict[tuple, str],
+    theirs: dict[tuple, str],
     *,
     other_id: Any,
 ) -> str:
@@ -6855,7 +6899,7 @@ def _describe_physical_match(
     )
 
 
-def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
+def _is_distributable_registry_row(row: dict[str, Any]) -> bool:
     """Whether ``row`` is the shape ``agnes pull`` downloads —
     ``query_mode in ('local', 'materialized')`` and not ``server_only``.
     The single definition both §3.2 directions below are keyed on, so the
@@ -6868,9 +6912,9 @@ def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
 
 
 def _find_policied_physical_source_twin(
-    my_signals: Dict[tuple, str],
+    my_signals: dict[tuple, str],
     *,
-    exclude_id: Optional[str],
+    exclude_id: str | None,
 ) -> tuple:
     """``(row, note)`` for the first existing registry row that carries
     ``access_policy_sql`` and whose physical-source signals intersect
@@ -6895,9 +6939,9 @@ def _find_policied_physical_source_twin(
 
 
 def _find_unpolicied_physical_source_twin(
-    my_signals: Dict[tuple, str],
+    my_signals: dict[tuple, str],
     *,
-    exclude_id: Optional[str],
+    exclude_id: str | None,
 ) -> tuple:
     """``(row, note)`` for the first existing registry row that carries NO
     policy and whose physical-source signals intersect ``my_signals`` — the
@@ -6930,17 +6974,17 @@ def _find_unpolicied_physical_source_twin(
 
 def _check_access_policy_physical_source_conflict(
     *,
-    source_type: Optional[str],
-    connection_id: Optional[str],
-    bucket: Optional[str],
-    source_table: Optional[str],
-    bq_fqn: Optional[str],
-    source_query: Optional[str],
-    query_mode: Optional[str],
+    source_type: str | None,
+    connection_id: str | None,
+    bucket: str | None,
+    source_table: str | None,
+    bq_fqn: str | None,
+    source_query: str | None,
+    query_mode: str | None,
     server_only: bool,
     has_access_policy: bool = False,
     clearing_policy: bool = False,
-    exclude_id: Optional[str] = None,
+    exclude_id: str | None = None,
 ) -> None:
     """§3.2 (table access policies design doc) — the physical-source twin.
 
@@ -7040,7 +7084,7 @@ def _check_access_policy_physical_source_conflict(
         )
 
 
-def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_id: str) -> None:
+def _check_policied_row_has_no_unpolicied_twin(merged: dict[str, Any], *, table_id: str) -> None:
     """§3.2, the ATTACH direction — refuse to leave a policy on a row that
     an EXISTING unpolicied row resolves to the same physical source as.
 
@@ -7105,7 +7149,7 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
         )
 
 
-def _coerce_policy_timestamp(value: Any) -> Optional[datetime]:
+def _coerce_policy_timestamp(value: Any) -> datetime | None:
     """``table_registry.access_policy_updated_at`` as an aware datetime.
 
     The column round-trips as a datetime on both backends, but a row read
@@ -7115,13 +7159,13 @@ def _coerce_policy_timestamp(value: Any) -> Optional[datetime]:
     lost revision.
     """
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, str) and value.strip():
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     return None
 
 
@@ -7190,7 +7234,7 @@ def _access_policy_write_lock(table_id: str):
         return contextlib.nullcontext()
 
 
-def _norm_policy_text(value: Optional[str]) -> Optional[str]:
+def _norm_policy_text(value: str | None) -> str | None:
     """Fold the two ways "no value" arrives for an access-policy text field
     into one, so a comparison against the stored row does not read a
     round-tripped empty string as an edit.
@@ -7209,11 +7253,11 @@ def _norm_policy_text(value: Optional[str]) -> Optional[str]:
 def _record_access_policy_revision(
     table_id: str,
     *,
-    existing: Dict[str, Any],
-    policy_sql: Optional[str],
-    policy_note: Optional[str],
+    existing: dict[str, Any],
+    policy_sql: str | None,
+    policy_note: str | None,
     policy_mapping: bool,
-    saved_by: Optional[str],
+    saved_by: str | None,
 ) -> None:
     """Append the state a table's access policy was just saved in (#1979).
 
@@ -7978,9 +8022,9 @@ class PolicyPreviewRequest(BaseModel):
     group-sets" (an ad-hoc set never needs a real account to exist).
     """
 
-    sql: Optional[str] = None
-    as_user: Optional[str] = None
-    as_groups: Optional[List[str]] = None
+    sql: str | None = None
+    as_user: str | None = None
+    as_groups: list[str] | None = None
 
 
 # The only three identity values a policy may reference (§6.2) — mirrors the
@@ -8163,7 +8207,7 @@ def _policy_preview_variable_usage(sql: str) -> tuple[set, set]:
     return referenced, variables_in_pattern_position(statement)
 
 
-def _policy_preview_dialect(row: dict) -> Optional[str]:
+def _policy_preview_dialect(row: dict) -> str | None:
     """Which transpile dialect (if any) a LIVE read of this table's policy
     actually executes in -- so the preview's "Transpiled for <dialect>"
     block never shows SQL that is not what would run (K1-sweep finding 3,
@@ -8214,7 +8258,7 @@ def _policy_preview_failure_reason(exc: Exception) -> str:
     return _POLICY_PREVIEW_REASONS.get(type(exc).__name__, "execution_error")
 
 
-def _policy_preview_failed_detail(exc: Exception, *, table_id: str, group: Optional[str] = None) -> str:
+def _policy_preview_failed_detail(exc: Exception, *, table_id: str, group: str | None = None) -> str:
     """The one message both previews return when executing a policy body
     fails -- table-scoped, engine-text-free, and logged in full server-side
     so an operator loses nothing."""
@@ -8233,7 +8277,7 @@ def _policy_preview_failed_detail(exc: Exception, *, table_id: str, group: Optio
     )
 
 
-def _policy_preview_local_view_unavailable(row: dict) -> Optional[str]:
+def _policy_preview_local_view_unavailable(row: dict) -> str | None:
     """Why an admin preview cannot run against this table at all, or ``None``.
 
     Both previews below execute the policy body on the server's LOCAL
@@ -8272,9 +8316,9 @@ def _policy_preview_local_view_unavailable(row: dict) -> Optional[str]:
 def _policy_preview_mapping_warning(
     policy_sql: str,
     *,
-    table_id: Optional[str] = None,
-    table_name: Optional[str] = None,
-) -> Optional[str]:
+    table_id: str | None = None,
+    table_name: str | None = None,
+) -> str | None:
     """review plan P2.6 -- an empty/never-synced ``policy_mapping`` table
     behind a ``JOIN`` reads, from a live query, as an ordinary empty
     result: indistinguishable from "you legitimately have no data"
@@ -8315,10 +8359,10 @@ def _policy_preview_run_persona(
     table_name: str,
     referenced: set,
     *,
-    persona_user_id: Optional[str],
-    persona_user_email: Optional[str],
-    persona_groups: List[str],
-) -> Dict[str, Any]:
+    persona_user_id: str | None,
+    persona_user_email: str | None,
+    persona_groups: list[str],
+) -> dict[str, Any]:
     """One persona's slice of a policy body -- the COUNT and the before/
     after bounded sample -- factored out of ``preview_table_policy`` so the
     persona-matrix endpoint (design doc §13.1, issue #2147) can run the
@@ -8330,7 +8374,7 @@ def _policy_preview_run_persona(
     (``_policy_preview_variable_usage``) -- this only binds ONE persona's
     values and runs the live queries.
     """
-    params: Dict[str, Any] = {}
+    params: dict[str, Any] = {}
     if "user_email" in referenced:
         params["user_email"] = persona_user_email
     if "user_id" in referenced:
@@ -8671,7 +8715,7 @@ class PolicyPreviewGroupsRequest(BaseModel):
     given previews a candidate body first.
     """
 
-    sql: Optional[str] = None
+    sql: str | None = None
 
 
 @router.post("/registry/{table_id}/policy/preview-groups")
@@ -8803,7 +8847,7 @@ def preview_table_policy_all_groups(
             # value in every position the pattern check above leaves
             # standing, so a group called `sales_cz` previews exactly as it
             # reads (#1979 -- the live resolver stopped refusing those too).
-            params: Dict[str, Any] = {}
+            params: dict[str, Any] = {}
             if "user_email" in referenced:
                 params["user_email"] = None
             if "user_id" in referenced:
@@ -8861,9 +8905,9 @@ class PolicyPreviewMatrixRequest(BaseModel):
     absolute ceiling a caller can never raise past.
     """
 
-    sql: Optional[str] = None
+    sql: str | None = None
     personas: Literal["group_sets", "policy_groups", "both"] = "both"
-    limit: Optional[int] = None
+    limit: int | None = None
 
 
 # §13.1: "enumerates the distinct group-sets among users who can access the
@@ -8893,7 +8937,7 @@ def _policy_preview_group_set_personas(table_id: str, *, max_group_sets: int) ->
     from app.auth.access import is_user_admin
     from src.rbac import can_access_table
 
-    seen: "dict[tuple[str, ...], list[str]]" = {}
+    seen: dict[tuple[str, ...], list[str]] = {}
     truncated = False
     for u in users_repo().list_all():
         if u.get("active") is False:
@@ -8937,17 +8981,21 @@ def _policy_preview_referenced_group_literals(policy_sql: str) -> list[str]:
     if statement is None:
         return []
 
-    def _is_user_groups_placeholder(node: Optional[exp.Expression]) -> bool:
+    def _is_user_groups_placeholder(node: exp.Expression | None) -> bool:
         return isinstance(node, exp.Placeholder) and node.name == "user_groups"
 
-    def _string_literal(node: Optional[exp.Expression]) -> Optional[str]:
+    def _string_literal(node: exp.Expression | None) -> str | None:
         return node.this if isinstance(node, exp.Literal) and node.is_string else None
 
     names: set = set()
 
     for call in statement.find_all(exp.ArrayContains):
         a, b = call.this, call.expression
-        lit = _string_literal(b) if _is_user_groups_placeholder(a) else (_string_literal(a) if _is_user_groups_placeholder(b) else None)
+        lit = (
+            _string_literal(b)
+            if _is_user_groups_placeholder(a)
+            else (_string_literal(a) if _is_user_groups_placeholder(b) else None)
+        )
         if lit:
             names.add(lit)
 
@@ -9181,7 +9229,7 @@ def preview_table_policy_matrix(
         universe_keys = {_row_key(r) for r in universe_rows}
 
         # Persona enumeration (§13.1) ------------------------------------
-        personas: List[Dict[str, Any]] = []
+        personas: list[dict[str, Any]] = []
         seen_group_tuples: set = set()
         truncated = False
 
@@ -9211,8 +9259,8 @@ def preview_table_policy_matrix(
                 seen_group_tuples.add(())
                 personas.append({"kind": "policy_group", "label": "(no groups)", "groups": []})
 
-        entries: List[Dict[str, Any]] = []
-        persona_visible_keys: List[set] = []
+        entries: list[dict[str, Any]] = []
+        persona_visible_keys: list[set] = []
         for persona in personas:
             try:
                 result = _policy_preview_run_persona(
@@ -9225,7 +9273,9 @@ def preview_table_policy_matrix(
                     persona_groups=persona["groups"],
                 )
             except Exception as exc:
-                raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+                raise HTTPException(
+                    status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)
+                ) from exc
             visible_keys = {_row_key(r) for r in result["sample_rows"]} & universe_keys
             persona_visible_keys.append(visible_keys)
             entries.append(
@@ -9298,7 +9348,7 @@ def preview_table_policy_matrix(
     }
 
 
-def _policy_builder_describe(name: str) -> Optional[list]:
+def _policy_builder_describe(name: str) -> list | None:
     """``DESCRIBE {name}`` on the read-only analytics connection -- the
     last-resort fallback for a name ``_policy_builder_schema_columns``
     below could not resolve any other way. Never trusts a caller-supplied
@@ -9600,9 +9650,9 @@ class PolicyCompileRequest(BaseModel):
     a different table into the generated SQL.
     """
 
-    row_rules: List[Dict[str, Any]] = Field(default_factory=list)
+    row_rules: list[dict[str, Any]] = Field(default_factory=list)
     row_combine: str = "and"
-    column_masks: Dict[str, Any] = Field(default_factory=dict)
+    column_masks: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/registry/{table_id}/policy/compile")
@@ -9687,19 +9737,19 @@ class TableDocsRequest(BaseModel):
     """
 
     # v52 fields.
-    sample_questions: Optional[List[str]] = None
-    things_to_know: Optional[str] = None
-    pairs_well_with: Optional[List[str]] = None
+    sample_questions: list[str] | None = None
+    things_to_know: str | None = None
+    pairs_well_with: list[str] | None = None
     # v56 fields.
-    grain: Optional[str] = None
-    platforms: Optional[List[str]] = None
-    partition_col: Optional[str] = None
-    history: Optional[str] = None
-    gotchas: Optional[List[_GotchaItem]] = None
+    grain: str | None = None
+    platforms: list[str] | None = None
+    partition_col: str | None = None
+    history: str | None = None
+    gotchas: list[_GotchaItem] | None = None
 
     @field_validator("platforms")
     @classmethod
-    def _check_platforms(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+    def _check_platforms(cls, v: list[str] | None) -> list[str] | None:
         if v is None:
             return None
         if len(v) > 8:
@@ -10018,7 +10068,7 @@ async def configure_instance(
         # lives in the static instance.yaml is what registrations resolved
         # against, and reading only the overlay would score it as unset and
         # report a change where there is none.
-        repoint_patch: Dict[str, Dict[str, Any]] = {}
+        repoint_patch: dict[str, dict[str, Any]] = {}
         if request.data_source == "keboola":
             repoint_patch = {"keboola": {"stack_url": request.keboola_url, "token_env": "KEBOOLA_STORAGE_TOKEN"}}
         elif request.data_source == "bigquery":
@@ -10456,8 +10506,8 @@ def _discover_and_register_tables(
             "dry_run": dry_run,
         }
 
-    from connectors.keboola.client import KeboolaClient
     from app.datasource_secrets import keboola_instance_token
+    from connectors.keboola.client import KeboolaClient
 
     # Read from data_source.keboola (matches what /api/admin/configure writes)
     url = get_value("data_source", "keboola", "stack_url", default="")
@@ -10606,7 +10656,7 @@ def run_session_collector(
     # try to parse uvicorn's sys.argv and SystemExit(2) the worker.
     rc: int = 1
     stats: dict = {}
-    job_error: Optional[Exception] = None
+    job_error: Exception | None = None
     try:
         rc, stats = collector.run(dry_run=False, verbose=False)
     except Exception as e:
@@ -10702,7 +10752,7 @@ def run_session_processor(
     # from the time budget too.
     session_processor_cap = None if processor == "usage" else _session_processor_max_per_run()
     stats: dict = {}
-    job_error: Optional[Exception] = None
+    job_error: Exception | None = None
     try:
         stats = _run_processor(job_conn, proc, max_sessions_per_run=session_processor_cap)
         # Rebuild daily rollups after a successful usage run so the
@@ -10712,10 +10762,10 @@ def run_session_processor(
         # cheap. Kept here (not in runner.py) to stay processor-agnostic at
         # the framework level.
         if processor == "usage" and stats.get("errors", 0) == 0:
-            from datetime import datetime, timedelta, timezone
+            from datetime import datetime, timedelta
 
             try:
-                since_day = (datetime.now(timezone.utc) - timedelta(days=7)).date()
+                since_day = (datetime.now(UTC) - timedelta(days=7)).date()
                 usage_repo().rebuild_rollups(since_day=since_day)
             except Exception as rollup_exc:
                 logger.warning("usage rollup rebuild failed: %s", rollup_exc)
@@ -10777,7 +10827,7 @@ def run_corporate_memory(
     # no env keys are present. Surface the actionable factory message in a
     # 500 instead of letting it crash the request anonymously.
     stats: dict = {}
-    job_error: Optional[Exception] = None
+    job_error: Exception | None = None
     try:
         stats = collect_all(dry_run=False)
     except ValueError as e:
@@ -10934,7 +10984,7 @@ def knowledge_packaging_status(
     return {"last_run": last_run, "running": running, "next_due": _knowledge_packaging_next_due()}
 
 
-def _knowledge_packaging_next_due() -> Optional[str]:
+def _knowledge_packaging_next_due() -> str | None:
     """Best-effort estimate of the next ``knowledge-packaging`` scheduler
     tick, read from the scheduler's durable last-run marker
     (``services/scheduler/__main__.py``'s ``scheduler_last_run.json``, on
@@ -10976,7 +11026,7 @@ def run_knowledge_digests(
     """
     from src.knowledge_digests import run_digest_pass
 
-    job_error: Optional[Exception] = None
+    job_error: Exception | None = None
     summary: dict = {}
     try:
         summary = run_digest_pass()
@@ -11115,7 +11165,7 @@ def run_jira_sla_poll(
     from connectors.jira.scripts.poll_sla import run as _run_poll_sla
 
     stats: dict = {}
-    job_error: Optional[Exception] = None
+    job_error: Exception | None = None
     try:
         stats = _run_poll_sla(dry_run=False)
     except ValueError as e:
@@ -11199,7 +11249,7 @@ def run_jira_consistency_check(
         return {"status": "skipped", "reason": "jira_not_configured", "detail": str(e)}
 
     report: dict = {}
-    job_error: Optional[Exception] = None
+    job_error: Exception | None = None
     try:
         checker = JiraConsistencyChecker(config)
         report = checker.run_check(
@@ -11249,18 +11299,18 @@ def run_jira_consistency_check(
 # runs surfaces.
 # ---------------------------------------------------------------------------
 
-import shutil as _shutil  # noqa: E402
+import shutil as _shutil
 
 
 @router.get("/store/submissions")
 async def admin_list_store_submissions(
-    status: Optional[str] = None,
-    submitter: Optional[str] = None,
-    type: Optional[str] = None,  # noqa: A002 — FastAPI query-param name
-    name: Optional[str] = None,
-    version: Optional[str] = None,
-    sort: Optional[str] = None,
-    order: Optional[str] = None,
+    status: str | None = None,
+    submitter: str | None = None,
+    type: str | None = None,
+    name: str | None = None,
+    version: str | None = None,
+    sort: str | None = None,
+    order: str | None = None,
     limit: int = 100,
     skip: int = 0,
     user: dict = Depends(require_admin),
@@ -11383,7 +11433,7 @@ async def admin_override_store_submission(
     # (no prior approved) the version_no already matches — the loop
     # just no-ops and we skip promotion harmlessly.
     entity_row = ents_repo.get(entity_id) or {}
-    promoted_to: Optional[int] = None
+    promoted_to: int | None = None
     # Look up THIS submission's version entry by submission_id, NOT
     # by hash. Hash-based lookup breaks when the user re-uploads
     # byte-identical bundles (e.g. v2 same content as v1): the loop
@@ -11394,7 +11444,7 @@ async def admin_override_store_submission(
     # live on a development deployment.
     from app.api.store import _version_no_for_submission
 
-    target_version_no: Optional[int] = _version_no_for_submission(
+    target_version_no: int | None = _version_no_for_submission(
         entity_row,
         submission_id,
     )
@@ -11727,7 +11777,7 @@ async def admin_delete_store_submission(
 # v30: download blocked bundle for forensic inspection
 # ---------------------------------------------------------------------------
 
-from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi.responses import StreamingResponse
 
 
 @router.get("/store/submissions/{submission_id}/bundle.zip")
