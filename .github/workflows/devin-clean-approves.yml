@@ -98,6 +98,13 @@ jobs:
           owner=${REPO%/*}; name=${REPO#*/}
           echo "credential: $TOKEN_KIND"
 
+          # The dispatch input is free text; accept "123", " 123 " or "#123", refuse the rest
+          # with a clear message instead of a GraphQL type error.
+          ONLY_PR=${ONLY_PR//[[:space:]]/}; ONLY_PR=${ONLY_PR#\#}
+          if [ -n "$ONLY_PR" ] && ! [[ "$ONLY_PR" =~ ^[0-9]+$ ]]; then
+            echo "input 'pr' must be a pull request number, got '$ONLY_PR'"; exit 1
+          fi
+
           # Runtime guard: this file must be the default branch's copy. (Belt;
           # the environment's branch policy is the braces — see the header.)
           default_branch=${DEFAULT_BRANCH:-$(gh api "repos/$REPO" --jq '.default_branch')}
