@@ -9,7 +9,18 @@ name: Devin clean verdict approves org members' PRs
 # so its verdict never counted. This workflow makes it count, for org members:
 #
 #   author is an org member AND Devin's latest verdict is clean -> approve
-#   Devin's latest verdict lists issues                         -> dismiss ours
+#   ... or its latest verdict listed issues, every Devin review thread is
+#       resolved and the branch has moved past the reviewed commit  -> approve
+#   Devin's latest verdict lists issues still open                  -> dismiss ours
+#
+# The second line exists because Devin does not re-review a diff it considers
+# already reviewed: once the author fixes every finding and resolves the
+# threads, "found N potential issues" stays Devin's last word forever. A
+# resolved thread is the same trust the team extends to a human approval that
+# persists across pushes. A "N security issues" verdict never clears this way —
+# those findings are hidden from GitHub by the org setting, so there is no
+# thread whose resolution could vouch for them; they need a fresh clean verdict
+# or a human approval.
 #
 # It is a POLLER, on purpose. It runs only from the default branch — on a
 # schedule and on manual dispatch — and never from a pull request's ref.
@@ -167,16 +178,37 @@ jobs:
 
             # Every review of this PR, one JSON object per line, all pages.
             reviews=$(gh api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" --jq '.[] | @json')
-            verdict=$(printf '%s\n' "$reviews" | jq -rs --arg re "$verdict_re" '[.[]
-                | select(.user.login == "devin-ai-integration[bot]") | .body // ""
-                | select(test("This report is out of date") | not)
-                | select(test($re))] | last // ""')
+            verdict_review=$(printf '%s\n' "$reviews" | jq -cs --arg re "$verdict_re" '[.[]
+                | select(.user.login == "devin-ai-integration[bot]")
+                | select((.body // "") | test("This report is out of date") | not)
+                | select((.body // "") | test($re))] | last // {}')
+            verdict=$(jq -r '.body // ""' <<<"$verdict_review")
+            verdict_sha=$(jq -r '.commit_id // ""' <<<"$verdict_review")
             # Our own active approval (whichever identity approves: the bot token's
             # login or github-actions[bot]); an old one must never outlive a later
             # issue verdict, so it is looked up over all pages, never a window.
             ours=$(printf '%s\n' "$reviews" | jq -rs --arg me "$me" '[.[]
                 | select(.state == "APPROVED" and (.user.login == $me or .user.login == "github-actions[bot]")) | .id] | last // ""')
             headline=$(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)
+
+            # Findings fixed but never re-verdicted: all of Devin's threads resolved
+            # and commits after the reviewed one. Not for security verdicts (no threads).
+            if printf '%s' "$verdict" | grep -Eq 'found [1-9][0-9]* (new )?potential issue' \
+               && [ -n "$verdict_sha" ] && [ "$verdict_sha" != "$head" ]; then
+              open_threads=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$n" -f query='
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+                    reviewThreads(first: 100) { totalCount nodes { isResolved comments(first: 1) { nodes { author { login } } } } } } } }' \
+                --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+                       | select(.isResolved == false and .comments.nodes[0].author.login == "devin-ai-integration")] | length')
+              if [ "$open_threads" = "0" ]; then
+                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} — treating the findings as addressed"
+                verdict="Devin Review: No Issues Found (all findings resolved)"
+                headline="$headline — all threads resolved, head moved on"
+              else
+                echo "#$n: Devin said \"$headline\"; $open_threads Devin thread(s) still unresolved"
+              fi
+            fi
 
             if printf '%s' "$verdict" | grep -Eq "$issues_re"; then
               if [ -n "$ours" ]; then
@@ -189,7 +221,7 @@ jobs:
             elif printf '%s' "$verdict" | grep -Eq "$clean_re"; then
               if [ -n "$ours" ]; then echo "#$n: Devin says \"$headline\"; already approved ($ours)"; continue; fi
               gh pr review "$n" --repo "$REPO" --approve --body \
-                "Approved on Devin's clean verdict (PR head ${head:0:9}) for an organization member's pull request (see .github/workflows/devin-clean-approves.yml). Dismissed again if a later Devin review lists issues."
+                "Approved for an organization member's pull request on Devin's verdict \"$headline\" (PR head ${head:0:9}; see .github/workflows/devin-clean-approves.yml). Dismissed again if a later Devin review lists issues."
               echo "#$n: Devin says \"$headline\"; approved"
             else
               echo "#$n: no Devin verdict yet; nothing to do"
