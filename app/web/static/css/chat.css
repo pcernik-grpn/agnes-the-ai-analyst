@@ -3114,6 +3114,29 @@ html[data-ui-layout="rail"] .cloud-chat-shell {
   gap: 0;
   background: var(--ds-surface);
 }
+/* The data-app preview pane under rail. The base `.has-preview-pane` rule
+   adds the pane's track to the TOPNAV template (sidebar + main + pane), but
+   the one-track rule above outranks it here, so the pane — appended as the
+   shell's second grid child — landed in an implicit row of the base
+   `grid-template-rows: 100%` shell: a 0px strip below the thread, "App
+   preview" header and nothing else. Watched live: the agent swapped the
+   pane to the running app and the reader said "I can't see the dashboard".
+   Give it its column (no sidebar to keep under rail), letting it widen on a
+   large screen; on a narrow viewport stack it under the thread as a
+   bottom sheet with an EXPLICIT second row instead. */
+html[data-ui-layout="rail"] .cloud-chat-shell.has-preview-pane {
+  grid-template-columns: minmax(0, 1fr) minmax(var(--chat-preview-width), 42%);
+}
+@media (max-width: 900px) {
+  html[data-ui-layout="rail"] .cloud-chat-shell.has-preview-pane {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 45dvh;
+  }
+  html[data-ui-layout="rail"] .cloud-chat-shell.has-preview-pane .cloud-chat-preview-pane {
+    border-left: 0;
+    border-top: 1px solid var(--ds-border);
+  }
+}
 html[data-ui-layout="rail"] .cloud-chat-main { position: relative; }
 
 /* ---- Full-viewport shell (rail) ---------------------------------------

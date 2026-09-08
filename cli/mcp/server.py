@@ -773,7 +773,11 @@ def data_app_create(slug: str, name: str, description: str = "") -> dict:
     The app is created empty. Seed it before deploying: clone with
     ``data_app_git_credential``, copy the baked scaffold from
     ``/work/scaffolds/nodejs-dashboard/``, push to ``main``, then
-    ``data_app_deploy``. Deploying an empty repo fails with
+    ``data_app_create_draft`` and ``data_app_deploy(draft_slug, mode="dev")``
+    — every dev deploy needs a draft, the very first included
+    (``dev_requires_draft`` otherwise). A prod deploy of a brand-new app
+    (``data_app_deploy(slug)``, no mode) is the promote step, taken only after
+    the user picks "Publish". Deploying an empty repo fails with
     ``deploy_empty_repo``.
 
     Args:

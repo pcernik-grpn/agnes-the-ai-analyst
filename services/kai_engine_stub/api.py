@@ -514,6 +514,37 @@ SCENARIOS: dict[str, list[dict]] = {
     # A turn that "renders" deliverables: registers real bytes in the stub's
     # sandbox file store for this chat (see `chat()`), so the web UI's Files
     # overlay lists and downloads them end to end.
+    # The turn shape from the data-app preview transcript: prose, a preview tool
+    # (no card — its result is a RENDER DIRECTIVE, delivered inside the MCP
+    # envelope the real engine forwards), more prose, the credentials tool (the
+    # terminal render: the shareable URL), a closing paragraph. The deltas after
+    # each call start flush, as a real stream's new text part does. What must
+    # NOT appear: "Preview unavailable.", or "Let me refresh it:The preview…" —
+    # the sentence before a preview call glued to the one after it.
+    "preview": [
+        _text("The app built and started successfully. Let me refresh it:"),
+        _tool_call("call_refresh", "agnes_data_app_refresh", {"slug": "arr-trends"}),
+        _tool_output("call_refresh", _mcp_envelope({"render": "data_app_preview_refresh", "slug": "arr-trends"})),
+        _text(
+            "The preview should be refreshing now. If you still can't see it in the side panel, "
+            "you can also open the app directly at its URL:"
+        ),
+        _tool_call("call_creds", "agnes_data_app_credentials", {"slug": "arr-trends"}),
+        _tool_output(
+            "call_creds",
+            _mcp_envelope(
+                {"render": "data_app_credentials", "slug": "arr-trends", "url": "/apps/arr-trends/", "password": None}
+            ),
+        ),
+        _text(
+            "Your dashboard is live at that URL. It has four sections:\n\n"
+            "1. **KPI cards** — current ARR, 12-month change, peak, customer count\n"
+            "2. **ARR trend line** — rolling 12-month area chart\n"
+            "3. **Top customers** — start vs current\n"
+            "4. **Movement breakdown** — net new / upgrade / downgrade / churn by month"
+        ),
+        {"type": "finish"},
+    ],
     "deliverable": [
         _text("Rendering the documents.\n\n"),
         _tool_call("call_render", "Bash", {"command": "python render_deliverables.py"}),
@@ -527,7 +558,7 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_output("call_d", _mcp_envelope({"authenticated": True, "health": {"status": "ok"}})),
         _text(
             "\n\nTry `interleaved`, `wall`, `table`, `fail`, `approval`, `error`, `markdown`, "
-            "`tabular`, `nextactions` or `deliverable`."
+            "`tabular`, `nextactions`, `preview` or `deliverable`."
         ),
         {"type": "finish"},
     ],
