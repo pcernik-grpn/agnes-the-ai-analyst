@@ -14,6 +14,26 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
 5. Add a CHANGELOG fragment (`changelog.d/<slug>.md`, see `changelog.d/README.md`) for any user-visible behavior change. A feature/fix PR never edits `CHANGELOG.md` itself — only the daily release-cut PR does, when it folds the fragments in.
 
+## Dependencies — `uv.lock` is what ships
+
+`pyproject.toml` declares ranges; `uv.lock` pins the exact set. The Docker
+image and every CI job install from the lock (`scripts/ci/install-from-lock.sh`
+— `uv export --frozen`, then `uv pip install`), so what CI tested is what the
+image runs. Two rules follow:
+
+- **Changed `pyproject.toml`? Run `uv lock` and commit `uv.lock` in the same
+  PR.** CI's `lock-check` job (`uv lock --check`) is blocking — the `test`
+  rollup needs it. Dependabot PRs already re-lock; the daily release cut
+  re-locks after its version bump.
+- **Never let tooling re-lock for you.** `uv run`, `uv sync`, `uv export` and
+  `uv tree` rewrite `uv.lock` whenever it is behind `pyproject.toml`; pass
+  `--frozen` (the repo's hooks already do). A dirty `uv.lock` you did not mean
+  to change is `git checkout -- uv.lock`, never a commit.
+
+A local venv built with `uv pip install ".[dev,server]"` resolves from the
+ranges and is fine for development; `uv sync --extra server --extra extraction`
+gives you the exact set CI runs instead.
+
 ## Landing a PR — the merge queue is the gate, not the review badge
 
 What merges a ready (non-draft) PR is GitHub's **merge queue** on `main`

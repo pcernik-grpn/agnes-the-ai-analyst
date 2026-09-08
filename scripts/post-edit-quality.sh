@@ -36,7 +36,9 @@ if [ -x ".venv/bin/ruff" ]; then
 elif command -v ruff >/dev/null 2>&1; then
     RUFF=(ruff)
 elif command -v uv >/dev/null 2>&1; then
-    RUFF=(uv run --quiet ruff)
+    # --frozen: run against the lock as committed, never rewrite it (a lock
+    # behind pyproject.toml is CI's `lock-check` finding, not a hook side effect).
+    RUFF=(uv run --frozen --quiet ruff)
 else
     RUFF=()
 fi
