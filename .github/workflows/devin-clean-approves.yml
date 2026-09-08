@@ -11,135 +11,127 @@ name: Devin clean verdict approves org members' PRs
 #   author is an org member AND Devin's latest verdict is clean -> approve
 #   Devin's latest verdict lists issues                         -> dismiss ours
 #
-# Two ways in:
-#   * pull_request_review (submitted/edited): Devin's review just landed —
-#     Devin often submits an empty review and fills the verdict in by editing
-#     it, and edits OLD reports to prepend "This report is out of date".
-#   * workflow_dispatch with a PR number: catch-up. Devin re-reviews only some
-#     pushes (its latest review matched the final head on 4 of the last 15
-#     merged PRs) and a merge of `main` into a branch changes nothing in the
-#     PR's diff, so it never re-reviews that. This mode evaluates Devin's
-#     latest verdict-bearing review on the PR as it stands.
+# It is a POLLER, on purpose. It runs only from the default branch — on a
+# schedule and on manual dispatch — and never from a pull request's ref.
+# A `pull_request_review`-triggered version would execute the PR's own copy
+# of this file with a write token, so any same-repository author could edit
+# the gate and approve themselves (Devin finding, CWE-829). Polling also
+# covers the case an event never fires: Devin re-reviews only some pushes
+# (its latest review matched the final head on 4 of the last 15 merged PRs)
+# and never re-reviews a merge of `main` into a branch, since the PR's diff
+# does not change.
 #
-# An outside collaborator's PR (author_association COLLABORATOR) gets nothing
-# here and still needs a human approval. So does the daily release-cut PR: it
-# is authored by github-actions[bot], the identity this workflow approves
-# with, and GitHub refuses self-approval — the person who merges the cut
-# approves it, one click. The approval persists across later pushes, like a
-# human's under this ruleset, and falls to a later Devin review that lists
-# issues; leave the ruleset's "dismiss stale reviews on push" OFF.
+# Membership is never inferred from `author_association` (Devin finding,
+# CWE-863: CONTRIBUTOR does not prove membership). A same-repository branch
+# needs write access, and write access minus the repository's outside
+# collaborators (`GET /repos/{repo}/collaborators?affiliation=outside`) is
+# exactly the organization members — both facts come from repo-scoped API
+# calls the Actions token can make. Bots (Devin, Copilot, the release-cut
+# author github-actions[bot]) are excluded by type; the cut PR needs a human
+# approval, one click by whoever merges it.
 #
-# Every decision is made in the shell step, never in a job-level `if`, so a
-# run that does nothing still logs WHY (the first version filtered in `if:`
-# and Devin's own events were silently skipped, with nothing to read).
+# The approval persists across later pushes, like a human's under this
+# ruleset, and falls to a later Devin review that lists issues (including the
+# "N security issues" headline Devin posts when the org setting hides the
+# findings from GitHub); leave the ruleset's "dismiss stale reviews on push"
+# OFF. Every decision is logged per PR, so a run that does nothing says why.
 #
-# Safety: the job never checks out PR code; payload values reach the shell via
-# environment variables only. `pull_request_review` runs the workflow from the
-# PR's merge ref, so a same-repo PR could edit this file — the exposure every
-# `pull_request`-triggered workflow already has under this repository's
-# default write token, not a new one. Approvals come from the Actions token
-# (repo setting "Allow GitHub Actions to create and approve pull requests"
-# must stay on).
+# Safety: nothing is checked out; the step only calls the GitHub API.
+# Approvals come from the Actions token (repo setting "Allow GitHub Actions
+# to create and approve pull requests" must stay on).
 
 on:
-  pull_request_review:
-    types: [submitted, edited]
+  schedule:
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       pr:
-        description: "Pull request number to evaluate from Devin's latest verdict (catch-up)"
-        required: true
+        description: "Only this pull request number (default: every open, non-draft PR)"
+        required: false
         type: string
 
 permissions:
   pull-requests: write
 
 concurrency:
-  group: devin-clean-approves-${{ github.event.pull_request.number || inputs.pr }}
+  group: devin-clean-approves
   cancel-in-progress: false
 
 jobs:
   bridge:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Decide from Devin's verdict (approve, dismiss, or explain why not)
+      - name: Approve org members' PRs on Devin's clean verdict, dismiss on issues
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
-          ACTION: ${{ github.event.action }}
-          PR: ${{ github.event.pull_request.number || inputs.pr }}
-          REVIEWER: ${{ github.event.review.user.login }}
-          EVENT_BODY: ${{ github.event.review.body }}
+          ONLY_PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
-          echo "event=$EVENT action=${ACTION:-} pr=$PR reviewer=${REVIEWER:-}"
+          owner=${REPO%/*}; name=${REPO#*/}
 
-          if [ "$EVENT" = "pull_request_review" ] && [ "$REVIEWER" != "devin-ai-integration[bot]" ]; then
-            echo "review by ${REVIEWER:-?}, not Devin; nothing to do"; exit 0
-          fi
+          # Everyone with access who is NOT an organization member.
+          outside=$(gh api --paginate "repos/$REPO/collaborators?affiliation=outside&per_page=100" --jq '.[].login' | sort -u)
+          echo "outside collaborators: $(printf '%s' "$outside" | tr '\n' ' ')"
 
-          # The PR as the API sees it — one code path for both modes.
-          pr_json=$(gh api "repos/$REPO/pulls/$PR")
-          author=$(jq -r '.user.login' <<<"$pr_json")
-          assoc=$(jq -r '.author_association' <<<"$pr_json")
-          head_repo=$(jq -r '.head.repo.full_name' <<<"$pr_json")
-          head_sha=$(jq -r '.head.sha' <<<"$pr_json")
-          echo "author=$author association=$assoc head_repo=$head_repo head=${head_sha:0:9}"
+          # One query for every open PR and the reviews the decision needs.
+          # GraphQL logins carry no "[bot]" suffix; __typename tells User from Bot.
+          prs=$(gh api graphql -f owner="$owner" -f name="$name" -f query='
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number isDraft headRefOid
+                    author { login __typename }
+                    headRepository { nameWithOwner }
+                    reviews(last: 100) { nodes { databaseId state body author { login __typename } } }
+                  }
+                }
+              }
+            }' --jq '.data.repository.pullRequests.nodes')
 
-          if [ "$head_repo" != "$REPO" ]; then
-            echo "PR from a fork; nothing to do"; exit 0
-          fi
-          # Deny-list, not allow-list: outside collaborators are always
-          # COLLABORATOR, while an org member can read as MEMBER, OWNER or
-          # (when membership is private to the token) CONTRIBUTOR.
-          case "$assoc" in
-            COLLABORATOR|NONE|FIRST_TIMER|FIRST_TIME_CONTRIBUTOR|MANNEQUIN)
-              echo "author $author is not an organization member ($assoc); a human approval is required"; exit 0;;
-          esac
-          if [ "$author" = "github-actions[bot]" ]; then
-            echo "bot-authored PR (release cut); this token cannot self-approve; a human approval is required"; exit 0
-          fi
+          clean_re='Devin Review: No Issues Found|found 0 (new )?potential issues'
+          issues_re='found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'
+          verdict_re='Devin Review: No Issues Found|found [0-9]+ (new )?potential issue|Devin Review: [0-9]+ security issue'
 
-          # Devin's verdict. Event mode: the review that fired. Catch-up mode:
-          # Devin's latest review that carries a verdict and is not out of date.
-          if [ "$EVENT" = "pull_request_review" ]; then
-            verdict="$EVENT_BODY"
-            if printf '%s' "$verdict" | grep -q 'This report is out of date'; then
-              echo "Devin edited an old report to mark it out of date; nothing to do"; exit 0
+          jq -c '.[]' <<<"$prs" | while read -r pr; do
+            n=$(jq -r '.number' <<<"$pr")
+            if [ -n "$ONLY_PR" ] && [ "$n" != "$ONLY_PR" ]; then continue; fi
+            author=$(jq -r '.author.login // "?"' <<<"$pr")
+            atype=$(jq -r '.author.__typename // "?"' <<<"$pr")
+            head_repo=$(jq -r '.headRepository.nameWithOwner // "?"' <<<"$pr")
+            head=$(jq -r '.headRefOid' <<<"$pr")
+
+            if [ "$(jq -r '.isDraft' <<<"$pr")" = "true" ]; then echo "#$n: draft; skip"; continue; fi
+            if [ "$head_repo" != "$REPO" ]; then echo "#$n: head in $head_repo, not this repository; skip"; continue; fi
+            if [ "$atype" != "User" ]; then echo "#$n: author $author is a $atype, not a person; a human approval is required"; continue; fi
+            if printf '%s\n' "$outside" | grep -qx -- "$author"; then
+              echo "#$n: author $author is an outside collaborator; a human approval is required"; continue
             fi
-          else
-            verdict=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews?per_page=100" \
-              --jq 'add | [.[] | select(.user.login == "devin-ai-integration[bot]") | .body
-                      | select(test("This report is out of date") | not)
-                      | select(test("Devin Review: No Issues Found|found [0-9]+ (new )?potential issue|Devin Review: [0-9]+ security issue"))]
-                    | last // ""')
-            echo "latest verdict-bearing Devin review: $(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)"
-          fi
+            # Same-repository branch (needs write) and not an outside collaborator => organization member.
 
-          # Our current approval, if any (paginate: the endpoint pages at 30).
-          ours_id=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews?per_page=100" \
-                     --jq 'add | [.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED")] | last | .id // empty')
+            verdict=$(jq -r --arg re "$verdict_re" '[.reviews.nodes[]
+                | select(.author.login == "devin-ai-integration") | .body // ""
+                | select(test("This report is out of date") | not)
+                | select(test($re))] | last // ""' <<<"$pr")
+            ours=$(jq -r '[.reviews.nodes[] | select(.author.login == "github-actions" and .state == "APPROVED") | .databaseId] | last // ""' <<<"$pr")
+            headline=$(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)
 
-          dismiss() {
-            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$ours_id/dismissals" -f message="$1" >/dev/null
-            echo "dismissed review $ours_id ($1)"
-          }
-
-          # "N security issues" is Devin's headline when the org setting hides the
-          # findings themselves from GitHub; the count still says the PR is not clean.
-          if printf '%s' "$verdict" | grep -Eq 'found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'; then
-            if [ -n "$ours_id" ]; then
-              dismiss "Dismissed: Devin's latest review lists issues. It re-approves once a clean verdict lands."
+            if printf '%s' "$verdict" | grep -Eq "$issues_re"; then
+              if [ -n "$ours" ]; then
+                gh api -X PUT "repos/$REPO/pulls/$n/reviews/$ours/dismissals" \
+                  -f message="Dismissed: Devin's latest review lists issues (\"$headline\"). It re-approves once a clean verdict lands." >/dev/null
+                echo "#$n: Devin says \"$headline\"; dismissed our approval $ours"
+              else
+                echo "#$n: Devin says \"$headline\"; nothing of ours to dismiss"
+              fi
+            elif printf '%s' "$verdict" | grep -Eq "$clean_re"; then
+              if [ -n "$ours" ]; then echo "#$n: Devin says \"$headline\"; already approved ($ours)"; continue; fi
+              gh pr review "$n" --repo "$REPO" --approve --body \
+                "Approved on Devin's clean verdict (PR head ${head:0:9}) for an organization member's pull request (see .github/workflows/devin-clean-approves.yml). Dismissed again if a later Devin review lists issues."
+              echo "#$n: Devin says \"$headline\"; approved"
             else
-              echo "Devin lists issues; nothing of ours to dismiss"
+              echo "#$n: no Devin verdict yet; nothing to do"
             fi
-          elif printf '%s' "$verdict" | grep -Eq 'Devin Review: No Issues Found|found 0 (new )?potential issues'; then
-            if [ -n "$ours_id" ]; then echo "already approved (review $ours_id)"; exit 0; fi
-            gh pr review "$PR" --repo "$REPO" --approve --body \
-              "Approved on Devin's clean verdict (PR head ${head_sha:0:9}) for an organization member's pull request (see .github/workflows/devin-clean-approves.yml). Dismissed again if a later Devin review lists issues."
-            echo "approved"
-          else
-            echo "no verdict to act on (empty review body, or Devin has not reviewed this PR); nothing to do"
-          fi
+          done
