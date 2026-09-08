@@ -805,6 +805,118 @@ def _summarize_sse(body: bytes) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Chat turn structure — the spans a chat turn is made of
+#
+# One ``agnes.chat.turn`` per delivered user message, one
+# ``agnes.chat.tool <tool>`` per tool call under it, and the completions the
+# broker forwards for that turn parented under the same context (they are
+# opened in another process — see :func:`remote_parent_context` and
+# ``app/chat/turn_context.py``). Structure only: a tool's arguments and its
+# result never reach a span, in this product they routinely carry customer
+# data. Nothing here may cost a turn, so every call is wrapped exactly like
+# the completion helpers above.
+# ---------------------------------------------------------------------------
+
+
+def child_context(span: Any) -> Any:
+    """The OTel ``Context`` whose current span is ``span`` — the parent for a
+    span opened in THIS process (the remote sibling is
+    :func:`remote_parent_context`). ``None`` when there is nothing to parent
+    under, which makes the child a root span rather than an error."""
+    if not _OTEL_API:
+        return None
+    try:
+        return trace.set_span_in_context(span) if span.is_recording() else None
+    except Exception:  # noqa: BLE001 - see the module docstring
+        return None
+
+
+def start_turn_span(
+    *,
+    session_id: Optional[str],
+    turn_id: Optional[str],
+    user_id: Optional[str],
+    agent_id: Optional[str],
+    surface: Optional[str],
+    workload: Optional[str],
+) -> Any:
+    """Open the span for one chat turn. Labels only — no message text."""
+    attrs = _clean(
+        {
+            "agnes.kind": "turn",
+            "agnes.session_id": session_id,
+            "agnes.turn_id": turn_id,
+            "agnes.user_id": user_id,
+            "agnes.agent_id": agent_id,
+            "agnes.surface": surface,
+            "agnes.workload": workload,
+        }
+    )
+    return _open_span("agnes.chat.turn", attrs, kind=SpanKind.INTERNAL if _OTEL_API else None)
+
+
+def end_turn_span(
+    span: Any,
+    *,
+    tool_calls: int,
+    usage: Optional[Mapping[str, Any]] = None,
+    cost_usd: Optional[float] = None,
+    error_kind: Optional[str] = None,
+) -> None:
+    """Finish a turn span with what the turn cost: how many tools it ran, the
+    tokens it burned and the price of them. ``error_kind`` is the ``kind`` of
+    the turn's error frame (``turn_idle_timeout`` and friends) — a label, not
+    a message, so nothing a model or a user wrote leaks into it."""
+    try:
+        if not span.is_recording():
+            return
+        span.set_attribute("agnes.tool_calls", int(tool_calls))
+        set_usage_attributes(span, usage)
+        _set_cost(span, cost_usd)
+        if error_kind:
+            span.set_attribute("error.type", str(error_kind))
+            span.set_status(StatusCode.ERROR, str(error_kind)[:200])
+        else:
+            span.set_status(StatusCode.OK)
+    except Exception:  # noqa: BLE001 - see the module docstring
+        logger.debug("otel: could not finish the turn span", exc_info=True)
+    finally:
+        try:
+            span.end()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def start_tool_span(*, tool: Optional[str], args_hash: Optional[str], parent: Any) -> Any:
+    """Open the span for one tool call of a turn. ``args_hash`` is the same
+    digest the ``chat.tool_call`` audit record carries — enough to tell two
+    calls of one tool apart, never enough to read what they did."""
+    attrs = _clean({"agnes.kind": "tool", "agnes.tool": tool, "agnes.args_hash": args_hash})
+    return _open_span(
+        f"agnes.chat.tool {tool}",
+        attrs,
+        kind=SpanKind.INTERNAL if _OTEL_API else None,
+        parent_context=child_context(parent),
+    )
+
+
+def end_tool_span(span: Any, *, is_error: bool) -> None:
+    """Finish a tool span. Whether it failed, never how."""
+    try:
+        if not span.is_recording():
+            return
+        span.set_attribute("agnes.is_error", bool(is_error))
+        span.set_status(StatusCode.ERROR if is_error else StatusCode.OK)
+    except Exception:  # noqa: BLE001 - see the module docstring
+        logger.debug("otel: could not finish the tool span", exc_info=True)
+    finally:
+        try:
+            span.end()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 __all__ = [
     "CAPTURE_CONTENT_VAR",
     "COMPLETION_EVENT",
@@ -813,11 +925,14 @@ __all__ = [
     "MAX_CONTENT_CHARS",
     "CompletionSummary",
     "capture_content_enabled",
+    "child_context",
     "collector",
     "configure_otel",
     "describe_completion",
     "end_completion_span",
     "end_generation_span",
+    "end_tool_span",
+    "end_turn_span",
     "endpoint_configured",
     "input_messages_from_request",
     "is_enabled",
@@ -828,6 +943,8 @@ __all__ = [
     "span_ids",
     "start_completion_span",
     "start_generation_span",
+    "start_tool_span",
+    "start_turn_span",
     "summarize_completion",
     "tracer",
     "truncate_content",
