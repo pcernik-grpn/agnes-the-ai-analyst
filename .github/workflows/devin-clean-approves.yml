@@ -76,6 +76,7 @@ on:
 
 permissions:
   pull-requests: write
+  contents: read   # compare API ("is the head ahead of the reviewed commit?")
 
 concurrency:
   # ONE group for every run, scheduled or dispatched: two runs looking at the
@@ -152,7 +153,10 @@ jobs:
               --jq '.data.repository.pullRequests.nodes[] | @json')
           fi
           echo "open PRs considered: $(printf '%s\n' "$prs" | grep -c . || true)"
-          me=$(gh api user --jq '.login' 2>/dev/null || echo "github-actions[bot]")
+          # Identity of the approving token. The Actions token cannot call /user
+          # (403); gh prints the error body on stdout, so validate the shape.
+          me=$(gh api user --jq '.login' 2>/dev/null || true)
+          [[ "$me" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$ ]] || me="github-actions[bot]"
           echo "approving as: $me"
 
           clean_re='Devin Review: No Issues Found|found 0 (new )?potential issues'
@@ -198,7 +202,8 @@ jobs:
               # "Moved past" means the head DESCENDS from the reviewed commit (compare
               # status "ahead"). A rewound or rewritten branch ("behind", "diverged", or
               # a commit GitHub no longer knows) proves nothing and keeps the findings open.
-              relation=$(gh api "repos/$REPO/compare/$verdict_sha...$head" --jq '.status' 2>/dev/null || echo "unknown")
+              relation=$(gh api "repos/$REPO/compare/$verdict_sha...$head" --jq '.status' 2>/dev/null || true)
+              case "$relation" in ahead|behind|identical|diverged) ;; *) relation="unknown" ;; esac
               if [ "$relation" != "ahead" ]; then
                 echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; head ${head:0:9} is '$relation' relative to it, not ahead — findings stay open"
                 open_threads="n/a"
