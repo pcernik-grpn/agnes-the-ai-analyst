@@ -1088,6 +1088,44 @@ def _agnes_mcp_servers() -> dict:
     }
 
 
+def _mcp_server_startup_warnings(init_data: object) -> list[str]:
+    """Stderr lines for every MCP server the SDK's ``init`` system message
+    reports as NOT connected.
+
+    Claude Code lists each configured server's ``status`` (``connected`` /
+    ``failed`` / ``needs-auth`` / ``pending``) exactly once, in the ``init``
+    message at the top of the first turn, and otherwise drops a failed server
+    without a word: the agent keeps its built-in tools and the server's tools
+    are simply absent. For the ``agnes`` server that means every foundation
+    tool and every Universal-MCP passthrough tool is gone — the live case was
+    a sandbox image whose unpinned ``mcp`` resolved 2.x, so ``agnes mcp`` died
+    at import and nothing in the sandbox log said so. Pure and defensive on
+    purpose: it is read from the turn loop and must never raise on a
+    malformed payload.
+    """
+    if not isinstance(init_data, dict):
+        return []
+    servers = init_data.get("mcp_servers")
+    if not isinstance(servers, list):
+        return []
+    lines: list[str] = []
+    for entry in servers:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        status = entry.get("status")
+        if not isinstance(name, str) or not name or status == "connected":
+            continue
+        line = f"mcp server {name!r} did not connect (status={status!r}); its tools are absent this session"
+        if name == _AGNES_MCP_SERVER_NAME:
+            line += (
+                " — no Agnes foundation or passthrough tools; run `agnes mcp` inside the sandbox image"
+                " to see why (an `mcp` outside pyproject's range is the known cause)"
+            )
+        lines.append(line)
+    return lines
+
+
 async def _call_delegation_endpoint(agent_slug: str, message: str) -> dict:
     """POST one delegation request through the in-sandbox relay's main-scope
     leg (Track C7 MVP, @delegation).
@@ -1939,6 +1977,7 @@ async def _consume_turn(
     from claude_agent_sdk import (  # type: ignore[import-untyped]
         AssistantMessage,
         ResultMessage,
+        SystemMessage,
         TextBlock,
         ToolResultBlock,
         ToolUseBlock,
@@ -2198,6 +2237,13 @@ async def _consume_turn(
                 for block in msg.content:
                     if isinstance(block, ToolResultBlock):
                         _emit_tool_result(block)
+
+        elif isinstance(msg, SystemMessage) and msg.subtype == "init":
+            # The one place Claude Code reports MCP server status. A server
+            # that failed is otherwise dropped silently — the agent just runs
+            # without its tools — so say so in the sandbox log.
+            for line in _mcp_server_startup_warnings(msg.data):
+                print(line, file=sys.stderr, flush=True)
 
         elif isinstance(msg, ResultMessage):
             if msg.usage:
