@@ -218,8 +218,10 @@ jobs:
                 echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} — treating the findings as addressed"
                 verdict="Devin Review: No Issues Found (all findings resolved)"
                 headline="$headline — all threads resolved, head moved on"
-              else
-                echo "#$n: Devin said \"$headline\"; $open_threads Devin thread(s) still unresolved"
+              elif [[ "$open_threads" =~ ^[0-9]+$ ]]; then
+                echo "#$n: Devin said \"$headline\"; $open_threads Devin thread(s) still unresolved — findings stay open"
+              elif [ "$open_threads" != "n/a" ]; then
+                echo "#$n: Devin said \"$headline\"; cannot prove every Devin thread is resolved ($open_threads) — findings stay open"
               fi
             fi
 
