@@ -48,6 +48,11 @@ that lists issues. What follows from that, for an agent or a person:
 - **Un-draft only when you would merge as-is** (`CLAUDE.md`: "ready for review"
   means "ready to merge") and name a reviewer at un-draft time, so the blocker
   has an owner from the first minute.
+- **Bypass is the exception, with a stated reason.** `internal` members can
+  merge around the queue (`gh pr merge <N> --merge --admin`) for a hotfix, the
+  cut PR, or a PR Devin never re-reviewed and so never approved; required CI
+  still applies. Say why in the merge commit or a comment. Everything else is
+  queued.
 - **The hand-driven merge trains are retired.** CHANGELOG fragments removed
   the collisions the train driver used to resolve; the queue does the rest.
 

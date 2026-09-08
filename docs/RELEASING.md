@@ -76,8 +76,8 @@ a day.
 
 Since 2026-09-07 `main` has a GitHub **merge queue** (ruleset *Merge queue on
 main*: merge-commit method, `ALLGREEN` grouping, up to five entries per group,
-60 min check timeout; the queue ruleset has no bypass actors, so nobody merges
-around it)
+60 min check timeout; the `internal` team can bypass it — see the last bullet
+below for when that is legitimate)
 and its "require branch up to date" rule is off. This is the automated form of the merge train that used to land
 most of `main` as `Train N: #…`; the hand-driven train is retired.
 
@@ -107,6 +107,16 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
   cut is exactly the collision class the cut PR exists to prevent.
   `daily-cut.yml` will not open a second cut PR while one is open (it checks
   for the `release-cut` label first).
+- **Bypassing the queue is the exception, and you say why.** Members of the
+  `internal` team can merge directly (`gh pr merge <N> --merge --admin`, or
+  the "bypass rules" checkbox), which skips the queue and the review rule;
+  classic branch protection still requires `test` and `docker-build` green,
+  so a bypass merge is "not re-tested against current `main`", never
+  "untested". Legitimate reasons: a hotfix, the cut PR (its bot commits can
+  never get the bridge's approval), or a PR Devin never re-reviewed after its
+  last push and so has no approval — Devin re-reviews only some heads. Put the
+  reason in the merge commit or a PR comment. Everything else goes through the
+  queue with `gh pr merge <N> --merge --auto`.
 - **Changing the queue's behaviour** (merge method, group size, timeout) is a
   ruleset edit (`gh api repos/<owner>/<repo>/rulesets/<id>`), not a per-PR
   flag; `--merge` on the `gh` command line only has to be *a* method so `gh`
