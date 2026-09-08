@@ -584,7 +584,7 @@ variable "dev_instances" {
     brand_short  = optional(string, "")
     subtitle     = optional(string, "")
     copyright    = optional(string, "")
-    favicon     = optional(string, "")
+    favicon      = optional(string, "")
     theme_colors = optional(object({
       primary        = optional(string)
       primary_dark   = optional(string)
