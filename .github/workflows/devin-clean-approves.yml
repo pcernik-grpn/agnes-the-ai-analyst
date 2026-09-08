@@ -67,9 +67,13 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # A single-PR dispatch must not wait behind a full scheduled poll (an urgent
-  # dismissal, say); only full runs serialize among themselves.
-  group: devin-clean-approves-${{ inputs.pr || 'all' }}
+  # ONE group for every run, scheduled or dispatched: two runs looking at the
+  # same PR under different groups can interleave (a poll reads a clean
+  # verdict, a dispatch reads a newer issue verdict and finds nothing to
+  # dismiss, then the poll approves — stale approval). Serializing costs a
+  # dispatch at most one poll's runtime (well under a minute); correctness of
+  # the gate is worth that.
+  group: devin-clean-approves
   cancel-in-progress: false
 
 jobs:
@@ -134,7 +138,8 @@ jobs:
           issues_re='found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'
           verdict_re='Devin Review: No Issues Found|found [0-9]+ (new )?potential issue|Devin Review: [0-9]+ security issue'
 
-          printf '%s\n' "$prs" | grep . | while read -r pr; do
+          printf '%s\n' "$prs" | while read -r pr; do
+            [ -n "$pr" ] || continue   # an empty poll is a valid, quiet run — not a failure
             n=$(jq -r '.number' <<<"$pr")
             if [ -n "$ONLY_PR" ] && [ "$n" != "$ONLY_PR" ]; then continue; fi
             author=$(jq -r '.author.login // "?"' <<<"$pr")
