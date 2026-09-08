@@ -30,6 +30,7 @@
   const GRACE_MS = {{ start_grace_seconds }} * 1000;
   const INTERVAL_MS = 2000;
   const ERROR_LIMIT = 5;  // ~10s of a poll that cannot answer at all
+  const REQUEST_TIMEOUT_MS = 5000;
 
   const head = document.getElementById("wake-head");
   const msg = document.getElementById("wake-msg");
@@ -44,8 +45,19 @@
   };
 
   const poll = async () => {
+    // Every request is bounded. Without the abort a stalled connection never
+    // settles, so neither the error count nor the deadline below is ever
+    // reached and the page spins with no reload offered — the exact hole the
+    // bound was added to close (Devin Review on #2336).
+    const ctl = new AbortController();
+    const cancel = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const r = await fetch(READINESS_URL, { credentials: "include" });
+      const r = await fetch(READINESS_URL, { credentials: "include", signal: ctl.signal });
+      // An error response with a JSON body parses perfectly well, so testing
+      // `r.ok` is what keeps `errors` from resetting on it: a repeated 401 or
+      // 5xx would otherwise wait out the whole grace instead of stopping
+      // after ERROR_LIMIT.
+      if (!r.ok) throw new Error("readiness " + r.status);
       const j = await r.json();
       errors = 0;
       if (j.ready) { location.reload(); return; }
@@ -54,6 +66,8 @@
         stop("This page can’t check the app’s status automatically on this deployment. The app was asked to start — reload to see whether it is up.");
         return;
       }
+    } finally {
+      clearTimeout(cancel);
     }
     if (Date.now() - startedAt > GRACE_MS) {
       stop("The app is taking longer than usual to start. Reload to check again.");

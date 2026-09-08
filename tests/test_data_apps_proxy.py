@@ -365,6 +365,101 @@ def test_sleeping_app_returns_holding_page_and_wakes(client_granted, fake_runner
     assert fake_runner.up_calls  # wake fired exactly once
 
 
+def _grace_ms_in(page: str) -> int:
+    """The give-up horizon the holding page was actually handed, in seconds."""
+    import re as _re
+
+    m = _re.search(r"const GRACE_MS = (\d+) \* 1000;", page)
+    assert m, f"holding page carries no GRACE_MS: {page[:300]}"
+    return int(m.group(1))
+
+
+def test_holding_page_hands_a_late_viewer_only_the_remaining_grace(client_granted, fake_runner, monkeypatch):
+    """The server's start grace runs from the deploy; the page's used to run
+    from its own load, so every new viewer restarted the deadline and a late
+    arrival could sit through a second full window (Devin Review on #2336).
+
+    A deploy already most of the way through its window now hands over only
+    what is left of it.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import app.api.data_apps_proxy as proxy_api
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    monkeypatch.setattr(proxy_api, "_START_GRACE_SECONDS", 400)
+    conn = get_system_db()
+    try:
+        repo = DataAppsRepository(conn)
+        app_id = repo.create(slug="late", name="LATE", owner_user_id="owner1")
+        repo.set_state(app_id, "deploying")
+        stale = datetime.now(timezone.utc) - timedelta(seconds=360)
+        conn.execute(
+            "UPDATE data_apps SET updated_at = ?, last_deploy_at = ? WHERE id = ?",
+            [stale, stale, app_id],
+        )
+    finally:
+        conn.close()
+
+    r = client_granted.get("/apps/late/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    remaining = _grace_ms_in(r.text)
+    assert 0 < remaining <= 60, f"expected ~40s left of 400, got {remaining}"
+
+
+def test_holding_page_gives_a_freshly_woken_app_the_whole_grace(client_granted, fake_runner, monkeypatch):
+    """The asymmetry is deliberate: a wake triggered by THIS request starts
+    booting now, so a stale row must not shorten its window — only a deploy
+    already under way gets the remainder.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import app.api.data_apps_proxy as proxy_api
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    monkeypatch.setattr(proxy_api, "_START_GRACE_SECONDS", 400)
+    conn = get_system_db()
+    try:
+        repo = DataAppsRepository(conn)
+        app_id = repo.create(slug="woken", name="WOKEN", owner_user_id="owner1", sleep_mode="recreate")
+        repo.set_state(app_id, "sleeping")
+        stale = datetime.now(timezone.utc) - timedelta(seconds=390)
+        conn.execute(
+            "UPDATE data_apps SET updated_at = ?, last_deploy_at = ? WHERE id = ?",
+            [stale, stale, app_id],
+        )
+    finally:
+        conn.close()
+
+    r = client_granted.get("/apps/woken/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert _grace_ms_in(r.text) == 400
+
+
+def test_holding_page_bounds_each_readiness_request_and_counts_http_errors(
+    client_granted, fake_runner, sleeping_app
+):
+    """Two ways the bound could be escaped, both closed in the page itself:
+    a request that never settles (nothing after the ``await`` ever runs, so
+    neither the error count nor the deadline is reached) and an HTTP error
+    carrying a JSON body (it parses, so the error count used to reset on it).
+
+    Honest about what this is: a PRESENCE check on the rendered page, not a
+    proof of the behaviour. Both live entirely in browser JS, and the suites
+    this file runs in have no JS runtime — the repo's browser harness
+    (Playwright) is a separate opt-in suite needing `playwright install
+    chromium`. So this guards against the abort or the `r.ok` test being
+    deleted, and a real hung-fetch case belongs in that browser suite.
+    """
+    r = client_granted.get(f"/apps/{sleeping_app}/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert "AbortController" in r.text
+    assert "signal: ctl.signal" in r.text
+    assert "if (!r.ok) throw" in r.text
+
+
 def test_holding_page_bounds_its_retry_on_the_servers_own_start_grace(
     client_granted, fake_runner, sleeping_app, monkeypatch
 ):
