@@ -572,6 +572,9 @@ class ChatRepository:
         tokens_out: Optional[int] = None,
         cache_read_tokens: Optional[int] = None,
         cache_creation_tokens: Optional[int] = None,
+        llm_calls: Optional[int] = None,
+        llm_duration_ms: Optional[int] = None,
+        llm_ttfb_ms: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
     ) -> ChatMessage:
@@ -586,12 +589,16 @@ class ChatRepository:
                 tokens_out=tokens_out,
                 cache_read_tokens=cache_read_tokens,
                 cache_creation_tokens=cache_creation_tokens,
+                llm_calls=llm_calls,
+                llm_duration_ms=llm_duration_ms,
+                llm_ttfb_ms=llm_ttfb_ms,
                 model=model,
                 sender_email=sender_email,
             )
-        # DuckDB app-state path: the two prompt-cache columns exist only on
-        # Postgres (migration 0092 — the DuckDB ladder is frozen at
-        # FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step, A3). The
+        # DuckDB app-state path: the two prompt-cache columns (migration
+        # 0092) and the three completion-timing columns (migration 0114)
+        # exist only on Postgres — the DuckDB ladder is frozen at
+        # FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step, A3. The
         # figures are accepted and dropped rather than refused: recording a
         # turn is the caller's actual job here, and losing an accounting
         # detail must not fail a chat. `cost_breakdown` below reports the
@@ -1027,10 +1034,12 @@ class ChatRepository:
         user_email: Optional[str] = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Per-(session, model) token sums for the cost readout.
+        """Per-(session, model) token and completion-timing sums for the
+        cost readout.
 
         Postgres-only: the two prompt-cache columns the readout exists to
-        expose have no DuckDB sibling (migration 0092, A3 freeze). Raises
+        expose have no DuckDB sibling (migration 0092, A3 freeze), and
+        neither do the completion-timing columns (0114). Raises
         ``RequiresPostgresBackend`` on the DuckDB backend so the route
         answers a typed ``501`` rather than serving cache-blind zeros that
         would read as a measured "this workload used no cache".

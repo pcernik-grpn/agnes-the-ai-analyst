@@ -71,6 +71,9 @@ def test_tool_call_dispatch_wrapper_logs_one_row(seeded_app):
         # captured here (not after asyncio.run() returns) because a Task's
         # contextvar copy never propagates back to the caller.
         seen["client_kind"] = audit_context.auto_client_kind()
+        # Long enough that a duration measured around THIS call is clearly
+        # distinguishable from one measured before it started.
+        await asyncio.sleep(0.02)
         return x
 
     wrapped = install_tool_call_audit(mcp, caller_id_fn=lambda: "audit-gap-u1")
@@ -86,6 +89,42 @@ def test_tool_call_dispatch_wrapper_logs_one_row(seeded_app):
     assert set(params.keys()) == {"tool", "args_hash"}
     assert params["tool"] == "echo"
     assert row["client_kind"] == "mcp"
+    # The row is written AFTER the tool ran, with the tool's own wall time —
+    # not the request-start→audit-write autofill, which for a row written
+    # before dispatch measured only the gates and reported a ~100 ms p95 for
+    # tools that take seconds.
+    assert row["result"] == "success"
+    assert row["duration_ms"] is not None and row["duration_ms"] >= 15, row["duration_ms"]
+
+
+def test_tool_call_dispatch_wrapper_times_and_marks_a_failing_tool(seeded_app):
+    """A tool that raises still leaves its row — after the call, with the
+    measured duration and an ``error`` result — and the exception propagates
+    unchanged (the low-level server turns it into the MCP error result)."""
+    from mcp.server.fastmcp import FastMCP
+
+    from app.api.mcp.tools_generator import install_tool_call_audit
+    from src.audit_helpers import classify_result
+    from src.repositories import audit_repo
+
+    mcp = FastMCP("test-dispatch-err", instructions="t")
+
+    @mcp.tool()
+    async def boom(x: int) -> int:
+        await asyncio.sleep(0.02)
+        raise ValueError("no")
+
+    wrapped = install_tool_call_audit(mcp, caller_id_fn=lambda: "audit-gap-u-err")
+    with pytest.raises(Exception):
+        asyncio.run(wrapped("boom", {"x": 1}))
+
+    rows, _ = audit_repo().query(action="mcp.tool_call", user_id="audit-gap-u-err", limit=5)
+    assert len(rows) == 1, "exactly one row per call, raised or not"
+    row = rows[0]
+    assert row["resource"] == "mcp_tool:boom"
+    assert set(_as_dict(row["params"]).keys()) == {"tool", "args_hash"}, "never the raw arguments"
+    assert classify_result(row["result"]) == "error", row["result"]
+    assert row["duration_ms"] is not None and row["duration_ms"] >= 15, row["duration_ms"]
 
 
 def test_tool_call_dispatch_wrapper_skips_unresolved_caller(seeded_app):

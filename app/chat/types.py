@@ -101,6 +101,14 @@ class ChatMessage:
     #: reports as unavailable rather than as zero.
     cache_read_tokens: Optional[int] = None
     cache_creation_tokens: Optional[int] = None
+    #: The turn's LLM latency, summed over its completions by the secret
+    #: broker (app/chat/turn_usage.py): how many completions the turn made,
+    #: their total wall time and their total time-to-first-byte. Postgres
+    #: app-state only (migration 0114), same NULL-means-unrecorded rule as
+    #: the prompt-cache columns above.
+    llm_calls: Optional[int] = None
+    llm_duration_ms: Optional[int] = None
+    llm_ttfb_ms: Optional[int] = None
 
 
 @dataclass

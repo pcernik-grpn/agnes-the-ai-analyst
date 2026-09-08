@@ -38,15 +38,24 @@ def write_audit(
     action: str,
     details: dict[str, Any],
     user_id: str | None = None,
+    duration_ms: int | None = None,
+    result: str | None = None,
 ) -> None:
     """Best-effort insert into audit_log; failure is logged, not raised.
 
     Maps to the existing audit_log schema:
-      user_id  → ``users.id`` resolved from *user_email* (pass ``user_id``
-                 explicitly to skip the lookup); unresolvable emails are
-                 stored as-is rather than dropping the row
-      action   → action
-      params   → details dict
+      user_id     → ``users.id`` resolved from *user_email* (pass ``user_id``
+                    explicitly to skip the lookup); unresolvable emails are
+                    stored as-is rather than dropping the row
+      action      → action
+      params      → details dict
+      duration_ms → the event's own measured wall time, when the caller has
+                    one (``chat.tool_call`` times call→result). Chat frames
+                    arrive outside any HTTP request, so the repository's
+                    request-start autofill has nothing to fall back on and
+                    ``None`` here is stored as NULL — "not measured".
+      result      → ``success`` / ``error…`` per ``src.audit_helpers.
+                    RESULT_CLASS_CASE_SQL``; ``None`` when no verdict exists
 
     Routes through the ``src.repositories`` factory (``audit_repo().log()``)
     so the row lands in whichever backend (DuckDB or Postgres) the
@@ -61,6 +70,8 @@ def write_audit(
             user_id=user_id if user_id is not None else _resolve_user_id(user_email),
             action=action,
             params=details,
+            result=result,
+            duration_ms=duration_ms,
         )
     except Exception:
         logger.exception("audit_log write failed: action=%s", action)

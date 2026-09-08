@@ -144,6 +144,13 @@ class ChatMessage(Base):
     #: schema step) — NULL means "not recorded", never "zero".
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_creation_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: The turn's LLM latency, summed over its completions by the secret
+    #: broker (migration 0114): completion count, total wall time, total
+    #: time-to-first-byte. Same NULL-means-unrecorded rule as the two
+    #: prompt-cache columns above.
+    llm_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    llm_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    llm_ttfb_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     sender_email: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

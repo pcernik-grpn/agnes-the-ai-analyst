@@ -29,7 +29,7 @@ from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
-from app.chat.turn_usage import drain_turn_usage
+from app.chat.turn_usage import drain_turn_timing, drain_turn_usage
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
 from app.chat.workdir import WorkdirManager
 from app.coordination.base import CoordinationUnavailable
@@ -411,6 +411,13 @@ class LiveSession:
     #: retirement and unattended-resolution must broadcast/deliver
     #: question-typed frames, not approval-typed ones.
     pending_questions: dict = field(default_factory=dict)
+    #: ``chat.tool_call`` audit rows waiting for their ``tool_result``, keyed
+    #: by ``tool_use_id`` → ``(perf_counter at the call frame, params)``.
+    #: The row is written when the result arrives so it can carry the
+    #: tool's measured duration (``_audit_tool_call_finished``); whatever is
+    #: still here at turn end / kill / pump exit is written without one
+    #: (``_flush_pending_tool_audits``) so the attempt is never lost.
+    pending_tool_audits: dict[str, tuple[float, dict]] = field(default_factory=dict)
     turn_in_flight: bool = False
     #: Track C7 (@delegation MVP) — depth-1 guard. 0 for an ordinary,
     #: user-driven session; set to 1 by ``ChatManager.handle_delegation``
@@ -893,7 +900,19 @@ class ChatManager:
         the ``usage_turns`` row. ``drain_turn_usage`` never raises; a
         coordination outage leaves the frame untouched and the turn records
         exactly as before this feature existed.
+
+        Completion TIMING (``drain_turn_timing``) is hydrated on its own
+        rule: no frame producer reports it — only the broker, which forwards
+        every completion, can measure a completion's wall time — so it is
+        stamped whenever the counters hold any, even on a frame that carries
+        its own tokens. No double count is possible: nothing else ever
+        writes it.
         """
+        timing = drain_turn_timing(live.chat_id)
+        if timing is not None and frame.get("llm_calls") is None:
+            frame["llm_calls"] = timing["llm_calls"]
+            frame["llm_duration_ms"] = timing["llm_duration_ms"]
+            frame["llm_ttfb_ms"] = timing["llm_ttfb_ms"]
         drained = drain_turn_usage(live.chat_id)
         if drained is None:
             return
@@ -2546,6 +2565,16 @@ class ChatManager:
 
     async def _pump_subprocess_to_ws(self, live: LiveSession) -> None:
         assert live.handle is not None
+        try:
+            await self._pump_frames(live)
+        finally:
+            # The pump leaving — EOF from a dead sandbox, a cancel on
+            # respawn or teardown — means no further tool_result will ever
+            # pair with a call still in flight; record those attempts now.
+            self._flush_pending_tool_audits(live)
+
+    async def _pump_frames(self, live: LiveSession) -> None:
+        assert live.handle is not None
         while True:
             line = await live.handle.stdout.readline()
             if not line:
@@ -2692,6 +2721,9 @@ class ChatManager:
                     tokens_out=frame.get("tokens_out"),
                     cache_read_tokens=frame.get("cache_read_tokens"),
                     cache_creation_tokens=frame.get("cache_creation_tokens"),
+                    llm_calls=frame.get("llm_calls"),
+                    llm_duration_ms=frame.get("llm_duration_ms"),
+                    llm_ttfb_ms=frame.get("llm_ttfb_ms"),
                     model=frame.get("model"),
                 )
                 # Feed the turn's token delta into the shared daily-spend
@@ -2706,6 +2738,7 @@ class ChatManager:
                 # counter above: that counter gates the user's next turn, so
                 # it must never queue behind a telemetry write.
                 self._record_turn_usage(live, frame)
+                self._flush_pending_tool_audits(live)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
                 # Auto-title backstop: the primary trigger is the first
@@ -2719,6 +2752,7 @@ class ChatManager:
                 if not live.auto_title_started:
                     self._retry_auto_title_if_untitled(live)
             elif ftype == "done":
+                self._flush_pending_tool_audits(live)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
                 # #2268: copy this turn's deliverables OUT of the sandbox
@@ -2726,15 +2760,69 @@ class ChatManager:
                 # see _schedule_artifact_harvest.
                 self._schedule_artifact_harvest(live)
             if ftype == "tool_call":
-                write_audit(
-                    user_email=live.user_email,
-                    action="chat.tool_call",
-                    details={
-                        "session_id": live.chat_id,
-                        "tool": frame.get("tool"),
-                        "args_hash": hash_args(frame.get("args", {})),
-                    },
-                )
+                self._audit_tool_call_started(live, frame)
+            elif ftype == "tool_result":
+                self._audit_tool_call_finished(live, frame)
+
+    # ------------------------------------------------------------------
+    # chat.tool_call audit — one row per call, timed call → result
+    # ------------------------------------------------------------------
+
+    def _audit_tool_call_started(self, live: LiveSession, frame: dict) -> None:
+        """Hold a ``tool_call`` frame's audit row until its result arrives.
+
+        The row used to be written right here, before the tool had run, so
+        its ``duration_ms`` was always NULL and the observability KPIs could
+        say nothing about how long chat tools take. Both frame producers
+        (``app/chat/runner.py``, ``app/chat/kai_engine_provider.py``) stamp
+        ``tool_use_id`` on the call AND on its ``tool_result``, so the pair
+        is correlated on it and ``_audit_tool_call_finished`` writes the row
+        with the wall time between the two frames' arrival here — transport
+        and any approval wait included, which is the latency the user
+        actually sat through. A frame with no pairing id cannot be matched
+        to a result and is written at once, exactly as before, rather than
+        given an invented duration. ``params`` is unchanged: identifiers and
+        an argument hash, never the arguments.
+        """
+        details = {
+            "session_id": live.chat_id,
+            "tool": frame.get("tool"),
+            "args_hash": hash_args(frame.get("args", {})),
+        }
+        tool_use_id = str(frame.get("tool_use_id") or "")
+        if not tool_use_id:
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details)
+            return
+        live.pending_tool_audits[tool_use_id] = (time.perf_counter(), details)
+
+    def _audit_tool_call_finished(self, live: LiveSession, frame: dict) -> None:
+        """Write the paired ``chat.tool_call`` row for a ``tool_result``,
+        with the measured duration and the result frame's own verdict."""
+        pending = live.pending_tool_audits.pop(str(frame.get("tool_use_id") or ""), None)
+        if pending is None:
+            return  # no call on record for this result (unpaired producer)
+        started, details = pending
+        write_audit(
+            user_email=live.user_email,
+            action="chat.tool_call",
+            details=details,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            result="error" if frame.get("is_error") else "success",
+        )
+
+    def _flush_pending_tool_audits(self, live: LiveSession) -> None:
+        """Record every call still awaiting a result — without a duration.
+
+        Runs when a turn ends (``assistant_message`` / ``done``), on a forced
+        kill, and when the pump exits: the attempt stays in the trail even
+        when the sandbox died mid-tool, and a NULL duration says honestly
+        that nobody measured one.
+        """
+        if not live.pending_tool_audits:
+            return
+        for _started, details in live.pending_tool_audits.values():
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details)
+        live.pending_tool_audits.clear()
 
     # ------------------------------------------------------------------
     # Turn-end artifact harvest (#2268)
@@ -4330,6 +4418,7 @@ class ChatManager:
             # Teardown is best-effort throughout — a failed partial-save must
             # not abort the rest of the kill (sandbox destroy, lease release).
             logger.exception("partial-save failed for %s", live.chat_id)
+        self._flush_pending_tool_audits(live)
         live.turn_buffer.clear()
         live.turn_in_flight = False
 

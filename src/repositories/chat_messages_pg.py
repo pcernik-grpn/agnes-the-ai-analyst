@@ -56,6 +56,9 @@ class ChatMessagePgRepository:
         tokens_out: Optional[int] = None,
         cache_read_tokens: Optional[int] = None,
         cache_creation_tokens: Optional[int] = None,
+        llm_calls: Optional[int] = None,
+        llm_duration_ms: Optional[int] = None,
+        llm_ttfb_ms: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
     ) -> ChatMessage:
@@ -67,10 +70,12 @@ class ChatMessagePgRepository:
                     "INSERT INTO chat_messages "
                     "(id, session_id, role, content, tool_calls, parts, tokens_in, "
                     "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                    "llm_calls, llm_duration_ms, llm_ttfb_ms, "
                     "model, sender_email, created_at) "
                     "VALUES (:id, :session_id, :role, :content, "
                     "CAST(:tool_calls AS JSONB), CAST(:parts AS JSONB), "
                     ":tokens_in, :tokens_out, :cache_read_tokens, :cache_creation_tokens, "
+                    ":llm_calls, :llm_duration_ms, :llm_ttfb_ms, "
                     ":model, :sender_email, :created_at)"
                 ),
                 {
@@ -84,6 +89,9 @@ class ChatMessagePgRepository:
                     "tokens_out": tokens_out,
                     "cache_read_tokens": cache_read_tokens,
                     "cache_creation_tokens": cache_creation_tokens,
+                    "llm_calls": llm_calls,
+                    "llm_duration_ms": llm_duration_ms,
+                    "llm_ttfb_ms": llm_ttfb_ms,
                     "model": model,
                     "sender_email": sender_email,
                     "created_at": now,
@@ -109,6 +117,9 @@ class ChatMessagePgRepository:
             tokens_out=tokens_out,
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
+            llm_calls=llm_calls,
+            llm_duration_ms=llm_duration_ms,
+            llm_ttfb_ms=llm_ttfb_ms,
             model=model,
             sender_email=sender_email,
             created_at=now,
@@ -125,6 +136,7 @@ class ChatMessagePgRepository:
             sql = (
                 "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                 "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                "llm_calls, llm_duration_ms, llm_ttfb_ms, "
                 "model, sender_email, created_at FROM chat_messages "
                 "WHERE session_id = :session_id"
             )
@@ -147,6 +159,9 @@ class ChatMessagePgRepository:
                 tokens_out=r["tokens_out"],
                 cache_read_tokens=r["cache_read_tokens"],
                 cache_creation_tokens=r["cache_creation_tokens"],
+                llm_calls=r["llm_calls"],
+                llm_duration_ms=r["llm_duration_ms"],
+                llm_ttfb_ms=r["llm_ttfb_ms"],
                 model=r["model"],
                 sender_email=r["sender_email"],
                 created_at=r["created_at"],
@@ -168,6 +183,7 @@ class ChatMessagePgRepository:
                     sa.text(
                         "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                         "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                        "llm_calls, llm_duration_ms, llm_ttfb_ms, "
                         "model, sender_email, created_at FROM chat_messages "
                         "WHERE session_id = :session_id ORDER BY created_at DESC LIMIT :limit"
                     ),
@@ -188,6 +204,9 @@ class ChatMessagePgRepository:
                 tokens_out=r["tokens_out"],
                 cache_read_tokens=r["cache_read_tokens"],
                 cache_creation_tokens=r["cache_creation_tokens"],
+                llm_calls=r["llm_calls"],
+                llm_duration_ms=r["llm_duration_ms"],
+                llm_ttfb_ms=r["llm_ttfb_ms"],
                 model=r["model"],
                 sender_email=r["sender_email"],
                 created_at=r["created_at"],
@@ -279,6 +298,14 @@ class ChatMessagePgRepository:
         USD is deliberately NOT computed here: pricing belongs to
         ``src/llm_pricing.py``, which the caller applies per row using that
         row's own ``model``.
+
+        The same row carries the session's measured LLM latency —
+        ``llm_calls`` / ``llm_duration_ms`` / ``llm_ttfb_ms`` summed over its
+        assistant messages — with ``timing_recorded_messages`` playing the
+        role ``cache_recorded_messages`` plays for the cache figures: a
+        message written before migration 0114, or by a turn whose
+        completions never transited the broker, has no timing, and that is
+        "unknown", not "instant".
         """
         clauses = ["m.role = 'assistant'"]
         params: dict = {"limit": limit}
@@ -300,6 +327,10 @@ class ChatMessagePgRepository:
                         "COALESCE(SUM(m.tokens_out), 0) AS tokens_out, "
                         "COALESCE(SUM(m.cache_read_tokens), 0) AS cache_read_tokens, "
                         "COALESCE(SUM(m.cache_creation_tokens), 0) AS cache_creation_tokens, "
+                        "COUNT(m.llm_duration_ms) AS timing_recorded_messages, "
+                        "COALESCE(SUM(m.llm_calls), 0) AS llm_calls, "
+                        "COALESCE(SUM(m.llm_duration_ms), 0) AS llm_duration_ms, "
+                        "COALESCE(SUM(m.llm_ttfb_ms), 0) AS llm_ttfb_ms, "
                         "MAX(m.created_at) AS last_message_at "
                         "FROM chat_messages m "
                         "JOIN chat_sessions s ON m.session_id = s.id "

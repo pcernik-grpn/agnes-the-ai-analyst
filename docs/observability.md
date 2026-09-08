@@ -153,8 +153,20 @@ Two honesty markers, both load-bearing:
 - **`priced_as`** per row states the four rates used, so any figure here can
   be re-derived rather than taken on trust.
 
-The prompt-cache columns are Postgres-only (`migrations/versions/0092_*`, A3
-freeze), so on the frozen DuckDB app-state backend this route answers a typed
+The same rows carry the session's **measured LLM latency**: `llm_calls`,
+`llm_duration_ms` and `llm_ttfb_ms` are the number of completions the
+session's turns made, their summed wall time (request start → last upstream
+byte) and their summed time-to-first-byte, exactly as the secret broker
+measured each completion on its way through; `avg_completion_ms` /
+`avg_ttfb_ms` are derived per row and for the window. `timing_accounting`
+is the honesty marker for them — a message written before the timing columns
+existed (migration `0114_*`), or by a turn whose completions never transited
+the broker, has no figures, and that is *unknown*, not *instant*. The CLI
+table shows the per-session average as `llm/call`.
+
+The prompt-cache and completion-timing columns are Postgres-only
+(`migrations/versions/0092_*` and `0114_*`, A3 freeze), so on the frozen
+DuckDB app-state backend this route answers a typed
 `501 requires_postgres_backend` rather than serving zeros.
 
 Note the separate, deliberately coarser surface: the daily spend cap

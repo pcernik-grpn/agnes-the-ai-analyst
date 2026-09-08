@@ -470,6 +470,13 @@ def chat_cost(
     zero is not a measurement: rows written before migration 0092 carry no
     cache figures at all, and a "0 cached tokens" that means "unrecorded" is
     exactly the mistake this route exists to stop.
+
+    The same rows carry the session's measured LLM latency — ``llm_calls``,
+    ``llm_duration_ms`` (request start → last upstream byte, summed) and
+    ``llm_ttfb_ms`` (request start → first upstream byte, summed), as the
+    secret broker measured them per completion — with the per-call
+    averages derived here and ``timing_accounting`` playing the same
+    honesty role for them (migration 0114: NULL is unknown, not instant).
     """
     if window not in _CHAT_COST_WINDOWS:
         raise HTTPException(status_code=400, detail=f"window must be one of {sorted(_CHAT_COST_WINDOWS)}")
@@ -494,6 +501,10 @@ def chat_cost(
         "cache_read_tokens": 0,
         "cache_creation_tokens": 0,
         "cost_usd": 0.0,
+        "timing_recorded_messages": 0,
+        "llm_calls": 0,
+        "llm_duration_ms": 0,
+        "llm_ttfb_ms": 0,
     }
     for r in rows:
         row_cost = cost_usd(
@@ -511,6 +522,16 @@ def chat_cost(
             accounting = "partial"
         else:
             accounting = "recorded"
+        timing_recorded = int(r.get("timing_recorded_messages") or 0)
+        llm_calls = int(r.get("llm_calls") or 0)
+        llm_duration_ms = int(r.get("llm_duration_ms") or 0)
+        llm_ttfb_ms = int(r.get("llm_ttfb_ms") or 0)
+        if timing_recorded == 0:
+            timing_accounting = "unavailable"
+        elif timing_recorded < messages:
+            timing_accounting = "partial"
+        else:
+            timing_accounting = "recorded"
         price = resolve_price(r.get("model"))
         sessions.append(
             {
@@ -531,9 +552,20 @@ def chat_cost(
                 "cache_read_tokens": int(r.get("cache_read_tokens") or 0),
                 "cache_creation_tokens": int(r.get("cache_creation_tokens") or 0),
                 "cost_usd": round(row_cost, 6),
+                "timing_recorded_messages": timing_recorded,
+                "timing_accounting": timing_accounting,
+                "llm_calls": llm_calls,
+                "llm_duration_ms": llm_duration_ms,
+                "llm_ttfb_ms": llm_ttfb_ms,
+                "avg_completion_ms": round(llm_duration_ms / llm_calls) if llm_calls else None,
+                "avg_ttfb_ms": round(llm_ttfb_ms / llm_calls) if llm_calls else None,
                 "last_message_at": r.get("last_message_at"),
             }
         )
+        totals["timing_recorded_messages"] += timing_recorded
+        totals["llm_calls"] += llm_calls
+        totals["llm_duration_ms"] += llm_duration_ms
+        totals["llm_ttfb_ms"] += llm_ttfb_ms
         totals["messages"] += messages
         totals["cache_recorded_messages"] += recorded
         totals["input_tokens"] += int(r.get("tokens_in") or 0)
@@ -548,6 +580,9 @@ def chat_cost(
     # A high share is the signal that a per-turn context re-read is cheap —
     # the term a hand-built cost model is most likely to price at 10x.
     totals["cached_input_share"] = round(totals["cache_read_tokens"] / read_input, 4) if read_input else None
+    calls = totals["llm_calls"]
+    totals["avg_completion_ms"] = round(totals["llm_duration_ms"] / calls) if calls else None
+    totals["avg_ttfb_ms"] = round(totals["llm_ttfb_ms"] / calls) if calls else None
 
     notes = []
     if totals["messages"] and totals["cache_recorded_messages"] < totals["messages"]:
@@ -555,6 +590,13 @@ def chat_cost(
             f"{totals['messages'] - totals['cache_recorded_messages']} of {totals['messages']} assistant "
             "messages carry no prompt-cache figures (written before migration 0092). Their cached tokens "
             "are unknown, NOT zero, so cost_usd for those rows is a floor rather than a measurement."
+        )
+    if totals["messages"] and totals["timing_recorded_messages"] < totals["messages"]:
+        notes.append(
+            f"{totals['messages'] - totals['timing_recorded_messages']} of {totals['messages']} assistant "
+            "messages carry no completion timing (written before migration 0114, or by a turn whose "
+            "completions never transited the broker). Their LLM latency is unknown, NOT zero; the "
+            "averages describe only the timed messages."
         )
     if not rows:
         notes.append("No assistant messages in this window.")

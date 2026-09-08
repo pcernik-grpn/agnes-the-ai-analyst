@@ -2387,3 +2387,130 @@ def test_agent_session_feeds_both_ledger_and_turn_counters(
     assert len(llm_usage_repo().list_for_agent(ctx["agent_id"])) == 1
     drained = drain_turn_usage(ctx["session_id"])
     assert drained is not None and drained["input_tokens"] == 11
+
+
+# ---------------------------------------------------------------------------
+# Completion timing: every session-bound 2xx completion records its wall time
+# (request start → stream end) and time-to-first-byte on the session's turn
+# counters (app/chat/turn_usage.py), next to the token usage above. Tokens
+# alone said what a turn cost, never how long the model took — and the
+# observability KPIs had no measured LLM latency at all.
+# ---------------------------------------------------------------------------
+
+
+def test_sse_completion_records_duration_and_ttfb(broker_app, e2e_env, _fresh_turn_counters, monkeypatch):
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_timing
+
+    session_id, tok = _agentless_session_ticket()
+    real_cls = httpx.AsyncClient
+
+    class _SlowSSEClient(_StreamShimMixin):
+        def __init__(self, *a, **k):
+            self._real = real_cls(*a, **k) if "transport" in k else None
+
+        async def __aenter__(self):
+            return await self._real.__aenter__() if self._real else self
+
+        async def __aexit__(self, *a):
+            return await self._real.__aexit__(*a) if self._real else False
+
+        async def send(self, req, stream=False):
+            class _R:
+                status_code = 200
+                headers = {"content-type": "text/event-stream"}
+
+                async def aiter_bytes(self):
+                    await asyncio.sleep(0.03)  # the model "thinking" before its first byte
+                    yield b"event: message_start\n\n"
+                    await asyncio.sleep(0.03)  # ...and streaming after it
+                    yield b"event: message_stop\n\n"
+
+                async def aclose(self):
+                    pass
+
+            return _R()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _SlowSSEClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-sonnet-5", "messages": [], "stream": True},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+    timing = drain_turn_timing(session_id)
+    assert timing is not None, "a streamed completion must leave its timing on the turn counters"
+    assert timing["llm_calls"] == 1
+    # Whole stream: both sleeps. First byte: only the first one.
+    assert timing["llm_duration_ms"] >= 50, timing
+    assert 20 <= timing["llm_ttfb_ms"] < timing["llm_duration_ms"], timing
+
+
+def test_buffered_completion_records_duration_and_ttfb(broker_app, e2e_env, _fresh_turn_counters, monkeypatch):
+    """The non-stream (JSON) completion path records the same two figures;
+    for a buffered reply the first byte is the response head, so ttfb can
+    never exceed the duration."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_timing
+
+    session_id, tok = _agentless_session_ticket()
+    _StubResponseClient.status_code = 200
+    _StubResponseClient.body = _json.dumps(
+        {"id": "m1", "model": "claude-sonnet-5", "usage": {"input_tokens": 1, "output_tokens": 1}}
+    ).encode()
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-sonnet-5", "messages": []},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+    timing = drain_turn_timing(session_id)
+    assert timing is not None
+    assert timing["llm_calls"] == 1
+    assert 0 <= timing["llm_ttfb_ms"] <= timing["llm_duration_ms"]
+
+
+def test_failed_completion_records_no_timing(broker_app, e2e_env, _fresh_turn_counters, monkeypatch):
+    """An upstream error is not a completion: no tokens, no timing — the
+    per-turn LLM latency must describe answers, not refusals."""
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_timing
+
+    session_id, tok = _agentless_session_ticket()
+    _StubResponseClient.status_code = 500
+    _StubResponseClient.body = b'{"error":{"type":"api_error","message":"boom"}}'
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-sonnet-5", "messages": []},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 500
+    assert drain_turn_timing(session_id) is None

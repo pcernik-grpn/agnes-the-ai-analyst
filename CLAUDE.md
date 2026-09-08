@@ -479,7 +479,10 @@ records all four kinds per message (`chat_messages.cache_read_tokens` /
 `cache_creation_tokens`, PG-only, migration `0092`), which is what makes
 `GET /api/admin/telemetry/chat-cost` (`agnes admin usage chat-cost`) a
 measurement rather than a model — see
-[`docs/observability.md`](docs/observability.md) → *Chat cost*. The daily
+[`docs/observability.md`](docs/observability.md) → *Chat cost*. The same
+message row carries the turn's LLM latency as the secret broker measured
+it per completion (`llm_calls` / `llm_duration_ms` / `llm_ttfb_ms`, PG-only,
+migration `0114`), summed per turn through `app/chat/turn_usage.py`. The daily
 spend cap remains deliberately coarser (a two-bucket counter with no model
 attached) and says so.
 
