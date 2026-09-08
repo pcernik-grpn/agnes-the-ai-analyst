@@ -54,7 +54,9 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: devin-clean-approves
+  # A single-PR dispatch must not wait behind a full scheduled poll (an urgent
+  # dismissal, say); only full runs serialize among themselves.
+  group: devin-clean-approves-${{ inputs.pr || 'all' }}
   cancel-in-progress: false
 
 jobs:
@@ -75,27 +77,36 @@ jobs:
           outside=$(gh api --paginate "repos/$REPO/collaborators?affiliation=outside&per_page=100" --jq '.[].login' | sort -u)
           echo "outside collaborators: $(printf '%s' "$outside" | tr '\n' ' ')"
 
-          # One query for every open PR and the reviews the decision needs.
+          # The PR set: one PR when dispatched with a number, else EVERY open PR
+          # (paginated — a list capped at 100 would silently skip the rest).
           # GraphQL logins carry no "[bot]" suffix; __typename tells User from Bot.
-          prs=$(gh api graphql -f owner="$owner" -f name="$name" -f query='
-            query($owner: String!, $name: String!) {
-              repository(owner: $owner, name: $name) {
-                pullRequests(states: OPEN, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                  nodes {
-                    number isDraft headRefOid
-                    author { login __typename }
-                    headRepository { nameWithOwner }
-                    reviews(last: 100) { nodes { databaseId state body author { login __typename } } }
-                  }
-                }
-              }
-            }' --jq '.data.repository.pullRequests.nodes')
+          # `reviews(last: 100)` is only used to find Devin's LATEST verdict, which
+          # is by construction among the newest reviews; the workflow's own
+          # approval is looked up separately with full REST pagination below.
+          fields='number isDraft headRefOid author { login __typename } headRepository { nameWithOwner }
+                  reviews(last: 100) { nodes { body author { login } } }'
+          # One compact JSON object per line (`@json`); `gh api --jq` prints strings raw.
+          if [ -n "$ONLY_PR" ]; then
+            prs=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$ONLY_PR" -f query="
+              query(\$owner: String!, \$name: String!, \$number: Int!) {
+                repository(owner: \$owner, name: \$name) { pullRequest(number: \$number) { state $fields } } }" \
+              --jq '.data.repository.pullRequest | select(.state == "OPEN") | @json')
+          else
+            prs=$(gh api graphql --paginate -f owner="$owner" -f name="$name" -f query="
+              query(\$owner: String!, \$name: String!, \$endCursor: String) {
+                repository(owner: \$owner, name: \$name) {
+                  pullRequests(states: OPEN, first: 100, after: \$endCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes { $fields } } } }" \
+              --jq '.data.repository.pullRequests.nodes[] | @json')
+          fi
+          echo "open PRs considered: $(printf '%s\n' "$prs" | grep -c . || true)"
 
           clean_re='Devin Review: No Issues Found|found 0 (new )?potential issues'
           issues_re='found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'
           verdict_re='Devin Review: No Issues Found|found [0-9]+ (new )?potential issue|Devin Review: [0-9]+ security issue'
 
-          jq -c '.[]' <<<"$prs" | while read -r pr; do
+          printf '%s\n' "$prs" | grep . | while read -r pr; do
             n=$(jq -r '.number' <<<"$pr")
             if [ -n "$ONLY_PR" ] && [ "$n" != "$ONLY_PR" ]; then continue; fi
             author=$(jq -r '.author.login // "?"' <<<"$pr")
@@ -115,7 +126,11 @@ jobs:
                 | select(.author.login == "devin-ai-integration") | .body // ""
                 | select(test("This report is out of date") | not)
                 | select(test($re))] | last // ""' <<<"$pr")
-            ours=$(jq -r '[.reviews.nodes[] | select(.author.login == "github-actions" and .state == "APPROVED") | .databaseId] | last // ""' <<<"$pr")
+            # Our own active approval, over ALL reviews (REST, paginated): an old
+            # approval must never hide behind 100 newer reviews and outlive a
+            # later issue verdict.
+            ours=$(gh api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" \
+                     --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id' | tail -1)
             headline=$(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)
 
             if printf '%s' "$verdict" | grep -Eq "$issues_re"; then
