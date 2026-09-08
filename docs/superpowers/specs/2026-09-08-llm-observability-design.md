@@ -16,7 +16,13 @@ Agnes cannot answer three questions about its own model usage in one place:
 2. **What did it cost?** Per instance, per agent, per user, per *kind of
    work* (chat vs. builder vs. extraction vs. corporate memory).
 3. **Why was an answer bad?** And its cousins: why did an agent's memory
-   notebook store nonsense, why did a builder propose the wrong skill.
+   notebook store nonsense, why did a builder propose the wrong skill, why
+   did document extraction pull the wrong facts.
+
+A fourth need sits next to the three questions and must not be confused
+with them: the team's quality work needs a **queryable corpus of whole
+conversations** to run an evaluation pipeline over. That is a dataset, not
+telemetry — section 3.12.
 
 Everything needed exists in fragments (verified against the code on
 2026-09-08):
@@ -71,6 +77,10 @@ Everything needed exists in fragments (verified against the code on
   (`otlp_proxy`) forwards those batches byte-for-byte — so once the engine's
   relay scope is enabled, content leaves the instance regardless of the Agnes
   flag.
+- The broker mirrors a streamed completion into an 8 MiB buffer
+  (`_SSE_USAGE_COLLECT_MAX_BYTES`) to parse usage after the stream ends; on
+  overflow it records **no usage** and the span gets `usage=None`. The most
+  expensive completions are exactly the ones that fall out of every ledger.
 - `agnes.user_email` rides every completion span. It is personal data with
   no join value off-instance (`agnes.user_id` is the stable key), and
   fetching it is the only reason the broker reads the session row for the
@@ -93,7 +103,12 @@ Everything needed exists in fragments (verified against the code on
   builder patches) linked to the same turn.
 - One content policy that names **placement** (where content may go) and
   **consent** (who approved it, on what basis) separately, and that governs
-  every export path including the engine's relay.
+  every export path including the engine's relay — and can say so per
+  workload, because a chat transcript and a builder prompt are not the same
+  class of content.
+- A conversation corpus export — complete conversations, one record each,
+  in the shape an evaluation pipeline consumes — as its own surface, pulled
+  or pushed, under the same policy.
 
 **Non-goals**
 
@@ -173,6 +188,20 @@ Pricing is `src/llm_pricing.cost_usd` at write time, with `priced_as`
 stored beside the figure so any row can be re-derived. An unknown model
 prices at `DEFAULT_PRICE` exactly as every other surface does, and the
 `priced_as` rates say so.
+
+**Usage survives an oversized stream.** Anthropic puts usage in
+`message_start` (the first bytes) and `message_delta` (the last bytes), so
+the broker keeps a bounded head buffer (first 64 KiB) and a rolling tail
+buffer (last 64 KiB) regardless of body size, and when the full 8 MiB mirror
+overflows it parses usage from head + tail. Tokens, cost, model and stop
+reason are then always recorded; only the content summary is truncated,
+flagged as `agnes.response_truncated` on the span and `response_truncated`
+on the row. `parse_usage` already scans exactly those two events.
+
+**One write path.** `llm_calls` is the single place that says "an LLM call
+happened". `llm_usage` (agent budgets) and `usage_turns` (per-turn tokens)
+keep their readers as projections until folded; nothing new writes to
+`llm_usage`, and the connector layer writes to `llm_calls` only.
 
 ### 3.2 Turn structure without engine propagation
 
@@ -285,6 +314,13 @@ and `source_message_id`; `remember` fills them from
 audit row carries `turn_id`. The DuckDB sibling accepts and drops them
 (the same pattern as `chat_messages` cache columns).
 
+**Extraction provenance.** "Why did extraction pull the wrong facts" is
+answered by the `llm_calls` rows with `workload=extraction`,
+`purpose=facts_extraction|facts_retry|facts_batch`, `subject_id=<document
+id>` and `job_id=<ingest run>`, joined to `facts_ingest_runs` — one row per
+document call, so a wrong fact traces to the call, its model, its cost and,
+under policy, its prompt.
+
 **Builder provenance.** The five builder turns set the context (3.3), so
 their `llm_calls` rows say which builder, for which subject, by whom. The
 prompt and the reply are content and follow the content policy: generation
@@ -320,7 +356,25 @@ observability:
     basis: ""            # free text: contract clause, DPA reference, "internal dev instance"
     approved_by: ""      # a person, never blank unless off
     approved_at: ""      # ISO date
+    workloads: []        # allowlist; empty = every workload when mode != off
 ```
+
+**Content classes differ by workload**, and the policy can say so:
+
+| workload | the prompt is | the completion is |
+|---|---|---|
+| `chat` / `agent_api` | the customer's conversation and data | the customer's conversation |
+| `extraction` (facts, OCR, vision, NER) | the customer's document | a derived artifact (facts, proposals) |
+| `builder` | an admin-authored draft plus candidate ids | a config patch |
+| `corporate_memory` / `knowledge` / `semantic_layer` | employee notes, catalog text | derived notes |
+
+`workloads` is an allowlist of workloads whose content may leave the
+instance; empty means all of them when `mode` is not `off`. An operator may
+export builder and corporate-memory content for quality work while keeping
+chat at `off`. Every producer passes its own workload to
+`capture_content_enabled(workload=...)`; the engine relay is workload
+`chat` by definition. The decision stays the operator's — the mechanism
+only makes an asymmetric decision expressible.
 
 Rules, enforced in `src/observability/otel.py`:
 
@@ -359,6 +413,14 @@ are rewritten, under `full` forwarded. Metrics are always forwarded. A
 gzip-encoded batch is decompressed for processing and re-sent
 uncompressed; an undecodable batch is refused with `400
 otlp_batch_undecodable` rather than forwarded blind.
+
+**Cross-instance views.** A fleet-wide view assumes several instances
+export to one collector. For a source-available product that is an
+operator's choice per instance — the OTLP endpoint and the conversation
+export endpoint (3.12) are per-instance settings — never a default. A
+customer instance may point both at the customer's own collector or data
+platform; a vendor-run collector is placement `third_party` from the
+customer's side, and the policy record has to say so.
 
 **Identity minimisation.** `agnes.user_email` is removed from completion
 spans; `agnes.user_id` stays. The broker no longer reads the session row
@@ -470,6 +532,80 @@ A deployment that relied on `AGNES_OTEL_CAPTURE_CONTENT=1` must add the
 policy record to keep exporting content; the changelog and
 `docs/observability.md` say exactly that.
 
+Two later steps:
+
+6. Usage recovery for oversized streams (head + tail buffers) — touches the
+   broker after step 3 has landed there.
+7. Conversation corpus export (3.12): the pull endpoint, CLI and docs first
+   — the evaluation work is waiting on it — the push sink second. Depends on
+   step 5 (feedback and memory provenance feed the record).
+
+### 3.12 Conversation corpus export
+
+Telemetry and an evaluation corpus are different products:
+
+| | telemetry (3.1–3.6) | evaluation corpus |
+|---|---|---|
+| shape | one span / row per LLM call | one record per conversation |
+| completeness | content capped at `MAX_CONTENT_CHARS`, truncation flagged | complete, never truncated |
+| purpose | what it cost, where it burns, per-turn debugging | why answers are bad, at scale |
+
+Content on span events (3.5, 3.6) stays for per-turn debugging. The corpus
+is its own surface, built on-instance from what the instance already keeps.
+
+**Shape.** One record per chat session, every surface (web, Slack, Telegram,
+agent API), assembled from `chat_messages` (content and `parts` with tool
+arguments and results), `chat_sessions`, `llm_calls`,
+`chat_message_feedback` and `agent_memories` provenance. Field names follow
+the conversation-level fact shape an OTel-analysis pipeline already
+consumes, so an evaluation job can point at this export without remapping:
+
+| field | source |
+|---|---|
+| `thread_id` | `chat_sessions.id` |
+| `source` | literal `agnes` |
+| `surface`, `agent_id`, `user_id` | the session — **never the email** |
+| `deployment_environment` | the instance label the logs and spans carry |
+| `conversation_start`, `conversation_end`, `duration_seconds` | first and last message timestamps |
+| `turn_count`, `message_count`, `tool_call_count`, `tool_calls_sequence` | derived from messages and parts |
+| `llm_run_count`, `total_prompt_tokens`, `total_completion_tokens`, `llm_cache_read_tokens`, `llm_cache_creation_tokens`, `total_cost`, `primary_model`, `provider` | summed from the session's `llm_calls` rows; fallback to `chat_messages` token columns with `cost_status` naming which |
+| `messages_json` | `[{role, content, turn_id, created_at, parts}]` — complete, tool_use and tool_result blocks included, in order |
+| `tool_calls_json` | `[{turn_id, tool_name, input, output, is_error, started_at}]` |
+| `first_user_message`, `last_message_role`, `final_assistant_message_complete` | derived |
+| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames |
+| `feedback_json` | `[{turn_id, user_id, verdict, comment, created_at}]` |
+| `memory_writes_json` | `[{memory_id, turn_id, status, content_length}]` |
+| `content_mode` | `full` or `pseudonymized` — what this record's text went through |
+| `exported_at` | |
+
+**Delivery, pull (first).**
+`GET /api/admin/conversations/export?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+— admin-only, newline-delimited JSON by default, keyset cursor on
+`(conversation_end, thread_id)`, `limit` at most 500, Postgres-only (typed
+`501` on the frozen DuckDB backend). CLI
+`agnes admin conversations export --since … --until … --out <file>` mirrors
+it (`--json` for an array). Audit action `conversations.export` (read;
+params: window, count, `content_mode`, `placement` — never content). A data
+platform pulls it with a generic HTTP extractor and a personal access
+token; the integration is deliberately transport-neutral.
+
+**Delivery, push (second).** `observability.conversation_export` in
+`instance.yaml`: `{endpoint, headers_secret_env, interval_minutes,
+surfaces}`. A worker job kind `conversation-export` posts the records
+completed since a Postgres-persisted watermark to `endpoint` as
+newline-delimited JSON with the headers read from the named environment
+variable, in batches of at most 200 records or 8 MiB, retried with backoff,
+the watermark advanced only after a 2xx. Same audit action, `delivery=push`.
+
+**Under the content policy.** Both deliveries refuse with
+`403 content_export_disabled` when `observability.content_export.mode` is
+`off`, has no basis or approver, or excludes workload `chat`.
+`pseudonymized` runs `messages_json`, `tool_calls_json` and
+`first_user_message` through the instance anonymizer **once, at export
+time** — never per span; `full` exports verbatim. `content_mode` on every
+record says which. No new retention: the export reads what `chat_messages`
+keeps.
+
 ## 4. Decisions taken (and why)
 
 - **New `llm_calls` table rather than widening `llm_usage`.** `llm_usage`
@@ -494,3 +630,11 @@ policy record to keep exporting content; the changelog and
   new retention surface for admin-authored content; the export answers the
   question where a collector exists, and the decision to store can be
   taken later with evidence.
+- **The evaluation corpus is not the span content.** Spans cap content and
+  carry it beside telemetry; an evaluation needs whole conversations as
+  clean records. The corpus export reads the transcript the instance
+  already keeps and applies anonymisation once, at export, on one dataset
+  under one recorded agreement.
+- **Pull before push.** A pull endpoint plus a token is enough for any data
+  platform to ingest, needs no scheduler, no watermark and no outbound
+  credential, and can ship first; the push sink is the convenience layer.

@@ -23,7 +23,7 @@
 - **Design system:** the admin page section uses `--ds-*` tokens, no raw hex, no `var(--primary)`; the page already extends `base_admin_page.html`.
 - **Command-UX standard** for the new CLI commands: `--limit`, `--json`; no new boolean scope flag; a "nothing found" answer says what to do next.
 - **Tests:** builders run ONLY their own test files plus the specific guards named in their task. Never a lane, never the full suite (one host, many parallel builders). The integrator runs `--lane impacted` once; CI runs everything on the push.
-- **Worktree hygiene:** a builder in an isolated worktree must NOT create a venv; run `ln -sfn /Users/zdeneksrotyr/Sources/VsCode/component_factory/tmp_oss/.venv .venv` first and use `.venv/bin/pytest`.
+- **Worktree hygiene:** a builder in an isolated worktree must NOT create a venv; symlink the main checkout's `.venv` into the worktree first (`ln -sfn <main-checkout>/.venv .venv`) and use `.venv/bin/pytest`.
 - **Postgres tests** (`tests/db_pg/`) run locally through the bundled `pixeltable_pgserver` (default `AGNES_TEST_PG_BACKEND=pgserver`); they are slow to boot (one shared server per run) — run them once per task, not per edit.
 - Spec vocabulary, verbatim: workloads `chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`, `knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`, `auto_title`, `readiness`, `store_guardrails`, `verification`; content modes `off | pseudonymized | full`; placements `operator | third_party`; coordination key `chat:turn:{session_id}` with a 24 h TTL; span names `agnes.chat.turn`, `agnes.chat.tool <tool>`, `agnes.chat.feedback`; span event `agnes.feedback`; audit actions `chat.feedback`, `observability.content_export`; migration `0113_llm_observability`; config keys `observability.content_export.{mode,placement,basis,approved_by,approved_at}` and `retention.llm_calls_days`.
 
@@ -3229,3 +3229,93 @@ git commit -m "docs: LLM observability — call ledger, turn traces, content pol
 | 3.9 invariants | every producer/sink wrapped; 501 typed; relay fails closed |
 | 3.10 tests | per task; coverage guard in 3; policy table in 5; protobuf incl. gzip in 5; OpenAPI + `KNOWN_UNTESTED` in 7/8/9 |
 | 3.11 order | Tasks 1–5 no schema, 6 the migration, 7–8 after it |
+
+---
+
+## Addendum (2026-09-08, after Tasks 1–2 merged): spec sections 3.12, the 8 MiB usage hole, per-workload content classes
+
+Spec delta landed in the same commit as this addendum. Three new tasks and one
+follow-up; the orchestrator sequences them as noted. Global constraints above
+apply unchanged.
+
+### Task 2b: Usage survives an oversized stream (head + tail buffers)
+
+**When:** after Task 4 has merged (both touch the broker's SSE `finally`).
+
+**Files:**
+- Modify: `app/api/broker.py` (the SSE mirror: `_SSE_USAGE_COLLECT_MAX_BYTES`, the `collected`/`state["overflow"]` block in `_passthrough`, and the `usage = None if state["overflow"] …` line)
+- Modify: `app/api/broker_agent_policy.py` (`parse_usage` gains `parse_usage_from_edges(head: bytes, tail: bytes, content_type) -> dict | None`)
+- Modify: `src/observability/llm_record.py` (`response_truncated: bool | None` on the record and row) — only if not already present
+- Test: `tests/test_broker_llm_calls.py`, `tests/test_otel_export.py`
+
+**Interfaces:**
+- `_SSE_EDGE_BYTES = 64 * 1024`. The mirror keeps `head` (first 64 KiB, append-only until full) and `tail` (a `collections.deque` of chunks trimmed to the last 64 KiB) for EVERY streamed completion, in addition to the existing capped full mirror.
+- On overflow: `usage = parse_usage_from_edges(bytes(head), b"".join(tail), ctype)`; the record/span get `usage` as normal, `response_truncated=True`, `stream_complete` from the tail's `message_delta` (`stop_reason` present). Content summary (`describe_completion`) runs on the head only and is flagged truncated. No overflow: behaviour unchanged.
+- `parse_usage_from_edges` scans `message_start` in `head` and `message_delta` in `tail` with the same event parser `parse_usage` uses; a `message_start` missing from the head (pathological) yields `None` for input tokens but still returns output tokens/model from the tail.
+
+- [ ] **Step 1: Failing tests** — a 9 MiB synthetic SSE body (one `message_start` with usage, many `content_block_delta`, a final `message_delta` with `stop_reason` + `output_tokens`): the span carries all four token kinds, `gen_ai.response.finish_reasons`, `agnes.response_truncated=True`, `agnes.cost_usd > 0`; the `llm_calls` row is written with the same numbers; a second test with the body under the cap asserts nothing changed.
+- [ ] **Step 2: Implement** the edge buffers and `parse_usage_from_edges`; keep the existing warning log for the overflow but downgrade its wording ("usage recovered from stream edges; content summary truncated").
+- [ ] **Step 3: Run** `tests/test_broker_llm_calls.py tests/test_otel_export.py tests/test_broker_agent_policy.py`; commit `broker: recover usage from stream edges when the mirror overflows`.
+
+### Task 5b: Per-workload content classes (`workloads` allowlist)
+
+**When:** after Task 5 has merged. Small.
+
+**Files:**
+- Modify: `src/observability/content_policy.py` (`workloads: tuple[str, ...]` on the record; `content_export_mode(workload: str | None = None)` returns `off` when the allowlist is non-empty and excludes `workload`), `src/observability/otel.py` (`capture_content_enabled(workload=None)`; the completion/generation event emission passes the record's workload), `src/observability/llm_tracing.py` (passes `purpose`'s workload), `app/api/broker.py` (`otlp_proxy` evaluates the policy for workload `chat`), `config/instance.yaml.example` (`workloads: []` line + the content-class table as comments), `docs/observability.md` (the policy section: the table from spec 3.6)
+- Test: `tests/test_content_policy.py` (policy table gains the workload dimension), `tests/test_otel_export.py`, `tests/test_broker_otlp.py`
+
+- [ ] **Step 1: Failing tests** — `mode: full, workloads: [builder]`: a broker completion span (workload `chat`) carries NO content events, a builder generation span does; the relay strips for `chat`. Empty `workloads` = every workload.
+- [ ] **Step 2: Implement**; `announce_policy()` logs the allowlist. Commit `observability: content policy can allow content per workload`.
+
+### Task 10: Conversation corpus export — pull endpoint, CLI, docs (spec 3.12)
+
+**When:** after Task 6 (migration) has merged — the record reads `chat_message_feedback`, `agent_memories.source_turn_id`, `chat_messages.turn_id`, `llm_calls`. Urgent: build it right after 6, in parallel with 7 and 8 (disjoint files; append-only shared lists).
+
+**Files:**
+- Create: `src/conversation_export.py` — `build_conversation_record(session, messages, calls, feedback, memories, *, content_mode, anonymizer) -> dict`, `iter_conversations(repo_bundle, *, since, until, surface, agent_id, limit, cursor) -> (records, next_cursor)`, `serialize_jsonl(records) -> Iterator[bytes]`
+- Create: `app/api/conversations_export.py` — router `GET /api/admin/conversations/export` (admin gate, PG-only repos resolved as dependencies → typed 501, policy check → `403 content_export_disabled` with `{"error": "content_export_disabled", "reason": "mode_off|no_basis|workload_excluded"}`, `StreamingResponse` for jsonl, JSON array for `format=json`, `X-Next-Cursor` header + `next_cursor` in JSON), registered in `app/main.py` next to the other admin routers
+- Create: `cli/commands/admin_conversations.py` — `agnes admin conversations export --since --until --surface --agent-id --limit --out <file> [--json]`; streams pages through the cursor until exhausted; "nothing found" answers name the window and the policy state; wired into `cli/commands/admin.py` (or wherever `admin usage` is registered)
+- Modify: `src/repositories/chat_sessions_pg.py` (`list_completed_between(since, until, *, surface, agent_id, limit, after: tuple[datetime, str] | None)` keyset on `(last_message_at, id)`), `src/repositories/chat_messages_pg.py` (`list_for_sessions(session_ids) -> dict[str, list[ChatMessage]]`), `src/repositories/llm_calls_pg.py` (`totals_for_sessions(session_ids) -> dict[str, dict]`, `statuses_for_sessions`), `src/repositories/chat_message_feedback_pg.py` (`list_for_sessions`), `src/repositories/agent_memories_pg.py` (`list_for_sessions`)
+- Modify (append-only): `src/audit_posture.py` (`READ_POSTURE["GET /api/admin/conversations/export"] = "conversations.export"`), `src/audit_events.py` (`conversations.export`, kind `read`, "A conversation corpus export was read."), `tests/test_documentation_api_triple_surface.py` (`_EXEMPT` — CLI-covered), `docs/api-reference.md`, `tests/db_pg/test_endpoints_smoke.py` `KNOWN_UNTESTED`, `docs/observability.md` (new section "Conversation corpus export — for evaluation, under the content policy": shape table from spec 3.12, the policy gate, the pull example with a PAT, `content_mode`, the note that emails never appear)
+- Test: `tests/db_pg/test_conversation_export_pg.py` (new; PG), `tests/test_conversation_export.py` (new; pure record builder), `tests/test_cli_admin_conversations.py` (new)
+
+**Interfaces / rules:**
+- A conversation is "completed" for the window when `chat_sessions.last_message_at` (or the last message's `created_at`) falls in `[since, until)`; default `until=now`, `since` required (400 when absent).
+- `messages_json` items: `{"role", "content", "turn_id", "created_at", "parts": [...]}` — `parts` verbatim from `chat_messages.parts` (tool_use/tool_result with `args`/`result`), `content` the message text; `tool_calls_json` flattened from `parts` in message order with `started_at = message.created_at`.
+- `content_mode`: `full` → verbatim; `pseudonymized` → `src.anonymization.anonymize_markdown` (instance key, `rules_from_config()`) applied ONCE to `messages_json` (each `content`, each tool `args`/`result` string leaf), `tool_calls_json` and `first_user_message`; never to ids or timestamps.
+- `user_id` only; the record never carries an email (`sender_email` is dropped; a test asserts `"@"` does not appear in any `user_id` field and that `sender_email` is absent).
+- Totals from `llm_calls` when at least one row exists for the session (`cost_status="ledger"`), else from `chat_messages` token columns priced with `src.llm_pricing.cost_usd` per message model (`cost_status="transcript"`), else `cost_status="unavailable"` with zeros — never a silent zero.
+- Audit one row per request: `conversations.export` with `{since, until, surface, agent_id, count, content_mode, placement, delivery: "pull"}`.
+- Policy evaluation uses `content_export_mode(workload="chat")` (Task 5b) — if 5b has not merged, use the global mode.
+
+- [ ] **Step 1: Failing tests** — record builder (shape, ordering, tool_calls flattening, feedback/memory joins, pseudonymised leaves, no email, `cost_status` three ways); PG endpoint (admin gate 403 for non-admin, 501 on DuckDB via the parity sweep exemption, 403 `content_export_disabled` when policy off, jsonl streaming with cursor pagination across 3 pages of `limit=2`, `format=json`); CLI (`--out` file written, pages followed, `--json`).
+- [ ] **Step 2: Implement** the repo helpers (keyset, bulk-by-session-ids, no N+1), the record builder, the router, the CLI.
+- [ ] **Step 3: Bookkeeping** — posture, catalog, triple-surface exemption, api-reference, `KNOWN_UNTESTED`, docs section; the integrator regenerates the OpenAPI snapshot.
+- [ ] **Step 4: Run** the three test files + `tests/test_audit_read_posture.py tests/test_audit_catalog.py tests/test_documentation_api_triple_surface.py`; commit `conversations: corpus export endpoint and CLI under the content policy`.
+
+### Task 11: Conversation corpus export — push sink (spec 3.12, optional, last)
+
+**When:** after Task 10 and Task 9; only if time remains before the PR leaves draft — otherwise leave a `TODO` in `docs/observability.md` naming this task.
+
+**Files:**
+- Create: `app/worker/kinds_conversation_export.py` (or extend `app/worker/kinds.py`): job kind `conversation-export`, LIGHT lane, idempotency key `conversation-export:<instance>`; reads the watermark, calls `iter_conversations`, POSTs newline-delimited JSON batches (≤ 200 records / ≤ 8 MiB) with headers from `os.environ[headers_secret_env]` parsed like `OTEL_EXPORTER_OTLP_HEADERS`, retries 3× with backoff on 5xx/connection errors, advances the watermark only after 2xx, audits `conversations.export` with `delivery: "push"`, `count`, `endpoint_host` (never headers)
+- Create: migration `0114_export_watermarks.py` — table `export_watermarks (name text pk, watermark timestamptz, updated_at timestamptz)`; model; PG-only repo `export_watermarks_pg.py`; registry entry
+- Modify: `services/scheduler/__main__.py` (an interval tick that enqueues the job when `observability.conversation_export.endpoint` is set; `interval_minutes` default 60), `config/instance.yaml.example` (`observability.conversation_export` block), `app/instance_config.py` (typed reader), `docs/observability.md`
+- Test: `tests/db_pg/test_conversation_export_push_pg.py` (fake HTTP server via `httpx.MockTransport`; watermark advances only on 2xx; a 500 leaves it; batches split at 200), `tests/test_scheduler_conversation_export_tick.py`
+
+- [ ] **Step 1: Failing tests**; **Step 2: implement**; **Step 3: docs**; commit `conversations: scheduled push of the corpus export`.
+
+### File map additions
+
+| File | Task | Responsibility |
+|---|---|---|
+| `app/api/broker.py` (SSE mirror edges), `app/api/broker_agent_policy.py` (`parse_usage_from_edges`) | 2b | usage survives an oversized stream |
+| `src/observability/content_policy.py` (`workloads`), producers pass workload | 5b | per-workload content classes |
+| `src/conversation_export.py`, `app/api/conversations_export.py`, `cli/commands/admin_conversations.py` (new); repo read helpers | 10 | corpus export, pull |
+| `app/worker/kinds_conversation_export.py`, `migrations/versions/0114_export_watermarks.py`, `src/repositories/export_watermarks_pg.py` (new) | 11 | corpus export, push |
+
+### Execution-notes additions
+
+- Order: 3, 4, 5 (running) → integrate → **2b and 5b** in parallel (2b touches the broker's SSE path, 5b touches `content_policy.py`/`otel.py` event gating — disjoint) → 6 (migration) → **7, 8, 10** in parallel → 9 (integrator; the CHANGELOG fragment gains the corpus-export bullet and the `workloads` line) → 11 if time remains.
+- The self-review table gains rows: 3.1 usage survives an oversized stream → 2b; 3.6 `workloads` allowlist + content-class table → 5b; 3.12 pull → 10; 3.12 push → 11; 3.5 extraction provenance → 3 (`subject_id`, `job_id` already required there).
