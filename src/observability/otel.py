@@ -50,6 +50,7 @@ import logging
 import os
 import socket
 import threading
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, Mapping, Optional
@@ -450,6 +451,71 @@ def set_usage_attributes(span: Any, usage: Optional[Mapping[str, Any]]) -> None:
         span.set_attribute("gen_ai.response.model", str(model))
 
 
+@dataclass
+class CompletionSummary:
+    """What one completion's request and response say about themselves —
+    the parse both sinks need, done once.
+
+    The span sets its attributes from this and the ledger row copies the
+    same figures, so a row and a span can never disagree about the model,
+    the stop reason or the sizes. Text (``prompt_json`` /
+    ``completion_json``) is carried for the content EVENTS only; it is
+    never written to an attribute and never leaves the process unless
+    content capture is on.
+    """
+
+    model: Optional[str] = None
+    stop_reason: Optional[str] = None
+    prompt_chars: Optional[int] = None
+    completion_chars: Optional[int] = None
+    prompt_json: Optional[str] = None
+    completion_json: Optional[str] = None
+    stream_complete: Optional[bool] = None
+    response_bytes: Optional[int] = None
+
+
+def describe_completion(
+    *,
+    request_body: Optional[bytes],
+    response_body: Optional[bytes],
+    content_type: str,
+    response_truncated: bool = False,
+) -> CompletionSummary:
+    """Parse one completion exchange into a :class:`CompletionSummary`.
+
+    Pure and total: a malformed body, a half-written stream or a body far
+    past the mirror cap yields a summary with fewer fields set, never an
+    exception — the response has already been (or is being) delivered.
+    """
+    out = CompletionSummary()
+    try:
+        if response_body is not None:
+            # A completion the client walked away from (or that never got
+            # past the headers) leaves an empty or partial body: no usage,
+            # no answer. Say so, so an analysis can tell a turn the model
+            # never finished from one it did — the two look the same
+            # otherwise, and a burst of them is a broken engine, not a gap
+            # in the export.
+            out.response_bytes = len(response_body)
+        if response_body is not None and not response_truncated:
+            summary = summarize_completion(response_body, content_type)
+            out.model = summary.get("model")
+            out.stop_reason = summary.get("stop_reason")
+            if "text/event-stream" in (content_type or "").lower():
+                out.stream_complete = bool(summary.get("stop_reason"))
+            if summary.get("blocks") is not None:
+                out.completion_json = json.dumps(
+                    [{"role": "assistant", "parts": _parts_from_content(summary["blocks"])}], ensure_ascii=False
+                )
+                out.completion_chars = len(out.completion_json)
+        if request_body is not None:
+            out.prompt_json = json.dumps(input_messages_from_request(request_body), ensure_ascii=False)
+            out.prompt_chars = len(out.prompt_json)
+    except Exception:  # noqa: BLE001 - see the module docstring
+        logger.debug("otel: could not describe the completion", exc_info=True)
+    return out
+
+
 def end_completion_span(  # noqa: C901
     span: Any,
     *,
@@ -461,56 +527,55 @@ def end_completion_span(  # noqa: C901
     error: Optional[BaseException] = None,
     response_truncated: bool = False,
     cost_usd: Optional[float] = None,
+    summary: Optional[CompletionSummary] = None,
 ) -> None:
     """Finish a completion span with whatever the forward produced. Never
-    raises — the response has already been (or is being) delivered."""
+    raises — the response has already been (or is being) delivered.
+
+    ``summary`` is the parse the caller already did (the broker describes
+    the exchange once and builds its ledger row from the same object); when
+    it is absent the parse happens here — but only after the non-recording
+    early return, so an instance with export off still pays nothing.
+    """
     try:
         if not span.is_recording():
             return
+        described = summary or describe_completion(
+            request_body=request_body,
+            response_body=response_body,
+            content_type=content_type,
+            response_truncated=response_truncated,
+        )
         if status_code is not None:
             span.set_attribute("http.response.status_code", int(status_code))
         set_usage_attributes(span, usage)
         _set_cost(span, cost_usd)
-        summary: dict[str, Any] = {}
-        if response_body is not None:
-            # A completion the client walked away from (or that never got
-            # past the headers) leaves an empty or partial body: no usage,
-            # no answer. Say so on the span, so an analysis can tell a turn
-            # the model never finished from one it did — the two look the
-            # same otherwise, and a burst of them is a broken engine, not a
-            # gap in the export.
-            span.set_attribute("agnes.response_bytes", len(response_body))
-        if response_body is not None and not response_truncated:
-            summary = summarize_completion(response_body, content_type)
-            if "text/event-stream" in (content_type or "").lower():
-                span.set_attribute("agnes.stream_complete", bool(summary.get("stop_reason")))
-            if summary.get("model") and not (usage and usage.get("model")):
-                span.set_attribute("gen_ai.response.model", str(summary["model"]))
-            if summary.get("stop_reason"):
-                span.set_attribute("gen_ai.response.finish_reasons", [str(summary["stop_reason"])])
+        if described.response_bytes is not None:
+            span.set_attribute("agnes.response_bytes", described.response_bytes)
+        if described.stream_complete is not None:
+            span.set_attribute("agnes.stream_complete", described.stream_complete)
+        if described.model and not (usage and usage.get("model")):
+            span.set_attribute("gen_ai.response.model", str(described.model))
+        if described.stop_reason:
+            span.set_attribute("gen_ai.response.finish_reasons", [str(described.stop_reason)])
         if response_truncated:
             span.set_attribute("agnes.response_truncated", True)
-        prompt_json: Optional[str] = None
-        completion_json: Optional[str] = None
-        if request_body is not None:
-            prompt_json = json.dumps(input_messages_from_request(request_body), ensure_ascii=False)
-            span.set_attribute("agnes.prompt_chars", len(prompt_json))
-        if summary.get("blocks") is not None:
-            out = [{"role": "assistant", "parts": _parts_from_content(summary["blocks"])}]
-            completion_json = json.dumps(out, ensure_ascii=False)
-            span.set_attribute("agnes.completion_chars", len(completion_json))
+        if described.prompt_chars is not None:
+            span.set_attribute("agnes.prompt_chars", described.prompt_chars)
+        if described.completion_chars is not None:
+            span.set_attribute("agnes.completion_chars", described.completion_chars)
         if capture_content_enabled():
             # Content goes on EVENTS (see the module docstring): the span's
             # attribute object stays small and parseable however long the
             # conversation is, and each side of the exchange is its own
             # record a collector can map, cap or drop independently.
             truncated = False
-            if prompt_json is not None:
-                text, cut = truncate_content(prompt_json)
+            if described.prompt_json is not None:
+                text, cut = truncate_content(described.prompt_json)
                 truncated = truncated or cut
                 span.add_event(PROMPT_EVENT, {"gen_ai.prompt": text})
-            if completion_json is not None:
-                text, cut = truncate_content(completion_json)
+            if described.completion_json is not None:
+                text, cut = truncate_content(described.completion_json)
                 truncated = truncated or cut
                 span.add_event(COMPLETION_EVENT, {"gen_ai.completion": text})
             if truncated:
@@ -746,9 +811,11 @@ __all__ = [
     "PROMPT_EVENT",
     "ENDPOINT_VAR",
     "MAX_CONTENT_CHARS",
+    "CompletionSummary",
     "capture_content_enabled",
     "collector",
     "configure_otel",
+    "describe_completion",
     "end_completion_span",
     "end_generation_span",
     "endpoint_configured",
