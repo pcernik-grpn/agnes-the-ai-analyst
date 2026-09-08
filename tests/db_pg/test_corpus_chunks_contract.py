@@ -372,6 +372,54 @@ def test_search_by_filename_ignores_non_matching_names(repo):
     assert repo.search_by_filename([CORPUS_ID], ["quarterly", "report"], limit=10) == []
 
 
+def test_search_by_filename_requires_the_file_row_itself_to_be_in_scope(repo):
+    """A name hit needs the file's CURRENT collection in scope, not only the
+    chunk rows': ``move_to_corpus`` re-homes the file row while stale chunk
+    rows may still carry the old ``corpus_id``, and the moved file must stop
+    answering by name under the collection it left (fail-closed, both
+    backends — see ``search_by_filename``'s docstring)."""
+    files_repo = _files_repo_for(repo)
+    fid = files_repo.add(
+        corpus_id=CORPUS_ID,
+        filename="quarterly-report.md",
+        sha256="s",
+        file_type="md",
+        size_bytes=1,
+        storage_path="/x",
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": fid, "ordinal": 0, "text": "alpha"}])
+    assert repo.search_by_filename([CORPUS_ID], ["quarterly"], limit=10)
+
+    assert files_repo.move_to_corpus(fid, "col_elsewhere")
+
+    assert repo.search_by_filename([CORPUS_ID], ["quarterly"], limit=10) == []
+    assert repo.search_by_filename(["col_elsewhere"], ["quarterly"], limit=10) == []
+    # Back in scope once BOTH the file's collection and the chunks' are granted.
+    hits = repo.search_by_filename([CORPUS_ID, "col_elsewhere"], ["quarterly"], limit=10)
+    assert [h["file_id"] for h in hits] == [fid]
+
+
+def test_search_candidates_row_shape_is_the_column_pruned_set_on_both_backends(repo):
+    """The candidate row shape is pinned across backends: the PG side's
+    stored ``tsv`` column (migration ``0113_corpus_chunks_tsv``) is a
+    ranking input, never part of the returned dict."""
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "apple pie"}])
+    (row,) = repo.search_candidates([CORPUS_ID], "apple", limit=10)
+    assert set(row) == {
+        "id",
+        "corpus_id",
+        "file_id",
+        "ordinal",
+        "text",
+        "section_path",
+        "page",
+        "bbox",
+        "metadata",
+        "created_at",
+        "embedding",
+    }
+
+
 def test_search_by_filename_empty_terms_or_corpus_ids(repo):
     files_repo = _files_repo_for(repo)
     fid = files_repo.add(
@@ -540,3 +588,74 @@ def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_ra
     rows = pg_repo.search_candidates([CORPUS_ID], "contract", limit=3)
     assert len(rows) == 3
     assert all("contract" in r["text"] for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Stored tsvector (migration 0113_corpus_chunks_tsv, PG-only — the DuckDB
+# sibling neither stores nor ranks, see its docstring)
+# ---------------------------------------------------------------------------
+
+
+def _null_out_tsv(pg_repo, where: str = "TRUE") -> None:
+    with pg_repo._engine.begin() as conn:
+        conn.execute(sa.text(f"UPDATE corpus_chunks SET tsv = NULL WHERE {where}"))
+
+
+def test_add_many_stores_the_tokenized_body_alongside_the_text(pg_repo):
+    """Every new row carries ``tsv`` = ``to_tsvector('simple', text)`` from
+    the insert itself — nothing written after the column landed ever needs
+    the backfill. A NULL text stays NULL on both columns."""
+    pg_repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "Contract renewal terms"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": None},
+        ]
+    )
+    with pg_repo._engine.connect() as conn:
+        rows = conn.execute(
+            sa.text(
+                "SELECT tsv::text AS stored, to_tsvector('simple', text)::text AS fresh "
+                "FROM corpus_chunks ORDER BY ordinal"
+            )
+        ).all()
+    assert rows[0].stored == rows[0].fresh
+    assert "'contract':1" in rows[0].stored
+    assert rows[1].stored is None and rows[1].fresh is None
+
+
+def test_search_candidates_ranking_is_identical_with_and_without_the_stored_tsvector(pg_repo):
+    """The stored column is a cache of the ranking input, never a different
+    input: the ranked result is identical whether every row, no row, or only
+    some rows carry ``tsv`` (the per-row ``COALESCE`` fallback — what a
+    table looks like part-way through ``scripts/backfill_corpus_chunks_tsv.py``,
+    and what every pre-migration row looks like until then)."""
+    texts = [
+        "contract",
+        "contract contract contract",
+        "a contract mentioned once",
+        "renewal of the contract and its terms",
+        "nothing relevant here",
+    ]
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": t} for i, t in enumerate(texts)])
+
+    stored = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+    assert len(stored) == 4
+    assert stored[0]["text"] == "contract contract contract"
+    assert "tsv" not in stored[0]
+
+    _null_out_tsv(pg_repo, where="ordinal % 2 = 0")  # partially backfilled
+    partial = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+    _null_out_tsv(pg_repo)  # nothing backfilled
+    fallback = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+
+    assert stored == partial == fallback
+
+
+def test_search_candidates_still_matches_rows_without_a_stored_tsvector(pg_repo):
+    """The WHERE clause stays on the ``to_tsvector('simple', text)``
+    expression — a row the backfill has not reached is still a candidate
+    (``tsv @@ query`` would have silently dropped it)."""
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "shared keyword apple"}])
+    _null_out_tsv(pg_repo)
+    rows = pg_repo.search_candidates([CORPUS_ID], "apple", limit=10)
+    assert len(rows) == 1 and rows[0]["text"] == "shared keyword apple"

@@ -3449,7 +3449,14 @@ separate bounded path and is unaffected). The backing GIN index
 a table over 1,000,000 rows to avoid a long lock during startup; see that
 migration's docstring for the `CREATE INDEX CONCURRENTLY` statement an
 operator must then run out-of-band. Full-text search works without the
-index either way, just via a slower sequential scan.
+index either way, just via a slower sequential scan. Ranking reads a stored
+tokenized copy of each chunk (`corpus_chunks.tsv`, migration
+`0113_corpus_chunks_tsv`, written on every insert) rather than re-tokenizing
+the text per matched row; on a table over 200,000 rows that migration adds
+the column but leaves populating existing rows to
+`scripts/backfill_corpus_chunks_tsv.py` (batched, idempotent, run off-peak —
+see `docs/migrations.md`), and until then those rows rank through a per-row
+fallback — slower, identical results.
 
 - /api/collections
 - /api/collections/search

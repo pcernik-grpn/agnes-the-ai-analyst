@@ -35,6 +35,7 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy import REAL, BigInteger, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db_pg import Base
@@ -144,6 +145,19 @@ class CorpusChunk(Base):
         PG_ARRAY(REAL()),
         nullable=True,
     )
+    # Tokenized body (``to_tsvector('simple', text)``), stored once so the
+    # retrieval ranking (``ts_rank_cd`` in
+    # ``CorpusChunksPgRepository.search_candidates``) reads a column instead
+    # of re-parsing ``text`` per matched row. Nullable BY DESIGN: written by
+    # ``add_many`` for every new row, backfilled for pre-existing rows either
+    # in place by migration ``0113_corpus_chunks_tsv`` (small table) or
+    # out-of-band by ``scripts/backfill_corpus_chunks_tsv.py`` (large one) —
+    # and every reader falls back per row with ``COALESCE(tsv,
+    # to_tsvector('simple', text))``, so a NULL here is slower, never wrong.
+    # The GIN index above stays on the expression (not this column) for the
+    # same reason. Not a GENERATED STORED column: adding one rewrites the
+    # whole table under an exclusive lock — see the migration's docstring.
+    tsv: Mapped[str | None] = mapped_column(TSVECTOR(), nullable=True)
     section_path: Mapped[str | None] = mapped_column(String, nullable=True)
     page: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bbox: Mapped[str | None] = mapped_column(String, nullable=True)
