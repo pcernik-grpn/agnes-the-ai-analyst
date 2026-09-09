@@ -38,6 +38,7 @@ class TestRailReportButton:
         html = resp.text
 
         assert 'id="rail-report-issue"' in html
+        assert 'aria-label="Report a problem"' in html
         assert "Report a problem" in html
         assert 'id="rail-report-issue-menu"' in html
         assert 'id="issue-dialog"' in html
