@@ -233,3 +233,100 @@ def test_call_without_a_pairing_id_is_written_immediately(manager, audit_rows):
         assert row.get("duration_ms") is None
 
     asyncio.run(_run())
+
+
+class _SlowWS(FakeWS):
+    """A sink whose delivery takes longer than the tool itself — a Slack
+    poster mid-HTTP, a browser on a bad link."""
+
+    async def send_json(self, data: dict) -> None:
+        await asyncio.sleep(0.05)
+        await super().send_json(data)
+
+
+def _attach_slow_live(mgr: ChatManager, chat_id: str, user_email: str) -> LiveSession:
+    live = _attach_live(mgr, chat_id, user_email)
+    live.sinks = [SinkEntry(participant_email=user_email, sink=_SlowWS())]
+    return live
+
+
+def test_duration_comes_from_the_producer_clock_not_sink_delivery(manager, audit_rows):
+    """The pump is one sequential loop: a slow sink on the call frame delays
+    when the result frame is even read, so manager-side arrival times can
+    never separate delivery latency from tool time. Both producers stamp
+    ``emitted_at`` (their own monotonic clock) on the call AND the result,
+    and the difference between the two is the tool's real duration."""
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_slow_live(manager, s.id, "u@x")
+        await manager.send_user_message(s.id, "hello")
+
+        async def _body():
+            live.handle.emit({**_CALL, "emitted_at": 100.0})
+            live.handle.emit(
+                {"type": "tool_result", "tool_use_id": "tu1", "tool": "tu1", "result": "ok", "emitted_at": 100.25}
+            )
+            await _wait_until(lambda: len(_tool_rows(audit_rows)) >= 1)
+
+        await _with_pump(manager, live, _body)
+        row = _tool_rows(audit_rows)[0]
+        # Two slow broadcasts (~100 ms) happened between the frames' arrival
+        # at the pump; none of it is the tool's.
+        assert row["duration_ms"] == 250, row["duration_ms"]
+
+    asyncio.run(_run())
+
+
+def test_without_producer_stamps_the_duration_falls_back_to_arrival_times(manager, audit_rows):
+    """An older producer that stamps nothing still gets a measured row —
+    from the frames' arrival at the pump, which then includes whatever the
+    pump was doing in between."""
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_slow_live(manager, s.id, "u@x")
+        await manager.send_user_message(s.id, "hello")
+
+        async def _body():
+            live.handle.emit(dict(_CALL))
+            live.handle.emit({"type": "tool_result", "tool_use_id": "tu1", "tool": "tu1", "result": "ok"})
+            await _wait_until(lambda: len(_tool_rows(audit_rows)) >= 1)
+
+        await _with_pump(manager, live, _body)
+        row = _tool_rows(audit_rows)[0]
+        assert row["duration_ms"] is not None and row["duration_ms"] >= 0
+
+    asyncio.run(_run())
+
+
+def test_a_producer_stamp_on_only_one_side_is_ignored(manager, audit_rows):
+    """A stamp can only be compared with a stamp from the same clock; one
+    side missing means the arrival fallback, never a mixed-clock number."""
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x")
+        await manager.send_user_message(s.id, "hello")
+
+        async def _body():
+            live.handle.emit({**_CALL, "emitted_at": 5000.0})
+            live.handle.emit({"type": "tool_result", "tool_use_id": "tu1", "tool": "tu1", "result": "ok"})
+            await _wait_until(lambda: len(_tool_rows(audit_rows)) >= 1)
+
+        await _with_pump(manager, live, _body)
+        row = _tool_rows(audit_rows)[0]
+        assert 0 <= row["duration_ms"] < 1000, row["duration_ms"]
+
+    asyncio.run(_run())
+
+
+def test_both_frame_producers_stamp_emitted_at():
+    """The two frame producers must keep stamping the pairing clock, or the
+    manager silently degrades to arrival times."""
+    import inspect
+
+    from app.chat import kai_engine_provider, runner
+
+    assert '"emitted_at": time.monotonic()' in inspect.getsource(kai_engine_provider)
+    assert '"emitted_at": time.monotonic()' in inspect.getsource(runner)

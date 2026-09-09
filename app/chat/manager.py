@@ -358,6 +358,17 @@ class SinkEntry:
     sink: object
 
 
+def _producer_stamp(frame: dict) -> float | None:
+    """The frame's ``emitted_at`` — a monotonic reading from the clock of
+    whichever process built the frame — or ``None`` when absent or not a
+    number. Only ever used as a DIFFERENCE between two frames of the same
+    producer; never compared with this process's clock."""
+    value = frame.get("emitted_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 @dataclass
 class LiveSession:
     chat_id: str
@@ -412,12 +423,13 @@ class LiveSession:
     #: question-typed frames, not approval-typed ones.
     pending_questions: dict = field(default_factory=dict)
     #: ``chat.tool_call`` audit rows waiting for their ``tool_result``, keyed
-    #: by ``tool_use_id`` → ``(perf_counter at the call frame, params)``.
+    #: by ``tool_use_id`` → ``(perf_counter at the call frame's arrival, the
+    #: producer's own ``emitted_at`` stamp or None, params)``.
     #: The row is written when the result arrives so it can carry the
     #: tool's measured duration (``_audit_tool_call_finished``); whatever is
     #: still here at turn end / kill / pump exit is written without one
     #: (``_flush_pending_tool_audits``) so the attempt is never lost.
-    pending_tool_audits: dict[str, tuple[float, dict]] = field(default_factory=dict)
+    pending_tool_audits: dict[str, tuple[float, float | None, dict]] = field(default_factory=dict)
     turn_in_flight: bool = False
     #: Track C7 (@delegation MVP) — depth-1 guard. 0 for an ordinary,
     #: user-driven session; set to 1 by ``ChatManager.handle_delegation``
@@ -2583,6 +2595,11 @@ class ChatManager:
                 frame = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # Arrival mark for the chat.tool_call duration fallback — taken
+            # before the fan-out below, so a slow sink on THIS frame never
+            # reads as tool time (the producers' own ``emitted_at`` stamps
+            # are preferred; see _audit_tool_call_finished).
+            arrived = time.perf_counter()
             live.last_activity = datetime.now(UTC)
             if frame.get("type") in ("approval_request", "question_request"):
                 # Stamped BEFORE the fan-out so every sink sees the same
@@ -2760,15 +2777,15 @@ class ChatManager:
                 # see _schedule_artifact_harvest.
                 self._schedule_artifact_harvest(live)
             if ftype == "tool_call":
-                self._audit_tool_call_started(live, frame)
+                self._audit_tool_call_started(live, frame, arrived)
             elif ftype == "tool_result":
-                self._audit_tool_call_finished(live, frame)
+                self._audit_tool_call_finished(live, frame, arrived)
 
     # ------------------------------------------------------------------
     # chat.tool_call audit — one row per call, timed call → result
     # ------------------------------------------------------------------
 
-    def _audit_tool_call_started(self, live: LiveSession, frame: dict) -> None:
+    def _audit_tool_call_started(self, live: LiveSession, frame: dict, arrived: float) -> None:
         """Hold a ``tool_call`` frame's audit row until its result arrives.
 
         The row used to be written right here, before the tool had run, so
@@ -2777,12 +2794,15 @@ class ChatManager:
         (``app/chat/runner.py``, ``app/chat/kai_engine_provider.py``) stamp
         ``tool_use_id`` on the call AND on its ``tool_result``, so the pair
         is correlated on it and ``_audit_tool_call_finished`` writes the row
-        with the wall time between the two frames' arrival here — transport
-        and any approval wait included, which is the latency the user
-        actually sat through. A frame with no pairing id cannot be matched
-        to a result and is written at once, exactly as before, rather than
-        given an invented duration. ``params`` is unchanged: identifiers and
-        an argument hash, never the arguments.
+        with the duration — an approval wait included, which is the latency
+        the user actually sat through. A frame with no pairing id cannot be
+        matched to a result and is written at once, exactly as before,
+        rather than given an invented duration. ``params`` is unchanged:
+        identifiers and an argument hash, never the arguments.
+
+        ``arrived`` is this frame's ``perf_counter`` at decode time — the
+        fallback clock; the producers' own ``emitted_at`` stamps are what
+        the duration is normally taken from (see the sibling below).
         """
         details = {
             "session_id": live.chat_id,
@@ -2793,20 +2813,36 @@ class ChatManager:
         if not tool_use_id:
             write_audit(user_email=live.user_email, action="chat.tool_call", details=details)
             return
-        live.pending_tool_audits[tool_use_id] = (time.perf_counter(), details)
+        live.pending_tool_audits[tool_use_id] = (arrived, _producer_stamp(frame), details)
 
-    def _audit_tool_call_finished(self, live: LiveSession, frame: dict) -> None:
+    def _audit_tool_call_finished(self, live: LiveSession, frame: dict, arrived: float) -> None:
         """Write the paired ``chat.tool_call`` row for a ``tool_result``,
-        with the measured duration and the result frame's own verdict."""
+        with the measured duration and the result frame's own verdict.
+
+        The duration is the difference between the two frames' ``emitted_at``
+        stamps when both carry one — the producer's own monotonic clock,
+        read where the frames are born, so nothing that happens on the way
+        here counts: this pump is one sequential loop, and a slow sink on
+        the call frame delays even READING the result frame, which no
+        manager-side clock can tell apart from tool time. Without a stamp on
+        both sides (an older producer, or a stamp on only one of them — a
+        stamp is only comparable with one from the same clock) it falls back
+        to the frames' arrival at the pump, taken before each fan-out.
+        """
         pending = live.pending_tool_audits.pop(str(frame.get("tool_use_id") or ""), None)
         if pending is None:
             return  # no call on record for this result (unpaired producer)
-        started, details = pending
+        call_arrived, call_stamp, details = pending
+        result_stamp = _producer_stamp(frame)
+        if call_stamp is not None and result_stamp is not None and result_stamp >= call_stamp:
+            duration_ms = int((result_stamp - call_stamp) * 1000)
+        else:
+            duration_ms = int((arrived - call_arrived) * 1000)
         write_audit(
             user_email=live.user_email,
             action="chat.tool_call",
             details=details,
-            duration_ms=int((time.perf_counter() - started) * 1000),
+            duration_ms=duration_ms,
             result="error" if frame.get("is_error") else "success",
         )
 
@@ -2820,7 +2856,7 @@ class ChatManager:
         """
         if not live.pending_tool_audits:
             return
-        for _started, details in live.pending_tool_audits.values():
+        for _arrived, _stamp, details in live.pending_tool_audits.values():
             write_audit(user_email=live.user_email, action="chat.tool_call", details=details)
         live.pending_tool_audits.clear()
 

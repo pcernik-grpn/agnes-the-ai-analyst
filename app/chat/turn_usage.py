@@ -27,6 +27,18 @@ completion's wall time and time-to-first-byte, the manager drains them once
 per turn onto the assistant message. Kept apart from the token counters so a
 completion whose usage could not be parsed still keeps its timing, and so a
 timing-only turn can never hydrate a frame with zero tokens.
+
+The timing pair has the same precision contract as the token pair, and the
+same reason it holds in practice: the three counters are written and drained
+as separate keys (there is no multi-key atomic operation in the coordination
+backend), but the broker writes them in the stream's ``finally`` — BEFORE the
+sandbox can observe the response end, and therefore before the engine can
+emit the ``assistant_message`` whose persistence drains them. A write and a
+drain of the same session are causally ordered, not racing; the residual
+window (an engine acting on ``message_stop`` a few microseconds before the
+upstream EOF reaches the broker) moves a whole completion to the adjacent
+turn, the conservation property stated above, and would need that window to
+land between two of three back-to-back ``incr`` calls to split one.
 """
 
 from __future__ import annotations

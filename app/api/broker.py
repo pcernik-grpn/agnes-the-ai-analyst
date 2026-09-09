@@ -1478,7 +1478,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         turn_session_id = row.get("session_id") if is_completion else None
         collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
-        state: dict[str, Any] = {"overflow": False, "first_byte_at": None}
+        state: dict[str, Any] = {"overflow": False, "first_byte_at": None, "exhausted": False}
 
         async def _passthrough():
             try:
@@ -1491,6 +1491,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                         else:
                             state["overflow"] = True
                     yield chunk
+                # Reached only when the upstream ran to its natural end AND
+                # the client consumed all of it — a drop on either side
+                # leaves this False and the timing below unrecorded.
+                state["exhausted"] = True
             finally:
                 await resp.aclose()
                 await client.aclose()
@@ -1523,9 +1527,15 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                             "llm usage recording failed for agent %s (stream already forwarded)",
                             agent_row.get("id"),
                         )
-                if turn_session_id and resp.status_code == 200:
-                    # Independent of the usage parse above: an over-long
-                    # stream still took its time.
+                if turn_session_id and resp.status_code == 200 and state["exhausted"]:
+                    # Independent of the usage parse above (an over-long
+                    # stream still took its time), but NOT of the stream
+                    # finishing: a completion cut short — the upstream
+                    # dropping, the client walking away — is not a
+                    # completion, and its truncated wall time would pull
+                    # every latency average toward whatever aborted it.
+                    # The partial usage above is still recorded: tokens
+                    # were spent either way, time was not fully measured.
                     _record_completion_timing(
                         turn_session_id, forward_started, state["first_byte_at"] or upstream_head_at
                     )

@@ -2514,3 +2514,61 @@ def test_failed_completion_records_no_timing(broker_app, e2e_env, _fresh_turn_co
     r = asyncio.run(_run())
     assert r.status_code == 500
     assert drain_turn_timing(session_id) is None
+
+
+def test_a_stream_that_never_finishes_records_no_completion_timing(
+    broker_app, e2e_env, _fresh_turn_counters, monkeypatch
+):
+    """A stream cut short — the upstream dropping, or the client walking
+    away — is not a completion: counting its truncated wall time as one
+    would pull every latency average toward whatever aborted it."""
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_timing
+
+    session_id, tok = _agentless_session_ticket()
+    real_cls = httpx.AsyncClient
+
+    class _BreakingSSEClient(_StreamShimMixin):
+        def __init__(self, *a, **k):
+            self._real = real_cls(*a, **k) if "transport" in k else None
+
+        async def __aenter__(self):
+            return await self._real.__aenter__() if self._real else self
+
+        async def __aexit__(self, *a):
+            return await self._real.__aexit__(*a) if self._real else False
+
+        async def send(self, req, stream=False):
+            class _R:
+                status_code = 200
+                headers = {"content-type": "text/event-stream"}
+
+                async def aiter_bytes(self):
+                    yield b"event: message_start\n\n"
+                    raise RuntimeError("simulated upstream drop mid-stream")
+
+                async def aclose(self):
+                    pass
+
+            return _R()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BreakingSSEClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            try:
+                await c.post(
+                    "/api/broker/anthropic/v1/messages",
+                    headers={"Authorization": f"Bearer {tok}"},
+                    json={"model": "claude-sonnet-5", "messages": [], "stream": True},
+                )
+            except Exception:
+                pass  # the mid-stream break propagates through the ASGI transport — expected
+
+    asyncio.run(_run())
+    assert drain_turn_timing(session_id) is None
