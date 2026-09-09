@@ -44458,7 +44458,7 @@
     },
     "/api/collections/{collection_id}/files/{file_id}/move": {
       "post": {
-        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartifact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.",
+        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartifact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.\n\nThe file's body and its extracted facts move with it, so search and the\nfact graph follow the file into the target collection rather than\ncontinuing to answer under the one it left. A move either completes or\nleaves the file and its content together where they were; it never\nreports success having applied only part of that.\n\nAnswers ``409 move_conflict`` when someone else moved the same file while\nthis request was in flight. The response names the collection the file\nactually ended up in, so a client can re-target or refresh rather than\nretry blindly into the same race.",
         "operationId": "move_file_api_collections__collection_id__files__file_id__move_post",
         "parameters": [
           {

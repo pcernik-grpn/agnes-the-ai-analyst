@@ -2021,13 +2021,14 @@ async def move_file(
     artifact IS its file in the Library, so dragging that file into a folder
     must not strand an empty husk in the listing.
 
-    A file's body (``corpus_chunks``) and facts (``claims``) carry their own
-    denormalized collection id and are repointed here too — see the ordering
-    comment below for why they move first and what happens when a write in
-    the middle of that sequence fails.
+    The file's body and its extracted facts move with it, so search and the
+    fact graph follow the file into the target collection rather than
+    continuing to answer under the one it left. A move either completes or
+    leaves the file and its content together where they were; it never
+    reports success having applied only part of that.
 
     Answers ``409 move_conflict`` when someone else moved the same file while
-    this request was in flight; the body carries the collection the file
+    this request was in flight. The response names the collection the file
     actually ended up in, so a client can re-target or refresh rather than
     retry blindly into the same race.
     """
