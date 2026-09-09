@@ -339,7 +339,7 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
     ),
     # Postgres-only, same reasoning as `agnes_turns`/`agnes_extraction_runs`/
     # `agnes_facts_ingest_runs` above: `llm_calls` landed after the A3 freeze
-    # (Alembic revision 0115, no `src/db.py` ladder step), so it exists on
+    # (Alembic revision 0117, no `src/db.py` ladder step), so it exists on
     # Postgres alone.
     InternalTable(
         registry_id="agnes_llm_calls",
