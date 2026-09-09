@@ -111,3 +111,112 @@ class TestTheQueueIsAdminOnly:
                 headers=_auth(seeded_app["admin_token"]),
             )
         )
+
+
+class TestARestrictedPrincipalDoesNotCrash:
+    """`get_current_user` can return a frozen principal, not a dict.
+
+    Indexing it (`user["id"]`) raised a TypeError -> 500 on every reporter
+    route, including the in-sandbox `report_issue` tool this channel was
+    built for (Devin review on #2402). These pin the decision each principal
+    kind now gets, at the unit level: the routes themselves are covered on
+    Postgres, and what matters here is that no shape reaches an index.
+    """
+
+    def _principals(self):
+        from app.auth.session_principal import AgentPrincipal, DataAppViewerPrincipal, SessionPrincipal
+
+        return AgentPrincipal, DataAppViewerPrincipal, SessionPrincipal
+
+    def test_agent_files_as_its_caller(self):
+        from app.api.issues import _reporter
+
+        AgentPrincipal, _, _ = self._principals()
+        p = AgentPrincipal(
+            session_id="s1",
+            agent_id="a1",
+            owner_user_id="owner-1",
+            owner_email="owner@example.com",
+            intersection={},
+            caller_user_id="caller-1",
+            caller_email="caller@example.com",
+        )
+        assert _reporter(p) == ("caller-1", "caller@example.com")
+
+    def test_agent_without_a_caller_files_as_its_owner(self):
+        from app.api.issues import _reporter
+
+        AgentPrincipal, _, _ = self._principals()
+        p = AgentPrincipal(
+            session_id="s1",
+            agent_id="a1",
+            owner_user_id="owner-1",
+            owner_email="owner@example.com",
+            intersection={},
+        )
+        assert _reporter(p) == ("owner-1", "owner@example.com")
+
+    def test_single_participant_session_files_as_that_person(self):
+        from app.api.issues import _reporter
+
+        _, _, SessionPrincipal = self._principals()
+        p = SessionPrincipal(
+            session_id="s1",
+            participant_user_ids=["only-1"],
+            participant_emails=["only@example.com"],
+            intersection={},
+        )
+        assert _reporter(p) == ("only-1", "only@example.com")
+
+    def test_a_shared_co_session_is_refused_not_guessed(self):
+        import pytest as _pytest
+        from fastapi import HTTPException
+
+        from app.api.issues import _reporter
+
+        _, _, SessionPrincipal = self._principals()
+        p = SessionPrincipal(
+            session_id="s1",
+            participant_user_ids=["a", "b"],
+            participant_emails=["a@example.com", "b@example.com"],
+            intersection={},
+        )
+        with _pytest.raises(HTTPException) as exc:
+            _reporter(p)
+        assert exc.value.status_code == 403
+        assert exc.value.detail["error"] == "reporter_unidentified"
+
+    def test_a_data_app_viewer_is_refused(self):
+        """The narrowest principal stays narrow: `agnes_issues` is an internal
+        table and #2383 deliberately denied this principal that surface."""
+        import pytest as _pytest
+        from fastapi import HTTPException
+
+        from app.api.issues import _reporter
+
+        _, DataAppViewerPrincipal, _ = self._principals()
+        p = DataAppViewerPrincipal(
+            slug="app",
+            app_id="app-1",
+            owner_user_id="owner-1",
+            owner_email="owner@example.com",
+            viewer_user_id="viewer-1",
+            viewer_email="viewer@example.com",
+            intersection={},
+        )
+        with _pytest.raises(HTTPException) as exc:
+            _reporter(p)
+        assert exc.value.status_code == 403
+
+    def test_a_restricted_principal_is_never_admin(self):
+        from app.api.issues import _is_admin
+
+        AgentPrincipal, _, _ = self._principals()
+        p = AgentPrincipal(
+            session_id="s1",
+            agent_id="a1",
+            owner_user_id="owner-1",
+            owner_email="owner@example.com",
+            intersection={},
+        )
+        assert _is_admin(p) is False

@@ -157,13 +157,21 @@ class IssueReportsPgRepository:
         return dict(row)
 
     def resolve(self, issue_id: str, *, resolved_by: str, resolution_note: str | None) -> dict[str, Any] | None:
+        """Close one report. Exactly one concurrent caller wins.
+
+        The guarded ``UPDATE`` is the whole decision — deliberately NOT a
+        ``SELECT`` first. Two admins hitting Resolve at the same moment both
+        read ``status='open'``, so a read-then-write would let both return
+        200 and the loser would silently overwrite who closed it. Reading the
+        rowcount instead makes the database the arbiter: the winner updates
+        one row, the loser updates none and gets the 409 the API promises.
+
+        A zero-row update has two causes and they are not the same answer, so
+        the follow-up read separates them: the row is gone (``None`` -> 404)
+        or someone else just resolved it (``IssueAlreadyResolved`` -> 409).
+        """
         with self._engine.begin() as conn:
-            status = conn.execute(sa.text("SELECT status FROM issue_reports WHERE id = :id"), {"id": issue_id}).scalar()
-            if status is None:
-                return None
-            if status == "resolved":
-                raise IssueAlreadyResolved(issue_id)
-            conn.execute(
+            updated = conn.execute(
                 sa.text(
                     """
                     UPDATE issue_reports
@@ -173,7 +181,14 @@ class IssueReportsPgRepository:
                     """
                 ),
                 {"id": issue_id, "by": resolved_by, "note": resolution_note},
-            )
+            ).rowcount
+            if not updated:
+                still_there = conn.execute(
+                    sa.text("SELECT 1 FROM issue_reports WHERE id = :id"), {"id": issue_id}
+                ).scalar()
+                if still_there is None:
+                    return None
+                raise IssueAlreadyResolved(issue_id)
         return self.get(issue_id)
 
     def set_screenshot(self, issue_id: str, relative_path: str) -> None:

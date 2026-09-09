@@ -195,7 +195,18 @@
 
     version()
       .then(function (v) {
-        var payload = { title: title, body: body || null, kind: kind, page_url: pageUrl(), context: envelope(v) };
+        var payload = {
+        title: title,
+        body: body || null,
+        kind: kind,
+        page_url: pageUrl(),
+        context: envelope(v),
+        // Tells the mirror a screenshot is on its way, so the operator
+        // message waits for it instead of promising a link the row has not
+        // got yet — the upload is a separate PUT that cannot start until
+        // this POST has answered.
+        expect_screenshot: wantShot,
+      };
         return fetch("/api/issues", {
           method: "POST",
           credentials: "include",

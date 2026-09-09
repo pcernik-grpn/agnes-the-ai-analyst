@@ -217,3 +217,122 @@ def test_unconfigured_webhook_leaves_delivery_null(state_backend, seeded_app_bot
     c, tok = seeded_app_both["client"], _auth(seeded_app_both["analyst_token"])
     row = c.post("/api/issues", json={"title": "x"}, headers=tok).json()
     assert row["webhook_delivered_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# Devin review on #2402 — the three defects it found, each pinned by a test
+# that fails on the code as reviewed.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_race_produces_exactly_one_winner(state_backend, seeded_app_both):
+    """Two admins resolving at once: one 200, one 409 — never two 200s.
+
+    The read-then-write this replaced let both callers pass the status check
+    before either wrote, so the loser returned success and silently overwrote
+    who closed the report. Driven through the repository rather than the HTTP
+    layer because the interleaving has to be exact: caller B must act after
+    A's UPDATE has committed and while B still believes the report is open,
+    which is precisely the window a SELECT-first implementation opens.
+    """
+    if state_backend != "pg":
+        pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
+    from src.repositories import issue_reports_repo
+    from src.repositories.issue_reports_pg import IssueAlreadyResolved
+
+    repo = issue_reports_repo()
+    row = repo.create(
+        title="raced",
+        body=None,
+        kind="bug",
+        created_by="u-race",
+        created_by_email=None,
+        source_surface="web",
+        page_url=None,
+        context=None,
+    )
+
+    first = repo.resolve(row["id"], resolved_by="admin-a", resolution_note="a")
+    assert first is not None and first["status"] == "resolved"
+
+    with pytest.raises(IssueAlreadyResolved):
+        repo.resolve(row["id"], resolved_by="admin-b", resolution_note="b")
+
+    # The winner's signature survives — the loser must not overwrite it.
+    assert repo.get(row["id"])["resolved_by"] == "admin-a"
+    assert repo.get(row["id"])["resolution_note"] == "a"
+
+    # A report that is simply gone is a different answer from a resolved one.
+    assert repo.resolve("iss_gone", resolved_by="admin-a", resolution_note=None) is None
+
+
+def test_webhook_names_the_screenshot_uploaded_after_the_201(state_backend, seeded_app_both, monkeypatch):
+    """The operator message links a screenshot that lands after the 201.
+
+    The upload is a SECOND request the client cannot start until the 201 has
+    been received, so mirroring the creation snapshot always produced a
+    message with no screenshot line — the gap Devin flagged, and one a live
+    run reproduced.
+
+    The late arrival is written through the repository rather than the HTTP
+    route on purpose: ``TestClient`` runs background tasks inside the
+    request/response cycle, so a second HTTP call could not overlap the
+    waiting mirror at all and the test would deadlock instead of testing
+    anything. What is under test is the mirror's wait-and-re-read, and this
+    reproduces exactly the state transition it has to notice.
+    """
+    if state_backend != "pg":
+        pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
+    import threading
+    import time
+
+    from app.services import issue_notifier
+    from src.repositories import issue_reports_repo
+
+    monkeypatch.setenv("AGNES_ISSUES_WEBHOOK_URL", "https://hooks.example.com/x")
+    monkeypatch.setattr("app.api.issues._SCREENSHOT_WAIT_SEC", 10.0)
+    monkeypatch.setattr("app.api.issues._SCREENSHOT_POLL_SEC", 0.05)
+
+    posted: list[dict] = []
+    monkeypatch.setattr(issue_notifier, "post_webhook", lambda url, payload, **kw: posted.append(payload) or True)
+
+    title = "with a late screenshot"
+
+    def _attach_when_the_row_appears() -> None:
+        repo = issue_reports_repo()
+        for _ in range(400):
+            match = next((r for r in repo.list_all(limit=50) if r["title"] == title), None)
+            if match is not None:
+                repo.set_screenshot(match["id"], f"issues/{match['id']}/screenshot.png")
+                return
+            time.sleep(0.02)
+
+    attacher = threading.Thread(target=_attach_when_the_row_appears, daemon=True)
+    attacher.start()
+
+    c, tok = seeded_app_both["client"], _auth(seeded_app_both["analyst_token"])
+    created = c.post("/api/issues", json={"title": title, "kind": "bug", "expect_screenshot": True}, headers=tok)
+    attacher.join(timeout=15)
+
+    assert created.status_code == 201, created.text
+    assert posted, "the operator mirror posted nothing"
+    text = posted[-1]["text"]
+    assert f"/api/issues/{created.json()['id']}/screenshot" in text, f"message never named the screenshot: {text!r}"
+
+
+def test_report_without_a_screenshot_is_mirrored_immediately(state_backend, seeded_app_both, monkeypatch):
+    """No screenshot promised, no waiting — the common case stays fast."""
+    if state_backend != "pg":
+        pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
+    from app.services import issue_notifier
+
+    monkeypatch.setenv("AGNES_ISSUES_WEBHOOK_URL", "https://hooks.example.com/x")
+    monkeypatch.setattr("app.api.issues._SCREENSHOT_WAIT_SEC", 30.0)  # would hang if consulted
+
+    posted: list[dict] = []
+    monkeypatch.setattr(issue_notifier, "post_webhook", lambda url, payload, **kw: posted.append(payload) or True)
+
+    c, tok = seeded_app_both["client"], _auth(seeded_app_both["analyst_token"])
+    r = c.post("/api/issues", json={"title": "no screenshot", "kind": "bug"}, headers=tok)
+    assert r.status_code == 201, r.text
+    assert posted and "Screenshot:" not in posted[-1]["text"]

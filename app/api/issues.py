@@ -50,6 +50,13 @@ _MAX_CONTEXT_STRING = 300
 _MAX_SCREENSHOT_BYTES = 3 * 1024 * 1024
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
+#: How long the operator mirror waits for a screenshot the client said it is
+#: about to upload, before posting the summary without one. Comfortably longer
+#: than a page capture (measured ~10 s on a heavy page) and far shorter than a
+#: person's patience for the message to appear in chat.
+_SCREENSHOT_WAIT_SEC = 20.0
+_SCREENSHOT_POLL_SEC = 1.0
+
 
 def _issues_repo() -> Any:
     """Resolve the PG-only repo AS A DEPENDENCY.
@@ -77,6 +84,11 @@ class IssueCreate(BaseModel):
     kind: Literal["bug", "wrong_answer", "request", "question", "other"] = "bug"
     page_url: str | None = Field(default=None, max_length=2000)
     context: dict[str, Any] | None = None
+    #: "A screenshot is coming on the follow-up PUT." Only the client knows —
+    #: it has the checkbox (web) or the `--screenshot` flag (CLI) — and the
+    #: operator mirror uses it to wait for the upload instead of posting a
+    #: summary that promises a link the row does not have yet.
+    expect_screenshot: bool = False
 
 
 class CommentCreate(BaseModel):
@@ -156,14 +168,66 @@ def _public_base_url(request: Request) -> str:
     return configured.rstrip("/") or str(request.base_url).rstrip("/")
 
 
-def _is_admin(user: dict) -> bool:
+def _reporter(user: Any) -> tuple[str, str | None]:
+    """Who is filing, as ``(user_id, email)`` — never index ``user`` directly.
+
+    ``get_current_user`` hands back EITHER a user dict OR one of the frozen
+    restricted principals (``app/auth/session_principal.py``), returned
+    verbatim precisely because they are not dicts. Every route in this module
+    goes through here, so a sandboxed caller gets a decision rather than a
+    ``TypeError`` on ``user["id"]`` — which is what the in-sandbox
+    ``report_issue`` tool used to hit, i.e. the one path this whole channel
+    was built for (Devin review on #2402).
+
+    A principal that carries exactly one human is attributed to that human;
+    one that carries several, or none, has no single reporter and is refused
+    rather than guessed at:
+
+    * ``AgentPrincipal`` -> its CALLER (C2.3), the person whose turn is
+      running, falling back to the owner for a single-owner agent. This is
+      the agent-offers-to-file case.
+    * ``SessionPrincipal`` -> the sole participant of a one-person chat. A
+      co-session with several participants is ambiguous and refused: a report
+      would otherwise be filed against whoever happens to sort first.
+    * ``DataAppViewerPrincipal`` -> refused. It is deliberately the narrowest
+      principal (no internal-table carve-out, #2383), and ``agnes_issues`` is
+      an internal table; widening it here would quietly undo that decision.
+    """
+    if isinstance(user, dict):
+        uid = user.get("id")
+        if not uid:
+            raise _err(403, "reporter_unidentified", "This credential has no user identity to file a report under.")
+        return uid, user.get("email")
+
+    from app.auth.session_principal import AgentPrincipal, SessionPrincipal
+
+    if isinstance(user, AgentPrincipal):
+        return (user.caller_user_id or user.owner_user_id, user.caller_email or user.owner_email)
+    if isinstance(user, SessionPrincipal) and len(user.participant_user_ids) == 1:
+        email = user.participant_emails[0] if user.participant_emails else None
+        return user.participant_user_ids[0], email
+    raise _err(
+        403,
+        "reporter_unidentified",
+        "This session has no single person to file the report as.",
+        hint='File it from your own account: agnes issue report "<what is wrong>"',
+    )
+
+
+def _is_admin(user: Any) -> bool:
+    """Restricted principals are never admin — the admin seam denies them
+    outright, so asking ``is_user_admin`` about the human behind one would
+    hand an agent its owner's authority."""
+    if not isinstance(user, dict):
+        return False
     return bool(is_user_admin(user.get("id")))
 
 
-def _owned_or_admin(repo: Any, issue_ref: str, user: dict) -> dict:
+def _owned_or_admin(repo: Any, issue_ref: str, user: Any) -> dict:
     """404 (not 403) for someone else's issue: ids must not be probeable."""
+    reporter_id, _ = _reporter(user)
     row = repo.get(issue_ref)
-    if row is None or (row["created_by"] != user["id"] and not _is_admin(user)):
+    if row is None or (row["created_by"] != reporter_id and not _is_admin(user)):
         raise _err(404, "issue_not_found", f"No issue {issue_ref!r} you can see.", hint="List yours: agnes issue list")
     return row
 
@@ -203,6 +267,7 @@ async def create_issue(
 ):
     """Report a problem (any signed-in caller). Stored in the instance; a text
     summary is mirrored to ``issues.webhook_url`` in the background."""
+    reporter_id, reporter_email = _reporter(user)
     title = _clean(body.title)
     if not title:
         raise _err(400, "missing_title", "title is required")
@@ -211,8 +276,8 @@ async def create_issue(
         title=title,
         body=_clean(body.body),
         kind=body.kind,
-        created_by=user["id"],
-        created_by_email=user.get("email"),
+        created_by=reporter_id,
+        created_by_email=reporter_email,
         source_surface=_surface(request),
         page_url=_clean(body.page_url),
         context=context,
@@ -221,7 +286,7 @@ async def create_issue(
     from src.audit_helpers import log_safe
 
     log_safe(
-        user_id=user.get("id"),
+        user_id=reporter_id,
         action="issue.report",
         resource=row["id"],
         params={"kind": row["kind"], "surface": row["source_surface"]},
@@ -229,10 +294,36 @@ async def create_issue(
     base_url = _public_base_url(request)
 
     def _mirror() -> None:
+        """Post the operator summary once, from the report's CURRENT state.
+
+        Deliberately re-reads instead of mirroring the ``row`` captured above:
+        a screenshot arrives on a SEPARATE request (``PUT .../screenshot``)
+        that the client cannot even start until this 201 has been received, so
+        the creation snapshot never has ``screenshot_path`` set and the
+        message promised a link it never carried (Devin review on #2402).
+
+        When the client says a screenshot is coming, wait for it — bounded, so
+        a capture that fails or never uploads costs the operator a short delay
+        and not the notification itself. Exactly one message is sent either
+        way; the wait is what decides whether it can name the screenshot.
+        """
+        import time
+
         from app.services.issue_notifier import notify_issue_filed
 
-        if notify_issue_filed(row, public_base_url=base_url):
-            repo.mark_webhook_delivered(row["id"])
+        deadline = time.monotonic() + _SCREENSHOT_WAIT_SEC if body.expect_screenshot else 0.0
+        current = row
+        while True:
+            fresh = repo.get(row["id"])
+            if fresh is None:  # deleted under us — nothing to mirror
+                return
+            current = fresh
+            if current.get("screenshot_path") or time.monotonic() >= deadline:
+                break
+            time.sleep(_SCREENSHOT_POLL_SEC)
+
+        if notify_issue_filed(current, public_base_url=base_url):
+            repo.mark_webhook_delivered(current["id"])
 
     background.add_task(_mirror)
     return row
@@ -248,7 +339,7 @@ async def put_screenshot(
     """Attach a PNG screenshot to a report — owner only, never an admin on
     someone else's behalf: the screenshot is what the REPORTER saw."""
     row = _owned_or_admin(repo, issue_id, user)
-    if row["created_by"] != user["id"]:
+    if row["created_by"] != _reporter(user)[0]:
         raise _err(404, "issue_not_found", "only the reporter can attach the screenshot")
     data = await request.body()
     if len(data) > _MAX_SCREENSHOT_BYTES:
@@ -262,7 +353,7 @@ async def put_screenshot(
 
     from src.audit_helpers import log_safe
 
-    log_safe(user_id=user.get("id"), action="issue.screenshot", resource=row["id"], params={"bytes": len(data)})
+    log_safe(user_id=_reporter(user)[0], action="issue.screenshot", resource=row["id"], params={"bytes": len(data)})
     return Response(status_code=204)
 
 
@@ -301,8 +392,9 @@ async def list_my_issues(
 ):
     """The caller's own reports, newest activity first."""
     st, lim = _status_or_400(status), _clamp(limit)
-    rows = repo.list_for_user(user["id"], status=st, limit=lim)
-    return _envelope(rows, repo.count_for_user(user["id"], status=st), lim)
+    reporter_id, _ = _reporter(user)
+    rows = repo.list_for_user(reporter_id, status=st, limit=lim)
+    return _envelope(rows, repo.count_for_user(reporter_id, status=st), lim)
 
 
 @router.get("/api/issues/{issue_id}")
@@ -328,14 +420,13 @@ async def add_comment(
     text = _clean(body.body)
     if not text:
         raise _err(400, "missing_body", "comment body is required")
-    kind = "reporter" if row["created_by"] == user["id"] else "admin"
-    comment = repo.add_comment(
-        row["id"], author_id=user.get("id"), author_email=user.get("email"), author_kind=kind, body=text
-    )
+    author_id, author_email = _reporter(user)
+    kind = "reporter" if row["created_by"] == author_id else "admin"
+    comment = repo.add_comment(row["id"], author_id=author_id, author_email=author_email, author_kind=kind, body=text)
 
     from src.audit_helpers import log_safe
 
-    log_safe(user_id=user.get("id"), action="issue.comment", resource=row["id"], params={"author_kind": kind})
+    log_safe(user_id=author_id, action="issue.comment", resource=row["id"], params={"author_kind": kind})
     return comment
 
 

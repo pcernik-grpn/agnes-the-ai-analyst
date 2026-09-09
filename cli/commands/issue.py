@@ -141,7 +141,17 @@ def report(
 
     resp = api_post(
         _ISSUES_PATH,
-        json={"title": title, "body": body, "kind": kind, "page_url": url, "context": context},
+        json={
+            "title": title,
+            "body": body,
+            "kind": kind,
+            "page_url": url,
+            "context": context,
+            # The upload is a separate PUT below, so the operator mirror has
+            # to be told to wait for it — otherwise its message names no
+            # screenshot even when `--screenshot` attached one.
+            "expect_screenshot": screenshot is not None,
+        },
         headers=_CLIENT_HEADER,
     )
     if resp.status_code != 201:

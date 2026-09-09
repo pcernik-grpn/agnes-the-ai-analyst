@@ -6444,6 +6444,11 @@
             ],
             "title": "Context"
           },
+          "expect_screenshot": {
+            "default": false,
+            "title": "Expect Screenshot",
+            "type": "boolean"
+          },
           "kind": {
             "default": "bug",
             "enum": [
