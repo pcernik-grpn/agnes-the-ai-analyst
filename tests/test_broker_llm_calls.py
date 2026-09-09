@@ -209,3 +209,189 @@ def test_ledger_rows_are_written_even_when_export_is_off(e2e_env, shared_app, mo
     usage_accumulator.flush()
     (row,) = ledger
     assert row["trace_id"] is None and row["span_id"] is None and row["cost_usd"] > 0
+
+
+def _oversized_stream_events():
+    """One ``message_start`` (all four token kinds), enough
+    ``content_block_delta`` filler to exceed the broker's 8 MiB full-body
+    mirror, and a closing ``message_delta`` with a stop reason and more
+    output tokens."""
+    events = [
+        (
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "model": "claude-stream-big",
+                    "usage": {
+                        "input_tokens": 500,
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": 300,
+                        "cache_creation_input_tokens": 50,
+                    },
+                },
+            },
+        ),
+    ]
+    chunk_text = "x" * 500_000
+    for _ in range(20):  # ~10 MB of content_block_delta payload
+        events.append(
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": chunk_text}},
+            )
+        )
+    events.append(
+        (
+            "message_delta",
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4321}},
+        )
+    )
+    return events
+
+
+def test_oversized_streamed_completion_recovers_usage_from_edges(otel_broker, otel_exporter, ledger):  # noqa: F811
+    """A stream whose body blows past the 8 MiB full mirror still yields a
+    priced, complete ``llm_calls`` row and span — from the bounded head/tail
+    edges (spec 3.1), not the (now-overflowed) full mirror."""
+    from app.api.broker_agent_policy import usage_accumulator
+
+    _FakeUpstream.content_type = "text/event-stream"
+    _FakeUpstream.sse_chunks = _sse(_oversized_stream_events())
+    tok = ticket_repo().mint("chat_ledger_oversized", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-stream-big", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    usage_accumulator.flush()
+
+    (span,) = otel_exporter.get_finished_spans()
+    attrs = dict(span.attributes)
+    (row,) = ledger
+
+    assert attrs["gen_ai.usage.input_tokens"] == 500
+    assert attrs["gen_ai.usage.output_tokens"] == 4321
+    assert attrs["gen_ai.usage.cache_read_input_tokens"] == 300
+    assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 50
+    assert tuple(attrs["gen_ai.response.finish_reasons"]) == ("end_turn",)
+    assert attrs["agnes.response_truncated"] is True
+    assert attrs["agnes.cost_usd"] > 0
+
+    assert row["input_tokens"] == 500
+    assert row["output_tokens"] == 4321
+    assert row["cache_read_tokens"] == 300
+    assert row["cache_creation_tokens"] == 50
+    assert row["stop_reason"] == "end_turn"
+    assert row["stream_complete"] is True
+    assert row["response_truncated"] is True
+    assert row["cost_usd"] > 0
+
+
+def test_streamed_completion_under_cap_is_not_flagged_truncated(otel_broker, otel_exporter, ledger):  # noqa: F811
+    """An ordinary (non-overflowing) stream is byte-for-byte unchanged by the
+    edge buffers: no truncation flag, on the row or the span."""
+    from app.api.broker_agent_policy import usage_accumulator
+
+    _FakeUpstream.content_type = "text/event-stream"
+    _FakeUpstream.sse_chunks = _sse(
+        [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {"model": "claude-stream", "usage": {"input_tokens": 20, "output_tokens": 1}},
+                },
+            ),
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}},
+            ),
+            (
+                "message_delta",
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}},
+            ),
+        ]
+    )
+    tok = ticket_repo().mint("chat_ledger_under_cap", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-stream", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    usage_accumulator.flush()
+
+    (span,) = otel_exporter.get_finished_spans()
+    attrs = dict(span.attributes)
+    (row,) = ledger
+
+    assert row["input_tokens"] == 20 and row["output_tokens"] == 4
+    assert row["stop_reason"] == "end_turn" and row["stream_complete"] is True
+    assert row["response_truncated"] is False
+    assert "agnes.response_truncated" not in attrs
+
+
+def test_tail_recovers_usage_when_head_misses_message_start(otel_broker, otel_exporter, ledger):  # noqa: F811
+    """The pathological case: the head buffer fills before ``message_start``
+    ever arrives (a huge non-usage event first). The tail's own
+    ``message_delta`` still yields output tokens, model and stop reason —
+    only the input/cache tokens (which never left ``message_start``) are
+    lost."""
+    from app.api.broker_agent_policy import usage_accumulator
+
+    padding_text = "p" * (70 * 1024)  # > the 64 KiB head cap
+    events = [
+        ("ping", {"type": "ping", "padding": padding_text}),
+        (
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {"model": "claude-stream-tail", "usage": {"input_tokens": 999, "output_tokens": 1}},
+            },
+        ),
+    ]
+    chunk_text = "x" * 500_000
+    for _ in range(20):  # push the body past the 8 MiB overflow cap
+        events.append(
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": chunk_text}},
+            )
+        )
+    events.append(
+        (
+            "message_delta",
+            {
+                "type": "message_delta",
+                "model": "claude-stream-tail-final",
+                "delta": {"stop_reason": "max_tokens"},
+                "usage": {"output_tokens": 777},
+            },
+        )
+    )
+
+    _FakeUpstream.content_type = "text/event-stream"
+    _FakeUpstream.sse_chunks = _sse(events)
+    tok = ticket_repo().mint("chat_ledger_tail_only", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-stream-tail", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    usage_accumulator.flush()
+    (row,) = ledger
+
+    # message_start's input usage never reached the head buffer — lost, not
+    # crashed — but the tail's message_delta still yields output tokens,
+    # model and stop reason rather than an empty result.
+    assert row["input_tokens"] == 0
+    assert row["output_tokens"] == 777
+    assert row["model_response"] == "claude-stream-tail-final"
+    assert row["stop_reason"] == "max_tokens"
+    assert row["response_truncated"] is True

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from src.llm_pricing import DEFAULT_PRICE, cost_usd
 from src.observability.llm_context import LlmCallContext
@@ -81,6 +81,7 @@ def test_build_record_prices_the_four_token_kinds_and_stores_the_rates():
         "completion_chars",
         "stop_reason",
         "stream_complete",
+        "response_truncated",
     }
 
 
@@ -206,7 +207,7 @@ def test_priced_as_for_is_stable_and_serialisable():
         "cache_write_per_mtok": 6.25,
         "batch_multiplier": 1.0,
     }
-    assert datetime.now(timezone.utc)  # sanity: tz-aware datetimes are what created_at holds
+    assert datetime.now(UTC)  # sanity: tz-aware datetimes are what created_at holds
 
 
 # ---------------------------------------------------------------------------

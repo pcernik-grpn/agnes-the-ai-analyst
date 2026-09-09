@@ -43,6 +43,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -172,6 +173,32 @@ def _parse_json_usage(resp_body: bytes) -> Optional[Dict[str, Any]]:
     return _normalize_usage(usage, body.get("model"))
 
 
+def _iter_sse_events(text: str, event_types: tuple[str, ...]) -> Iterator[tuple[str, Dict[str, Any]]]:
+    """Yield ``(event_type, data)`` for each SSE event in ``event_types``
+    found in ``text``. The one line-scanner both ``_parse_sse_usage`` (a full
+    buffered body) and ``parse_usage_from_edges`` (a bounded head/tail slice
+    of the same body) drive, so the two parse identically.
+    """
+    event_type: Optional[str] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            event_type = None
+            continue
+        if line.startswith("event:"):
+            event_type = line[len("event:") :].strip()
+            continue
+        if not line.startswith("data:") or event_type not in event_types:
+            continue
+        payload = line[len("data:") :].strip()
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            yield event_type, data
+
+
 def _parse_sse_usage(resp_body: bytes) -> Optional[Dict[str, Any]]:
     """Scan a buffered ``text/event-stream`` body for ``message_start`` /
     ``message_delta`` events and recover the response's usage.
@@ -195,24 +222,7 @@ def _parse_sse_usage(resp_body: bytes) -> Optional[Dict[str, Any]]:
     model: Optional[str] = None
     totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     seen = False
-    event_type: Optional[str] = None
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            event_type = None
-            continue
-        if line.startswith("event:"):
-            event_type = line[len("event:") :].strip()
-            continue
-        if not line.startswith("data:") or event_type not in ("message_start", "message_delta"):
-            continue
-        payload = line[len("data:") :].strip()
-        try:
-            data = json.loads(payload)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
+    for event_type, data in _iter_sse_events(text, ("message_start", "message_delta")):
         if event_type == "message_start":
             message = data.get("message")
             usage = message.get("usage") if isinstance(message, dict) else None
@@ -248,6 +258,73 @@ def parse_usage(resp_body: bytes, content_type: str) -> Optional[Dict[str, Any]]
         return _parse_json_usage(resp_body)
     except Exception:
         logger.debug("parse_usage: failed to parse upstream response body", exc_info=True)
+        return None
+
+
+def parse_usage_from_edges(head: bytes, tail: bytes, content_type: str) -> Optional[Dict[str, Any]]:
+    """Recover a streamed completion's usage, stop reason and model from a
+    bounded head + rolling tail buffer, for the rare completion whose full
+    body overran the broker's full-body mirror (``_SSE_USAGE_COLLECT_MAX_BYTES``
+    in ``app/api/broker.py``).
+
+    Anthropic puts usage in ``message_start`` (the first bytes of the
+    stream) and ``message_delta`` (the last), so scanning only those two
+    windows with the same event scanner :func:`parse_usage` uses recovers
+    the same numbers a full mirror would have, without ever holding the
+    whole body in memory. A ``message_start`` missing from the head — the
+    head buffer itself filled before the event closed, the pathological
+    case — still yields the tail's output tokens, stop reason, and (when the
+    closing event happens to carry one) model, rather than an empty result.
+    Adds ``stop_reason`` to ``parse_usage``'s shape, since that is the other
+    field a truncated call must not lose. Never raises: a body that fails to
+    decode or parse yields ``None``, exactly like :func:`parse_usage`.
+    """
+    if "text/event-stream" not in (content_type or "").lower():
+        return None
+    try:
+        model: Optional[str] = None
+        stop_reason: Optional[str] = None
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+        seen = False
+        head_text = head.decode("utf-8", errors="replace")
+        for _event_type, data in _iter_sse_events(head_text, ("message_start",)):
+            message = data.get("message")
+            if not isinstance(message, dict):
+                continue
+            model = model or message.get("model")
+            usage = message.get("usage")
+            if isinstance(usage, dict):
+                seen = True
+                for key in totals:
+                    totals[key] = max(totals[key], _to_int(usage.get(key, 0)))
+        tail_text = tail.decode("utf-8", errors="replace")
+        for _event_type, data in _iter_sse_events(tail_text, ("message_delta",)):
+            delta = data.get("delta")
+            if isinstance(delta, dict) and delta.get("stop_reason"):
+                stop_reason = delta.get("stop_reason")
+            model = model or data.get("model")  # pathological: no message_start seen at all
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                seen = True
+                for key in totals:
+                    totals[key] = max(totals[key], _to_int(usage.get(key, 0)))
+        if not seen:
+            return None
+        return {
+            "model": model,
+            "input_tokens": totals["input_tokens"],
+            "output_tokens": totals["output_tokens"],
+            "cache_read_tokens": totals["cache_read_input_tokens"],
+            "cache_creation_tokens": totals["cache_creation_input_tokens"],
+            "stop_reason": stop_reason,
+        }
+    except Exception:
+        logger.debug("parse_usage_from_edges: failed to parse stream edges", exc_info=True)
         return None
 
 
