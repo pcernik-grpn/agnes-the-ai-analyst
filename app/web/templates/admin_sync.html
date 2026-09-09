@@ -325,7 +325,7 @@ function renderZeroExplain(total, synced) {
 
 async function loadRegistry() {
   try {
-    const r = await fetch("/api/admin/registry", { credentials: "include" });
+    const r = await fetch("/api/admin/registry", { credentials: "include", headers: { "X-Agnes-Registry-Poll": "1" } });
     if (r.status === 503) {
       registryLoaded = false; // Another dashboard is reading; retry on the next poll.
       return;

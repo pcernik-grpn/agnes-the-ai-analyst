@@ -6,6 +6,7 @@ import threading
 
 import anyio
 import httpx
+from starlette.requests import Request
 
 
 def test_version_responds_while_registry_read_is_blocked(seeded_app, monkeypatch):
@@ -18,8 +19,9 @@ def test_version_responds_while_registry_read_is_blocked(seeded_app, monkeypatch
     original_list_all = repo.list_all
 
     def slow_list_all(*args, **kwargs):
-        entered.set()
-        assert release.wait(10), "test controller did not release registry read"
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(10), "test controller did not release registry read"
         return original_list_all(*args, **kwargs)
 
     monkeypatch.setattr(repo, "list_all", slow_list_all)
@@ -40,27 +42,30 @@ def test_version_responds_while_registry_read_is_blocked(seeded_app, monkeypatch
         limiter = anyio.to_thread.current_default_thread_limiter()
         original_tokens = limiter.total_tokens
         limiter.total_tokens = 4
+        poll_headers = {"Authorization": f"Bearer {seeded_app['admin_token']}", "X-Agnes-Registry-Poll": "1"}
         transport = httpx.ASGITransport(app=seeded_app["client"].app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             registry = asyncio.create_task(
                 client.get(
                     "/api/admin/registry",
-                    headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+                    headers=poll_headers,
                 )
             )
             try:
                 assert await asyncio.to_thread(entered.wait, 5), "registry never reached the read"
                 response = await client.get("/api/version")
                 assert response.status_code == 200
+                # Existing CLI/package-drawer clients send no polling marker.
+                # They must not fail just because a dashboard read is held.
+                ordinary = await client.get(
+                    "/api/admin/registry", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}
+                )
+                assert ordinary.status_code == 200
+                assert ordinary.json()["packaged_read_ok"] is True
                 # More overlapping polls than pool slots must fail fast, leaving
                 # room for real authentication dependencies and sync handlers.
                 polls = await asyncio.gather(
-                    *(
-                        client.get(
-                            "/api/admin/registry", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}
-                        )
-                        for _ in range(12)
-                    )
+                    *(client.get("/api/admin/registry", headers=poll_headers) for _ in range(12))
                 )
                 assert all(p.status_code == 503 and p.headers["Retry-After"] == "3" for p in polls)
                 authenticated = await client.get(
@@ -76,9 +81,7 @@ def test_version_responds_while_registry_read_is_blocked(seeded_app, monkeypatch
             assert result.status_code == 200
             assert result.json()["packaged_read_ok"] is True
             # The admission lock must be released after the read finishes.
-            again = await client.get(
-                "/api/admin/registry", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}
-            )
+            again = await client.get("/api/admin/registry", headers=poll_headers)
             assert again.status_code == 200
 
     try:
@@ -159,7 +162,8 @@ def test_registry_admission_recovers_after_read_failure(monkeypatch):
     monkeypatch.setattr(admin, "_read_registry", fail)
     import pytest
 
+    request = Request({"type": "http", "headers": [(b"x-agnes-registry-poll", b"1")]})
     with pytest.raises(RuntimeError, match="read failed"):
-        admin.list_registry(user={}, conn=None)
+        admin.list_registry(request=request, user={}, conn=None)
     monkeypatch.setattr(admin, "_read_registry", lambda: {"tables": []})
-    assert admin.list_registry(user={}, conn=None) == {"tables": []}
+    assert admin.list_registry(request=request, user={}, conn=None) == {"tables": []}

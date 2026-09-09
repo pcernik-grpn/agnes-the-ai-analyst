@@ -31,13 +31,14 @@ const context = vm.createContext({console, Date,
   setTimeout(fn, ms){const id=++next; timers.set(id,{fn, at:now+ms}); return id;},
   clearTimeout(id){timers.delete(id);},
   setInterval(){throw new Error('Overlapping interval polling is forbidden');},
-  fetch: async url => {
+  fetch: async (url, options) => {
     if (url === '/api/sync/status') {
       statusCalls++;
       if (rejectStatus) throw new Error('transient failure');
       return {ok:true,json:async()=>({locked})};
     }
     assert.equal(url, '/api/admin/registry');
+    assert.equal(options.headers['X-Agnes-Registry-Poll'], '1');
     registryCalls++;
     await new Promise(resolve => {release=resolve;});
     return {ok:true,json:async()=>({tables:[]})};
