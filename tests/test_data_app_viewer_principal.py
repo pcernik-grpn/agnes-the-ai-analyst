@@ -159,6 +159,36 @@ def test_rbac_table_reads_use_the_intersection(conn):
     assert "t_owner_only" not in get_accessible_tables(p, conn)
 
 
+def test_viewer_principal_gets_no_internal_table_carveout(conn):
+    """The chat principals keep the internal usage tables reachable (they have
+    no personal stack); a hosted app querying as its viewer must NOT — the
+    app is owner-authored code, and a table absent from both the owner's and
+    the viewer's grants has to stay unreadable through it (Devin Review on
+    #2383). Both RBAC branches must agree."""
+    from connectors.internal.access import INTERNAL_TABLES
+    from src.rbac import can_access_table, get_accessible_tables
+
+    internal_ids = [t.registry_id for t in INTERNAL_TABLES]
+    assert internal_ids, "the seeded internal tables are the subject of this test"
+    p = _principal()
+    for tid in internal_ids:
+        assert can_access_table(p, tid, conn) is False, tid
+    assert not set(internal_ids) & set(get_accessible_tables(p, conn))
+
+    # ...while the chat principals' carve-out is untouched.
+    from app.auth.session_principal import AgentPrincipal
+
+    agent = AgentPrincipal(
+        session_id="s",
+        agent_id="a",
+        owner_user_id="owner",
+        owner_email="owner@example.com",
+        intersection={},
+    )
+    assert can_access_table(agent, internal_ids[0], conn) is True
+    assert set(internal_ids) <= set(get_accessible_tables(agent, conn))
+
+
 def test_client_kind_and_identity_for_audit(conn):
     from src.audit_helpers import client_kind_from_user, identity_for_audit
 

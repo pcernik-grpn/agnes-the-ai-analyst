@@ -10,11 +10,19 @@ carries no participant identity (SR-4), so this object is always live-fresh.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import ClassVar, Union
 
 
 @dataclass(frozen=True)
 class SessionPrincipal:
+    #: Whether ``src.rbac`` keeps the internal usage tables
+    #: (``agnes_sessions`` & co.) reachable for this principal kind despite
+    #: its intersection — the chat-context carve-out (a co-session or agent
+    #: has no personal stack, and the row filter still yields only its own
+    #: rows). A NEW principal kind must opt in explicitly; the default read by
+    #: ``src.rbac`` is False.
+    internal_tables_reachable: ClassVar[bool] = True
+
     session_id: str
     participant_user_ids: list[str]
     participant_emails: list[str]
@@ -58,6 +66,9 @@ class AgentPrincipal:
     exercised there.
     """
 
+    #: See :attr:`SessionPrincipal.internal_tables_reachable`.
+    internal_tables_reachable: ClassVar[bool] = True
+
     session_id: str
     agent_id: str
     owner_user_id: str
@@ -93,6 +104,12 @@ class DataAppViewerPrincipal:
     still say whose app ran the query. Same "restriction, never elevation"
     shape as :class:`AgentPrincipal`.
     """
+
+    #: NO internal-table carve-out: this principal runs inside owner-authored
+    #: code, so a table absent from both the owner's and the viewer's grants
+    #: must stay unreadable — the intersection is the whole authority (Devin
+    #: Review on #2383, "viewer tokens bypass internal-table grants").
+    internal_tables_reachable: ClassVar[bool] = False
 
     slug: str
     app_id: str

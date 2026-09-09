@@ -177,6 +177,13 @@ and `AGNES_DATA_IDENTITY` (`owner` default | `viewer`).
 - Both the owner side and the viewer side of the intersection are
   **re-evaluated live per request** — no caching a grant snapshot at
   deploy time, no admin god-mode short-circuit on either side.
+- **No internal-table carve-out.** `src/rbac.py` keeps the internal usage
+  tables (`agnes_sessions`, `agnes_telemetry`, …) reachable for the *chat*
+  principals (co-session / agent-session), which have no personal stack.
+  `DataAppViewerPrincipal` opts out (`internal_tables_reachable = False`):
+  it runs inside owner-authored code, so a table absent from both the
+  owner's and the viewer's grants must stay unreadable through the app. The
+  intersection is the whole authority — nothing is appended to it.
 - Neither `AGNES_VIEWER_SECRET` nor the token value it signs is ever placed
   on a process argv or in a URL query string, matching the platform's
   existing rule for `AGNES_TOKEN` and every other credential
