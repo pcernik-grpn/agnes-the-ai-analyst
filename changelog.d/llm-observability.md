@@ -55,8 +55,9 @@
   `https://` URL to a named host (plain `http://` only to loopback) without
   credentials, and `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`, when set, applies to
   its host too. A single conversation whose own line exceeds the 8 MiB batch
-  cap is skipped and counted rather than posted over the advertised limit,
-  so it cannot block every conversation behind it. A run that fails mid-walk is audited as
+  cap is still offered to the destination, and only a refusal is stepped
+  over and counted, so an outsized transcript is neither dropped unasked nor
+  able to block every conversation behind it. A run that fails mid-walk is audited as
   failed, never raised into the worker. Migration `0116_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and
@@ -94,6 +95,9 @@
   usage entirely past the mirror's cap.
 
 ### Internal
+- A batch extraction result that errored, was canceled or expired now writes
+  its own zero-cost `llm_calls` row, so a failed batch is visible in the call
+  counts and the error summary instead of leaving no trace at all.
 - Every LLM call site is now traced with `trace_generation`, including ones that
   previously bypassed it entirely (document fact extraction, OCR, vision, the
   NER anonymizer, auto-title, the admin usage assistant) — closed by a static

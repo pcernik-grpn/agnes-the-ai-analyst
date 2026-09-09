@@ -3975,6 +3975,36 @@ def _poll_batch_until_ended(
         sleep(poll_s)
 
 
+def record_batch_failure(provider: Any, model: str, file_id: str, error_type: str) -> None:
+    """One zero-cost ``llm_calls`` row for a batch result that never produced
+    a message — errored, canceled, expired.
+
+    The succeeded path records its call through ``record_generation``;
+    without this, a batch whose results all failed leaves no trace in the
+    ledger at all, so the call counts read as "we never asked" and the error
+    summary meant to answer "why did extraction pull nothing for this
+    document" is blind to exactly the runs that went wrong (design
+    2026-09-08 §3.3/§3.5). Never raises: a measurement never costs an
+    extraction pass.
+    """
+    try:
+        from src.observability import llm_context, record_generation
+        from src.observability.llm_tracing import provider_label
+
+        with llm_context(workload="extraction"):
+            record_generation(
+                provider=provider_label(provider),
+                model=model,
+                purpose="facts_batch",
+                usage=None,
+                subject_id=file_id,
+                batch=True,
+                error_type=error_type,
+            )
+    except Exception:  # noqa: BLE001 - a measurement never costs the pass
+        logger.debug("facts extraction: could not record the failed batch result", exc_info=True)
+
+
 def _collect_batch_results(client: Any, batch_id: str) -> Dict[str, Any]:
     """``{custom_id: result}`` for an ENDED batch. The SDK's own iterator
     arrives in ANY order (Anthropic's own contract), so callers key off
@@ -5056,6 +5086,7 @@ def _run_batch_pass(
             elif result_type == "errored":
                 error = getattr(result, "error", None)
                 error_type = str(getattr(error, "type", "") or "")
+                record_batch_failure(provider, resolved_model, file_id, error_type or "errored")
                 if error_type.startswith("invalid_request"):
                     _requeue(
                         file_id, reason=f"invalid_request: {getattr(error, 'message', error_type)}", permanent=True
@@ -5065,6 +5096,7 @@ def _run_batch_pass(
                     _requeue(file_id, reason=f"errored: {error_type or 'unknown'}", permanent=False)
                     requeued += 1
             else:  # "canceled" / "expired" / anything unrecognized
+                record_batch_failure(provider, resolved_model, file_id, str(result_type or "unknown"))
                 _requeue(file_id, reason=str(result_type or "unknown"), permanent=False)
                 requeued += 1
         elapsed = time.monotonic() - started

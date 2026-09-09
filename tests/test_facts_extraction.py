@@ -3233,3 +3233,47 @@ def test_a_failed_extraction_is_recorded_as_an_error_and_still_raises(llm_record
     assert llm_records[0].status == "error"
     assert llm_records[0].error_type == "Boom"
     assert llm_records[0].purpose == "facts_extraction"
+
+
+class TestFailedBatchResultsReachTheLedger:
+    """Review finding: only the succeeded branch of the batch collector
+    recorded its call, so a batch whose results errored, were canceled or
+    expired left no ``llm_calls`` row at all — the call counts read as "we
+    never asked" and the error summary was blind to the runs that failed."""
+
+    def test_a_failed_batch_result_records_one_zero_usage_error_row(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "src.observability.record_generation", lambda **kw: calls.append(kw), raising=False
+        )
+
+        fe.record_batch_failure("anthropic", "claude-haiku-4-5", "cf_1", "expired")
+
+        assert len(calls) == 1
+        (call,) = calls
+        assert call["purpose"] == "facts_batch"
+        assert call["subject_id"] == "cf_1"
+        assert call["error_type"] == "expired"
+        assert call["batch"] is True
+        assert call["usage"] is None
+
+    def test_recording_never_costs_the_pass(self, monkeypatch):
+        def _boom(**_kw):
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr("src.observability.record_generation", _boom, raising=False)
+
+        fe.record_batch_failure("anthropic", "claude-haiku-4-5", "cf_1", "errored")  # must not raise
+
+    def test_both_failure_branches_call_it(self):
+        """The recorder is reached from a closure the unit tests cannot
+        drive, so this pins the wiring at the source level — the same shape
+        `tests/test_chat_sources_verdict.py` uses for `manager.py`."""
+        import inspect
+
+        src = inspect.getsource(fe)
+        collector = src.split("def _collect_batch(batch_id: str) -> None:", 1)[1].split("\n    def ", 1)[0]
+        assert collector.count("record_batch_failure(") == 2, (
+            "the errored and the canceled/expired branch must each record a ledger row"
+        )
+

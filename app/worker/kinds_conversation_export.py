@@ -463,27 +463,33 @@ def run_conversation_export_once(
         for batch in _batches(_records(bundle, since=since, until=until, surfaces=surfaces, start_cursor=start_cursor)):
             records = [record for record, _key in batch]
             body = b"".join(serialize_jsonl(records))
-            if len(batch) == 1 and len(body) > MAX_BATCH_BYTES:
-                # One conversation whose own line is larger than the batch
-                # size this sink advertises to the collector. It cannot be
-                # split (the export is "complete, never truncated"), and
-                # posting it anyway breaks the contract the collector
-                # enforces -- which then rejects it on every run and blocks
-                # every conversation behind it forever. Skip it, count it,
-                # and advance past it: one outsized transcript costs one
-                # record, not the whole corpus. The pull endpoint, which
-                # has no batch cap, still serves it.
+            # A single conversation whose own line exceeds the batch size
+            # this sink advertises. It cannot be split (the export is
+            # "complete, never truncated"), so it is still ATTEMPTED --
+            # skipping it unasked would leave the destination corpus
+            # quietly incomplete. What changes is the handling of a refusal:
+            # a collector that enforces the cap rejects this one record on
+            # every run, and treating that as an ordinary failed batch stops
+            # the walk and blocks every conversation behind it forever. So a
+            # refused over-cap record is stepped over instead: counted,
+            # logged with its id, and the watermark advanced past it, while
+            # the pull endpoint (no batch cap) still serves it whole.
+            oversized = len(batch) == 1 and len(body) > MAX_BATCH_BYTES
+            response = _post_with_retry(http_client, endpoint, headers, body, sleep=sleep)
+            if oversized and response is not None and 400 <= response.status_code < 500:
                 last_ts, last_id = batch[0][1]
                 logger.warning(
-                    "conversation-export: one conversation serializes to %d bytes, over the %d-byte batch cap -- "
-                    "skipped and the watermark advanced past it; fetch it with the pull endpoint",
+                    "conversation-export: conversation %s serializes to %d bytes, over the %d-byte batch cap, "
+                    "and the destination refused it with %d -- stepped over so it cannot block the ones behind "
+                    "it; fetch it with the pull endpoint",
+                    last_id,
                     len(body),
                     MAX_BATCH_BYTES,
+                    response.status_code,
                 )
                 oversized_skipped += 1
                 watermark_repo.set(name, last_ts, last_id)
                 continue
-            response = _post_with_retry(http_client, endpoint, headers, body, sleep=sleep)
             if response is None or not (200 <= response.status_code < 300):
                 logger.warning(
                     "conversation-export: batch of %d record(s) failed to deliver -- "

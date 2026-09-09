@@ -903,12 +903,13 @@ whole corpus under the new configuration from a fresh cursor, so the
 destination collector must upsert by `thread_id`), walks every
 conversation completed since it, and POSTs newline-delimited JSON
 batches (at most 200 records or 8 MiB per request — a single conversation
-whose own line already exceeds 8 MiB is skipped rather than posted over the
-cap this sink advertises, counted as `oversized_skipped` in the run's audit
-row and logged, so one outsized transcript costs one record instead of
-blocking every conversation behind it; the export is "complete, never
-truncated", so there is nothing smaller to send and the pull endpoint,
-which has no batch cap, still serves it) to `endpoint`, with the auth headers parsed
+whose own line already exceeds 8 MiB is still offered to the destination,
+since the export is "complete, never truncated" and there is nothing
+smaller to send; if the destination refuses it the run steps over that one
+record rather than stopping, counting it as `oversized_skipped` in the
+audit row and naming it in the log, so one outsized transcript cannot block
+every conversation behind it, and the pull endpoint — which has no batch
+cap — still serves it whole) to `endpoint`, with the auth headers parsed
 `OTEL_EXPORTER_OTLP_HEADERS`-style from the environment variable named by
 `headers_secret_env` — the header value itself never sits in
 `instance.yaml`. Because that request carries a secret and customer

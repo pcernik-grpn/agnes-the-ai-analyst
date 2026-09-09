@@ -483,23 +483,18 @@ class TestBatching:
 
 
 class TestOversizedRecordNeverBlocksTheCorpus:
-    """Review finding: a single conversation whose own ndjson line exceeds
-    the advertised batch cap used to be posted anyway. A collector that
-    enforces the cap rejects it on every run, and the watermark never gets
-    past it -- one outsized transcript blocks the whole corpus forever."""
+    """Review finding: a conversation whose own ndjson line exceeds the
+    advertised batch cap must neither be dropped unasked (the destination
+    corpus would be quietly incomplete) nor allowed to wedge the walk (a
+    collector that enforces the cap rejects it on every run, and every
+    conversation behind it waits forever). It is attempted; only a refusal
+    is stepped over."""
 
-    def test_an_oversized_record_is_skipped_and_the_ones_behind_it_still_deliver(
-        self, pg_client, pg_engine, monkeypatch
-    ):
+    def test_an_oversized_record_is_still_attempted(self, pg_client, pg_engine, monkeypatch):
         from app.worker import kinds_conversation_export as mod
-        from src.repositories import export_watermarks_repo
 
-        # A cap far below 8 MiB so the test does not have to build a real
-        # 8 MiB transcript: an ordinary record is a couple of KB and fits,
-        # the padded one does not.
         monkeypatch.setattr(mod, "MAX_BATCH_BYTES", 20_000)
         _seed_session(pg_engine, index=0, content="x" * 40_000)
-        _seed_session(pg_engine, index=1, content="hi")
 
         posted: list[bytes] = []
 
@@ -509,24 +504,67 @@ class TestOversizedRecordNeverBlocksTheCorpus:
 
         result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result["oversized_skipped"] == 1
-        assert all(len(body) <= 20_000 for body in posted), "an over-contract body was posted anyway"
-        assert b"hi" in b"".join(posted), "the record behind the oversized one never arrived"
-        # The watermark moved past BOTH, so the next run does not re-walk
-        # the oversized record forever.
-        watermark = export_watermarks_repo().get(_watermark_name_for())
-        assert watermark is not None
-        posted.clear()
-        again = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert again["sent"] == 0 and posted == []
+        assert len(posted) == 1, "the over-cap conversation was never offered to the destination"
+        assert result["sent"] == 1
+        assert result["oversized_skipped"] == 0
 
-    def test_the_skip_is_counted_in_the_audit_row(self, pg_client, pg_engine, monkeypatch):
+    def test_a_refused_oversized_record_is_stepped_over_and_the_rest_deliver(self, pg_client, pg_engine, monkeypatch):
+        from app.worker import kinds_conversation_export as mod
+        from src.repositories import export_watermarks_repo
+
+        monkeypatch.setattr(mod, "MAX_BATCH_BYTES", 20_000)
+        _seed_session(pg_engine, index=0, content="x" * 40_000)
+        _seed_session(pg_engine, index=1, content="hi")
+
+        accepted: list[bytes] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # A collector that enforces the cap it advertises.
+            if len(request.content) > 20_000:
+                return httpx.Response(413)
+            accepted.append(request.content)
+            return httpx.Response(200)
+
+        result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result["oversized_skipped"] == 1
+        assert result["sent"] == 1
+        assert b"hi" in b"".join(accepted), "the record behind the refused one never arrived"
+        # The watermark moved past both, so the next run neither retries the
+        # refusal forever nor re-sends what already landed.
+        assert export_watermarks_repo().get(_watermark_name_for()) is not None
+        accepted.clear()
+        again = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert again["sent"] == 0 and accepted == []
+
+    def test_a_5xx_on_an_oversized_record_is_an_ordinary_failure_not_a_skip(self, pg_client, pg_engine, monkeypatch):
+        """A destination that is merely down must not cost the record: only
+        a refusal (4xx) is stepped over, a 5xx leaves the watermark alone so
+        the next run tries it again."""
+        from app.worker import kinds_conversation_export as mod
+        from src.repositories import export_watermarks_repo
+
+        monkeypatch.setattr(mod, "MAX_BATCH_BYTES", 20_000)
+        _seed_session(pg_engine, index=0, content="x" * 40_000)
+
+        result = mod.run_conversation_export_once(
+            client=_mock_client(lambda _r: httpx.Response(503)), sleep=lambda *_: None
+        )
+
+        assert result["oversized_skipped"] == 0
+        assert result["batches_failed"] == 1
+        assert export_watermarks_repo().get(_watermark_name_for()) is None
+
+    def test_the_step_over_is_counted_in_the_audit_row(self, pg_client, pg_engine, monkeypatch):
         from app.worker import kinds_conversation_export as mod
 
         monkeypatch.setattr(mod, "MAX_BATCH_BYTES", 20_000)
         _seed_session(pg_engine, index=0, content="x" * 40_000)
 
-        mod.run_conversation_export_once(client=_mock_client(lambda _r: httpx.Response(200)), sleep=lambda *_: None)
+        mod.run_conversation_export_once(
+            client=_mock_client(lambda r: httpx.Response(413 if len(r.content) > 20_000 else 200)),
+            sleep=lambda *_: None,
+        )
         params = _latest_export_audit_params(pg_engine)
         assert params["oversized_skipped"] == 1
         assert params["count"] == 0
