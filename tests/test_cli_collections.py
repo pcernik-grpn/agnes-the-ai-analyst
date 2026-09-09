@@ -35,14 +35,25 @@ def test_collections_help_lists_subcommands():
         assert cmd in r.output, f"missing subcommand {cmd!r} in help"
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def test_cat_help_uses_the_canonical_paging_flags():
     """`--offset` / `--limit` / `--json`, the same vocabulary `show` uses —
-    no new boolean or `--k`-style flag (command-ux playbook)."""
+    no new boolean or `--k`-style flag (command-ux playbook).
+
+    Asserted on the text a reader sees: under a colour-forcing CI terminal
+    Rich styles each hyphen of a flag separately, so the raw bytes never
+    contain the literal ``--offset`` even though the flag is right there.
+    Stripping the escapes keeps the test honest in both directions — it
+    still fails when a flag is genuinely missing.
+    """
     r = runner.invoke(collections_app, ["cat", "--help"])
     assert r.exit_code == 0, r.output
+    plain = _ANSI.sub("", r.output)
     for flag in ("--offset", "--limit", "--json"):
-        assert flag in r.output, f"cat --help does not list {flag}"
-    assert "whole" in r.output.lower(), "the help must say the default prints the whole file"
+        assert flag in plain, f"cat --help does not list {flag}"
+    assert "whole" in plain.lower(), "the help must say the default prints the whole file"
 
 
 # ---------------------------------------------------------------------------
