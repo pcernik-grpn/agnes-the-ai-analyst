@@ -317,6 +317,68 @@ def test_a_direct_grant_beside_an_everyone_grant_covers_all_members():
     assert mkt["applies_to"] == "all_members"
 
 
+def _with_direct_available_on_mkt(everyone_requirement: str) -> dict:
+    grants = [dict(g) for g in _OVERVIEW["grants"]]
+    grants[1]["requirement"] = everyone_requirement  # the Everyone grant on pkg_mkt
+    grants.append(
+        {
+            "id": "gr6",
+            "group_id": "g_fin",
+            "resource_type": "data_package",
+            "resource_id": "pkg_mkt",
+            "requirement": "available",
+            "audience": "g_fin",
+            "scope": None,
+        }
+    )
+    return {**_OVERVIEW, "grants": grants}
+
+
+def test_a_stronger_everyone_grant_does_not_speak_for_the_group_s_service_accounts():
+    """Everyone `required` + direct `available`: people in the group have the
+    package always (via Everyone), but a service account in the group is not
+    reached by the Everyone grant, so under classic membership it still needs
+    a subscription. One merged row must not let the people-effective state
+    stand for the service accounts too."""
+    overview = _with_direct_available_on_mkt("required")
+
+    def dispatch(url: str, **_kwargs):
+        if "/api/admin/access-overview" in url:
+            return _mock_resp(overview)
+        return _dispatch(url)
+
+    result, _ = _call(auto_membership=False, dispatch=dispatch)
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    mkt = next(p for p in fin["packages"] if p["id"] == "pkg_mkt")
+    assert (mkt["requirement"], mkt["in_stack"], mkt["applies_to"]) == ("required", "always", "all_members")
+    assert mkt["service_accounts"] == {"requirement": "available", "in_stack": "if_subscribed"}
+
+    # Auto-membership: the subscription question disappears, the tier
+    # difference does not.
+    result, _ = _call(auto_membership=True, dispatch=dispatch)
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    mkt = next(p for p in fin["packages"] if p["id"] == "pkg_mkt")
+    assert mkt["service_accounts"] == {"requirement": "available", "in_stack": "always"}
+
+
+def test_no_service_account_block_when_the_direct_grant_is_at_least_as_strong():
+    overview = _with_direct_available_on_mkt("available")
+
+    def dispatch(url: str, **_kwargs):
+        if "/api/admin/access-overview" in url:
+            return _mock_resp(overview)
+        return _dispatch(url)
+
+    result, _ = _call(auto_membership=False, dispatch=dispatch)
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    mkt = next(p for p in fin["packages"] if p["id"] == "pkg_mkt")
+    assert "service_accounts" not in mkt
+    # And a people-only row never carries one either: there are no
+    # non-people to describe separately.
+    everyone = next(g for g in result["by_group"] if g["group_id"] == "everyone")
+    assert all("service_accounts" not in p for p in everyone["packages"])
+
+
 def test_packages_carry_their_lifecycle_visibility():
     result, _ = _call()
 

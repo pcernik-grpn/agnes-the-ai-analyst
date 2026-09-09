@@ -293,21 +293,30 @@ def _compose_access_picture(
         for e in entries:
             cur = by_id.get(e["id"])
             if cur is None:
-                by_id[e["id"]] = {**e, "via": [e["via"]]}
-                continue
-            if e["via"] not in cur["via"]:
+                cur = by_id[e["id"]] = {**e, "via": [e["via"]], "_member_req": None}
+            elif e["via"] not in cur["via"]:
                 cur["via"].append(e["via"])
             if e["requirement"] == "required":
                 cur["requirement"] = "required"
             if e["in_stack"] == "always":
                 cur["in_stack"] = "always"
+            if e["via"] in ("group", "admin") and (e["requirement"] == "required" or cur["_member_req"] is None):
+                # The strongest tier among the sources that reach EVERY member.
+                cur["_member_req"] = e["requirement"]
         out = []
         for e in by_id.values():
             e["via"] = sorted(e["via"])
+            member_req = e.pop("_member_req")
             # An everyone-scoped grant reaches PEOPLE only (the grant reader
             # applies it to human users), while a group may hold service
             # accounts too. Only a direct (or admin) grant covers every member.
-            e["applies_to"] = "all_members" if any(v in ("group", "admin") for v in e["via"]) else "people_only"
+            e["applies_to"] = "all_members" if member_req is not None else "people_only"
+            if member_req is not None and member_req != e["requirement"]:
+                # A stronger everyone-scoped grant lifted the row's tier, but
+                # it reaches people only: a service account in the group holds
+                # just the member-wide tier, so say so beside the row rather
+                # than let the people-effective state stand for it.
+                e["service_accounts"] = {"requirement": member_req, "in_stack": _in_stack(member_req, "group")}
             out.append(e)
         return out
 
@@ -388,7 +397,9 @@ def _compose_access_picture(
         ),
         (
             "Everyone-scoped grants reach people only: a service account in a group reaches just the "
-            "group's direct grants -- by_group entries say so with applies_to=all_members | people_only."
+            "group's direct grants -- by_group entries say so with applies_to=all_members | people_only, "
+            "and carry service_accounts={requirement, in_stack} when a stronger Everyone grant lifted the "
+            "row above what the group's own grant gives its service accounts."
         ),
         (
             "tables_in_no_package lists distributable tables only (query_mode blank/local/materialized): "
@@ -2939,7 +2950,11 @@ def register_foundation_tools(
           ``everyone`` / ``admin``; ``requirement`` is ``required`` if any
           source is; ``applies_to`` is ``people_only`` when the ONLY source
           is an everyone-scoped grant, which reaches human users and not a
-          service account the group may also hold, else ``all_members``).
+          service account the group may also hold, else ``all_members``;
+          when a stronger everyone-scoped grant lifted the row's tier above
+          the group's own grant, ``service_accounts: {requirement,
+          in_stack}`` carries the member-wide state that a service account
+          in the group actually holds).
           Drafts and coming-soon packages are excluded exactly as
           ``StackResolver.stack`` excludes them; ``bypasses_grants`` is true
           for the Admin group, which reaches everything regardless. This is
