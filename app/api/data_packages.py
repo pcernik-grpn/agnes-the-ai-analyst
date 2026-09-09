@@ -22,7 +22,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
 
 # Six-digit hex colors only — the /catalog cards use the value directly as
@@ -391,6 +391,13 @@ def _serialize(pkg: Dict[str, Any], conn: Optional[duckdb.DuckDBPyConnection] = 
 async def list_data_packages(
     search: Optional[str] = None,
     include_table_ids: bool = False,
+    limit: int = Query(
+        200,
+        ge=1,
+        le=5000,
+        description="Page size. The repository always had one (default 200); exposing it lets a composed "
+        "reader ask for the whole inventory instead of silently losing every package past the 200th.",
+    ),
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -404,7 +411,7 @@ async def list_data_packages(
     ``DataPackagesRepository.list_member_ids_bulk``.
     """
     repo = data_packages_repo()
-    rows = repo.list(search=search)
+    rows = repo.list(search=search, limit=limit)
     serialized = [_serialize(r, conn) for r in rows]
     if include_table_ids:
         members_by_pkg = repo.list_member_ids_bulk()
