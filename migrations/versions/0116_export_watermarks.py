@@ -2,10 +2,14 @@
 (design 2026-09-08, §3.12, Task 11).
 
 One row per named sink. The ``conversation-export`` worker job kind
-(``app/worker/kinds_conversation_export.py``) reads the row named
-``"conversation_export"`` to know which conversations it has already
-delivered to ``observability.conversation_export.endpoint``, and advances
-it only after that endpoint answers 2xx.
+(``app/worker/kinds_conversation_export.py``) reads the row named after
+its own delivery configuration (``watermark_name(endpoint, surfaces)`` —
+a ``"conversation_export:<hash>"`` name, not a single fixed row, so a
+repointed endpoint or a widened/narrowed surfaces list gets a fresh
+cursor rather than silently resuming the old configuration's position)
+to know which conversations it has already delivered to
+``observability.conversation_export.endpoint``, and advances it only
+after that endpoint answers 2xx.
 
 PG-ONLY (A3 PG-first ratchet — ``CLAUDE.md`` -> "Dual-backend discipline").
 This is a brand-new table landing after the DuckDB app-state backend was

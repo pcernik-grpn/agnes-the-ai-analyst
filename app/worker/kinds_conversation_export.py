@@ -5,13 +5,14 @@ Task 10 built the PULL side (``GET /api/admin/conversations/corpus`` —
 ``app/api/conversations_export.py``): an admin (or a data platform with a
 PAT) asks for a window and gets it back. This is the PUSH side: a
 scheduled ``conversation-export`` job reads a Postgres-persisted watermark
-(``export_watermarks``, name ``"conversation_export"``), walks every
-conversation completed since it via the SAME record builder
-(``src.conversation_export.iter_conversations``), and POSTs
-newline-delimited JSON batches to ``observability.conversation_export
-.endpoint`` — advancing the watermark only after a batch's destination
-answers 2xx, so a failed delivery is retried on the next tick rather than
-silently skipped, and a delivered one is never resent from scratch.
+(``export_watermarks``, keyed by :func:`watermark_name` — never a single
+fixed row, see below), walks every conversation completed since it via
+the SAME record builder (``src.conversation_export.iter_conversations``),
+and POSTs newline-delimited JSON batches to
+``observability.conversation_export.endpoint`` — advancing the watermark
+only after a batch's destination answers 2xx, so a failed delivery is
+retried on the next tick rather than silently skipped, and a delivered
+one is never resent from scratch.
 
 **The watermark is a keyset position, not a record timestamp.** It is
 ``(last_message_at, id)`` of the last DELIVERED ``chat_sessions`` row —
@@ -32,6 +33,35 @@ conversation of a run from being re-sent on every subsequent tick.
 fetched at all — the walk's keyset only ever advances across rows that
 were actually sent, and an excluded surface never causes the same filtered
 tail to be re-fetched and re-discarded on every tick.
+
+**The watermark identity tracks the delivery configuration, not a fixed
+name.** :func:`watermark_name` derives the ``export_watermarks.name`` row
+from a hash of ``endpoint`` and the sorted ``surfaces`` allowlist
+(prefixed :data:`WATERMARK_PREFIX`), so two runs with the SAME endpoint
+and SAME surfaces resume the SAME cursor exactly as before, while a run
+whose endpoint changed or whose surfaces widened/narrowed resolves to a
+DIFFERENT row and starts fresh at the epoch for that configuration. This
+is deliberate: resuming the OLD cursor after such a change would mean the
+new destination (or the newly-included surface) never receives the
+conversations completed before the change. The old watermark row is left
+in place, harmless. The consequence is that changing ``endpoint`` or
+``surfaces`` RE-DELIVERS the whole corpus under the new configuration —
+the destination collector must upsert by ``thread_id``, exactly as it
+already must for a forked/continued session (see below and the settle
+window paragraph).
+
+**A conversation is walked only once it has settled for
+``SETTLE_WINDOW`` (5 minutes).** This job sets ``until = now -
+SETTLE_WINDOW`` rather than ``now`` when calling ``list_completed_between``,
+so a session whose ``last_message_at`` was just bumped by a USER message
+that has no assistant answer yet is left off this run's page instead of
+being exported (and its watermark advanced past) mid-turn — a later tick
+re-checks a fresh ``now`` and picks it up once it is quiet. An
+interrupted turn (a user message that never gets answered) still exports
+once the window passes, unchanged from today. A thread that continues
+after being exported is re-exported later with the fuller transcript once
+it settles again, so here too the destination must upsert by
+``thread_id``.
 
 **Registered unconditionally, no-ops when unconfigured** — the same
 posture as ``distribution-mirror``/``ducklake-maintenance`` in
@@ -81,12 +111,13 @@ connection at all on an unconfigured or policy-off instance).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
 from collections.abc import Callable, Iterable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -99,12 +130,21 @@ from src.observability.otel import parse_otlp_headers
 
 logger = logging.getLogger(__name__)
 
-#: The ``jobs.kind`` string and the ``export_watermarks.name`` row this
-#: module owns — kept as named constants rather than repeated literals so
-#: the scheduler/registry/repo layers can't drift on the spelling.
+#: The ``jobs.kind`` string this module owns and the prefix for the
+#: ``export_watermarks.name`` row :func:`watermark_name` derives — kept as
+#: named constants rather than repeated literals so the scheduler/registry/
+#: repo layers can't drift on the spelling.
 KIND = "conversation-export"
-WATERMARK_NAME = "conversation_export"
+WATERMARK_PREFIX = "conversation_export"
 IDEMPOTENCY_KEY = "conversation-export"
+
+#: A conversation is walked only once its ``last_message_at`` is at least
+#: this old — see the module docstring's "settle window" paragraph. A
+#: user message with no assistant answer yet bumps ``last_message_at``
+#: before the record is complete; leaving it off this run's page (rather
+#: than exporting a half-turn and advancing the watermark past it) means a
+#: later tick re-checks a fresh "now" and picks it up once it is quiet.
+SETTLE_WINDOW = timedelta(minutes=5)
 
 #: Spec 3.12: "batches of at most 200 records or 8 MiB".
 MAX_BATCH_RECORDS = 200
@@ -128,6 +168,22 @@ PAGE_LIMIT = 200
 #: ``endpoint``), so a first run backfilling the whole transcript is the
 #: expected behaviour, not a runaway scan.
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def watermark_name(endpoint: str, surfaces: tuple[str, ...]) -> str:
+    """The ``export_watermarks.name`` row for one delivery configuration —
+    see the module docstring's "watermark identity" paragraph. A short
+    hash of ``endpoint`` and the SORTED ``surfaces`` allowlist (order must
+    not matter — ``("web", "slack")`` and ``("slack", "web")`` are the
+    same configuration), prefixed :data:`WATERMARK_PREFIX`. Two calls with
+    the same arguments always return the same name; changing either
+    argument returns a different one, which is what makes a repointed
+    endpoint or a widened/narrowed surfaces list start a fresh cursor
+    rather than silently resuming the old configuration's position.
+    """
+    digest = hashlib.sha256(f"{endpoint}\n{','.join(sorted(surfaces))}".encode()).hexdigest()[:16]
+    return f"{WATERMARK_PREFIX}:{digest}"
+
 
 #: One warning per process for "policy excludes workload chat" — the
 #: scheduler ticks hourly by default; nobody needs that warning hourly.
@@ -350,7 +406,13 @@ def run_conversation_export_once(
         logger.debug("conversation-export: DuckDB-backed instance -- no push sink to run")
         return {"skipped": "requires_postgres_backend"}
 
-    watermark = watermark_repo.get(WATERMARK_NAME)
+    endpoint = config["endpoint"]
+    endpoint_host = urlsplit(endpoint).hostname or ""
+    headers = {"Content-Type": "application/x-ndjson", **_resolve_headers(config["headers_secret_env"])}
+    surfaces = tuple(config["surfaces"]) if config["surfaces"] else ()
+    name = watermark_name(endpoint, surfaces)
+
+    watermark = watermark_repo.get(name)
     if watermark is None:
         since = _EPOCH
         start_cursor = None
@@ -358,7 +420,10 @@ def run_conversation_export_once(
         watermark_ts, watermark_cursor_id = watermark
         since = watermark_ts
         start_cursor = encode_cursor(watermark_ts, watermark_cursor_id)
-    until = datetime.now(UTC)
+    # SETTLE_WINDOW: a session whose last_message_at falls after `until`
+    # may still be mid-turn (a user message with no assistant answer yet)
+    # -- left for a later tick rather than exported incomplete.
+    until = datetime.now(UTC) - SETTLE_WINDOW
 
     anonymizer = export_text if mode == "pseudonymized" else None
     bundle = ConversationExportRepoBundle(
@@ -371,11 +436,6 @@ def run_conversation_export_once(
         content_mode=mode,
         anonymizer=anonymizer,
     )
-
-    endpoint = config["endpoint"]
-    endpoint_host = urlsplit(endpoint).hostname or ""
-    headers = {"Content-Type": "application/x-ndjson", **_resolve_headers(config["headers_secret_env"])}
-    surfaces = tuple(config["surfaces"]) if config["surfaces"] else ()
 
     own_client = client is None
     http_client = client or httpx.Client(timeout=HTTP_TIMEOUT_S)
@@ -397,7 +457,7 @@ def run_conversation_export_once(
                 batches_failed += 1
                 break
             last_ts, last_id = batch[-1][1]
-            watermark_repo.set(WATERMARK_NAME, last_ts, last_id)
+            watermark_repo.set(name, last_ts, last_id)
             total_sent += len(batch)
             batches_sent += 1
     except Exception as exc:
@@ -474,7 +534,9 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MAX_BATCH_BYTES",
     "MAX_BATCH_RECORDS",
-    "WATERMARK_NAME",
+    "SETTLE_WINDOW",
+    "WATERMARK_PREFIX",
     "run_conversation_export",
     "run_conversation_export_once",
+    "watermark_name",
 ]
