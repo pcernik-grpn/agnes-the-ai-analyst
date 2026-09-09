@@ -165,3 +165,4 @@
 0111_fact_collection_type_counts
 0112_jobs_idem_pattern_index
 0113_data_apps_data_identity
+0114_issue_reports
