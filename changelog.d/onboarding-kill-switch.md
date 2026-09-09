@@ -24,6 +24,21 @@
   `yaml` or the default. See [`docs/feature-flags.md`](docs/feature-flags.md)
   and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
+### Fixed
+- **A present-but-empty `AGNES_*` override is no longer blamed on YAML.**
+  `/api/admin/config-surface` decided a knob's `source` from the env var's
+  content, which is right for the string and select knobs (they read
+  `os.environ.get(X) or get_value(...)`, so an empty value is ignored) and
+  wrong for the switch-backed booleans (`feature_enabled` honours any PRESENT
+  value and coerces `""` to `False`). A rendered `.env` line with nothing after
+  the `=` therefore turned such a feature off while the inventory reported
+  `source: "yaml"`, sending an operator to look for a config line that does not
+  exist. Rows now opt in with `env_empty_overrides`, set on the four knobs that
+  need it — `onboarding_enabled`, `agent_profiles_enabled`,
+  `home_automode_visibility` and `home_status_frame_visibility` — and a sweep in
+  `tests/test_config_surface_api.py` fails if a future row honours an empty
+  override without declaring it, or declares it without honouring one.
+
 ### Internal
 - The design-system reference's accent vocabulary named `--ds-kai-*`, a token
   family that no longer exists — it was renamed to `--ds-assistant-*` when the

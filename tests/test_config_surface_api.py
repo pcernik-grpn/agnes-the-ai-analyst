@@ -266,3 +266,73 @@ class TestFaviconKnob:
         assert _source_for(None, "r", "img/x.png?v=9", "img/x.png") == "yaml"
         assert _source_for(None, "r", "img/x.png?v=9", "img/x.png", cache_busted=True) == "default"
         assert _source_for(None, "r", "img/other.png?v=9", "img/x.png", cache_busted=True) == "yaml"
+
+
+class TestEmptyEnvProvenance:
+    """`_source_for` decides `env` from the env var's CONTENT, which is right
+    for the knobs that read `os.environ.get(X) or get_value(...)` and wrong for
+    the ones that go through `feature_enabled` — that takes any PRESENT value
+    and coerces `""` to False. A rendered `.env` line with nothing after the
+    `=` therefore turns such a feature off while the inventory blamed `yaml`,
+    sending an operator to look for a config line that does not exist (Devin
+    Review on #2419).
+
+    The per-row `env_empty_overrides` flag is the fix. This sweep is the guard
+    that the next row to need it gets it, since nothing else couples the two.
+    """
+
+    def _resolves_empty_as_override(self, resolver_name, env_var):
+        import app.instance_config as ic
+
+        fn = getattr(ic, resolver_name, None)
+        if fn is None:
+            return False
+        had = os.environ.get(env_var)
+        try:
+            os.environ.pop(env_var, None)
+            ic.reset_cache()
+            unset = fn()
+            os.environ[env_var] = ""
+            ic.reset_cache()
+            empty = fn()
+        except Exception:  # noqa: BLE001 — a resolver that raises is not comparable, so skip it
+            return False
+        finally:
+            os.environ.pop(env_var, None)
+            if had is not None:
+                os.environ[env_var] = had
+            ic.reset_cache()
+        return empty != unset
+
+    def test_every_row_honouring_an_empty_override_declares_it(self):
+        from app.api.config_surface import _KNOB_CATALOGUE
+
+        missing = [
+            e["key"]
+            for e in _KNOB_CATALOGUE
+            if e.get("env_var")
+            and not e.get("env_empty_overrides")
+            and self._resolves_empty_as_override(e["resolver"], e["env_var"])
+        ]
+        assert not missing, (
+            "these knobs treat a present-but-empty env var as an override, so their "
+            f'source must be reported as `env` — add "env_empty_overrides": True to '
+            f"their _KNOB_CATALOGUE rows: {missing}"
+        )
+
+    def test_the_flag_is_not_set_where_an_empty_override_is_ignored(self):
+        """The other direction, so the flag cannot be sprinkled on by habit: a
+        knob that ignores an empty value must NOT claim `env` for one."""
+        from app.api.config_surface import _KNOB_CATALOGUE
+
+        wrong = [
+            e["key"]
+            for e in _KNOB_CATALOGUE
+            if e.get("env_empty_overrides")
+            and e.get("env_var")
+            and not self._resolves_empty_as_override(e["resolver"], e["env_var"])
+        ]
+        assert not wrong, (
+            "these knobs ignore a present-but-empty env var, so declaring "
+            f"env_empty_overrides would mislabel their source as `env`: {wrong}"
+        )

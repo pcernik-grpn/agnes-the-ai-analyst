@@ -368,3 +368,36 @@ def test_the_page_and_the_inventory_share_one_read(seeded_app):
     with patch.dict("os.environ", {"AGNES_ONBOARDING_ENABLED": "0"}):
         assert get_onboarding_enabled() is False
         assert _router._onboarding_enabled() is False
+
+
+def test_an_empty_env_override_is_reported_as_env_not_yaml(seeded_app):
+    """`AGNES_ONBOARDING_ENABLED=` — a rendered `.env` line with nothing
+    filled in — turns onboarding OFF, because `feature_enabled` takes any
+    PRESENT env value and coerces `""` to False. The inventory has to say that
+    came from `env`: reporting `yaml` (which it did, because `_source_for`
+    tested content rather than presence, and False differs from this knob's
+    True default) sends an operator looking for a config line that does not
+    exist. Devin Review on this PR."""
+    with patch.dict("os.environ", {"AGNES_ONBOARDING_ENABLED": ""}):
+        knob = _knob(seeded_app["client"], seeded_app["admin_token"])
+    assert knob is not None
+    assert knob["current_value"] is False, "an empty present env var means off"
+    assert knob["source"] == "env", "yaml contributed nothing — do not blame it"
+
+
+def test_the_empty_env_rule_is_opt_in_and_did_not_leak_to_string_knobs(seeded_app):
+    """The scoping half, and the reason the fix is a per-row flag rather than
+    a new global rule: string and select knobs read `os.environ.get(X) or
+    get_value(...)`, so an EMPTY override is ignored and the yaml tier still
+    decides. Presence-based detection for everything would label those `env`
+    when the environment contributed nothing — the opposite mistake."""
+    resp = None
+    with patch.dict("os.environ", {"AGNES_HOME_ROUTE": "", "AGNES_INSTANCE_THEME": ""}):
+        resp = seeded_app["client"].get(
+            "/api/admin/config-surface",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    knobs = {k["resolver"]: k for k in resp.json()["knobs"]}
+    for resolver in ("get_home_route", "get_instance_theme"):
+        assert knobs[resolver]["source"] != "env", f"{resolver} ignores an empty override, so its source is not env"
