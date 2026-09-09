@@ -39399,6 +39399,102 @@
         ]
       }
     },
+    "/api/admin/telemetry/feedback": {
+      "get": {
+        "description": "The chat-turn thumbs feedback queue \u2014 every ``chat_message_feedback``\nrow in the window, newest first, optionally narrowed to one verdict.\nPostgres-backed instances only (typed 501 otherwise).",
+        "operationId": "feedback_api_admin_telemetry_feedback_get",
+        "parameters": [
+          {
+            "description": "1d|7d|30d|all",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "1d|7d|30d|all",
+              "title": "Window",
+              "type": "string"
+            }
+          },
+          {
+            "description": "up|down",
+            "in": "query",
+            "name": "verdict",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "up|down",
+              "title": "Verdict"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Feedback",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
     "/api/admin/telemetry/kpis": {
       "get": {
         "description": "Four headline numbers, scoped to the same filters as /query \u2014 plus what\nthe window cost.\n\nThe cards on /admin/usage echo these as clickable quick-filters, so the\nserver applies the same WHERE the table will see \u2014 otherwise the cards\nand the table tell different stories at the same time.\n\n``cost_usd`` is the one figure here NOT read from ``usage_events``: token\ncounts live on session summaries, so it comes from the shared read model\n(``app.services.usage_stats``) over the same user and window, rounded up to\nwhole days. The narrower event filters (tool/source/event_type/only_errors)\ndo not apply to it \u2014 it prices everything the selected user spent in the\nwindow, which is the same number /me/activity and the adoption drill-down\nreport for them. It is ``null`` when it cannot be computed rather than a\nzero that would read as \"free\": an unresolvable ``username``, or an\ninstance-wide read on a backend without the Postgres-only ``usage_turns``\ntable.",
@@ -39550,6 +39646,232 @@
           }
         },
         "summary": "Usage Kpis",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
+    "/api/admin/telemetry/llm-calls": {
+      "get": {
+        "description": "Detail rows for one session/turn/job/user from the ``llm_calls``\nledger, newest first \u2014 the drill-down under ``llm-cost``'s aggregates.\n\nRequires at least one of ``session_id``/``turn_id``/``job_id``/\n``user_id`` so this never becomes an unbounded dump of every call the\ninstance ever made. ``before`` is the pagination cursor: pass the\nprevious page's ``next_before`` to fetch the next older page.",
+        "operationId": "llm_calls_api_admin_telemetry_llm_calls_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "turn_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Turn Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "job_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Job Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "user_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "ISO timestamp cursor; fetch rows older than this.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO timestamp cursor; fetch rows older than this.",
+              "title": "Before"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Calls",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
+    "/api/admin/telemetry/llm-cost": {
+      "get": {
+        "description": "Cost of every LLM call this instance made, by workload / agent / user /\nmodel / purpose \u2014 measured on-instance from ``llm_calls`` (priced at\nwrite time, the rates stored beside each row), so the same figure the\nexported span carries. ``chat-cost`` stays the per-session chat view;\nthis is the cross-workload one. Postgres-backed instances only (typed\n501 otherwise, since the repo dependency above is resolved first).",
+        "operationId": "llm_cost_api_admin_telemetry_llm_cost_get",
+        "parameters": [
+          {
+            "description": "1d|7d|30d|all",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "1d|7d|30d|all",
+              "title": "Window",
+              "type": "string"
+            }
+          },
+          {
+            "description": "workload|agent|user|model|purpose",
+            "in": "query",
+            "name": "by",
+            "required": false,
+            "schema": {
+              "default": "workload",
+              "description": "workload|agent|user|model|purpose",
+              "title": "By",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Cost",
         "tags": [
           "admin-telemetry"
         ]
