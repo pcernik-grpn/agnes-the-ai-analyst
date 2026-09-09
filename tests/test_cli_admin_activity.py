@@ -250,10 +250,58 @@ class TestCursorPagination:
         assert r.exit_code == 0, _clean(r.output)
         assert captured["params"]["cursor_ts"] == "2026-09-09T10:00:00+00:00"
         assert captured["params"]["cursor_id"] == "abc-123"
+        # since_ts is optional — a cursor printed without it (or hand-built)
+        # must keep working exactly as before this field existed.
+        assert "since_ts" not in captured["params"]
+
+    def test_cursor_forwards_since_ts_when_present(self, cli_admin, monkeypatch):
+        """since_ts pins the pagination floor a prior page computed
+        (PR #2400 review, Finding B) — forwarded verbatim when present."""
+        runner, app = cli_admin
+        captured: dict = {}
+
+        import cli.commands.admin_activity as mod
+
+        real_get = mod.api_get
+
+        def _spy(path, **kw):
+            captured["params"] = kw.get("params") or {}
+            return real_get(path, **kw)
+
+        monkeypatch.setattr(mod, "api_get", _spy)
+
+        cursor_arg = json.dumps(
+            {
+                "ts": "2026-09-09T10:00:00+00:00",
+                "id": "abc-123",
+                "since_ts": "2026-09-09T09:00:00+00:00",
+            }
+        )
+        r = runner.invoke(app, ["--cursor", cursor_arg, "--json"])
+        assert r.exit_code == 0, _clean(r.output)
+        assert captured["params"]["since_ts"] == "2026-09-09T09:00:00+00:00"
 
     def test_malformed_cursor_is_a_clean_error(self, cli_admin):
         runner, app = cli_admin
         r = runner.invoke(app, ["--cursor", "not-json", "--json"])
+        assert r.exit_code != 0
+        assert "--cursor" in _clean(r.output)
+
+    def test_empty_cursor_halves_are_rejected(self, cli_admin):
+        """{"ts": "", "id": ""} used to pass the old `"ts" not in parsed`
+        check and silently restart pagination from page one (PR #2400
+        review, Finding A) — an empty half must be rejected the same as a
+        missing one."""
+        runner, app = cli_admin
+        cursor_arg = json.dumps({"ts": "", "id": ""})
+        r = runner.invoke(app, ["--cursor", cursor_arg, "--json"])
+        assert r.exit_code != 0
+        assert "--cursor" in _clean(r.output)
+
+    def test_one_empty_cursor_half_is_rejected(self, cli_admin):
+        runner, app = cli_admin
+        cursor_arg = json.dumps({"ts": "2026-09-09T10:00:00+00:00", "id": ""})
+        r = runner.invoke(app, ["--cursor", cursor_arg, "--json"])
         assert r.exit_code != 0
         assert "--cursor" in _clean(r.output)
 

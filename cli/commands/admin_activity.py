@@ -62,14 +62,27 @@ def _parse_since(value: str) -> int:
     )
 
 
-def _parse_cursor(value: str) -> tuple[str, str]:
+_CURSOR_PARSE_ERROR = (
+    "Cannot parse --cursor. Pass the next_cursor object from a prior "
+    '--json response verbatim, e.g. --cursor \'{"ts": "...", "id": "..."}\'.'
+)
+
+
+def _parse_cursor(value: str) -> tuple[str, str, str | None]:
     """Parse a `--cursor` value.
 
     Takes the exact `next_cursor` object a prior `--json` response prints,
-    e.g. `{"ts": "2026-09-09T10:00:00+00:00", "id": "abc-123"}` — the
-    endpoint's cursor is a (timestamp, id) pair (app/api/activity.py), so a
-    single opaque value carrying both halves is the CLI-friendly shape
+    e.g. `{"ts": "2026-09-09T10:00:00+00:00", "id": "abc-123", "since_ts":
+    "2026-09-09T09:00:00+00:00"}` — the endpoint's cursor is a (timestamp,
+    id) pair plus an optional pinned floor (app/api/activity.py), so a
+    single opaque value carrying all of it is the CLI-friendly shape
     without inventing a new encoding for it.
+
+    `ts` and `id` are required and must be non-empty strings — `{"ts": "",
+    "id": ""}` used to pass an `"ts" not in parsed` check and silently
+    restart the timeline from page one instead of failing. `since_ts` is
+    optional (absent from a hand-built cursor, or one printed before this
+    field existed) but if present must also be a non-empty string.
 
     Raises typer.BadParameter on anything else — a garbled cursor must fail
     loudly rather than silently restarting the timeline from the top.
@@ -78,12 +91,16 @@ def _parse_cursor(value: str) -> tuple[str, str]:
         parsed = json_lib.loads(value)
     except (json_lib.JSONDecodeError, TypeError):
         parsed = None
-    if not isinstance(parsed, dict) or "ts" not in parsed or "id" not in parsed:
-        raise typer.BadParameter(
-            "Cannot parse --cursor. Pass the next_cursor object from a prior "
-            '--json response verbatim, e.g. --cursor \'{"ts": "...", "id": "..."}\'.'
-        )
-    return str(parsed["ts"]), str(parsed["id"])
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter(_CURSOR_PARSE_ERROR)
+    ts = parsed.get("ts")
+    cid = parsed.get("id")
+    if not isinstance(ts, str) or not ts or not isinstance(cid, str) or not cid:
+        raise typer.BadParameter(_CURSOR_PARSE_ERROR)
+    since_ts = parsed.get("since_ts")
+    if since_ts is not None and (not isinstance(since_ts, str) or not since_ts):
+        raise typer.BadParameter(_CURSOR_PARSE_ERROR)
+    return ts, cid, since_ts
 
 
 def _handle_error(resp, context: str) -> None:
@@ -163,10 +180,10 @@ def timeline(
         typer.echo(str(e), err=True)
         raise typer.Exit(2)
 
-    cursor_ts = cursor_id = None
+    cursor_ts = cursor_id = cursor_since_ts = None
     if cursor:
         try:
-            cursor_ts, cursor_id = _parse_cursor(cursor)
+            cursor_ts, cursor_id, cursor_since_ts = _parse_cursor(cursor)
         except typer.BadParameter as e:
             typer.echo(str(e), err=True)
             raise typer.Exit(2)
@@ -175,6 +192,8 @@ def timeline(
     if cursor_ts and cursor_id:
         params["cursor_ts"] = cursor_ts
         params["cursor_id"] = cursor_id
+        if cursor_since_ts:
+            params["since_ts"] = cursor_since_ts
     if action:
         params["action_prefix"] = action
     if user:

@@ -21,13 +21,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.access import require_admin
-
 from src.repositories import (
     audit_repo,
     session_processor_state_repo,
@@ -56,7 +54,7 @@ _AUDIT_SUPPRESS_WINDOW = timedelta(seconds=60)
 def _should_audit(actor_id: str, filter_payload: dict) -> bool:
     """True if this (actor, filter) combo hasn't been audited in the last 60s."""
     key = (actor_id, hashlib.sha1(json.dumps(filter_payload, sort_keys=True, default=str).encode()).hexdigest())
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     last = _RECENT_AUDITS.get(key)
     if last is not None and (now - last) < _AUDIT_SUPPRESS_WINDOW:
         return False
@@ -82,26 +80,36 @@ def _audit_read(user: dict, endpoint: str, filter_payload: dict) -> None:
 @router.get("")
 def activity_timeline(
     since_minutes: int = Query(default=1440, ge=1, le=43200),
-    user_id: Optional[str] = None,
-    action_prefix: Optional[str] = None,
-    resource: Optional[str] = None,
-    resource_prefix: Optional[str] = None,
-    result_pattern: Optional[str] = None,
-    result_class: Optional[str] = None,
-    q: Optional[str] = None,
-    source: Optional[str] = None,
-    trail: Optional[str] = Query(
+    user_id: str | None = None,
+    action_prefix: str | None = None,
+    resource: str | None = None,
+    resource_prefix: str | None = None,
+    result_pattern: str | None = None,
+    result_class: str | None = None,
+    q: str | None = None,
+    source: str | None = None,
+    trail: str | None = Query(
         default=None,
         description="Narrow to one physical trail: audit | sync | llm | agent_scope. "
         "Unset returns the unified timeline across all four.",
     ),
     include_self_reads: bool = Query(default=False),
-    cursor_ts: Optional[datetime] = None,
-    cursor_id: Optional[str] = None,
+    cursor_ts: datetime | None = None,
+    cursor_id: str | None = None,
+    since_ts: datetime | None = Query(
+        default=None,
+        description="Absolute floor for this page, carried verbatim from a prior page's "
+        "next_cursor.since_ts. since_minutes computes a floor relative to 'now', which "
+        "drifts forward between calls — passing the pinned since_ts back keeps a "
+        "multi-page read over the same window the first call saw, so a row near the "
+        "window's edge cannot fall out between pages. Omit on a fresh (uncursored) call; "
+        "the server computes the floor from since_minutes and returns it in "
+        "next_cursor.since_ts for the caller to carry forward.",
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     user: dict = Depends(require_admin),
 ):
-    since = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    since = since_ts if since_ts is not None else datetime.now(UTC) - timedelta(minutes=since_minutes)
     cursor = (cursor_ts, cursor_id) if cursor_ts and cursor_id else None
 
     try:
@@ -153,7 +161,11 @@ def activity_timeline(
     )
     return {
         "rows": rows,
-        "next_cursor": ({"ts": next_cursor[0].isoformat(), "id": next_cursor[1]} if next_cursor else None),
+        "next_cursor": (
+            {"ts": next_cursor[0].isoformat(), "id": next_cursor[1], "since_ts": since.isoformat()}
+            if next_cursor
+            else None
+        ),
         "filter": {
             "since_minutes": since_minutes,
             "user_id": user_id,
@@ -174,7 +186,7 @@ def activity_timeline(
 def activity_health(
     user: dict = Depends(require_admin),
 ):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if _HEALTH_CACHE["data"] is not None and _HEALTH_CACHE["expires_at"] > now:
         return _HEALTH_CACHE["data"]
     data = _compute_health(now)
@@ -190,7 +202,7 @@ def activity_sync(
     limit: int = Query(default=100, ge=1, le=500),
     user: dict = Depends(require_admin),
 ):
-    since = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    since = datetime.now(UTC) - timedelta(minutes=since_minutes)
     rows = sync_state_repo().list_recent(since=since, limit=limit)
     _audit_read(user, "sync", {"since_minutes": since_minutes})
     return {"rows": rows}
@@ -215,7 +227,7 @@ def _compute_health(now: datetime) -> dict:
         scheduler_value = "never"
     else:
         if last_tick.tzinfo is None:
-            last_tick = last_tick.replace(tzinfo=timezone.utc)
+            last_tick = last_tick.replace(tzinfo=UTC)
         scheduler_age_s = int((now - last_tick).total_seconds())
         if scheduler_age_s > 7200:
             scheduler_color = "red"
@@ -241,7 +253,7 @@ def _compute_health(now: datetime) -> dict:
     sync_value = f"{ok} ok / {fail} fail"
 
     # 3) active users today
-    midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    midnight = datetime(now.year, now.month, now.day, tzinfo=UTC)
     active = audit_repo().active_users_since(midnight)
 
     # 4) memory pipeline

@@ -1292,21 +1292,52 @@ class TestActivityTool:
         assert params["cursor_ts"] == "2026-09-09T10:00:00+00:00"
         assert params["cursor_id"] == "abc-123"
 
-    def test_omits_cursor_when_only_one_part_present(self):
-        """A partial cursor (e.g. the caller forgot cursor_id) must not reach
-        the endpoint — sending only one half is not a valid cursor per the
-        endpoint's own `cursor_ts and cursor_id` gate."""
+    def test_half_cursor_cursor_id_missing_raises(self):
+        """A partial cursor (only cursor_ts) used to be silently dropped —
+        the tool forwarded neither half and the caller got an unlabeled
+        page-one restart with no signal anything was wrong (PR #2400
+        review, Finding A). It must raise instead, naming the missing half,
+        and never reach the server."""
         mod = _import_mod()
 
         with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
             tv.get.return_value = "tok"
             get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
             MC.return_value.__aenter__.return_value.get = get_mock
-            _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00"))
+            with pytest.raises(ValueError, match="cursor_id"):
+                _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00"))
+            get_mock.assert_not_called()
+
+    def test_half_cursor_cursor_ts_missing_raises(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            with pytest.raises(ValueError, match="cursor_ts"):
+                _run(mod.activity(cursor_id="abc-123"))
+            get_mock.assert_not_called()
+
+    def test_forwards_since_ts_alongside_full_cursor(self):
+        """since_ts pins the pagination floor a prior page computed
+        (PR #2400 review, Finding B) — forwarded verbatim when present."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(
+                mod.activity(
+                    cursor_ts="2026-09-09T10:00:00+00:00",
+                    cursor_id="abc-123",
+                    since_ts="2026-09-09T09:00:00+00:00",
+                )
+            )
 
         params = get_mock.call_args.kwargs["params"]
-        assert "cursor_ts" not in params
-        assert "cursor_id" not in params
+        assert params["since_ts"] == "2026-09-09T09:00:00+00:00"
 
 
 # ── my_secret_test tool ──────────────────────────────────────────────────────

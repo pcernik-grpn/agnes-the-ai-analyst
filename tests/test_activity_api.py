@@ -1,12 +1,13 @@
 """Activity Center read API."""
 
+from datetime import UTC, datetime
+
 import pytest
-from datetime import datetime, timezone
 
 
 @pytest.fixture(autouse=True)
 def _reset_activity_dedup():
-    from app.api.activity import _RECENT_AUDITS, _HEALTH_CACHE
+    from app.api.activity import _HEALTH_CACHE, _RECENT_AUDITS
 
     _RECENT_AUDITS.clear()
     _HEALTH_CACHE["data"] = None
@@ -87,9 +88,10 @@ def test_activity_timeline_folds_in_sync_llm_and_agent_scope_trails(seeded_app, 
     """E3 slice 2: the timeline is a unified projection over audit_log +
     sync_history + llm_usage + agent_scope_snapshots — not audit_log alone."""
     import uuid
+
     from src.db import get_system_db
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     conn = get_system_db()
     conn.execute(
         "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
@@ -128,6 +130,7 @@ def test_activity_timeline_folds_in_sync_llm_and_agent_scope_trails(seeded_app, 
 
 def test_activity_timeline_trail_filter_narrows_to_audit_only(seeded_app, admin_user):
     import uuid
+
     from src.db import get_system_db
     from src.repositories.audit import AuditRepository
 
@@ -136,7 +139,7 @@ def test_activity_timeline_trail_filter_narrows_to_audit_only(seeded_app, admin_
     conn.execute(
         "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [str(uuid.uuid4()), "t1", datetime.now(timezone.utc), 1, 1, "ok", None],
+        [str(uuid.uuid4()), "t1", datetime.now(UTC), 1, 1, "ok", None],
     )
     conn.close()
 
@@ -158,6 +161,7 @@ def test_activity_timeline_never_surfaces_chat_messages(seeded_app, admin_user):
     """Privacy regression: chat transcript content must never leak into the
     unified Activity Center timeline (docs/observability.md)."""
     import uuid
+
     from src.db import get_system_db
 
     secret = "customer churn is 4.2 percent, keep this confidential"
@@ -165,11 +169,11 @@ def test_activity_timeline_never_surfaces_chat_messages(seeded_app, admin_user):
     session_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO chat_sessions (id, user_email, surface, started_at) VALUES (?, ?, ?, ?)",
-        [session_id, "leak-probe@example.com", "web", datetime.now(timezone.utc)],
+        [session_id, "leak-probe@example.com", "web", datetime.now(UTC)],
     )
     conn.execute(
         "INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-        [str(uuid.uuid4()), session_id, "user", secret, datetime.now(timezone.utc)],
+        [str(uuid.uuid4()), session_id, "user", secret, datetime.now(UTC)],
     )
     conn.close()
 
@@ -194,9 +198,10 @@ def test_activity_health_returns_pulse(seeded_app, admin_user):
 
 def test_activity_sync_returns_recent(seeded_app, admin_user):
     import uuid
+
     from src.db import get_system_db
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     conn = get_system_db()
     conn.execute(
         "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -297,7 +302,7 @@ class TestKpiTableParity:
 
     def _seed(self):
         import uuid
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from src.db import get_system_db
         from src.repositories.audit import AuditRepository
@@ -309,7 +314,7 @@ class TestKpiTableParity:
         repo.log(user_id="alice", action="query.run", result="error.400", client_kind="web")
         repo.log(user_id="bob", action="query.run", result="denied", client_kind="cli")
         repo.log(user_id="sched-user", action="run_session_processor:usage", result="success")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # One row per non-audit trail — sync_history/agent_scope_snapshots
         # carry no user_id (system/agent-runtime actors); the llm_usage row
         # reuses "alice" as the owning user so the pre-existing
@@ -421,14 +426,14 @@ def test_sessions_kpis_match_adoption_kpis(seeded_app, admin_user):
     """Glossary pin (consistency spec Phase D): the sessions browser and the
     adoption dashboard read the same table with the same anchor — their
     headline numbers must be equal for an equivalent window."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from src.db import get_system_db
     from src.repositories.usage import UsageRepository
 
     conn = get_system_db()
     repo = UsageRepository(conn)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for i, (user, sid) in enumerate([("ann", "s1"), ("ann", "s2"), ("ben", "s3")]):
         repo.upsert_summary(
             {
@@ -467,7 +472,7 @@ def test_sessions_kpis_match_adoption_kpis(seeded_app, admin_user):
 def test_health_reconciles_uploads_vs_ingested(seeded_app, admin_user):
     """Health pulse: uploaded session files without a summary row show as a
     yellow ingest gap; complete ingest is green. Join on file basename."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from src.db import get_system_db
     from src.repositories.audit import AuditRepository
@@ -490,7 +495,7 @@ def test_health_reconciles_uploads_vs_ingested(seeded_app, admin_user):
                 "session_id": f"content-id-{sid}",  # differs from file stem on purpose
                 "username": "ann@example.com",
                 "user_id": "u-1",
-                "started_at": datetime.now(timezone.utc),
+                "started_at": datetime.now(UTC),
             },
             processor_version=1,
         )
@@ -502,3 +507,103 @@ def test_health_reconciles_uploads_vs_ingested(seeded_app, admin_user):
     assert field["value"] == "3 up / 2 ingested"
     assert field["color"] == "yellow"
     assert field["raw"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cursor pagination — window pinning (PR #2400 review, Finding B)
+#
+# since_minutes computes `since = now() - since_minutes` fresh on every
+# call. A paged read spans several calls; if wall-clock time advances
+# between them, that floor drifts forward and a row that was inside the
+# caller's original window can fall out between two pages — appearing on
+# neither. next_cursor now carries the floor the FIRST call computed
+# (since_ts) so a continuation can pin the window instead of recomputing it.
+# ---------------------------------------------------------------------------
+
+
+class _FrozenDatetime(datetime):
+    """A `datetime` subclass whose `.now()` returns a settable fixed value,
+    monkeypatched over `app.api.activity.datetime` to control "now" without
+    a real clock dependency (same pattern as tests/test_kai_host.py)."""
+
+    _fixed: "datetime"
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+
+def test_pinned_floor_survives_a_wall_clock_advance_between_pages(seeded_app, admin_user, monkeypatch):
+    import app.api.activity as activity_mod
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    t0 = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+    _FrozenDatetime._fixed = t0
+    monkeypatch.setattr(activity_mod, "datetime", _FrozenDatetime)
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    recent_id = repo.log(action="test.winpin.recent", result="success")
+    edge_id = repo.log(action="test.winpin.edge", result="success")
+    # since_minutes=60 -> floor at t0 is t0 - 60min. The "recent" row sits
+    # well inside the window; the "edge" row sits only 30s inside it — close
+    # enough to fall below a floor recomputed after more than 30s pass.
+    from datetime import timedelta as _td
+
+    conn.execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [t0 - _td(minutes=1), recent_id])
+    conn.execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [t0 - _td(minutes=59, seconds=30), edge_id])
+    conn.close()
+
+    c = seeded_app["client"]
+    page1 = c.get(
+        "/api/admin/activity",
+        params={"since_minutes": 60, "limit": 1, "action_prefix": "test.winpin."},
+        headers=admin_user,
+    ).json()
+    assert [r["action"] for r in page1["rows"]] == ["test.winpin.recent"]
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+    assert "since_ts" in cursor
+
+    # Wall clock advances 5 minutes between the two page requests — long
+    # enough that a floor recomputed at page-2 time (t0 + 5min - 60min)
+    # would sit past the edge row's timestamp and exclude it.
+    _FrozenDatetime._fixed = t0 + _td(minutes=5)
+
+    page2 = c.get(
+        "/api/admin/activity",
+        params={
+            "since_minutes": 60,
+            "limit": 1,
+            "action_prefix": "test.winpin.",
+            "cursor_ts": cursor["ts"],
+            "cursor_id": cursor["id"],
+            "since_ts": cursor["since_ts"],
+        },
+        headers=admin_user,
+    ).json()
+    assert [r["action"] for r in page2["rows"]] == ["test.winpin.edge"], (
+        "the edge row fell out of the paged read when the clock advanced between "
+        "calls — pagination must run over the floor pinned at the first call, not "
+        "a freshly recomputed one"
+    )
+
+
+def test_omitting_since_ts_falls_back_to_recomputing_the_floor(seeded_app, admin_user):
+    """Backward compatibility: a caller that reconstructs cursor_ts/cursor_id
+    by hand without since_ts (e.g. the Activity Center web page before its
+    own forwarding fix, or any other pre-existing integration) must keep
+    working exactly as before this field existed."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={
+            "since_minutes": 60,
+            "limit": 1,
+            "cursor_ts": "2026-01-01T00:00:00+00:00",
+            "cursor_id": "does-not-exist",
+        },
+        headers=admin_user,
+    )
+    assert r.status_code == 200
