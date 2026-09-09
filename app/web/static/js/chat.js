@@ -3105,12 +3105,19 @@ async function loadAndRenderHistory(chatId) {
     if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
     // Same split as every other entry path: a signed-out reader gets the
     // login, not a warning about history they cannot reach either way.
-    if (!handleExpiredSession(err)) {
+    const authHandled = handleExpiredSession(err);
+    if (!authHandled) {
       setStatus(`Could not load history: ${err.message}`, "warn");
     }
     // #1973: the outcome is the caller's to act on — a RESTORE that cannot
     // read its own history must show an error, not the empty-state hero.
-    return { ok: false, error: err.message, count: 0 };
+    //
+    // `authHandled` is what stops the caller overwriting the sentence just
+    // written: a 401 is mid-redirect and its explanation is the only thing
+    // the reader gets to read before the page goes, and a 403 is a grant
+    // they lack, not the "deleted, archived, or someone else's" that
+    // `_renderRestoreFailure` would claim (Devin Review on 8906f735).
+    return { ok: false, error: err.message, count: 0, authHandled };
   }
   if (history.length === 0) {
     // A conversation with an agent opens with that agent introducing itself —
@@ -3372,7 +3379,10 @@ async function openSession(chatId, wsUrlOverride, { restoring = false, reconnect
   // rather than dropping the reader on the "Ask anything" hero with the
   // conversation they asked for silently missing (#1973).
   if (restoring && !hydrated.ok) {
-    _renderRestoreFailure(hydrated.error);
+    // An auth failure has already been explained accurately by
+    // `handleExpiredSession`; every ORDINARY restore failure (404, a 5xx)
+    // still gets the panel, which is the case it was written for.
+    if (!hydrated.authHandled) _renderRestoreFailure(hydrated.error);
     return;
   }
   // A recovery nobody asked for must not cost the reader their transcript.

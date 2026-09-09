@@ -690,8 +690,32 @@ class TestDeepLinkRestoreIsNotSilent:
             "async function loadAndRenderHistory(chatId) {",
             "/** A deep-link restore that could not be completed",
         )
-        assert "return { ok: false, error: err.message, count: 0 };" in body
+        assert "return { ok: false, error: err.message, count: 0, authHandled };" in body
         assert "return { ok: true, error: null, count: history.length };" in body
+
+    def test_history_load_reports_an_auth_failure_it_already_answered(self):
+        """`handleExpiredSession` writes the only sentence a signed-out
+        reader gets before the redirect fires, and a 403 is a missing grant
+        rather than the "deleted, archived, or someone else's" that
+        `_renderRestoreFailure` claims. Both are lost if the restoring
+        caller paints over them, so the outcome carries whether the auth
+        case was already answered — and the caller honours it.
+        """
+        body = _slice(
+            _chat_js(),
+            "async function loadAndRenderHistory(chatId) {",
+            "/** A deep-link restore that could not be completed",
+        )
+        assert "const authHandled = handleExpiredSession(err);" in body
+
+        opener = _slice(
+            _chat_js(),
+            "  const hydrated = await loadAndRenderHistory(chatId);",
+            "  // A recovery nobody asked for must not cost the reader their transcript.",
+        )
+        # Still the panel for an ORDINARY restore failure (404, a 5xx) —
+        # the case it was written for — and only that.
+        assert "if (!hydrated.authHandled) _renderRestoreFailure(hydrated.error);" in opener
 
 
 class TestConcurrentOpensCannotClobberEachOther:
