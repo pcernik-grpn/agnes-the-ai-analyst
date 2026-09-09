@@ -85,6 +85,8 @@ def test_the_entity_builder_labels_its_turn(e2e_env, shared_app, recording_extra
     ctx = _only(recording_extractor)
     assert (ctx.workload, ctx.purpose) == ("builder", "entity_builder_turn")
     assert ctx.user_id == "author1"
+    # A Library entity has no row until Save — nothing to attribute to yet.
+    assert ctx.subject_id is None
 
 
 def test_the_agent_builder_labels_its_turn_with_the_agent_as_subject(e2e_env, shared_app, recording_extractor):
@@ -127,6 +129,9 @@ def test_the_mcp_builder_labels_its_turn(seeded_app, recording_extractor):
     ctx = _only(recording_extractor)
     assert (ctx.workload, ctx.purpose) == ("builder", "mcp_builder_turn")
     assert ctx.user_id == "admin1"
+    # An MCP source has no row until it is registered — nothing to
+    # attribute to yet.
+    assert ctx.subject_id is None
 
 
 def test_the_package_builder_labels_its_turn(seeded_app, recording_extractor):
@@ -142,6 +147,8 @@ def test_the_package_builder_labels_its_turn(seeded_app, recording_extractor):
     ctx = _only(recording_extractor)
     assert (ctx.workload, ctx.purpose) == ("builder", "package_builder_turn")
     assert ctx.user_id == "admin1"
+    # A data package has no row until Create — nothing to attribute to yet.
+    assert ctx.subject_id is None
 
 
 def test_the_semantic_model_builder_labels_its_turn(seeded_app, recording_extractor):
@@ -157,6 +164,8 @@ def test_the_semantic_model_builder_labels_its_turn(seeded_app, recording_extrac
     ctx = _only(recording_extractor)
     assert (ctx.workload, ctx.purpose) == ("builder", "semantic_model_builder_turn")
     assert ctx.user_id == "admin1"
+    # A semantic model has no row until Save — nothing to attribute to yet.
+    assert ctx.subject_id is None
 
 
 def test_the_label_does_not_outlive_the_turn(seeded_app, recording_extractor):

@@ -385,6 +385,9 @@ async def mcp_builder_turn(payload: McpTurnRequest, user: dict = Depends(require
         result: Dict[str, Any] = _stub_turn(message, draft)
     else:
         try:
+            # No subject_id: an MCP source draft has no row until the admin
+            # registers it — there is nothing yet to attribute this turn's
+            # calls to.
             result = await asyncio.to_thread(
                 _llm_turn,
                 _prompt(message=message, history=payload.history, draft=draft),

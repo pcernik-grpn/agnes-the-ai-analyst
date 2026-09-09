@@ -669,6 +669,9 @@ async def semantic_model_builder_turn(
         )
         schema = _schema(sorted(candidate_ids))
         try:
+            # No subject_id: a semantic-model draft has no row until Save
+            # (POST /api/semantic-models/apply) — there is nothing yet to
+            # attribute this turn's calls to.
             result = await asyncio.to_thread(_llm_turn, prompt, schema, user_id=user["id"])
         except ValueError as e:
             logger.warning("semantic model builder: no LLM configured: %s", e)
