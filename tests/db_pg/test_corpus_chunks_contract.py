@@ -765,3 +765,32 @@ def test_search_candidates_top_up_does_not_re_run_for_a_single_term(pg_repo):
 
     ids = [r["id"] for r in rows]
     assert len(ids) == 3 == len(set(ids))
+
+
+def test_search_candidates_path_prefix_cannot_cross_a_corpus_boundary(repo_and_files):
+    """Scoping narrows; it never widens.
+
+    The prefix subquery is bound to the SAME ``corpus_ids`` as the outer
+    query, so naming a folder that exists in a corpus the caller was not
+    granted returns nothing rather than that corpus's files. Safe by
+    construction (one bound parameter, used twice) — pinned here so a future
+    refactor that re-derives the corpus list inside the subquery fails
+    loudly instead of quietly widening a scoped search.
+    """
+    repo, add_file = repo_and_files
+    add_file("cf_granted", "ours.md", "00_Granted/ours.md")
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": "cf_granted", "ordinal": 0, "text": "statement of work"}])
+
+    # A prefix naming a folder outside the granted corpus finds nothing...
+    assert (
+        repo.search_candidates(
+            [CORPUS_ID], "statement of work", limit=10, path_prefix="99_SomeOtherCorpus/"
+        )
+        == []
+    )
+    # ...and an EMPTY corpus list stays fail-closed with a prefix set, the
+    # same as without one.
+    assert repo.search_candidates([], "statement of work", limit=10, path_prefix="00_Granted/") == []
+    # The control: the same query IS answered when the scope matches.
+    rows = repo.search_candidates([CORPUS_ID], "statement of work", limit=10, path_prefix="00_Granted/")
+    assert [r["file_id"] for r in rows] == ["cf_granted"]
