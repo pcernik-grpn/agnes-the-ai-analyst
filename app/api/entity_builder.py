@@ -402,23 +402,27 @@ def _open_slot_label(entity_type: str, draft: Dict[str, Any]) -> Optional[str]:
     return still_open[0].label if still_open else None
 
 
-def _llm_turn(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+def _llm_turn(
+    prompt: str, schema: Dict[str, Any], *, user_id: str | None = None, subject_id: str | None = None
+) -> Dict[str, Any]:
     """One structured call. Raises ``ValueError`` when nothing is configured."""
     from app.instance_config import load_instance_config
     from connectors.llm import create_extractor_from_env_or_config
+    from src.observability.llm_context import llm_context
 
     try:
         instance_config = load_instance_config()
     except (ValueError, FileNotFoundError):
         instance_config = {}
     extractor = create_extractor_from_env_or_config((instance_config or {}).get("ai"))
-    return extractor.extract_json(
-        prompt=prompt,
-        max_tokens=4000,
-        json_schema=schema,
-        schema_name="entity_builder_turn",
-        system=SYSTEM,
-    )
+    with llm_context(workload="builder", purpose="entity_builder_turn", user_id=user_id, subject_id=subject_id):
+        return extractor.extract_json(
+            prompt=prompt,
+            max_tokens=4000,
+            json_schema=schema,
+            schema_name="entity_builder_turn",
+            system=SYSTEM,
+        )
 
 
 @router.post("/entities/builder/turn")
@@ -460,7 +464,7 @@ async def entity_builder_turn(
         )
         schema = _schema(entity_type, categories)
         try:
-            result = await asyncio.to_thread(_llm_turn, prompt, schema)
+            result = await asyncio.to_thread(_llm_turn, prompt, schema, user_id=user["id"])
         except ValueError as e:
             # Nothing configured — say so in a way the page can act on, and
             # keep the hand-editable panel as the working path.

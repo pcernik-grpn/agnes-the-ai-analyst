@@ -260,14 +260,21 @@ def _test_anthropic_sync(key: str, timeout: float) -> dict:
     # Reuse the cheap Haiku model the auto-title path already uses; a
     # 1-token completion is enough to authenticate the key.
     from app.chat.auto_title import _TITLE_MODEL
+    from src.observability import llm_context, trace_generation
 
     try:
         client = anthropic.Anthropic(api_key=key, timeout=timeout)
-        client.messages.create(
-            model=_TITLE_MODEL,
-            max_tokens=1,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+        with (
+            llm_context(workload="readiness"),
+            trace_generation(provider="anthropic", model=_TITLE_MODEL, purpose="probe") as cap,
+        ):
+            cap.set_input("ping")
+            response = client.messages.create(
+                model=_TITLE_MODEL,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            cap.set_output_from_anthropic(response)
     except Exception as exc:  # noqa: BLE001 — classify, never raise to the admin
         return {"ok": False, "detail": _classify(exc)}
     return {"ok": True, "detail": "Anthropic API key valid"}
@@ -304,6 +311,7 @@ def _test_wif_sync(timeout: float) -> dict:
     except ImportError:  # pragma: no cover — SDK is a hard dep for chat
         return {"ok": True, "detail": "federated token minted (anthropic SDK unavailable for full probe)"}
     from app.chat.auto_title import _TITLE_MODEL
+    from src.observability import llm_context, trace_generation
 
     try:
         client = anthropic.Anthropic(
@@ -311,11 +319,17 @@ def _test_wif_sync(timeout: float) -> dict:
             default_headers={"anthropic-beta": "oauth-2025-04-20"},
             timeout=timeout,
         )
-        client.messages.create(
-            model=_TITLE_MODEL,
-            max_tokens=1,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+        with (
+            llm_context(workload="readiness"),
+            trace_generation(provider="anthropic", model=_TITLE_MODEL, purpose="probe") as cap,
+        ):
+            cap.set_input("ping")
+            response = client.messages.create(
+                model=_TITLE_MODEL,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            cap.set_output_from_anthropic(response)
     except Exception as exc:  # noqa: BLE001 — classify, never raise to the admin
         # The cached token may be scope-limited or revoked — drop it so a later
         # probe/request re-mints rather than reusing a known-bad token.
@@ -357,14 +371,23 @@ def _test_vertex_sync(project_id: str, region: str, timeout: float) -> dict:
         return {"ok": True, "detail": "google token minted (anthropic SDK unavailable for full probe)"}
     from app.chat.auto_title import _TITLE_MODEL
     from connectors.llm.vertex_provider import to_vertex_model_id
+    from src.observability import llm_context, trace_generation
+    from src.observability.llm_tracing import provider_label
 
     try:
         client = vertex_client_cls(project_id=project_id, region=region, timeout=timeout)
-        client.messages.create(
-            model=to_vertex_model_id(_TITLE_MODEL),
-            max_tokens=1,
-            messages=[{"role": "user", "content": "ping"}],
-        )
+        model = to_vertex_model_id(_TITLE_MODEL)
+        with (
+            llm_context(workload="readiness"),
+            trace_generation(provider=provider_label("vertex"), model=model, purpose="probe") as cap,
+        ):
+            cap.set_input("ping")
+            response = client.messages.create(
+                model=model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            cap.set_output_from_anthropic(response)
     except Exception as exc:  # noqa: BLE001 — classify, never raise to the admin
         # The cached token may be scope-limited or revoked — drop it so a later
         # probe/request re-resolves rather than reusing a known-bad token.

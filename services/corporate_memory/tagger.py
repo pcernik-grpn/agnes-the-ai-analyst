@@ -86,14 +86,17 @@ def auto_tag_items(items: list[dict], extractor: Any) -> dict[str, list[str]]:
     if not items:
         return {}
 
+    from src.observability.llm_context import llm_context
+
     prompt = _build_prompt(items, TOPIC_VOCABULARY)
     try:
-        result = extractor.extract_json(
-            prompt,
-            max_tokens=1024,
-            json_schema=_TOPIC_TAG_SCHEMA,
-            schema_name="topic_tag_assignment",
-        )
+        with llm_context(workload="corporate_memory", purpose="tagger"):
+            result = extractor.extract_json(
+                prompt,
+                max_tokens=1024,
+                json_schema=_TOPIC_TAG_SCHEMA,
+                schema_name="topic_tag_assignment",
+            )
     except LLMError as e:
         logger.warning("auto_tag_items: LLM error — %s", type(e).__name__)
         return {}

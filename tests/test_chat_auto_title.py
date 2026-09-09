@@ -224,6 +224,52 @@ def test_generate_title_sync_sends_the_framed_request_without_sampling_knobs(mon
     assert "<first_message>\nSearch SharePoint for our engagement letters\n</first_message>" in content
 
 
+def test_the_title_call_is_recorded_against_the_session_it_titles(monkeypatch):
+    """Auto-title is a per-conversation cost, so its record names the
+    conversation — otherwise a spike in titling reads as chat spend."""
+    import anthropic
+
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+
+    class _Msgs:
+        def create(self, **_kw):
+            return type(
+                "R",
+                (),
+                {
+                    "content": [type("B", (), {"type": "text", "text": "Engagement letters"})()],
+                    "usage": type(
+                        "U",
+                        (),
+                        {
+                            "input_tokens": 120,
+                            "output_tokens": 4,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    )(),
+                    "model": "claude-haiku-4-5-20251001",
+                    "stop_reason": "end_turn",
+                },
+            )()
+
+    class _FakeAnthropic:
+        def __init__(self, **_kw):
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeAnthropic)
+    out = auto_title._generate_title_sync("Show me revenue last week", api_key="k", session_id="chat-42")
+
+    assert out == "Engagement letters"
+    assert len(records) == 1
+    record = records[0]
+    assert (record.workload, record.purpose) == ("auto_title", "auto_title")
+    assert record.subject_id == "chat-42"
+    assert record.provider == "anthropic"
+    assert record.output_tokens == 4
+
+
 # --- TCRD-290: deterministic fallback --------------------------------------------
 
 
@@ -311,7 +357,7 @@ def test_generate_title_dispatches_to_thread(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     captured = {}
 
-    def fake_sync(user_message, *, api_key):
+    def fake_sync(user_message, *, api_key, session_id=None):
         captured["user_message"] = user_message
         captured["api_key"] = api_key
         return "Weekly revenue"
@@ -343,7 +389,7 @@ def test_generate_title_ignores_stale_static_key_in_workload_identity_mode(monke
 
     out = asyncio.run(auto_title.generate_title("Show me revenue last week", llm_auth="workload_identity"))
     assert out == "WIF title"
-    assert captured == {"auth_token": "federated-token"}
+    assert captured == {"auth_token": "federated-token", "session_id": None}
 
 
 def test_generate_title_swallows_sync_exceptions(monkeypatch):
@@ -1238,7 +1284,7 @@ def test_generate_title_vertex_uses_passed_project_region(monkeypatch):
         )
     )
     assert out == "Vertex title"
-    assert captured == {"vertex": ("proj-1", "europe-west1")}
+    assert captured == {"vertex": ("proj-1", "europe-west1"), "session_id": None}
 
 
 def test_generate_title_vertex_unconfigured_returns_none(monkeypatch):

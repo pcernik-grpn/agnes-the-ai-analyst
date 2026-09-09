@@ -53,9 +53,7 @@ def _format_columns(columns: Optional[List[Dict[str, Any]]]) -> str:
     return "\n".join(lines) or "(no column metadata)"
 
 
-def _format_sample_rows(
-    sample_rows: Optional[List[Dict[str, Any]]], limit: int = SAMPLE_ROWS
-) -> str:
+def _format_sample_rows(sample_rows: Optional[List[Dict[str, Any]]], limit: int = SAMPLE_ROWS) -> str:
     rows = [r for r in (sample_rows or []) if isinstance(r, dict)][:limit]
     if not rows:
         return "(no sample rows)"
@@ -99,13 +97,16 @@ def generate_description(
     decides whether to skip or fail. Returns ``""`` if the model produced no
     usable string.
     """
+    from src.observability import llm_context
+
     prompt = build_prompt(table_name, columns, sample_rows, source=source)
-    result = extractor.extract_json(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        json_schema=DESCRIPTION_SCHEMA,
-        schema_name="table_description",
-    )
+    with llm_context(workload="semantic_layer", purpose="table_autodoc", subject_id=table_name):
+        result = extractor.extract_json(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            json_schema=DESCRIPTION_SCHEMA,
+            schema_name="table_description",
+        )
     desc = (result or {}).get("description", "")
     return desc.strip() if isinstance(desc, str) else ""
 

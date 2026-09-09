@@ -68,3 +68,24 @@ def test_domainless_item_still_names_the_cap(caplog):
         find_candidates(repo, new_item, max_candidates=5)
 
     assert [r for r in caplog.records if r.levelname == "WARNING" and "5" in r.getMessage()]
+
+
+def test_the_judgment_call_says_which_workload_it_belongs_to():
+    """One batched judgment per new item is a real per-item cost — it is
+    labelled so a contradiction sweep is visible next to the extraction
+    that fed it."""
+    from services.corporate_memory.contradiction import find_and_judge
+    from src.observability.llm_context import current_llm_context
+
+    seen = {}
+
+    class _RecordingExtractor:
+        def extract_json(self, **_kwargs):
+            seen["context"] = current_llm_context()
+            return {"judgments": []}
+
+    repo = _repo_returning(1)
+    find_and_judge(_RecordingExtractor(), {"id": "new", "domain": "finance"}, repo, max_candidates=5)
+
+    ctx = seen["context"]
+    assert (ctx.workload, ctx.purpose) == ("corporate_memory", "contradiction")

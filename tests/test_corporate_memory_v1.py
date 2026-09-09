@@ -1603,6 +1603,39 @@ class TestDetectorWiresContradictionDetection:
         conn.close()
 
 
+class TestTheSessionScanLabelsItsLlmCalls:
+    """A scheduled session scan is a recurring, unattended cost. Every model
+    call it makes carries the ``verification`` workload, so the 15-minute
+    cadence is visible as one line in a cost report instead of scattered
+    unlabelled generations. The PURPOSE on this path is the detector's own
+    (``detector``): it is the innermost label, and inner wins."""
+
+    def test_the_extraction_call_runs_under_the_verification_workload(self, tmp_path, monkeypatch):
+        conn = _fresh_db(tmp_path, monkeypatch)
+        import services.session_processors.verification as verification_module
+        from src.observability.llm_context import current_llm_context
+
+        seen: list = []
+
+        class _RecordingExtractor:
+            def extract_json(self, **_kwargs):
+                seen.append(current_llm_context())
+                return {"verifications": []}
+
+        session_dir = tmp_path / "user_sessions" / "alice"
+        session_dir.mkdir(parents=True)
+        session_path = session_dir / "s.jsonl"
+        session_path.write_text(json.dumps({"role": "user", "content": "the number was wrong"}) + "\n")
+
+        processor = verification_module.VerificationProcessor(_RecordingExtractor())
+        processor.process_session(session_path, "alice", "alice/s.jsonl", conn)
+
+        assert seen, "the detector was never called"
+        assert seen[0].workload == "verification"
+        assert seen[0].purpose == "detector"
+        conn.close()
+
+
 class TestVerificationProcessorTimeBudget:
     """Prod incident 2026-07-15: a single process_session() call looped over
     dozens of verification items, each doing an inline LLM contradiction

@@ -46,6 +46,20 @@ from src.observability.llm_record import build_record, usage_from_anthropic, usa
 logger = logging.getLogger(__name__)
 
 
+def provider_label(provider: str) -> str:
+    """The record's ``provider`` value for a call site's own concrete
+    provider setting (``"anthropic"``/``"vertex"``, ``resolve_effective_
+    provider``'s / ``resolve_llm_provider``'s return shape) — never the
+    setting-level ``"inherit"``.
+
+    ``"vertex"`` bills through Google Cloud, so its calls are labelled
+    ``"gcp.vertex_ai"``; everything else (a static Anthropic key, or a
+    self-hosted endpoint speaking the same Messages API) bills as a direct
+    Anthropic call and is labelled ``"anthropic"``.
+    """
+    return "gcp.vertex_ai" if provider == "vertex" else "anthropic"
+
+
 class _RecordedError(Exception):
     """Carries an already-observed error type through :func:`trace_generation`
     so a result collected after the fact (a batch job) is recorded as an
@@ -289,4 +303,4 @@ def record_generation(
         logger.debug("llm tracing: record_generation failed", exc_info=True)
 
 
-__all__ = ["record_generation", "trace_generation"]
+__all__ = ["provider_label", "record_generation", "trace_generation"]

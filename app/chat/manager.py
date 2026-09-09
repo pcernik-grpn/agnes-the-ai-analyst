@@ -4538,6 +4538,7 @@ class ChatManager:
                         getattr(self._config, "vertex_project_id", ""),
                         getattr(self._config, "vertex_region", ""),
                     ),
+                    session_id=live.chat_id,
                 )
             except asyncio.CancelledError:
                 # A pause or a kill cancels every task in ``live.tasks``, this

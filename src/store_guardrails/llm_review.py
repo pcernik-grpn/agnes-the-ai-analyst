@@ -23,6 +23,7 @@ from connectors.llm.exceptions import (
     LLMError,
 )
 from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
+from src.observability import llm_context
 
 from .prompts import (
     REVIEW_JSON_SCHEMA,
@@ -87,13 +88,14 @@ def review_bundle(
         # the reviewer rules. The user-content payload wraps the bundle
         # files in <bundle>...</bundle> sentinels per the trust-boundary
         # paragraph in SYSTEM_PROMPT.
-        result = extractor.extract_json(
-            prompt=user_payload,
-            system=SYSTEM_PROMPT,
-            max_tokens=MAX_RESPONSE_TOKENS,
-            json_schema=REVIEW_JSON_SCHEMA,
-            schema_name="store_guardrails_review",
-        )
+        with llm_context(workload="store_guardrails", purpose="llm_review"):
+            result = extractor.extract_json(
+                prompt=user_payload,
+                system=SYSTEM_PROMPT,
+                max_tokens=MAX_RESPONSE_TOKENS,
+                json_schema=REVIEW_JSON_SCHEMA,
+                schema_name="store_guardrails_review",
+            )
     except LLMError as e:
         # Bubble up as a structured error the runner can persist into
         # store_submissions.llm_findings — operators see the failure
