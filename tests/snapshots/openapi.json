@@ -20311,6 +20311,20 @@
             }
           },
           {
+            "description": "Page size. The repository always had one (default 200); exposing it lets a composed reader ask for the whole inventory instead of silently losing every package past the 200th.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "description": "Page size. The repository always had one (default 200); exposing it lets a composed reader ask for the whole inventory instead of silently losing every package past the 200th.",
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,

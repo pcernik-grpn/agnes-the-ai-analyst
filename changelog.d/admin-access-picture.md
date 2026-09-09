@@ -7,8 +7,15 @@
   reach — distributable tables in no package and packages granted to no group,
   folded the same way as the `/admin` gap cards. Until now no MCP tool exposed
   groups, grants or admin-side package membership, so the chat landing page's
-  admin starters asked questions the agent could only decline. See
+  admin starters asked questions the agent could only decline. The picture is
+  membership-mode aware (`in_stack: always | if_subscribed`), applies the stack
+  resolver's draft / coming-soon rules to the per-group view, reads the table
+  inventory from the admin registry (the catalog narrows a stack-surface admin
+  credential to their own stack), and says when a list was capped. See
   `docs/RBAC.md` → *Admin workflows → MCP (agents)*.
+- `GET /api/admin/data-packages` accepts `?limit=` (1–5000, default 200 as
+  before) so a reader can ask for the whole package inventory instead of
+  silently losing every package past the 200th.
 
 ### Changed
 - **The admin starters on the chat landing page say what they mean.** "Who can

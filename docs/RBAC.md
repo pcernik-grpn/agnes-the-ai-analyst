@@ -517,12 +517,17 @@ Every mutation writes an audit log entry (`user_group.created`, `resource_grant.
 
 An agent asked "who has access to which data?" has one read-only tool for the
 whole picture: **`admin_access_picture`** (admin identity required). It composes
-`GET /api/admin/access-overview`, `GET /api/admin/data-packages?include_table_ids=true`
-and `GET /api/catalog/tables` into every data package with the groups granted
+`GET /api/admin/access-overview`, `GET /api/admin/data-packages?include_table_ids=true&limit=5000`
+and `GET /api/admin/registry` into every data package with the groups granted
 it and their member counts, a per-group view of what a member can reach (the
-Admin group flagged as bypassing grants), and what nobody can reach —
-distributable tables in no package and packages granted to no group, folded
-the same way as the `/admin` gap cards. It is the tool behind the chat landing
+Admin group flagged as bypassing grants; drafts and coming-soon packages
+excluded exactly as the stack resolver excludes them; `in_stack` marks an
+`available` grant as `if_subscribed` under classic membership), and what
+nobody can reach — distributable tables in no package and packages granted to
+no group, folded the same way as the `/admin` gap cards. The table inventory
+is the admin registry rather than the catalog on purpose: agent credentials
+are stack-surface, and for that surface the catalog narrows even an admin to
+their own stack — the one set of tables that is never orphaned. It is the tool behind the chat landing
 page's admin starters; before it existed no MCP tool exposed groups, grants or
 admin-side package membership, so an agent could only decline them. There is
 deliberately no MCP tool that *writes* a grant — `stack_browse` /

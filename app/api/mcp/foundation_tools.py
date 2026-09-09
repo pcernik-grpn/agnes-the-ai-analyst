@@ -107,22 +107,56 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+#: How many packages `admin_access_picture` asks `GET /api/admin/data-packages`
+#: for. The route's default page is 200 and used to be its ceiling too, so a
+#: composed reader lost every package past the 200th and misclassified their
+#: tables as unpackaged; the route now takes `?limit=` up to this value and the
+#: tool reports `packages_truncated` when a page comes back full.
+_ACCESS_PICTURE_PACKAGE_LIMIT = 5000
+
+#: Longest list the picture carries for unpackaged tables. `include_tables=False`
+#: is the first narrowing step, but an instance with thousands of orphans would
+#: trip the output cap again with nothing narrower to ask for — so the list is
+#: capped and the true total rides beside it.
+_ACCESS_PICTURE_LIST_CAP = 200
+
+
+def _stack_auto_membership() -> bool:
+    """The instance's stack membership mode — a config flag, read in-process.
+
+    Not a data read, so no RBAC question arises from resolving it here rather
+    than over HTTP; the composed picture forks on it the way
+    ``StackResolver.stack`` does.
+    """
+    from app.instance_config import get_stack_auto_membership
+
+    return bool(get_stack_auto_membership())
+
+
 def _compose_access_picture(
     overview: dict,
     packages: list[dict],
-    catalog: dict,
+    registry: dict,
     *,
     include_tables: bool,
+    auto_membership: bool,
+    packages_truncated: bool,
 ) -> dict:
     """Fold the three admin reads behind ``admin_access_picture`` into one picture.
 
     Pure -- no I/O -- so the fold rules are testable without an HTTP round
-    trip. The "unreachable when unpackaged" rule is the ``/admin`` gap card's
-    (``app.services.admin_dashboard._DISTRIBUTABLE_QUERY_MODES``): imported,
-    not restated, so the tool and the dashboard cannot disagree about which
-    tables reach nobody.
+    trip. Every rule is imported from the surface that already owns it rather
+    than restated: which unpackaged tables count as unreachable is the
+    ``/admin`` gap card's (``app.services.admin_dashboard``), which package
+    statuses an analyst can see and pull is the stack resolver's
+    (``HIDDEN_STATUSES`` / ``UNDELIVERABLE_STATUSES``), and whether an
+    ``available`` grant is in a member's stack is the membership-mode fork
+    ``StackResolver.stack`` applies. The tool and those pages cannot disagree.
     """
+    from datetime import datetime, timezone
+
     from app.services.admin_dashboard import _DISTRIBUTABLE_QUERY_MODES
+    from app.services.stack_resolver import HIDDEN_STATUSES, UNDELIVERABLE_STATUSES
     from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
     from src.grant_scopes import EVERYONE_TARGET_ID
 
@@ -164,17 +198,28 @@ def _compose_access_picture(
             }
         )
 
-    tables_by_id = {t["id"]: t for t in (catalog.get("tables") or [])}
-    packaged: set[str] = set()
+    tables_by_id = {t["id"]: t for t in (registry.get("tables") or [])}
+    # `/api/admin/registry` stamps `packaged` on every row from ONE bulk
+    # membership read over every package -- the authority, and immune to the
+    # package page below being truncated. The union over the page is only the
+    # fallback for a payload that lacks the flag.
+    registry_knows_packaging = any("packaged" in t for t in tables_by_id.values())
+    packaged_union: set[str] = set()
     pkgs_out: list[dict] = []
     for p in packages:
         table_ids = [str(t) for t in (p.get("table_ids") or [])]
-        packaged.update(table_ids)
+        packaged_union.update(table_ids)
+        status = p.get("status") or "prod"
         entry: dict[str, Any] = {
             "id": p["id"],
             "slug": p.get("slug"),
             "name": p.get("name") or p["id"],
-            "status": p.get("status") or "prod",
+            "status": status,
+            # The stack resolver's two lifecycle axes, verbatim: a draft never
+            # reaches a non-admin surface; a coming-soon package is browsable
+            # but never in a stack or a pull manifest.
+            "visible_to_analysts": status not in HIDDEN_STATUSES,
+            "deliverable": status not in UNDELIVERABLE_STATUSES,
             "table_count": len(table_ids),
             "granted_to": grants_by_pkg.get(p["id"], []),
         }
@@ -184,19 +229,49 @@ def _compose_access_picture(
             ]
         pkgs_out.append(entry)
 
-    unpackaged = sorted(
+    def _is_packaged(t: dict) -> bool:
+        if registry_knows_packaging:
+            return bool(t.get("packaged"))
+        return t["id"] in packaged_union
+
+    unpackaged_all = sorted(
         (
             {"id": t["id"], "name": t.get("name") or t["id"], "query_mode": t.get("query_mode") or "local"}
             for t in tables_by_id.values()
-            if (t.get("query_mode") or "") in _DISTRIBUTABLE_QUERY_MODES and t["id"] not in packaged
+            if (t.get("query_mode") or "") in _DISTRIBUTABLE_QUERY_MODES and not _is_packaged(t)
         ),
         key=lambda t: t["name"],
     )
-    ungranted = [{"id": p["id"], "name": p["name"]} for p in pkgs_out if not p["granted_to"]]
+    unpackaged = unpackaged_all[:_ACCESS_PICTURE_LIST_CAP]
+    # A draft granted to nobody is the normal authoring state, not a gap: it
+    # is hidden from analysts whether or not it is granted.
+    ungranted = [
+        {"id": p["id"], "name": p["name"], "status": p["status"]}
+        for p in pkgs_out
+        if not p["granted_to"] and p["visible_to_analysts"]
+    ]
+
+    def _reachable(p: dict) -> bool:
+        return bool(p["visible_to_analysts"] and p["deliverable"])
+
+    def _in_stack(requirement: str | None, via: str) -> str:
+        # Auto-membership (the default): every granted package is in the
+        # stack the moment it is granted. Classic: only `required` lands
+        # automatically; `available` needs the member's own subscription.
+        if via == "admin" or auto_membership or requirement == "required":
+            return "always"
+        return "if_subscribed"
 
     everyone_pkgs = [
-        {"id": p["id"], "name": p["name"], "requirement": g["requirement"], "via": EVERYONE_TARGET_ID}
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "requirement": g["requirement"],
+            "via": EVERYONE_TARGET_ID,
+            "in_stack": _in_stack(g["requirement"], EVERYONE_TARGET_ID),
+        }
         for p in pkgs_out
+        if _reachable(p)
         for g in p["granted_to"]
         if g["audience"] == EVERYONE_TARGET_ID
     ]
@@ -214,11 +289,21 @@ def _compose_access_picture(
             continue  # the carrier is the `everyone` baseline above, not a roster
         is_admin = g["is_system"] and g["name"] == SYSTEM_ADMIN_GROUP
         if is_admin:
-            reach = [{"id": p["id"], "name": p["name"], "requirement": None, "via": "admin"} for p in pkgs_out]
+            reach = [
+                {"id": p["id"], "name": p["name"], "requirement": None, "via": "admin", "in_stack": "always"}
+                for p in pkgs_out
+            ]
         else:
             direct = [
-                {"id": p["id"], "name": p["name"], "requirement": gr["requirement"], "via": "group"}
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "requirement": gr["requirement"],
+                    "via": "group",
+                    "in_stack": _in_stack(gr["requirement"], "group"),
+                }
                 for p in pkgs_out
+                if _reachable(p)
                 for gr in p["granted_to"]
                 if gr["audience"] == "group" and gr["group_id"] == g["id"]
             ]
@@ -245,17 +330,47 @@ def _compose_access_picture(
             "remote tables answer server-side without a package and internal rows have no parquet to pull."
         ),
         (
-            "A package is invisible to analysts until it is granted to a group; 'required' grants land in "
-            "the stack automatically, 'available' ones are opt-in."
+            "Lifecycle: a draft package is hidden from analysts and a coming-soon package is browsable but "
+            "never delivered; by_group applies the same rule the stack resolver applies, and a draft granted "
+            "to nobody is not listed as a gap."
+        ),
+        (
+            "membership_mode=auto: every granted package is in a member's stack the moment it is granted, "
+            "required and available alike; subscribing only controls whether a local copy is kept."
+            if auto_membership
+            else "membership_mode=classic: only 'required' grants land in a member's stack automatically; an "
+            "'available' grant reaches a member only after they subscribe, so in_stack='if_subscribed' "
+            "entries are potential per-user access, not effective access."
+        ),
+        (
+            "captured_at: composed from three sequential reads, not one transaction -- a grant or package "
+            "edit racing the call can leave one read ahead of another; re-run if an edit just happened."
         ),
     ]
+    if packages_truncated:
+        notes.append(
+            f"packages_truncated=true: the package inventory filled a {_ACCESS_PICTURE_PACKAGE_LIMIT}-row page, "
+            "so packages and by_group are incomplete; tables_in_no_package stays complete because the registry "
+            "stamps packaging from a bulk read over every package."
+            if registry_knows_packaging
+            else f"packages_truncated=true: the package inventory filled a {_ACCESS_PICTURE_PACKAGE_LIMIT}-row page, "
+            "so packages, by_group AND tables_in_no_package are incomplete."
+        )
     return {
         "source": "server",
+        "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "membership_mode": "auto" if auto_membership else "classic",
         "account_total": account_total,
         "groups": groups,
         "packages": pkgs_out,
+        "packages_truncated": packages_truncated,
         "by_group": by_group,
-        "unreachable": {"tables_in_no_package": unpackaged, "packages_granted_to_no_group": ungranted},
+        "unreachable": {
+            "tables_in_no_package": unpackaged,
+            "tables_in_no_package_total": len(unpackaged_all),
+            "tables_in_no_package_truncated": len(unpackaged_all) > len(unpackaged),
+            "packages_granted_to_no_group": ungranted,
+        },
         "notes": notes,
     }
 
@@ -361,7 +476,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # has access to which data", "what is shared with no one", "what does a
     # non-admin see"): packages -> granted groups -> member counts, plus what
     # nobody can reach. Composes GET /api/admin/access-overview +
-    # GET /api/admin/data-packages + GET /api/catalog/tables -- no new REST
+    # GET /api/admin/data-packages + GET /api/admin/registry -- no new REST
     # surface, so no new CLI verb is owed; the CLI leg is the existing
     # `agnes admin group list` / `grant list` / `data-package list`.
     "admin_access_picture",
@@ -2681,58 +2796,89 @@ def register_foundation_tools(
     async def admin_access_picture(include_tables: bool = True) -> dict:
         """Admin-only access picture: every data package, which groups are granted it and how many accounts each holds, what nobody can reach (distributable tables in no package, packages granted to no group), and what each group can see. Answers "who has access to which data", "what is shared with no one" and "what does a non-admin see" from the real grants -- call it instead of guessing from the catalog.
 
-        Composes the three admin reads the ``/admin`` overview itself uses --
-        ``GET /api/admin/access-overview`` (groups, grants, people total),
-        ``GET /api/admin/data-packages?include_table_ids=true`` and
-        ``GET /api/catalog/tables`` -- so the answer is the dashboard's, not a
-        second opinion. Requires an admin identity: a non-admin caller gets
-        those routes' own 403, never a partial picture.
+        Composes three admin-wide reads -- ``GET /api/admin/access-overview``
+        (groups, grants, people total), ``GET /api/admin/data-packages
+        ?include_table_ids=true&limit=5000`` and ``GET /api/admin/registry``
+        (every registered table, each stamped ``packaged``) -- with the fold
+        rules the ``/admin`` gap cards and the stack resolver use, so the
+        answer is theirs, not a second opinion. Requires an admin identity: a
+        non-admin caller gets those routes' own 403, never a partial picture.
+        The registry, not the catalog, is the table inventory on purpose: an
+        agent credential is stack-surface, and for that surface the catalog
+        narrows even an admin to their own stack -- the one set of tables
+        that is never orphaned.
 
         Args:
             include_tables: Include each package's table list (default). Pass
                 ``False`` on a large instance when the response trips the
                 output cap -- ``table_count`` and the unreachable tray stay.
 
-        Returns ``{"source": "server", "account_total", "groups", "packages",
+        Returns ``{"source": "server", "captured_at", "membership_mode",
+        "account_total", "groups", "packages", "packages_truncated",
         "by_group", "unreachable", "notes"}``:
 
+        - ``membership_mode``: ``auto`` (the default -- every granted package
+          is in a member's stack at once) or ``classic`` (only ``required``
+          grants land automatically; ``available`` needs the member's own
+          subscription). Read ``by_group[].packages[].in_stack`` with it:
+          ``always`` or ``if_subscribed`` -- the latter is potential per-user
+          access, not effective access.
         - ``groups``: ``[{id, name, is_system, is_everyone, member_count}]``.
           ``member_count`` counts group rows (service accounts included); the
           Everyone carrier's roster is every account by construction.
-        - ``packages``: ``[{id, slug, name, status, table_count, tables?,
-          granted_to: [{group_id, group_name, requirement, audience,
-          member_count}]}]``. ``audience`` is ``"everyone"`` for an
-          everyone-scoped grant (``member_count`` is then the people total)
-          and ``"group"`` otherwise. ``requirement`` is ``required`` (always
-          in the analyst's stack) or ``available`` (opt-in).
+        - ``packages``: ``[{id, slug, name, status, visible_to_analysts,
+          deliverable, table_count, tables?, granted_to: [{group_id,
+          group_name, requirement, audience, member_count}]}]``.
+          ``visible_to_analysts`` is false for a draft, ``deliverable`` is
+          false for a coming-soon package (the stack resolver's two lifecycle
+          axes). ``audience`` is ``"everyone"`` for an everyone-scoped grant
+          (``member_count`` is then the people total) and ``"group"``
+          otherwise. ``packages_truncated`` is true when the 5000-row page
+          came back full -- the package half is then incomplete.
         - ``by_group``: what a member of each group can reach -- an
           ``everyone`` baseline entry first, then every group with its direct
           grants plus that baseline (``via``: ``group`` | ``everyone`` |
-          ``admin``). ``bypasses_grants`` is true for the Admin group, which
-          reaches everything regardless of grants. This is the "what would a
-          non-admin see" answer: pick the group, read its ``packages``.
+          ``admin``). Drafts and coming-soon packages are excluded exactly as
+          ``StackResolver.stack`` excludes them; ``bypasses_grants`` is true
+          for the Admin group, which reaches everything regardless. This is
+          the "what would a non-admin see" answer: pick the group, read its
+          ``packages``.
         - ``unreachable.tables_in_no_package``: registered tables no analyst
           can ever pull -- distributable ``query_mode`` (blank / ``local`` /
           ``materialized``) and in no package. ``remote`` tables answer
           server-side without a package and ``internal`` rows have no
-          parquet, so neither is listed. Fix: add the table to a package.
-        - ``unreachable.packages_granted_to_no_group``: packages no analyst
-          can see. Fix: grant the package to a group on ``/admin/access``.
+          parquet, so neither is listed. Capped at 200 entries;
+          ``tables_in_no_package_total`` / ``_truncated`` say whether more
+          exist. Fix: add the table to a package.
+        - ``unreachable.packages_granted_to_no_group``: analyst-visible
+          packages no analyst can see (drafts are not gaps). Fix: grant the
+          package to a group on ``/admin/access``.
+        - ``captured_at``: three sequential reads, not one transaction -- an
+          edit racing the call can leave one read ahead of another.
         """
+        limit = _ACCESS_PICTURE_PACKAGE_LIMIT
         async with httpx.AsyncClient() as c:
             ov = await c.get(f"{base_url}/api/admin/access-overview", headers=headers_fn(), timeout=30)
             _raise_for_status_with_detail(ov)
             pk = await c.get(
                 f"{base_url}/api/admin/data-packages",
                 headers=headers_fn(),
-                params={"include_table_ids": "true"},
+                params={"include_table_ids": "true", "limit": str(limit)},
                 timeout=30,
             )
             _raise_for_status_with_detail(pk)
-            tb = await c.get(f"{base_url}/api/catalog/tables", headers=headers_fn(), timeout=30)
-            _raise_for_status_with_detail(tb)
+            rg = await c.get(f"{base_url}/api/admin/registry", headers=headers_fn(), timeout=60)
+            _raise_for_status_with_detail(rg)
+        packages = pk.json() or []
         return ensure_output_size(
-            _compose_access_picture(ov.json(), pk.json(), tb.json(), include_tables=include_tables),
+            _compose_access_picture(
+                ov.json(),
+                packages,
+                rg.json(),
+                include_tables=include_tables,
+                auto_membership=_stack_auto_membership(),
+                packages_truncated=len(packages) >= limit,
+            ),
             "admin_access_picture",
             hint="call again with include_tables=False",
         )
