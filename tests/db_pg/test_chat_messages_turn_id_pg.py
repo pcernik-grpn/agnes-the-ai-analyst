@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
+
+from src.duckdb_conn import _open_duckdb
 import pytest
 
 from app.chat.persistence import ChatRepository
@@ -61,7 +62,7 @@ def test_pg_append_message_without_turn_id_is_none(pg_repo):
 
 
 def test_duckdb_backend_accepts_and_drops_turn_id():
-    conn = duckdb.connect(":memory:")
+    conn = _open_duckdb(":memory:")
     _ensure_schema(conn)
     repo = ChatRepository(conn)
     session = repo.create_session(user_email="a@test.com", surface=Surface.WEB)
