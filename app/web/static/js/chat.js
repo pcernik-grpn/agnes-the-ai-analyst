@@ -321,6 +321,28 @@ const WS_CLOSE_REJECTED = new Set([4404]);
 // caller's. Anything else — 408/429, a 5xx, a refused connection — is the
 // transient case retrying exists for.
 const WS_MINT_FATAL_STATUS = new Set([401, 403, 404]);
+
+/** A 401/403 anywhere in the chat path means the BROWSER'S SESSION is gone,
+ *  not that chat is broken — and the two need opposite reactions from the
+ *  reader. Rendering the raw status left them with "Could not start chat:
+ *  401" and nothing to do; the actual fix was to reload, which nobody has a
+ *  reason to guess (reported 2026-09-09, resolved by the reporter noticing
+ *  a reload had silently logged them out).
+ *
+ *  Says what happened, then goes to the login they need, carrying the page
+ *  they were on in `?next=` so signing in returns them here instead of the
+ *  dashboard. Returns true when it handled the error, so a caller can skip
+ *  its generic branch — and false for every other failure, which is still a
+ *  real chat error and must keep its own message. */
+function handleExpiredSession(err) {
+  if (!err || (err.status !== 401 && err.status !== 403)) return false;
+  setStatus("Your session expired — taking you to sign in\u2026", "error");
+  const next = encodeURIComponent(location.pathname + location.search);
+  // A beat before navigating: the sentence above is the only explanation the
+  // reader gets, and a redirect fired in the same tick renders it unread.
+  setTimeout(() => { location.href = `/login?next=${next}`; }, 1200);
+  return true;
+}
 let _wsReconnectAttempts = 0;
 let _wsReconnectTimer = null;
 // Invalidates a recovery already past its `setTimeout`. Clearing the timer
@@ -7153,7 +7175,12 @@ async function submitUserMessage(text) {
     // mid-send. The session is new; the conversation is not.
     _markConversationStarted();
   } catch (err) {
-    setStatus(`Could not start chat: ${err.message}`, "error");
+    // An expired login is not a broken chat — it gets its own sentence and a
+    // way out. The composer restore below still runs either way: the turn
+    // never started, so the text belongs to the reader whichever it was.
+    if (!handleExpiredSession(err)) {
+      setStatus(`Could not start chat: ${err.message}`, "error");
+    }
     showCapabilities();
     // Step 1 cleared the composer optimistically, but no turn ever started:
     // give the text back rather than destroying what they typed. A chat

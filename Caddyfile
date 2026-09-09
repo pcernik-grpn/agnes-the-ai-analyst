@@ -17,6 +17,21 @@
 		protocols tls1.2 tls1.3
 	}
 
+	# Access log. Off until 2026-09-09, and its absence cost us a diagnosis:
+	# an expired browser session returned 401 on POST /api/chat/sessions and
+	# left NO trace anywhere — the app logs no HTTP access lines and Caddy
+	# logged only warnings — so "how often does this hit people?" was
+	# unanswerable and we learned of it from a user's screenshot.
+	#
+	# JSON to stdout, so the container log carries it wherever the host
+	# already ships logs; Caddy redacts the Authorization header itself.
+	# One line per request, not per byte, so a multi-GB parquet pull costs
+	# one entry like anything else.
+	log {
+		output stdout
+		format json
+	}
+
 	# Security headers
 	header {
 		# HSTS: tell compliant browsers to refuse plain-HTTP for this host
