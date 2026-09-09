@@ -765,3 +765,30 @@ def test_model_resolution_falls_back_to_the_vision_env_then_the_default(monkeypa
 
     monkeypatch.delenv("AGNES_VISION_MODEL", raising=False)
     assert scan_ocr.default_model() == scan_ocr.FALLBACK_MODEL
+
+
+# ------------------------------------------------- call labelling (ocr)
+
+
+@pytest.fixture
+def llm_records(monkeypatch):
+    """Collect the ``LlmCallRecord`` every traced generation emits (the seam
+    is the name bound inside ``llm_tracing``, see the facts-extraction
+    fixture of the same name)."""
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    return records
+
+
+def test_a_transcribed_page_is_recorded_as_ocr_work(tmp_path, monkeypatch, llm_records):
+    client = _FakeClient("page one text")
+    settings = _enable(monkeypatch, client, max_pages=1)
+
+    ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1))
+
+    assert len(llm_records) == 1
+    record = llm_records[0]
+    assert (record.workload, record.purpose) == ("ocr", "scan_ocr")
+    assert record.provider == "anthropic"
+    assert record.status == "ok"
+    assert record.input_tokens == 100 and record.output_tokens == 20

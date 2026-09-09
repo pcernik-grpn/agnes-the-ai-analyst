@@ -1122,41 +1122,52 @@ class ScanTranscriber:
     # -- one page ----------------------------------------------------------
 
     def _create(self, image: bytes, media_type: str) -> Any:
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
         client, model = self._ensure_client()
-        return client.messages.create(
-            model=model,
-            max_tokens=self.settings.max_output_tokens,
-            # The rules ride the system channel with a cache breakpoint:
-            # byte-identical for every page of every document, which is the
-            # shape a cache can serve. Whether it DOES is model dependent — a
-            # prefix below the model's minimum cacheable length is silently
-            # not cached (inert, never an error) — so the breakpoint costs
-            # nothing and starts paying the moment a model with a lower
-            # minimum is pinned.
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64.standard_b64encode(image).decode("ascii"),
+        with (
+            llm_context(workload="ocr"),
+            trace_generation(
+                provider=provider_label(self._resolved_provider or "anthropic"), model=model, purpose="scan_ocr"
+            ) as cap,
+        ):
+            response = client.messages.create(
+                model=model,
+                max_tokens=self.settings.max_output_tokens,
+                # The rules ride the system channel with a cache breakpoint:
+                # byte-identical for every page of every document, which is the
+                # shape a cache can serve. Whether it DOES is model dependent — a
+                # prefix below the model's minimum cacheable length is silently
+                # not cached (inert, never an error) — so the breakpoint costs
+                # nothing and starts paying the moment a model with a lower
+                # minimum is pinned.
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": base64.standard_b64encode(image).decode("ascii"),
+                                },
                             },
-                        },
-                        {"type": "text", "text": _USER_TEXT},
-                    ],
-                }
-            ],
-        )
+                            {"type": "text", "text": _USER_TEXT},
+                        ],
+                    }
+                ],
+            )
+            cap.set_output_from_anthropic(response)
+        return response
 
     def _record(self, response: Any) -> None:
         usage = getattr(response, "usage", None)
@@ -1514,22 +1525,34 @@ class ScanTranscriber:
         credential/model work; a narrower failure of just this call is not
         grounds to burn the whole document's remaining budget on a guess.
         """
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
         client, model = self._ensure_client()
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=TRIAGE_MAX_OUTPUT_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": TRIAGE_SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                tools=[TRIAGE_TOOL],
-                tool_choice={"type": "tool", "name": _TRIAGE_TOOL_NAME},
-                messages=[{"role": "user", "content": [{"type": "text", "text": _fence_preview(preview_text)}]}],
-            )
+            with (
+                llm_context(workload="ocr"),
+                trace_generation(
+                    provider=provider_label(self._resolved_provider or "anthropic"),
+                    model=model,
+                    purpose="scan_ocr_retry",
+                ) as cap,
+            ):
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=TRIAGE_MAX_OUTPUT_TOKENS,
+                    system=[
+                        {
+                            "type": "text",
+                            "text": TRIAGE_SYSTEM_PROMPT,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    tools=[TRIAGE_TOOL],
+                    tool_choice={"type": "tool", "name": _TRIAGE_TOOL_NAME},
+                    messages=[{"role": "user", "content": [{"type": "text", "text": _fence_preview(preview_text)}]}],
+                )
+                cap.set_output_from_anthropic(response)
         except Exception as exc:  # noqa: BLE001 — classified as "stop", never guessed "continue"
             limit_reason = _permanent_refusal_reason(exc)
             if limit_reason is not None:

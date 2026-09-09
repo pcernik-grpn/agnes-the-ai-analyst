@@ -9,8 +9,8 @@ instead of writing them to a live WebSocket.
 **Frame shape note (verified against ``app/chat/manager.py``, not
 assumed):** the task brief's sketch reads an ``assistant_message`` frame's
 ``text``/``content`` field. The real frame — see
-``_pump_subprocess_to_ws``'s ``self._repo.append_message(... content=
-frame.get("content", "") ...)`` and ``add_sink``'s history-replay frames
+``_pump_frames``'s (the loop behind ``_pump_subprocess_to_ws``)
+``self._repo.append_message(... content=frame.get("content", "") ...)`` and ``add_sink``'s history-replay frames
 (``{"type": "assistant_message", "content": ..., "sender_email": ...}``)
 — only ever carries the text under ``content``, never ``text``. This
 sink reads ``content`` only (no ``text`` fallback) to match the real
@@ -19,7 +19,7 @@ producer would just leave ``answer`` at its previous value rather than
 raise.
 
 Turn completion is the ``"done"`` frame type (``manager.py``'s
-``_pump_subprocess_to_ws``, ``ftype == "done"`` branch) — NOT
+``_pump_frames``, ``ftype == "done"`` branch) — NOT
 ``assistant_message`` itself, since a turn can in principle emit more than
 one frame before the runner signals it's finished (e.g. tool calls interleave
 with the answer). ``done_event`` is only set on ``"done"``.

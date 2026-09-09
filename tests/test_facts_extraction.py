@@ -117,12 +117,17 @@ class StubExtractor:
         self._delay = delay
         self._lock = threading.Lock()
         self.seen: list[str] = []
+        #: `subject_id` as passed on every `call()` — the seam's own record
+        #: of who called it FOR, so a test can assert the caller threaded
+        #: the document id through without instrumenting `trace_generation`.
+        self.subject_ids_seen: list[str | None] = []
 
-    def call(self, user_message: str) -> str:
+    def call(self, user_message: str, *, subject_id: str | None = None) -> str:
         if self._delay:
             time.sleep(self._delay)
         with self._lock:
             self.seen.append(user_message)
+            self.subject_ids_seen.append(subject_id)
             index = min(len(self.seen) - 1, len(self._replies) - 1)
             self.usage["calls"] += 1
             self.usage["input_tokens"] += 10
@@ -3156,3 +3161,141 @@ def test_plan_documents_with_no_partition_sees_every_file(monkeypatch):
         )
     )
     assert sorted(w.file_id for w in works) == sorted(r["id"] for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# call labelling — every extraction generation says what it was for
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def llm_records(monkeypatch):
+    """Collect the ``LlmCallRecord`` every traced generation emits.
+
+    ``trace_generation`` binds ``record_call`` at import time, so the seam is
+    the name inside ``llm_tracing`` — patching the ledger module would leave
+    the already-bound reference in place.
+    """
+    records: list[Any] = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    return records
+
+
+def test_a_document_extraction_is_recorded_as_extraction_work(llm_records):
+    client = FakeClient(_Response("NODES\nEDGES\n"))
+    _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", client=client).call("first", subject_id="cf_1")
+
+    assert len(llm_records) == 1
+    record = llm_records[0]
+    assert (record.workload, record.purpose) == ("extraction", "facts_extraction")
+    assert record.provider == "anthropic"
+    assert record.model_requested == "claude-haiku-4-5"
+    assert record.status == "ok"
+    assert record.subject_id == "cf_1", "the row must say which document it was"
+
+
+def test_a_documents_corrective_retry_carries_the_same_subject_id():
+    """`extract_one`'s corrective retry re-calls the SAME extractor for the
+    SAME document — the retry call must still carry the document's id, not
+    go back to unlabelled."""
+    text = "The Northwind rollout began in March."
+    bad = _node("the rollout was cancelled")
+    good = _node("rollout began in March")
+    extractor = StubExtractor([_stream(bad), _stream(good)])
+
+    extract_one(extractor, _work(text, file_id="cf_1"))
+
+    assert extractor.subject_ids_seen == ["cf_1", "cf_1"], "the initial call AND the retry carry the document id"
+
+
+def test_a_vertex_pass_is_recorded_against_vertex(llm_records):
+    """Same model, different bill — the record has to tell them apart."""
+    client = FakeClient(_Response("NODES\nEDGES\n"))
+    _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, provider="vertex").call("first")
+
+    assert llm_records[0].provider == "gcp.vertex_ai"
+
+
+def test_a_failed_extraction_is_recorded_as_an_error_and_still_raises(llm_records):
+    """Instrumentation observes the failure; it never swallows it."""
+
+    class Boom(RuntimeError):
+        pass
+
+    client = FakeClient(Boom("upstream exploded"))
+    extractor = _Extractor(
+        system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, max_attempts=1, sleep=lambda _s: None
+    )
+    with pytest.raises(Exception):
+        extractor.call("first")
+
+    assert llm_records, "a failed call must still be recorded"
+    assert llm_records[0].status == "error"
+    assert llm_records[0].error_type == "Boom"
+    assert llm_records[0].purpose == "facts_extraction"
+
+
+class TestFailedBatchResultsReachTheLedger:
+    """Review finding: only the succeeded branch of the batch collector
+    recorded its call, so a batch whose results errored, were canceled or
+    expired left no ``llm_calls`` row at all — the call counts read as "we
+    never asked" and the error summary was blind to the runs that failed."""
+
+    def test_a_failed_batch_result_records_one_zero_usage_error_row(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("src.observability.record_generation", lambda **kw: calls.append(kw), raising=False)
+
+        fe.record_batch_failure("anthropic", "claude-haiku-4-5", "cf_1", "expired")
+
+        assert len(calls) == 1
+        (call,) = calls
+        assert call["purpose"] == "facts_batch"
+        assert call["subject_id"] == "cf_1"
+        assert call["error_type"] == "expired"
+        assert call["batch"] is True
+        assert call["usage"] is None
+
+    def test_recording_never_costs_the_pass(self, monkeypatch):
+        def _boom(**_kw):
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr("src.observability.record_generation", _boom, raising=False)
+
+        fe.record_batch_failure("anthropic", "claude-haiku-4-5", "cf_1", "errored")  # must not raise
+
+    def test_an_answer_whose_document_vanished_still_records_its_real_usage(self, monkeypatch):
+        """The model answered and the tokens were spent; only the document is
+        gone. The ledger records what was SPENT, so this is a normal priced
+        row rather than nothing at all (review finding)."""
+        calls = []
+        monkeypatch.setattr("src.observability.record_generation", lambda **kw: calls.append(kw), raising=False)
+
+        class _Msg:
+            usage = {"input_tokens": 10, "output_tokens": 2}
+            model = "claude-haiku-4-5"
+            stop_reason = "end_turn"
+
+        fe.record_generation_for_batch_message("anthropic", "claude-haiku-4-5", "cf_gone", _Msg())
+
+        assert len(calls) == 1
+        (call,) = calls
+        assert call["subject_id"] == "cf_gone"
+        assert call["usage"] == {"input_tokens": 10, "output_tokens": 2}
+        assert call.get("error_type") is None
+
+    def test_every_non_outcome_records_something(self):
+        """The recorder is reached from a closure the unit tests cannot
+        drive, so this pins the wiring at the source level — the same shape
+        `tests/test_chat_sources_verdict.py` uses for `manager.py`. Four
+        paths must record: a missing result, an answer whose document
+        vanished, an errored result, and canceled/expired."""
+        import inspect
+
+        src = inspect.getsource(fe)
+        collector = src.split("def _collect_batch(batch_id: str) -> None:", 1)[1].split("\n    def ", 1)[0]
+        assert collector.count("record_batch_failure(") == 3, (
+            "missing_result, errored and canceled/expired must each record a ledger row"
+        )
+        assert collector.count("record_generation_for_batch_message(") == 1, (
+            "an answer whose document vanished must still record its real usage"
+        )

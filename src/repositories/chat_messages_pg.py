@@ -56,8 +56,12 @@ class ChatMessagePgRepository:
         tokens_out: Optional[int] = None,
         cache_read_tokens: Optional[int] = None,
         cache_creation_tokens: Optional[int] = None,
+        llm_calls: Optional[int] = None,
+        llm_duration_ms: Optional[int] = None,
+        llm_ttfb_ms: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> ChatMessage:
         msg_id = _gen_id("msg")
         now = datetime.now(timezone.utc)
@@ -67,11 +71,13 @@ class ChatMessagePgRepository:
                     "INSERT INTO chat_messages "
                     "(id, session_id, role, content, tool_calls, parts, tokens_in, "
                     "tokens_out, cache_read_tokens, cache_creation_tokens, "
-                    "model, sender_email, created_at) "
+                    "llm_calls, llm_duration_ms, llm_ttfb_ms, "
+                    "model, sender_email, turn_id, created_at) "
                     "VALUES (:id, :session_id, :role, :content, "
                     "CAST(:tool_calls AS JSONB), CAST(:parts AS JSONB), "
                     ":tokens_in, :tokens_out, :cache_read_tokens, :cache_creation_tokens, "
-                    ":model, :sender_email, :created_at)"
+                    ":llm_calls, :llm_duration_ms, :llm_ttfb_ms, "
+                    ":model, :sender_email, :turn_id, :created_at)"
                 ),
                 {
                     "id": msg_id,
@@ -84,8 +90,12 @@ class ChatMessagePgRepository:
                     "tokens_out": tokens_out,
                     "cache_read_tokens": cache_read_tokens,
                     "cache_creation_tokens": cache_creation_tokens,
+                    "llm_calls": llm_calls,
+                    "llm_duration_ms": llm_duration_ms,
+                    "llm_ttfb_ms": llm_ttfb_ms,
                     "model": model,
                     "sender_email": sender_email,
+                    "turn_id": turn_id,
                     "created_at": now,
                 },
             )
@@ -109,8 +119,12 @@ class ChatMessagePgRepository:
             tokens_out=tokens_out,
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
+            llm_calls=llm_calls,
+            llm_duration_ms=llm_duration_ms,
+            llm_ttfb_ms=llm_ttfb_ms,
             model=model,
             sender_email=sender_email,
+            turn_id=turn_id,
             created_at=now,
         )
 
@@ -125,7 +139,8 @@ class ChatMessagePgRepository:
             sql = (
                 "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                 "tokens_out, cache_read_tokens, cache_creation_tokens, "
-                "model, sender_email, created_at FROM chat_messages "
+                "llm_calls, llm_duration_ms, llm_ttfb_ms, "
+                "model, sender_email, turn_id, created_at FROM chat_messages "
                 "WHERE session_id = :session_id"
             )
             params: dict = {"session_id": session_id}
@@ -147,8 +162,12 @@ class ChatMessagePgRepository:
                 tokens_out=r["tokens_out"],
                 cache_read_tokens=r["cache_read_tokens"],
                 cache_creation_tokens=r["cache_creation_tokens"],
+                llm_calls=r["llm_calls"],
+                llm_duration_ms=r["llm_duration_ms"],
+                llm_ttfb_ms=r["llm_ttfb_ms"],
                 model=r["model"],
                 sender_email=r["sender_email"],
+                turn_id=r["turn_id"],
                 created_at=r["created_at"],
             )
             for r in rows
@@ -168,7 +187,8 @@ class ChatMessagePgRepository:
                     sa.text(
                         "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                         "tokens_out, cache_read_tokens, cache_creation_tokens, "
-                        "model, sender_email, created_at FROM chat_messages "
+                        "llm_calls, llm_duration_ms, llm_ttfb_ms, "
+                        "model, sender_email, turn_id, created_at FROM chat_messages "
                         "WHERE session_id = :session_id ORDER BY created_at DESC LIMIT :limit"
                     ),
                     {"session_id": session_id, "limit": limit},
@@ -188,8 +208,12 @@ class ChatMessagePgRepository:
                 tokens_out=r["tokens_out"],
                 cache_read_tokens=r["cache_read_tokens"],
                 cache_creation_tokens=r["cache_creation_tokens"],
+                llm_calls=r["llm_calls"],
+                llm_duration_ms=r["llm_duration_ms"],
+                llm_ttfb_ms=r["llm_ttfb_ms"],
                 model=r["model"],
                 sender_email=r["sender_email"],
+                turn_id=r["turn_id"],
                 created_at=r["created_at"],
             )
             for r in rows
@@ -279,6 +303,14 @@ class ChatMessagePgRepository:
         USD is deliberately NOT computed here: pricing belongs to
         ``src/llm_pricing.py``, which the caller applies per row using that
         row's own ``model``.
+
+        The same row carries the session's measured LLM latency —
+        ``llm_calls`` / ``llm_duration_ms`` / ``llm_ttfb_ms`` summed over its
+        assistant messages — with ``timing_recorded_messages`` playing the
+        role ``cache_recorded_messages`` plays for the cache figures: a
+        message written before migration 0117, or by a turn whose
+        completions never transited the broker, has no timing, and that is
+        "unknown", not "instant".
         """
         clauses = ["m.role = 'assistant'"]
         params: dict = {"limit": limit}
@@ -300,6 +332,10 @@ class ChatMessagePgRepository:
                         "COALESCE(SUM(m.tokens_out), 0) AS tokens_out, "
                         "COALESCE(SUM(m.cache_read_tokens), 0) AS cache_read_tokens, "
                         "COALESCE(SUM(m.cache_creation_tokens), 0) AS cache_creation_tokens, "
+                        "COUNT(m.llm_duration_ms) AS timing_recorded_messages, "
+                        "COALESCE(SUM(m.llm_calls), 0) AS llm_calls, "
+                        "COALESCE(SUM(m.llm_duration_ms), 0) AS llm_duration_ms, "
+                        "COALESCE(SUM(m.llm_ttfb_ms), 0) AS llm_ttfb_ms, "
                         "MAX(m.created_at) AS last_message_at "
                         "FROM chat_messages m "
                         "JOIN chat_sessions s ON m.session_id = s.id "
@@ -313,3 +349,67 @@ class ChatMessagePgRepository:
                 .all()
             )
         return [dict(r) for r in rows]
+
+    def has_turn(self, session_id: str, turn_id: str) -> bool:
+        """Whether ``turn_id`` is a turn of ``session_id`` -- i.e. at least
+        one of the session's own messages carries it. The feedback endpoint
+        asks this before keying a thumbs row on a caller-supplied turn id,
+        so a participant of one session cannot attach feedback to a turn
+        that belongs to another (design 2026-09-08 §3.5; review finding).
+        """
+        if not session_id or not turn_id:
+            return False
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT 1 FROM chat_messages WHERE session_id = :session_id AND turn_id = :turn_id LIMIT 1"),
+                {"session_id": session_id, "turn_id": turn_id},
+            ).first()
+        return row is not None
+
+    def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[ChatMessage]]:
+        """Every message for ``session_ids``, grouped by session and ordered
+        oldest-first within each -- the conversation-corpus export's bulk
+        read (design 2026-09-08 §3.12): one query for a whole page of
+        sessions rather than one ``list_messages`` call per session.
+
+        A session with no messages is not a key in the returned dict --
+        callers that need every requested id present regardless use
+        ``dict.get(session_id, [])``.
+        """
+        if not session_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
+                        "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                        "model, sender_email, turn_id, created_at FROM chat_messages "
+                        "WHERE session_id = ANY(:session_ids) ORDER BY session_id ASC, created_at ASC"
+                    ),
+                    {"session_ids": list(session_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: dict[str, list[ChatMessage]] = {}
+        for r in rows:
+            out.setdefault(r["session_id"], []).append(
+                ChatMessage(
+                    id=r["id"],
+                    session_id=r["session_id"],
+                    role=r["role"],
+                    content=r["content"],
+                    tool_calls=_decode_json_column(r["tool_calls"]),
+                    parts=_decode_json_column(r["parts"]),
+                    tokens_in=r["tokens_in"],
+                    tokens_out=r["tokens_out"],
+                    cache_read_tokens=r["cache_read_tokens"],
+                    cache_creation_tokens=r["cache_creation_tokens"],
+                    model=r["model"],
+                    sender_email=r["sender_email"],
+                    turn_id=r["turn_id"],
+                    created_at=r["created_at"],
+                )
+            )
+        return out

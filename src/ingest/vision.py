@@ -95,26 +95,39 @@ def extract_image_text(path: str, *, ext: str) -> Optional[str]:
             model = to_vertex_model_id(_MODEL)
         else:
             client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data,
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
+        with (
+            llm_context(workload="vision"),
+            trace_generation(
+                provider=provider_label("vertex" if vertex is not None else "anthropic"),
+                model=model,
+                purpose="image_caption",
+            ) as cap,
+        ):
+            cap.set_input(_PROMPT)
+            resp = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": data,
+                                },
                             },
-                        },
-                        {"type": "text", "text": _PROMPT},
-                    ],
-                }
-            ],
-        )
+                            {"type": "text", "text": _PROMPT},
+                        ],
+                    }
+                ],
+            )
+            cap.set_output_from_anthropic(resp)
         parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
         text = "\n".join(parts).strip()
         return text or None

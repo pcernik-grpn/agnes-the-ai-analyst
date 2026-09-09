@@ -1508,7 +1508,7 @@ class TestVertexProvider:
         )
         assert isinstance(ext, VertexExtractor)
         assert ext._model == "claude-haiku-4-5@20251001"
-        assert ext._TRACE_PROVIDER == "vertex"
+        assert ext._TRACE_PROVIDER == "gcp.vertex_ai"  # bills through Google Cloud, not a direct Anthropic call
         ctor = mock_vertex_cls.call_args.kwargs
         assert ctor == {"project_id": "proj-1", "region": "europe-west1"}
 

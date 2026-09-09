@@ -7,6 +7,7 @@ functions directly, monkeypatching the repo/coordination seams.
 from __future__ import annotations
 
 import json
+import time
 
 from app.api import broker_agent_policy as pol
 
@@ -421,3 +422,159 @@ def test_accumulator_flush_is_noop_when_empty(monkeypatch):
 def test_module_singleton_exists_and_is_flushable():
     assert isinstance(pol.usage_accumulator, pol.UsageAccumulator)
     pol.usage_accumulator.flush()  # must not raise even with an empty buffer
+
+
+# ---------------------------------------------------------------------------
+# UsageAccumulator.add_call — the llm_calls ledger rows riding the same buffer
+# ---------------------------------------------------------------------------
+
+
+def test_accumulator_add_call_is_skipped_on_duckdb(monkeypatch):
+    """``llm_calls`` is Postgres-only (A3): on DuckDB the row is dropped at
+    the door rather than buffered forever."""
+    monkeypatch.setattr(pol, "use_pg", lambda: False)
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    acc.add_call({"id": "c1"})
+    assert acc._call_rows == []
+
+
+def test_accumulator_flushes_call_rows_to_the_ledger(monkeypatch):
+    import src.repositories as repos
+
+    flushed: list[list[dict]] = []
+
+    class _Repo:
+        def insert_batch(self, rows):
+            flushed.append(list(rows))
+            return len(rows)
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr(repos, "llm_calls_repo", lambda: _Repo(), raising=False)
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: _Repo())
+    acc = pol.UsageAccumulator(flush_size=2, flush_interval_s=3600)
+    acc.add_call({"id": "c1"})
+    assert flushed == []
+    acc.add_call({"id": "c2"})
+    assert flushed == [[{"id": "c1"}, {"id": "c2"}]]
+
+
+def test_accumulator_drops_call_rows_when_the_ledger_is_missing(monkeypatch):
+    import src.repositories as repos
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.delattr(repos, "llm_calls_repo", raising=False)
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    acc.add_call({"id": "c1"})  # flushes immediately; AttributeError swallowed
+    assert acc._call_rows == []
+
+
+def test_accumulator_call_rows_do_not_disturb_the_usage_flush(monkeypatch):
+    """A buffered call row must not make an otherwise-empty usage flush write
+    an empty batch, nor keep the usage rows from reaching their own repo."""
+    import src.repositories as repos
+
+    fake_repo = _FakeLlmUsageRepo()
+    ledger: list[list[dict]] = []
+
+    class _Ledger:
+        def insert_batch(self, rows):
+            ledger.append(list(rows))
+            return len(rows)
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: fake_repo)
+    monkeypatch.setattr(pol, "coordination", lambda: _FakeCoordination())
+    monkeypatch.setattr(repos, "llm_calls_repo", lambda: _Ledger(), raising=False)
+
+    acc = pol.UsageAccumulator(flush_size=20, flush_interval_s=3600)
+    acc.add(_usage_row(1), budget_ttl_s=60)
+    acc.add_call({"id": "c1"})
+    acc.flush()
+    assert len(fake_repo.batches) == 1 and len(fake_repo.batches[0]) == 1
+    assert ledger == [[{"id": "c1"}]]
+
+
+# ---------------------------------------------------------------------------
+# UsageAccumulator — lazily armed background flush timer
+# ---------------------------------------------------------------------------
+
+
+def test_accumulator_background_timer_flushes_a_lone_buffered_row(monkeypatch):
+    """A single buffered row on an otherwise-quiet accumulator must not stay
+    invisible until a second append (or shutdown) — a lazily armed
+    ``threading.Timer`` flushes it on its own after ``flush_interval_s``."""
+    fake_repo = _FakeLlmUsageRepo()
+    fake_coord = _FakeCoordination()
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: fake_repo)
+    monkeypatch.setattr(pol, "coordination", lambda: fake_coord)
+
+    acc = pol.UsageAccumulator(flush_size=20, flush_interval_s=0.05)
+    acc.add(_usage_row(1))
+    assert fake_repo.batches == []  # the append itself did not flush
+
+    time.sleep(0.3)
+    assert len(fake_repo.batches) == 1
+    assert len(fake_repo.batches[0]) == 1
+
+
+def test_accumulator_flush_after_size_trigger_leaves_no_pending_timer(monkeypatch):
+    fake_repo = _FakeLlmUsageRepo()
+    fake_coord = _FakeCoordination()
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: fake_repo)
+    monkeypatch.setattr(pol, "coordination", lambda: fake_coord)
+
+    acc = pol.UsageAccumulator(flush_size=2, flush_interval_s=3600)
+    acc.add(_usage_row(1))
+    assert acc._pending_timer is not None  # armed by the first, non-flushing append
+
+    acc.add(_usage_row(2))  # hits the size threshold; flush() must clear the timer
+    assert len(fake_repo.batches) == 1
+    assert acc._pending_timer is None
+
+
+def test_a_failed_ledger_flush_holds_the_rows_for_the_next_flush(monkeypatch):
+    """Review finding: a transient ledger write failure used to erase every
+    buffered call row. The ledger's contract is one row per call, so the
+    rows go back into the buffer and the next flush retries them
+    (`insert_batch` is idempotent on the row id)."""
+    import app.api.broker_agent_policy as pol
+
+    attempts: list[int] = []
+
+    class _Repo:
+        def insert_batch(self, rows):
+            attempts.append(len(rows))
+            if len(attempts) == 1:
+                raise RuntimeError("ledger down")
+            return len(rows)
+
+    repo = _Repo()
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr("src.repositories.llm_calls_repo", lambda: repo, raising=False)
+
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    acc.add_call({"id": "call_1"})
+
+    assert attempts == [1], "the first flush should have been attempted"
+    acc.flush()
+    assert attempts == [1, 1], "the held row should be retried by the next flush"
+
+
+def test_a_ledger_that_stays_down_sheds_the_oldest_rows(monkeypatch):
+    """Holding rows must not grow without limit: past the cap the OLDEST are
+    shed and the newest history is kept."""
+    import app.api.broker_agent_policy as pol
+
+    class _AlwaysDown:
+        def insert_batch(self, rows):
+            raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr("src.repositories.llm_calls_repo", lambda: _AlwaysDown(), raising=False)
+    monkeypatch.setattr(pol, "MAX_BUFFERED_CALL_ROWS", 3)
+
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    for i in range(5):
+        acc.add_call({"id": f"call_{i}"})
+
+    assert [r["id"] for r in acc._call_rows] == ["call_2", "call_3", "call_4"]

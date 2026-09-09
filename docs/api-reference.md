@@ -1266,11 +1266,39 @@ authoring-suggestions queue (never an admin-direct write).
 - /api/admin/telemetry/chat-cost
 - /api/admin/telemetry/export
 - /api/admin/telemetry/facets
+- /api/admin/telemetry/feedback
 - /api/admin/telemetry/kpis
+- /api/admin/telemetry/llm-calls
+- /api/admin/telemetry/llm-cost
 - /api/admin/telemetry/prune
 - /api/admin/telemetry/query
 - /api/admin/telemetry/reprocess
 - /api/admin/telemetry/summary
+
+  `llm-cost`, `llm-calls` and `feedback` are the LLM observability read
+  surfaces (design 2026-09-08): cross-workload cost grouped by workload /
+  agent / user / model / purpose, the underlying `llm_calls` detail rows for
+  one session/turn/job/user, and the chat-turn thumbs feedback queue. All
+  three are admin-only, Postgres-backed only (typed `501
+  requires_postgres_backend` on the frozen DuckDB app-state backend), and
+  mirrored by `agnes admin usage llm-cost|llm-calls|feedback`.
+### `/api/admin/conversations/corpus` — Conversation corpus export (evaluation, design 2026-09-08 §3.12)
+
+One COMPLETE record per chat session (every surface), for an evaluation pipeline —
+the opposite shape from the telemetry above, which is one row per LLM call with
+content capped. See [`observability.md`](observability.md) → *Conversation corpus
+export* for the full field table, the content-export policy gate, and a pull example.
+
+`GET /api/admin/conversations/corpus?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+— admin-only, Postgres-only (typed `501` on the frozen DuckDB backend), `since` required
+(`400 since_required` without it), refuses `403 content_export_disabled` when the
+instance's `observability.content_export` policy is off/basis-less/excludes workload
+`chat`. Newline-delimited JSON by default (`format=json` for one array); keyset
+cursor on `(last_message_at, id)`, `limit` at most 500, `X-Next-Cursor` header +
+`next_cursor` in the JSON body. CLI: `agnes admin conversations export --since …
+--out <file> [--json]`, following the cursor until exhausted. Audit action
+`conversations.export` (read; params: window, count, `content_mode`, `placement`,
+`delivery` — never content).
 
 ### `/api/admin/sessions` — Session management (admin)
 
@@ -3249,6 +3277,7 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/sessions
 - /api/chat/sessions/{chat_id}
 - /api/chat/sessions/{chat_id}/archived
+- /api/chat/sessions/{chat_id}/feedback
 - /api/chat/sessions/{chat_id}/files
 - /api/chat/sessions/{chat_id}/files/download
 - /api/chat/sessions/{chat_id}/files/preview
@@ -3484,6 +3513,19 @@ the column but leaves populating existing rows to
 `scripts/backfill_corpus_chunks_tsv.py` (batched, idempotent, run off-peak —
 see `docs/migrations.md`), and until then those rows rank through a per-row
 fallback — slower, identical results.
+
+`…/files/{file_id}/preview` returns one file's text a page at a time.
+Optional `offset` (characters, default `0`) and `limit` (default and maximum
+20 000; both clamped, never a `422`) select the page; the response echoes the
+`offset` it used and adds `next_offset` (`null` when the page reaches the end
+of the text) and `total_chars`, while `truncated` means "this response is not
+the end of the text". Chain `offset=next_offset` until it is `null` to read
+the whole file — that is what `agnes collections cat` and the
+`collection_file_read` MCP tool do. The per-call cap is the guarantee that one
+read cannot flood a context window; paging is how the rest is reached. A
+plain-text upload is read from disk up to 512 KiB: `total_chars` counts that
+window, and when the file continues past it the last page still says
+`truncated: true` with no `next_offset`.
 
 - /api/collections
 - /api/collections/search
@@ -4210,6 +4252,20 @@ session. Both delivery paths carry it: native providers mount the session
 directory, and the kai-agent provider packs the same bytes into its workspace
 tarball, so the preview cannot work on one provider and silently do nothing on
 the other.
+
+`POST /api/chat/sessions/{chat_id}/feedback` records a thumbs up/down on one
+completed chat turn (`{turn_id, verdict: "up"|"down", comment?}`) — the LLM
+observability design's quality signal (§3.5). Gated like the session's other
+routes: the owner or a live participant, 404 for a stranger (never 403), and
+the turn must be one of THIS session's turns — one the session's own
+messages carry — else 404 as well, so rating one conversation never lets a
+caller attach feedback to another's turns. One
+row per `(turn_id, user_id)` — resubmitting for the same turn UPDATEs it
+rather than adding a second opinion. Postgres-only (A3 ratchet): the feedback
+repository is resolved as a dependency, so a DuckDB-backed instance answers
+the typed `501 requires_postgres_backend` before the body is even validated.
+The comment never enters the audit trail or the structured log line — only
+`session_id`, `turn_id` and `verdict` do.
 
 `POST /api/store/entities/builder/preview-agent` backs that builder's Preview
 tab for agent TEMPLATES. A template is a system prompt, so trying one means

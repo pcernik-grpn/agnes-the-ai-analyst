@@ -21,13 +21,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
-
-from pydantic import Field
+from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from src.mcp_tooling import (
     compact_search_results,
@@ -1067,8 +1067,10 @@ def register_foundation_tools(
         failing the call. When the response carries ``truncated: true``, each hit
         whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
         ``…``) — never summarise a prefix as the whole passage. Read the document
-        in full with ``collection_file_read(collection_id=<corpus_id>,
-        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+        document's FIRST page; follow its ``next_offset`` with ``offset=``
+        until it is null, as its own docstring says — or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
         A large collection set (#2151) can ALSO set ``truncated: true`` for a
@@ -1130,8 +1132,10 @@ def register_foundation_tools(
         failing the call. When the response carries ``truncated: true``, each hit
         whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
         ``…``) — never summarise a prefix as the whole passage. Read the document
-        in full with ``collection_file_read(collection_id=<corpus_id>,
-        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+        document's FIRST page; follow its ``next_offset`` with ``offset=``
+        until it is null, as its own docstring says — or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
         Args:
@@ -1449,7 +1453,7 @@ def register_foundation_tools(
             return r.json()
 
     @tool(read_only=True)
-    async def collection_file_read(collection_id: str, file_id: str) -> dict:
+    async def collection_file_read(collection_id: str, file_id: str, offset: int = 0) -> dict:
         """Read one file's text straight, without guessing search terms.
 
         Use this when you know WHICH file you want — "what is in this
@@ -1457,28 +1461,39 @@ def register_foundation_tools(
         when you do not: it needs words that appear in the body, and it
         cannot enumerate a collection (see its own note).
 
-        Returns ``kind`` plus, for readable files, ``text`` and
-        ``truncated``. The server caps the text (~20k characters), so
-        ``truncated: true`` means you are holding a PREFIX — do not
-        summarise it as the whole document; fall back to
-        ``collections_search`` with a distinctive term to reach the rest.
-        Read ``text`` regardless of ``kind``: ``kind`` describes how a
-        BROWSER would show the file (``text`` / ``pdf`` / ``image``), and a
-        PDF comes back ``kind="pdf"`` while still carrying its ingested
+        Returns ``kind`` plus, for readable files, ``text``, ``truncated``,
+        ``offset``, ``next_offset`` and ``total_chars``. One call returns
+        at most ~20k characters — a page, so a single read can never flood
+        the context window. ``truncated: true`` means you are holding a
+        PREFIX: do not summarise it as the whole document. To continue,
+        call again with ``offset=next_offset`` and keep going until
+        ``next_offset`` is null; ``total_chars`` says up front how many
+        pages that is, so decide whether the whole file is worth reading
+        before you page (a 200k-character file is ten calls). ``truncated:
+        true`` with ``next_offset: null`` means a very large plain-text
+        file continues past what the server reads of it — the rest is
+        reachable only through ``collections_search`` with a distinctive
+        term. Read ``text`` regardless of ``kind``: ``kind`` describes how
+        a BROWSER would show the file (``text`` / ``pdf`` / ``image``), and
+        a PDF comes back ``kind="pdf"`` while still carrying its ingested
         text. When ``text`` is empty, ``reason`` says why (still ingesting,
         rejected, or nothing extractable) — relay that rather than
         reporting an access error.
 
         Do not loop this over a whole collection: reading many files to
-        answer one question is what retrieval is for.
+        answer one question is what retrieval is for. Paging through the
+        ONE file you were asked about is what ``offset`` exists for.
 
         Args:
             collection_id: Collection id from ``collections_list`` (``col_...``).
             file_id: File id from ``collection_get`` (``cf_...``).
+            offset: Character offset to read from — ``0`` (the default) for
+                the start, the previous response's ``next_offset`` to continue.
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{base_url}/api/collections/{collection_id}/files/{file_id}/preview",
+                params={"offset": offset},
                 headers=headers_fn(),
                 timeout=30,
             )
@@ -4085,6 +4100,9 @@ def register_foundation_tools(
         source: str = "",
         trail: str = "",
         q: str = "",
+        cursor_ts: str = "",
+        cursor_id: str = "",
+        since_ts: str = "",
     ) -> dict:
         """Tail the unified Activity Center timeline (admin only).
 
@@ -4107,12 +4125,57 @@ def register_foundation_tools(
                             "llm" | "agent_scope". Empty (default) returns the
                             unified timeline across all four.
             q:             Free-text search over the row's params JSON.
+            cursor_ts:      Pagination cursor, timestamp half — pass the prior
+                             page's ``next_cursor["ts"]`` verbatim. Both
+                             ``cursor_ts`` and ``cursor_id`` must be set
+                             together — setting only one raises ValueError
+                             naming the missing half, rather than silently
+                             restarting the read from page one.
+            cursor_id:      Pagination cursor, id half — pass the prior page's
+                             ``next_cursor["id"]`` verbatim.
+            since_ts:       Pagination floor — pass the prior page's
+                             ``next_cursor["since_ts"]`` verbatim alongside
+                             cursor_ts/cursor_id. Continuation-only: setting
+                             it without both cursor halves raises ValueError,
+                             and the server independently rejects it as more
+                             than since_minutes before cursor_ts, so it can
+                             never widen a single read's scan past what
+                             since_minutes already allows. ``since_minutes``
+                             computes a floor relative to "now", which drifts
+                             forward between calls; forwarding the pinned
+                             since_ts keeps a multi-page read over the same
+                             window the first call saw, so a row near the
+                             window's edge cannot silently fall out between
+                             pages. Omit only on the first (uncursored) call.
+
+        When a returned page's ``next_cursor`` is non-null, continue by
+        calling again with ``cursor_ts=next_cursor["ts"]``,
+        ``cursor_id=next_cursor["id"]``, and ``since_ts=next_cursor["since_ts"]``
+        — every other filter must stay identical across pages, since the
+        cursor only makes sense relative to the same query. Dropping
+        since_ts on a continuation call still works, but re-derives the
+        floor from since_minutes at call time instead of the one the first
+        call pinned — always forward it.
 
         Returns ``{"rows": [{"timestamp", "trail", "source", "action",
         "resource", "user_id", "user_email", "result", "params", ...}, ...],
-        "next_cursor"}``. Mirrors ``GET /api/admin/activity`` and
-        ``agnes admin activity``. Requires an admin PAT.
+        "next_cursor": {"ts", "id", "since_ts"} | null}``. Mirrors
+        ``GET /api/admin/activity`` and ``agnes admin activity``. Requires
+        an admin PAT.
         """
+        if bool(cursor_ts) != bool(cursor_id):
+            missing = "cursor_id" if cursor_ts else "cursor_ts"
+            raise ValueError(
+                f"activity: cursor_ts and cursor_id must be passed together — {missing} is "
+                "missing. Pass both halves from a prior page's next_cursor (or neither, for "
+                "a fresh read)."
+            )
+        if since_ts and not (cursor_ts and cursor_id):
+            raise ValueError(
+                "activity: since_ts is continuation-only — pass it together with a complete "
+                "cursor_ts and cursor_id from a prior page's next_cursor, never on a fresh "
+                "(uncursored) read."
+            )
         params: dict[str, Any] = {"since_minutes": since_minutes, "limit": limit}
         if action_prefix:
             params["action_prefix"] = action_prefix
@@ -4128,6 +4191,11 @@ def register_foundation_tools(
             params["trail"] = trail
         if q:
             params["q"] = q
+        if cursor_ts and cursor_id:
+            params["cursor_ts"] = cursor_ts
+            params["cursor_id"] = cursor_id
+        if since_ts:
+            params["since_ts"] = since_ts
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
             _raise_for_status_with_detail(r)

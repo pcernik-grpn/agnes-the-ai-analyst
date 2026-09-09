@@ -93,13 +93,16 @@ def extract_verifications(
     policy_text = _load_active_policy()
     prompt = render_verification_prompt(username, session_id, conversation_text, policy_text)
 
+    from src.observability.llm_context import llm_context
+
     try:
-        result = extractor.extract_json(
-            prompt=prompt,
-            max_tokens=4096,
-            json_schema=VERIFICATION_SCHEMA,
-            schema_name="verification_extract",
-        )
+        with llm_context(workload="verification", purpose="detector"):
+            result = extractor.extract_json(
+                prompt=prompt,
+                max_tokens=4096,
+                json_schema=VERIFICATION_SCHEMA,
+                schema_name="verification_extract",
+            )
         return result.get("verifications", [])
     except LLMError as e:
         logger.error("LLM extraction failed for session %s: %s", session_id, e)

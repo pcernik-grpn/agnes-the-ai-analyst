@@ -40,9 +40,21 @@ def _chunk_embed_store(corpus_id: str, file_id: str, source) -> tuple[int, bool]
     Returns ``(chunk_count, embedded)``. Idempotent: clears the file's prior
     chunks first. Embedding is best-effort (optional extra); failure → vectors
     NULL and lexical-only retrieval, never an ingest failure.
+
+    ``corpus_id`` is re-read from the file row here rather than trusted from
+    the caller. ``ingest_file`` reads it once at the top and everything slow
+    happens in between (conversion, OCR, embedding), so a file MOVED to
+    another collection in that window would otherwise have these chunks
+    written under the collection it has already left: the move re-homes the
+    rows that exist when it runs and cannot touch rows written after it, so
+    the ingest would silently restore the very leak the move closed
+    (``app/api/collections.py::move_file``). The passed value stays the
+    fallback for a file row that has since disappeared.
     """
     chunks = chunk_text(source)
     chunks_repo = corpus_chunks_repo()
+    current = corpus_files_repo().get(file_id) or {}
+    corpus_id = current.get("corpus_id") or corpus_id
     chunks_repo.delete_for_file(file_id)
     rows = [
         {

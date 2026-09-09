@@ -21,19 +21,18 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 from urllib.parse import urlparse
 
 import duckdb
 from jinja2 import TemplateError
 
-from src.prompt_render import make_prompt_env
-
 from app.instance_config import (
     get_instance_name,
     get_instance_subtitle,
 )
+from src.prompt_render import make_prompt_env
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +84,7 @@ def build_context(
 
     Note: ``now`` is tz-aware UTC.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     parsed = urlparse(server_url)
     user_ctx: dict[str, Any] | None = None
     if user:
@@ -239,6 +238,15 @@ def render_agent_prompt_banner(
             template = env.from_string(content)
             ctx = build_context(user=user, server_url=server_url)
             rendered = template.render(**ctx)
+            # An override saved before the bare-placeholder save-time guard
+            # shipped (or authored by hand, bypassing the editor) can still
+            # carry the single-brace `{server_url}` the live default
+            # substitutes outside Jinja — left alone, Jinja renders it
+            # through unchanged and the reader gets the literal placeholder
+            # instead of a URL. Same fix as the live default's own bind-time
+            # substitution, applied here so a stored override can't regress
+            # behind it.
+            rendered = rendered.replace("{server_url}", server_url)
             return _sanitize_banner_html(rendered)
         except TemplateError as exc:
             logger.warning("Agent-prompt banner render failed (template error): %s", exc)

@@ -5452,6 +5452,42 @@
         "title": "FactsSearchRequest",
         "type": "object"
       },
+      "FeedbackBody": {
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "turn_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "up",
+              "down"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "verdict"
+        ],
+        "title": "FeedbackBody",
+        "type": "object"
+      },
       "FeedbackCreate": {
         "description": "One report. Only the question is required.\n\nThe caps are the point of declaring these at all: the columns are ``TEXT``,\nthe submitter is any signed-in caller, and an uncapped field is an\ninvitation to store a megabyte of paste per row. They are generous enough\nthat no genuine report hits them.",
         "properties": {
@@ -18640,6 +18676,25 @@
             }
           },
           {
+            "description": "Pagination continuation floor \u2014 required together with a complete cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to 'now', which drifts forward between calls \u2014 passing the pinned since_ts back keeps a multi-page read over the same window the first call saw, so a row near the window's edge cannot fall out between pages. Bounded to at most since_minutes before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond what since_minutes already allows. The server computes the floor from since_minutes on a fresh call and returns it in next_cursor.since_ts for the caller to carry forward on the next page.",
+            "in": "query",
+            "name": "since_ts",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Pagination continuation floor \u2014 required together with a complete cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to 'now', which drifts forward between calls \u2014 passing the pinned since_ts back keeps a multi-page read over the same window the first call saw, so a row near the window's edge cannot fall out between pages. Bounded to at most since_minutes before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond what since_minutes already allows. The server computes the floor from since_minutes on a fresh call and returns it in next_cursor.since_ts for the caller to carry forward on the next page.",
+              "title": "Since Ts"
+            }
+          },
+          {
             "in": "query",
             "name": "limit",
             "required": false,
@@ -20218,6 +20273,174 @@
         "summary": "Delete Contributed Skill",
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/api/admin/conversations/corpus": {
+      "get": {
+        "description": "The evaluation-corpus pull (spec 3.12). Admin-only, Postgres-only,\ncontent-export-policy-gated. The default ``until`` lags by\n``SETTLE_WINDOW`` so an in-flight turn is not exported half-written;\nan explicit ``until`` is used as given. ``since`` is required \u2014 a caller that omits\nit gets a typed 400, not an unbounded scan of every conversation ever\nheld.",
+        "operationId": "export_conversations_api_admin_conversations_corpus_get",
+        "parameters": [
+          {
+            "description": "ISO date/datetime, inclusive lower bound. Required.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO date/datetime, inclusive lower bound. Required.",
+              "title": "Since"
+            }
+          },
+          {
+            "description": "ISO date/datetime, exclusive upper bound. Default: five minutes ago, so a turn still being written is left for a later call. An explicit value is honoured as given.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO date/datetime, exclusive upper bound. Default: five minutes ago, so a turn still being written is left for a later call. An explicit value is honoured as given.",
+              "title": "Until"
+            }
+          },
+          {
+            "description": "Filter to one chat surface (web, slack_dm, api, ...).",
+            "in": "query",
+            "name": "surface",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to one chat surface (web, slack_dm, api, ...).",
+              "title": "Surface"
+            }
+          },
+          {
+            "description": "Filter to one shared agent's sessions.",
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to one shared agent's sessions.",
+              "title": "Agent Id"
+            }
+          },
+          {
+            "description": "jsonl (default, streamed) or json (one array).",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "jsonl",
+              "description": "jsonl (default, streamed) or json (one array).",
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Records per page, at most 500.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "description": "Records per page, at most 500.",
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque token from a prior page's next_cursor / X-Next-Cursor.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque token from a prior page's next_cursor / X-Next-Cursor.",
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Conversations",
+        "tags": [
+          "admin-conversations-export"
         ]
       }
     },
@@ -30533,7 +30756,7 @@
     },
     "/api/admin/run-retention-prune": {
       "post": {
-        "description": "Trigger the opt-in retention sweep for ``sync_history``,\n``llm_usage``, and ``agent_scope_snapshots``.\n\nWraps :func:`src.audit_retention.run_retention_sweep`. The scheduler\nservice hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as\n``run-audit-prune``); admins can also run it on demand.\n\nEvery trail's window comes from ``retention.<trail>_days`` in\n``instance.yaml`` and defaults to 0 (keep forever) \u2014 nothing is pruned\nuntil an admin explicitly sets a window. ``audit_log`` has its own\nstandalone job (``run-audit-prune`` above, unchanged); ``usage_events``\nkeeps its own standalone job (``POST /api/admin/usage/prune``) \u2014 see\n``src/audit_retention.py``'s module docstring for why those two aren't\nfolded into this sweep.",
+        "description": "Trigger the opt-in retention sweep for ``sync_history``,\n``llm_usage``, ``agent_scope_snapshots``, and ``llm_calls``.\n\nWraps :func:`src.audit_retention.run_retention_sweep`. The scheduler\nservice hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as\n``run-audit-prune``); admins can also run it on demand.\n\nEvery trail's window comes from ``retention.<trail>_days`` in\n``instance.yaml`` and defaults to 0 (keep forever) \u2014 nothing is pruned\nuntil an admin explicitly sets a window. ``audit_log`` has its own\nstandalone job (``run-audit-prune`` above, unchanged); ``usage_events``\nkeeps its own standalone job (``POST /api/admin/usage/prune``) \u2014 see\n``src/audit_retention.py``'s module docstring for why those two aren't\nfolded into this sweep. ``llm_calls`` is Postgres-only (the LLM\nobservability ledger, design 2026-09-08); its pruner reports nothing\npruned on a DuckDB-backed instance rather than raising.",
         "operationId": "run_retention_prune_api_admin_run_retention_prune_post",
         "parameters": [
           {
@@ -39129,7 +39352,7 @@
     },
     "/api/admin/telemetry/chat-cost": {
       "get": {
-        "description": "Measured cost of chat sessions, split by cached vs uncached tokens.\n\nThe point of this route is that it MEASURES rather than models. A cost\ncomparison between two agent workflows (say, one that loads business\ndefinitions from a governed semantic layer once per session against one\nthat carries them by hand) turns almost entirely on how a re-read of a\nlarge cached prefix is priced: at the full input rate it dominates the\nbill, at the real cached rate (~0.1x) it nearly vanishes. Both figures\ncome from ``chat_messages`` here, per model, so nobody has to guess.\n\n``cache_accounting`` per row, and ``notes`` overall, say out loud when a\nzero is not a measurement: rows written before migration 0092 carry no\ncache figures at all, and a \"0 cached tokens\" that means \"unrecorded\" is\nexactly the mistake this route exists to stop.",
+        "description": "Measured cost of chat sessions, split by cached vs uncached tokens.\n\nThe point of this route is that it MEASURES rather than models. A cost\ncomparison between two agent workflows (say, one that loads business\ndefinitions from a governed semantic layer once per session against one\nthat carries them by hand) turns almost entirely on how a re-read of a\nlarge cached prefix is priced: at the full input rate it dominates the\nbill, at the real cached rate (~0.1x) it nearly vanishes. Both figures\ncome from ``chat_messages`` here, per model, so nobody has to guess.\n\n``cache_accounting`` per row, and ``notes`` overall, say out loud when a\nzero is not a measurement: rows written before migration 0092 carry no\ncache figures at all, and a \"0 cached tokens\" that means \"unrecorded\" is\nexactly the mistake this route exists to stop.\n\nThe same rows carry the session's measured LLM latency \u2014 ``llm_calls``,\n``llm_duration_ms`` (request start \u2192 last upstream byte, summed) and\n``llm_ttfb_ms`` (request start \u2192 first upstream byte, summed), as the\nsecret broker measured them per completion \u2014 with the per-call\naverages derived here and ``timing_accounting`` playing the same\nhonesty role for them (migration 0117: NULL is unknown, not instant).",
         "operationId": "chat_cost_api_admin_telemetry_chat_cost_get",
         "parameters": [
           {
@@ -39435,6 +39658,102 @@
         ]
       }
     },
+    "/api/admin/telemetry/feedback": {
+      "get": {
+        "description": "The chat-turn thumbs feedback queue \u2014 every ``chat_message_feedback``\nrow in the window, newest first, optionally narrowed to one verdict.\nPostgres-backed instances only (typed 501 otherwise).",
+        "operationId": "feedback_api_admin_telemetry_feedback_get",
+        "parameters": [
+          {
+            "description": "1d|7d|30d|all",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "1d|7d|30d|all",
+              "title": "Window",
+              "type": "string"
+            }
+          },
+          {
+            "description": "up|down",
+            "in": "query",
+            "name": "verdict",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "up|down",
+              "title": "Verdict"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Feedback",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
     "/api/admin/telemetry/kpis": {
       "get": {
         "description": "Four headline numbers, scoped to the same filters as /query \u2014 plus what\nthe window cost.\n\nThe cards on /admin/usage echo these as clickable quick-filters, so the\nserver applies the same WHERE the table will see \u2014 otherwise the cards\nand the table tell different stories at the same time.\n\n``cost_usd`` is the one figure here NOT read from ``usage_events``: token\ncounts live on session summaries, so it comes from the shared read model\n(``app.services.usage_stats``) over the same user and window, rounded up to\nwhole days. The narrower event filters (tool/source/event_type/only_errors)\ndo not apply to it \u2014 it prices everything the selected user spent in the\nwindow, which is the same number /me/activity and the adoption drill-down\nreport for them. It is ``null`` when it cannot be computed rather than a\nzero that would read as \"free\": an unresolvable ``username``, or an\ninstance-wide read on a backend without the Postgres-only ``usage_turns``\ntable.",
@@ -39586,6 +39905,250 @@
           }
         },
         "summary": "Usage Kpis",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
+    "/api/admin/telemetry/llm-calls": {
+      "get": {
+        "description": "Detail rows for one session/turn/job/user from the ``llm_calls``\nledger, newest first \u2014 the drill-down under ``llm-cost``'s aggregates.\n\nRequires at least one of ``session_id``/``turn_id``/``job_id``/\n``user_id`` so this never becomes an unbounded dump of every call the\ninstance ever made. ``before``/``before_id`` are the pagination cursor:\npass the previous page's ``next_before``/``next_before_id`` together to\nfetch the next older page via the composite keyset \u2014 rows sharing the\nexact boundary timestamp are never skipped between pages. ``before``\nalone still works (single-column cursor, kept for compatibility).",
+        "operationId": "llm_calls_api_admin_telemetry_llm_calls_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "turn_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Turn Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "job_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Job Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "user_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "ISO timestamp cursor; fetch rows older than this.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO timestamp cursor; fetch rows older than this.",
+              "title": "Before"
+            }
+          },
+          {
+            "description": "Row-id tiebreaker for `before`; pass the previous page's `next_before_id`.",
+            "in": "query",
+            "name": "before_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Row-id tiebreaker for `before`; pass the previous page's `next_before_id`.",
+              "title": "Before Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Calls",
+        "tags": [
+          "admin-telemetry"
+        ]
+      }
+    },
+    "/api/admin/telemetry/llm-cost": {
+      "get": {
+        "description": "Cost of every LLM call this instance made, by workload / agent / user /\nmodel / purpose \u2014 measured on-instance from ``llm_calls`` (priced at\nwrite time, the rates stored beside each row), so the same figure the\nexported span carries. ``chat-cost`` stays the per-session chat view;\nthis is the cross-workload one. Postgres-backed instances only (typed\n501 otherwise, since the repo dependency above is resolved first).",
+        "operationId": "llm_cost_api_admin_telemetry_llm_cost_get",
+        "parameters": [
+          {
+            "description": "1d|7d|30d|all",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "1d|7d|30d|all",
+              "title": "Window",
+              "type": "string"
+            }
+          },
+          {
+            "description": "workload|agent|user|model|purpose",
+            "in": "query",
+            "name": "by",
+            "required": false,
+            "schema": {
+              "default": "workload",
+              "description": "workload|agent|user|model|purpose",
+              "title": "By",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Cost",
         "tags": [
           "admin-telemetry"
         ]
@@ -41994,7 +42557,7 @@
     },
     "/api/broker/otlp/v1/{signal}": {
       "post": {
-        "description": "Forward one OTLP/HTTP export batch from the engine's sandbox to the\ninstance's collector, credential injected server-side.\n\nAccepts ONLY the ``kai_otlp`` scope \u2014 the ticket ``/api/kai/tickets`` mints\nfor the relay's ``otlp`` scope, and only while this instance exports OTLP\nitself (``OTEL_EXPORTER_OTLP_ENDPOINT``); an ``llm``/``main`` ticket is\nrefused with the usual scope-mismatch audit. Without a configured\ncollector the route answers ``503 otlp_export_not_configured`` so a\nmisordered rollout (engine env set before the export) fails loudly per\nbatch instead of silently swallowing telemetry \u2014 the turn itself is\nunaffected, the SDK's exporter just logs the refusal.\n\nThe body is the SDK's protobuf batch, forwarded byte-for-byte with its\nwire-format and compression headers; the collector's 2xx body comes back\nas-is (the OTLP success response), its error text never does \u2014 the status\n(and ``Retry-After``, which the exporter's retry honours) is enough.",
+        "description": "Forward one OTLP/HTTP export batch from the engine's sandbox to the\ninstance's collector, credential injected server-side.\n\nAccepts ONLY the ``kai_otlp`` scope \u2014 the ticket ``/api/kai/tickets`` mints\nfor the relay's ``otlp`` scope, and only while this instance exports OTLP\nitself (``OTEL_EXPORTER_OTLP_ENDPOINT``); an ``llm``/``main`` ticket is\nrefused with the usual scope-mismatch audit. Without a configured\ncollector the route answers ``503 otlp_export_not_configured`` so a\nmisordered rollout (engine env set before the export) fails loudly per\nbatch instead of silently swallowing telemetry \u2014 the turn itself is\nunaffected, the SDK's exporter just logs the refusal.\n\nThe body is the SDK's protobuf batch. It is forwarded under the\ninstance's content-export policy (``observability.content_export`` \u2014\n:mod:`src.observability.content_policy`), the same record the broker's\nown completion spans obey, because the sandbox's spans carry the prompt\nand the answer in their attributes:\n\n- ``full`` \u2014 forwarded byte-for-byte with its compression header.\n- ``pseudonymized`` \u2014 traces and log bodies rewritten through the\n  instance anonymizer; the batch is re-serialised uncompressed.\n- ``off`` (the default) \u2014 the content attributes are stripped from\n  traces (the structural turn/step/tool spans still flow) and a logs\n  batch is accepted and dropped, so the exporter sees a 2xx rather than\n  retrying a decision the operator made.\n\nMetrics carry counts, never content, and are always forwarded as sent.\n\n**The relay fails closed on content:** under ``off`` / ``pseudonymized``\na batch it cannot decode is refused with ``400 otlp_batch_undecodable``,\nnever forwarded unstripped \u2014 a relay that cannot read a batch cannot\nclaim the batch is free of content.\n\nThe collector's 2xx body comes back as-is (the OTLP success response),\nits error text never does \u2014 the status (and ``Retry-After``, which the\nexporter's retry honours) is enough.",
         "operationId": "otlp_proxy_api_broker_otlp_v1__signal__post",
         "parameters": [
           {
@@ -42639,6 +43202,79 @@
           }
         },
         "summary": "Set Session Archived",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/feedback": {
+      "post": {
+        "description": "Thumbs up/down on one completed chat turn (LLM observability design \u00a73.5).\n\nKeyed on the TURN, not the message: the client learns ``turn_id`` from the\nframes it already receives (\u00a73.2), while the assistant row is written only\nafter the frame is broadcast. One row per ``(turn_id, user_id)`` \u2014 a second\nsubmit for the same turn UPDATEs it rather than piling up a second opinion.\nGated like the session's other routes (owner or a live participant, 404\nfor a stranger \u2014 never 403, matching the sibling routes above), and the\nturn itself must be one of THIS session's turns (a message of the\nsession carries it) \u2014 a caller-supplied ``turn_id`` from some other\nsession is a 404 too, so being allowed to rate one conversation never\nlets anyone attach feedback to another's turns. The feedback repo is\nresolved as a FastAPI dependency so a DuckDB-backed instance answers\nthe typed 501 before the body is even validated. Audited as\n``chat.feedback`` with the verdict, never the comment.",
+        "operationId": "submit_feedback_api_chat_sessions__chat_id__feedback_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Feedback",
         "tags": [
           "chat"
         ]
@@ -44458,7 +45094,7 @@
     },
     "/api/collections/{collection_id}/files/{file_id}/move": {
       "post": {
-        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartifact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.",
+        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartifact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.\n\nThe file's body and its extracted facts move with it, so search and the\nfact graph follow the file into the target collection rather than\ncontinuing to answer under the one it left. A move either completes or\nleaves the file and its content together where they were; it never\nreports success having applied only part of that.\n\nAnswers ``409 move_conflict`` when someone else moved the same file while\nthis request was in flight. The response names the collection the file\nactually ended up in, so a client can re-target or refresh rather than\nretry blindly into the same race.",
         "operationId": "move_file_api_collections__collection_id__files__file_id__move_post",
         "parameters": [
           {
@@ -44540,7 +45176,7 @@
     },
     "/api/collections/{collection_id}/files/{file_id}/preview": {
       "get": {
-        "description": "What to show for this file, and how \u2014 the modal's single fetch.\n\nReturns a `kind` the client renders directly:\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url`` and let the browser draw it.\n* ``text`` \u2014 ``text`` holds the preview (source for textual uploads, the\n  ingested text for formats whose bytes aren't readable), ``truncated``\n  says a glance is all this is.\n* ``none`` \u2014 nothing to show yet; ``reason`` says why, in the words the\n  modal shows the caller.\n\nDeliberately one endpoint for every format: the client should not have to\nknow which extensions are streamable, which are text and which are only\npreviewable once ingestion has run.",
+        "description": "What to show for this file, and how \u2014 the modal's single fetch.\n\nReturns a `kind` the client renders directly:\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url`` and let the browser draw it.\n* ``text`` \u2014 ``text`` holds the preview (source for textual uploads, the\n  ingested text for formats whose bytes aren't readable), ``truncated``\n  says this response is not the end of the text.\n* ``none`` \u2014 nothing to show yet; ``reason`` says why, in the words the\n  modal shows the caller.\n\nThe text is paged. ``offset`` (characters, default ``0``) and ``limit``\n(default and maximum ``_PREVIEW_MAX_CHARS``; both clamped, never a 422)\nselect one page; the response echoes the ``offset`` it used and adds\n``next_offset`` (``null`` when the page reaches the end) and\n``total_chars``. A caller wanting the whole file chains\n``offset=next_offset`` until it is ``null``. The modal sends no\nparameters and gets the first page, exactly as before. For a textual\nupload the text is what fits in ``_PREVIEW_READ_MAX_BYTES`` of the\nfile: ``total_chars`` counts that window and, when the file continues\npast it, the last page is still ``truncated: true`` with no\n``next_offset`` \u2014 the byte cap is reported, never hidden by paging.\n\nDeliberately one endpoint for every format: the client should not have to\nknow which extensions are streamable, which are text and which are only\npreviewable once ingestion has run.",
         "operationId": "preview_file_api_collections__collection_id__files__file_id__preview_get",
         "parameters": [
           {
@@ -44559,6 +45195,26 @@
             "schema": {
               "title": "File Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20000,
+              "title": "Limit",
+              "type": "integer"
             }
           },
           {

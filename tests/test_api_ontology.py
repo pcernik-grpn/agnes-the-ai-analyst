@@ -214,6 +214,36 @@ def test_dry_run_returns_structured_facts_edges_and_not_captured(ontology_client
     assert captured["schema_name"] == "ontology_dry_run"
 
 
+def test_dry_run_labels_its_call_with_the_admin_and_the_document(ontology_client, monkeypatch):
+    """A dry run is an admin spending tokens on one document — the record
+    says who and on what, so a prompt-tuning session is attributable."""
+    from src.observability.llm_context import current_llm_context
+
+    corpus_id, file_id = _seed_document(ontology_client)
+    seen = {}
+
+    class _RecordingExtractor:
+        def extract_json(self, prompt, max_tokens, json_schema, schema_name, system=None):
+            seen["context"] = current_llm_context()
+            return {"facts": [], "edges": [], "not_captured": []}
+
+    import app.api.ontology as ontology_mod
+
+    monkeypatch.setattr(ontology_mod, "_make_extractor", lambda: _RecordingExtractor())
+
+    r = ontology_client["client"].post(
+        "/api/admin/ontology/dry-run",
+        json={"node_types": {}, "edge_types": {}, "collection_id": corpus_id, "file_id": file_id},
+        headers=_auth(ontology_client),
+    )
+    assert r.status_code == 200, r.text
+
+    ctx = seen["context"]
+    assert (ctx.workload, ctx.purpose) == ("semantic_layer", "ontology_draft")
+    assert ctx.user_id == "admin1"
+    assert ctx.subject_id == file_id
+
+
 def test_dry_run_system_prompt_includes_relationship_description(ontology_client, monkeypatch):
     """A relationship type's own description (section 3 of the builder) must
     reach the dry-run prompt exactly like an entity type's description does

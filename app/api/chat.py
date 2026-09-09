@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import secrets
+from typing import Any, Literal
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -14,6 +15,7 @@ from sqlalchemy import exc as sa_exc
 
 from app.auth.access import require_resource_access
 from app.auth.dependencies import _get_db
+from app.chat.audit import write_audit
 from app.chat.document_links import attach_document_urls
 from app.chat.frame_seq import stamp_frame
 from app.chat.manager import SENDER_LIMIT_REASONS, ChatManager, ConcurrencyCapHit, SessionNotFound
@@ -28,11 +30,13 @@ from app.chat.skills_catalog import (
     merged_skills,
 )
 from app.chat.sources import verdict as sources_verdict
+from app.chat.turn_context import read_turn
 from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.resource_types import ResourceType
 from src.audit_helpers import log_safe
+from src.observability import otel as _otel
 from src.repositories import agents_repo, user_journey_repo
 
 logger = logging.getLogger(__name__)
@@ -391,6 +395,115 @@ async def rename_session(
     return {"id": chat_id, "title": title}
 
 
+class FeedbackBody(BaseModel):
+    turn_id: str = Field(min_length=1, max_length=64)
+    verdict: Literal["up", "down"]
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+def _feedback_repo() -> Any:
+    """Resolved as a dependency: a DuckDB-backed instance answers the typed
+    501 before the request body is even validated — the same pattern
+    ``app/api/semantic_feedback.py::_feedback_repo`` uses for the same
+    reason (A3 PG-first ratchet)."""
+    from src.repositories import chat_message_feedback_repo
+
+    return chat_message_feedback_repo()
+
+
+def _can_rate(repo: ChatRepository, session: Any, user: dict) -> bool:
+    """Owner, or a live participant — the same authority `chat_copresence`
+    reads for a shared session. A repo that cannot answer the participants
+    question (e.g. no `_participants_pg` wired) fails toward "cannot rate"
+    rather than a 500."""
+    if session.user_email == user["email"]:
+        return True
+    try:
+        return any(
+            p.user_email == user["email"] and p.left_at is None for p in repo.get_session_participants(session.id)
+        )
+    except Exception:  # noqa: BLE001 - a repo that cannot answer degrades to "cannot rate", not a 500
+        return False
+
+
+@router.post("/sessions/{chat_id}/feedback")
+async def submit_feedback(
+    chat_id: str,
+    body: FeedbackBody,
+    request: Request,
+    user: dict = Depends(require_chat_access),
+    feedback_repo: Any = Depends(_feedback_repo),
+):
+    """Thumbs up/down on one completed chat turn (LLM observability design §3.5).
+
+    Keyed on the TURN, not the message: the client learns ``turn_id`` from the
+    frames it already receives (§3.2), while the assistant row is written only
+    after the frame is broadcast. One row per ``(turn_id, user_id)`` — a second
+    submit for the same turn UPDATEs it rather than piling up a second opinion.
+    Gated like the session's other routes (owner or a live participant, 404
+    for a stranger — never 403, matching the sibling routes above), and the
+    turn itself must be one of THIS session's turns (a message of the
+    session carries it) — a caller-supplied ``turn_id`` from some other
+    session is a 404 too, so being allowed to rate one conversation never
+    lets anyone attach feedback to another's turns. The feedback repo is
+    resolved as a FastAPI dependency so a DuckDB-backed instance answers
+    the typed 501 before the body is even validated. Audited as
+    ``chat.feedback`` with the verdict, never the comment.
+    """
+    _reject_restricted_principal(user, "rate an answer")
+    repo = _get_repo(request)
+    s = repo.get_session(chat_id)
+    if s is None or not _can_rate(repo, s, user):
+        raise HTTPException(404)
+    if not repo.has_turn(chat_id, body.turn_id):
+        raise HTTPException(404, detail="turn not found in this session")
+    comment = (body.comment or "").strip() or None
+    row = feedback_repo.upsert(
+        session_id=chat_id,
+        turn_id=body.turn_id,
+        user_id=user["id"],
+        verdict=body.verdict,
+        comment=comment,
+        message_id=None,
+    )
+    write_audit(
+        user_email=user["email"],
+        action="chat.feedback",
+        details={"session_id": chat_id, "turn_id": body.turn_id, "verdict": body.verdict},
+    )
+    logger.info(
+        "chat feedback",
+        extra={
+            "event": "chat_feedback",
+            "session_id": chat_id,
+            "turn_id": body.turn_id,
+            "verdict": body.verdict,
+            "has_comment": comment is not None,
+        },
+    )
+    # Parent the feedback span under the turn's own span context when the
+    # turn record is still the one this feedback is about — a stale/rotated
+    # record (the next turn already overwrote it) degrades to a root span
+    # rather than mislinking to the wrong turn.
+    turn = read_turn(chat_id)
+    parent = _otel.remote_parent_context(turn.trace_id, turn.span_id) if turn and turn.turn_id == body.turn_id else None
+    _otel.emit_feedback_span(
+        session_id=chat_id,
+        turn_id=body.turn_id,
+        user_id=user["id"],
+        verdict=body.verdict,
+        has_comment=comment is not None,
+        parent_context=parent,
+    )
+    return {
+        "id": row["id"],
+        "turn_id": body.turn_id,
+        "verdict": body.verdict,
+        "comment": comment,
+        "updated_at": row.get("updated_at"),
+    }
+
+
 async def _kill_quietly(request: Request, chat_id: str, *, reason: str) -> None:
     """Stop a session's sandbox if there is a manager to ask, and never fail for
     it.
@@ -679,6 +792,13 @@ async def list_messages(
             # parsed it as local time, shifting every reloaded bubble's
             # timestamp by the viewer's UTC offset.
             "created_at": m.created_at,
+            # NULL on a row written before migration 0117, and always NULL on
+            # the frozen DuckDB backend (PG-only column, dropped on write —
+            # the `chat_messages` cache-token precedent). What the web client
+            # stamps onto the reloaded article so the feedback thumbs
+            # (POST .../feedback) know which turn a reload's answer belongs
+            # to, same as the live frame already carries (§3.2).
+            "turn_id": getattr(m, "turn_id", None),
             # Recomputed on read rather than stored (see app/chat/sources.py):
             # the pair it needs is already here, so this costs no column, no
             # migration step and no DuckDB/Postgres parity surface — and a

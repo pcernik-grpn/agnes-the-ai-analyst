@@ -755,7 +755,12 @@ class TestRailChatHistory:
         import app.web.router as _router
 
         monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
-        _router.templates.env.globals["admin_setup_rail"] = lambda: None
+        # setitem, not a bare assignment: a raw write into the Jinja env
+        # globals is never undone, so the stub outlived this test and every
+        # later one reading the REAL global (the end-to-end wiring test
+        # below) saw `None` and read it as "the resolver is broken",
+        # depending only on which tests shared the worker.
+        monkeypatch.setitem(_router.templates.env.globals, "admin_setup_rail", lambda: None)
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         # Asserted against the rail chrome slice, not the whole document — the
@@ -1529,7 +1534,12 @@ class TestRailChatsDestination:
         import app.web.router as _router
 
         monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
-        _router.templates.env.globals["admin_setup_rail"] = lambda: None
+        # setitem, not a bare assignment: a raw write into the Jinja env
+        # globals is never undone, so the stub outlived this test and every
+        # later one reading the REAL global (the end-to-end wiring test
+        # below) saw `None` and read it as "the resolver is broken",
+        # depending only on which tests shared the worker.
+        monkeypatch.setitem(_router.templates.env.globals, "admin_setup_rail", lambda: None)
         admin_rail = self._rail(web_client, admin_cookie, "/admin/users")
         assert 'id="railGetStarted"' not in admin_rail
         assert "rail-getstarted" not in admin_rail

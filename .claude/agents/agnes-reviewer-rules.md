@@ -1,6 +1,6 @@
 ---
 name: agnes-reviewer-rules
-description: Use at the end of PR work to enforce Agnes conventions — CHANGELOG fragment (smart, not blind), vendor-agnostic content, no AI attribution, issue economy, clean commits. Fast, runs on every PR.
+description: Use at the end of PR work to enforce Agnes conventions — CHANGELOG fragment (smart, not blind), vendor-agnostic content, no AI authorship outside the accepted trailer/footer, issue economy, clean commits. Fast, runs on every PR.
 tools: Read, Bash
 model: haiku
 ---
@@ -80,12 +80,51 @@ must NOT carry the literal token list — that's why this agent reads it from
 
 ### 3. AI attribution
 
-Check commit messages and PR body:
+Two forms are ACCEPTED anywhere (`CLAUDE.md` → *Git commits & pull
+requests*) — the agent tooling appends them and `main` already carries
+them, so never report them:
 
-    git log --format='%B' <base>..HEAD | grep -i -E 'co-authored-by: claude|generated with claude|claude code'
+- the `Co-Authored-By: Claude …` commit trailer,
+- the `🤖 Generated with [Claude Code](…)` PR-body footer.
 
-Expected: zero matches. Any match is Missing — main agent must remove them
-before opening the PR.
+Report any OTHER claim of AI authorship: in a commit subject, in a commit
+BODY outside that trailer, in the PR title or prose, or in added code,
+comments or docs. One pattern finds all three — it matches an authorship
+CLAIM rather than a name:
+
+    CLAIM='(generated|written|authored|created) (with|by) (claude|copilot|chatgpt|an? (ai|llm))|ai[- ]generated|🤖'
+
+    # 1a. commit SUBJECTS — neither accepted form belongs in a subject, so
+    #     scan them whole, with nothing filtered out.
+    git log --format='%s' <base>..HEAD | grep -inE "$CLAIM"
+
+    # 1b. commit BODIES — drop the two accepted lines in their EXACT form
+    #     (a complete trailer ending in an angle-bracket address; the footer
+    #     with its real URL), then scan what is left. The exactness matters:
+    #     a prefix match also swallows a subject or a prose line that merely
+    #     opens with "Co-Authored-By: Claude …".
+    git log --format='%b' <base>..HEAD \
+      | grep -ivE '^Co-Authored-By: Claude [^<]*<[^>]+>$|^_?🤖 Generated with \[Claude Code\]\(https://claude\.com/claude-code\)_?$' \
+      | grep -inE "$CLAIM"
+
+    # 2. added lines, EXCLUDING the files that define this convention — they
+    #    quote the accepted strings on purpose, so scanning them makes every
+    #    edit to the convention itself self-report.
+    git diff <base>..HEAD -- . ':!CHANGELOG.md' ':!docs/archive' \
+      ':!CLAUDE.md' ':!.claude/agents/agnes-reviewer-rules.md' \
+      | grep -inE "^\+.*($CLAIM)"
+
+Expected: zero matches from all three. The pattern is deliberately narrow
+about the product name: "Claude Code" is a first-class subject of this repo
+(hooks, marketplace, the CLI) and appears in ordinary code and docs, and
+`claude/*` shows up in branch names inside merge-commit subjects — a bare
+`claude` grep reports those as violations. Measured on this repo, the three
+commands above return nothing across the last 300 commits on `main` while
+still catching a planted claim in a subject, a body, or an added line.
+
+They are aids, not the verdict: read the PR title and body yourself too.
+The footer is fine there; an "AI-generated" claim in the title or prose is
+Missing — main agent must remove it before opening the PR.
 
 ### 4. Issue economy
 
@@ -98,7 +137,7 @@ touching diff.
 ### 5. Commit hygiene
 
 `git log --oneline <base>..HEAD`. Red flags:
-- Commit message includes AI attribution (already covered above).
+- Commit subject or body advertises AI authorship beyond the accepted trailer (already covered above).
 - WIP / fixup / squash markers left in messages.
 - Commits that should have been amended (e.g., "typo", "lint fix" of an
   immediately preceding commit).

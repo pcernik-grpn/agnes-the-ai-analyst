@@ -151,7 +151,11 @@ class VertexExtractor(AnthropicExtractor):
     on Vertex, so the request shape carries over unchanged.
     """
 
-    _TRACE_PROVIDER = "vertex"
+    # Vertex bills through Google Cloud, so its calls are labelled the same
+    # way every other Vertex call site is
+    # (`src/observability/llm_tracing.py::provider_label`) — never the bare
+    # "vertex" setting value the config resolves to.
+    _TRACE_PROVIDER = "gcp.vertex_ai"
 
     def __init__(self, project_id: str, region: str, model: str) -> None:
         # Deliberately does NOT call super().__init__ — there is no API key.

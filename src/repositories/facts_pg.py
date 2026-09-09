@@ -1742,7 +1742,9 @@ class FactsPgRepository:
             self._decrement_collection_stats_for_deleted_claims(conn, deleted_rows)
         return len(deleted_rows)
 
-    def reassign_file_corpus(self, corpus_file_id: str, target_corpus_id: str) -> int:
+    def reassign_file_corpus(
+        self, corpus_file_id: str, target_corpus_id: str, *, expected_corpus_id: Optional[str] = None
+    ) -> int:
         """Repoint one file's claims at the collection it now lives in; return
         the count.
 
@@ -1756,7 +1758,14 @@ class FactsPgRepository:
         grouped the file's facts under the collection it had left, and — since
         this column is what visibility is filtered on — its facts stayed
         readable to the OLD collection's audience and invisible to the new
-        one's. Called on the move path, immediately after the file row moves.
+        one's. Called on the move path BEFORE the file row moves, so that a
+        failure cannot strand the facts in the collection the file is leaving
+        (``app/api/collections.py::move_file`` owns the ordering).
+
+        ``expected_corpus_id`` makes the write a compare-and-set — only claims
+        currently in that collection move. The endpoint's compensation path
+        uses it so that undoing a failed move cannot drag back claims a
+        concurrent, successful move of the same file has since claimed.
         """
         with self._engine.begin() as conn:
             source_ids = (
@@ -1767,10 +1776,12 @@ class FactsPgRepository:
                 .scalars()
                 .all()
             )
-            result = conn.execute(
-                sa.text("UPDATE claims SET corpus_id = :target WHERE corpus_file_id = :file_id"),
-                {"target": target_corpus_id, "file_id": corpus_file_id},
-            )
+            sql = "UPDATE claims SET corpus_id = :target WHERE corpus_file_id = :file_id"
+            params: Dict[str, Any] = {"target": target_corpus_id, "file_id": corpus_file_id}
+            if expected_corpus_id is not None:
+                sql += " AND corpus_id = :expected"
+                params["expected"] = expected_corpus_id
+            result = conn.execute(sa.text(sql), params)
         # TCRD-296 E.21: both the vacated source collection(s) and the
         # target need a recompute — same reasoning as `delete_claims_
         # for_file`'s hook.

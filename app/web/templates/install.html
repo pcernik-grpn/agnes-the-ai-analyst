@@ -909,10 +909,7 @@
 {% block scripts %}
 <script>
     (function() {
-        function copyToClipboard(text) {
-            if (navigator.clipboard && window.isSecureContext) {
-                return navigator.clipboard.writeText(text);
-            }
+        function copyViaTextarea(text) {
             var ta = document.createElement('textarea');
             ta.value = text;
             ta.style.position = 'fixed';
@@ -923,11 +920,27 @@
             ta.select();
             return new Promise(function(resolve, reject) {
                 try {
-                    document.execCommand('copy') ? resolve() : reject();
+                    document.execCommand('copy') ? resolve() : reject(new Error('execCommand copy returned false'));
                 } finally {
                     document.body.removeChild(ta);
                 }
             });
+        }
+
+        function copyToClipboard(text) {
+            // Prefer the modern Clipboard API but fall back to the textarea
+            // path on REJECTION too, not only when the API is missing —
+            // browsers can reject writeText() (e.g. NotAllowedError) for
+            // reasons that don't affect execCommand('copy'). Without this,
+            // a rejection skipped straight to the "select all manually"
+            // modal even though the textarea path would have worked
+            // silently. Mirrors _claude_setup_cta.jinja's copyToClipboard.
+            if (navigator.clipboard && window.isSecureContext) {
+                return navigator.clipboard.writeText(text).catch(function () {
+                    return copyViaTextarea(text);
+                });
+            }
+            return copyViaTextarea(text);
         }
 
         function flashCopied(button) {

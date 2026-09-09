@@ -367,6 +367,7 @@ POSTURE: dict[str, str] = {
     "DELETE /api/chat/sessions/{chat_id}": "chat.session.archive",
     "DELETE /api/chat/sessions/{chat_id}/permanent": "chat.session.delete",
     "POST /api/chat/sessions": "chat.session.create",
+    "POST /api/chat/sessions/{chat_id}/feedback": "chat.feedback",
     "POST /api/chat/sessions/{chat_id}/ticket": "chat.session.ticket",
     "PUT /api/chat/journey": "chat.journey_update",
     "PUT /api/chat/sessions/{chat_id}/archived": "chat.session.archive",
@@ -983,6 +984,12 @@ READ_POSTURE: dict[str, str] = {
     # action rather than exempt:ui_support per the read-posture policy.
     "GET /api/admin/telemetry/chat-cost": "usage.chat_cost",
     "GET /api/admin/telemetry/export": "usage.export",
+    # Cross-workload cost/detail/feedback reads (LLM observability design
+    # 2026-09-08 §3.4/§3.5) — same cross-user disclosure class as chat-cost
+    # right above, so cataloged rather than exempt.
+    "GET /api/admin/telemetry/llm-cost": "usage.llm_cost",
+    "GET /api/admin/telemetry/llm-calls": "usage.llm_calls",
+    "GET /api/admin/telemetry/feedback": "usage.feedback_list",
     # -- app.api.admin_usage_summary --
     "GET /api/admin/telemetry/facets": "exempt:ui_support",
     "GET /api/admin/telemetry/kpis": "exempt:ui_support",
@@ -1064,6 +1071,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/connectors/manifest": "exempt:ui_support",
     "GET /api/connectors/params": "exempt:ui_support",
     "GET /api/connectors/{slug}/prompt": "exempt:ui_support",
+    # -- app.api.conversations_export (design 2026-09-08 §3.12) --
+    # The evaluation-corpus pull. Real content (messages, tool calls), so a
+    # cataloged action rather than exempt -- same reasoning as
+    # `catalog.sample` / `collection.file_preview` above.
+    "GET /api/admin/conversations/corpus": "conversations.export",
     # -- app.api.cowork_bundle --
     "GET /api/user/setup-tokens": "exempt:self",
     # -- app.api.data --
@@ -1675,6 +1687,7 @@ JOB_POSTURE: dict[str, str] = {
     "distribution-mirror": "job.run",
     "webhook-deliver": "job.run",
     "knowledge-packaging": "job.run",
+    "conversation-export": "conversations.export",
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
@@ -1696,6 +1709,12 @@ JOB_POSTURE: dict[str, str] = {
     # -- see register_all_kinds()'s docstring) but still a real, enumerable
     # kind name when it IS registered, so it still needs an entry here.
     "agent_response": "job.run",
+    # The conversation-corpus export push sink (design 2026-09-08 §3.12,
+    # Task 11) writes its OWN more-specific row -- `conversations.export`,
+    # `delivery="push"` -- via `log_safe` on every run (success, partial,
+    # or a caught mid-walk failure), same shape as the pull endpoint's own
+    # `conversations.export` row. Per the "Names a more specific action"
+    # bullet above, the generic `job.run` row still fires too.
 }
 
 # MCP foundation tools (app/api/mcp/foundation_tools.py::FOUNDATION_TOOL_NAMES,

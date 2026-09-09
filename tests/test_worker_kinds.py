@@ -94,6 +94,7 @@ class TestRegisterAllKinds:
         "sharepoint-acl-sync",
         "sharepoint-subtree-sweep",
         "sharepoint-facts-extraction",
+        "conversation-export",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):

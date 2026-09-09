@@ -1956,6 +1956,54 @@ class MoveFileBody(BaseModel):
     target_collection_id: str = Field(min_length=1)
 
 
+def _undo_content_move(file_id: str, source_corpus_id: str, attempted_corpus_id: str) -> None:
+    """Put a file's chunks (and claims) back under ``source_corpus_id``.
+
+    Compensation for a move whose final file-row write failed after the
+    denormalized rows had already been repointed — see ``move_file``.
+
+    Conditional on ``attempted_corpus_id``: only rows still sitting under the
+    target THIS attempt moved them to are reverted. An unconditional revert
+    would be a race — a concurrent move of the same file that SUCCEEDED in
+    the meantime would have its content dragged back to our source, leaving
+    the winner's file row in one collection and its body in another, which is
+    the leak this endpoint exists to close, recreated by the cleanup for it.
+
+    Every failure here is logged and swallowed: the caller is already
+    receiving the original error, and replacing it with a failure from the
+    cleanup would hide what actually broke. A cleanup that fails leaves a
+    split the log names in full (file, both collections) so it can be
+    reconciled by hand; it is not silently reported as restored, because the
+    request still fails.
+    """
+    try:
+        corpus_chunks_repo().reassign_file_corpus(file_id, source_corpus_id, expected_corpus_id=attempted_corpus_id)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            "move_file: INCONSISTENT — chunks for file_id=%s may still be under %s while the file row is in %s "
+            "(restore failed: %s)",
+            file_id,
+            attempted_corpus_id,
+            source_corpus_id,
+            e,
+        )
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        facts_repo().reassign_file_corpus(file_id, source_corpus_id, expected_corpus_id=attempted_corpus_id)
+    except RequiresPostgresBackend:
+        pass
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            "move_file: INCONSISTENT — claims for file_id=%s may still be under %s while the file row is in %s "
+            "(restore failed: %s)",
+            file_id,
+            attempted_corpus_id,
+            source_corpus_id,
+            e,
+        )
+
+
 @router.post("/{collection_id}/files/{file_id}/move")
 async def move_file(
     collection_id: str,
@@ -1972,6 +2020,17 @@ async def move_file(
     When the source collection is left empty it is soft-deleted: a single-file
     artifact IS its file in the Library, so dragging that file into a folder
     must not strand an empty husk in the listing.
+
+    The file's body and its extracted facts move with it, so search and the
+    fact graph follow the file into the target collection rather than
+    continuing to answer under the one it left. A move either completes or
+    leaves the file and its content together where they were; it never
+    reports success having applied only part of that.
+
+    Answers ``409 move_conflict`` when someone else moved the same file while
+    this request was in flight. The response names the collection the file
+    actually ended up in, so a client can re-target or refresh rather than
+    retry blindly into the same race.
     """
     target_id = payload.target_collection_id
     if target_id == collection_id:
@@ -2000,16 +2059,38 @@ async def move_file(
     if managing is not None:
         _refuse_source_managed(managing)
 
-    if not cf_repo.move_to_corpus(file_id, target_id):
-        raise HTTPException(status_code=404, detail="file_not_found")
+    # Two columns are denormalized from `corpus_files.corpus_id` and do not
+    # follow the file on their own: `corpus_chunks.corpus_id` (what body
+    # search scopes candidates on — `search_with_meta` → `search_candidates`)
+    # and `claims.corpus_id` (what fact visibility is filtered on). A row left
+    # behind does not merely file the content under the old collection in the
+    # facets — it leaves it READABLE to the collection the file just left.
+    #
+    # Both are repointed BEFORE the file row moves, and the order is the
+    # safety property, not a detail: these writes commit separately (distinct
+    # repositories, and distinct connections on the frozen DuckDB backend), so
+    # one can land without the other. Failing before the file row moves leaves
+    # the file and its content together in the source — nothing stranded in a
+    # collection the file has left, and the same request replays cleanly,
+    # because the caller's source collection still owns the file. Doing it the
+    # other way round would fail into exactly the leak this fixes, and into a
+    # state where the retry 404s (the file no longer belongs to the source the
+    # caller addressed).
+    #
+    # The chunk write is NOT best-effort: chunks exist on both app-state
+    # backends, so a failure there is a real error, never a missing optional
+    # feature.
+    moved_chunks = corpus_chunks_repo().reassign_file_corpus(file_id, target_id)
+    if moved_chunks:
+        logger.info(
+            "corpus_file move repointed %s chunk(s) file_id=%s to=%s",
+            moved_chunks,
+            file_id,
+            target_id,
+        )
 
-    # The file row has moved; its CLAIMS have not. `claims.corpus_id` is
-    # denormalized from `corpus_files` and is the column fact visibility is
-    # filtered on, so leaving it behind does not merely file the facts under
-    # the old collection in the graph facets — it leaves them readable to the
-    # collection the file just left. Best-effort by design: the fact graph is
-    # Postgres-only and optional, so an instance without it must still be able
-    # to move a file.
+    # Claims stay best-effort by design: the fact graph is Postgres-only and
+    # optional, so an instance without it must still be able to move a file.
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
 
@@ -2025,6 +2106,47 @@ async def move_file(
         pass  # no fact graph on this backend — nothing to repoint
     except Exception as e:
         logger.warning("move_file: could not repoint claims for %s: %s", file_id, e)
+
+    # The content is already under the target; the file row is the last write.
+    # If it fails, put the content back rather than leaving the request's
+    # visible effect half-applied: this direction is the benign one (the
+    # caller has proven access to the target, and the retry works because the
+    # source still owns the file), but it is still a split nobody asked for.
+    # A compensation that itself fails is logged and never masks the original
+    # error — the caller must see what actually broke.
+    try:
+        moved = cf_repo.move_to_corpus(file_id, target_id, expected_corpus_id=collection_id)
+    except Exception:
+        _undo_content_move(file_id, collection_id, target_id)
+        raise
+    if not moved:
+        # Either the file is gone, or a CONCURRENT move of it committed while
+        # we were repointing the content: both requests validated the same
+        # source, so both got this far, and without the compare-and-set above
+        # the later write would silently overwrite the earlier one while our
+        # content sat at OUR target — the file in one collection, its body in
+        # another. Put the content wherever the file actually is (which is the
+        # winner's target, not the source it has already left), and say we
+        # lost rather than report a success we did not achieve.
+        current = cf_repo.get(file_id)
+        if current is None:
+            _undo_content_move(file_id, collection_id, target_id)
+            raise HTTPException(status_code=404, detail="file_not_found")
+        _undo_content_move(file_id, current["corpus_id"], target_id)
+        logger.info(
+            "corpus_file move lost a race file_id=%s wanted=%s actual=%s",
+            file_id,
+            target_id,
+            current["corpus_id"],
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "move_conflict",
+                "message": "The file was moved by someone else while this move was in progress.",
+                "collection_id": current["corpus_id"],
+            },
+        )
 
     source_emptied = False
     try:
@@ -2204,9 +2326,53 @@ _PREVIEW_TEXTUAL_EXTS: frozenset[str] = frozenset(
 )
 
 # A preview is a glance, not the file: cap what we read off disk AND what we
-# return, so a 100 MiB CSV can't turn a modal into a 100 MiB response.
+# return per call, so a 100 MiB CSV can't turn a modal into a 100 MiB
+# response. The per-call cap is a PAGE, though, not a wall: `offset` / `limit`
+# walk the text and the response carries `next_offset` / `total_chars`, so a
+# non-browser reader (`agnes collections cat`, the `collection_file_read` MCP
+# tool) reaches the rest one context-sized page at a time. Before that,
+# `_extracted_text` stopped joining chunks at the cap and NO surface could
+# reach a long file's remainder — an agent asked to summarise a long deck read
+# the first third and had to guess search terms for the rest.
 _PREVIEW_READ_MAX_BYTES = 512 * 1024
 _PREVIEW_MAX_CHARS = 20_000
+
+
+def _clamp_preview_offset(offset: int) -> int:
+    """Clamp to ``>= 0`` — silently, never a 422, same reasoning as the
+    file-list clamps above: a paging client builds these itself."""
+    return max(0, offset)
+
+
+def _clamp_preview_limit(limit: int) -> int:
+    """Clamp to ``1.._PREVIEW_MAX_CHARS``: the per-call cap is the endpoint's
+    guarantee to the context window, whatever a caller asks for."""
+    return max(1, min(limit, _PREVIEW_MAX_CHARS))
+
+
+def _text_page(text: str, offset: int, limit: int, *, continues_beyond: bool = False) -> dict:
+    """One page of ``text`` plus the fields a paging reader chains on.
+
+    ``next_offset`` is where the next call starts — ``None`` when this page
+    reaches the end of ``text``. ``truncated`` keeps its original meaning,
+    "this response is not the end of the text", which is why it is ALSO true
+    on the last page when ``continues_beyond`` says the source holds more
+    than ``text`` does (the textual branch's byte window): the caller then
+    sees ``truncated: true`` with no ``next_offset`` — an honest "the file
+    goes on, but not through here" rather than a prefix passed off as the
+    whole. ``total_chars`` counts what is reachable through this endpoint.
+    """
+    total = len(text)
+    page = text[offset : offset + limit]
+    end = offset + len(page)
+    next_offset = end if end < total else None
+    return {
+        "text": page,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total_chars": total,
+        "truncated": next_offset is not None or continues_beyond,
+    }
 
 
 def _document_text_visible(caller: Any, collection_id: str) -> bool:
@@ -2334,28 +2500,81 @@ def _no_text_reason(row: dict) -> str:
     }.get(status, "No preview is available for this format.")
 
 
-def _extracted_text(file_id: str) -> str:
-    """Joined chunk text for a file — the only text a docx/xlsx/pdf-scan has."""
-    chunks = corpus_chunks_repo().list_for_file(file_id)
-    if not chunks:
-        return ""
+# The shortest shared edge `_join_chunks` treats as the chunker's overlap
+# window rather than a coincidence. Two element-based chunks (which never
+# overlap by construction) would have to end and begin with the same 40+
+# characters to be merged wrongly.
+_CHUNK_OVERLAP_MIN_MATCH = 40
+
+
+def _join_chunks(texts: list[str]) -> str:
+    """Assemble one file's chunk texts into a faithful document.
+
+    ``src.ingest.chunking`` windows a text into fixed-size pieces that each
+    keep the last ``_OVERLAP_CHARS`` characters of the previous one, so a
+    verbatim join repeats every boundary passage once — a whole-file read
+    of a long document was about an eighth duplicate text. When a chunk's
+    head is exactly the previous chunk's tail (at least
+    ``_CHUNK_OVERLAP_MIN_MATCH`` characters), the shared part is dropped
+    and the two are joined seamlessly, which is what the source looked
+    like. Chunks that share no edge — element-based chunks, where each
+    element is windowed on its own — are joined with a blank line, as
+    before. A piece shorter than the threshold is never merged; a tiny
+    trailing window can therefore still repeat, which is the safe side.
+
+    The probe never looks further back than ``_OVERLAP_CHARS``: the chunker
+    overlaps by exactly that much, so a longer shared edge is not the
+    window but the document repeating itself (a table of identical rows,
+    a footer on every slide), and merging it would delete real content.
+    Within the window the longest match is the overlap itself, give or
+    take the whitespace ``strip`` removed at the seam.
+    """
+    from src.ingest.chunking import _OVERLAP_CHARS
+
     out: list[str] = []
-    total = 0
-    for c in chunks:
-        text = (c.get("text") or "").strip()
+    for raw in texts:
+        text = (raw or "").strip()
         if not text:
             continue
+        if out:
+            prev = out[-1]
+            head = text[:_CHUNK_OVERLAP_MIN_MATCH]
+            shared = 0
+            if len(head) == _CHUNK_OVERLAP_MIN_MATCH:
+                probe = min(len(prev), len(text), _OVERLAP_CHARS)
+                pos = prev.find(head, len(prev) - probe)
+                while pos != -1:
+                    candidate = len(prev) - pos
+                    if candidate <= len(text) and prev.endswith(text[:candidate]):
+                        shared = candidate
+                        break
+                    pos = prev.find(head, pos + 1)
+            if shared:
+                out[-1] = prev + text[shared:]
+                continue
         out.append(text)
-        total += len(text)
-        if total >= _PREVIEW_MAX_CHARS:
-            break
     return "\n\n".join(out)
+
+
+def _extracted_text(file_id: str) -> str:
+    """Joined chunk text for a file — the only text a docx/xlsx/pdf-scan has.
+
+    The WHOLE file: chunks come back ``ORDER BY ordinal`` and every one is
+    joined (overlap-aware, see ``_join_chunks``). This used to stop at
+    ``_PREVIEW_MAX_CHARS``, which left chunk 21 onward unreachable through
+    any surface — the cap belongs to the page the endpoint returns, not to
+    the text it pages over. Only the text column is read: a page never
+    needs the embeddings ``list_for_file`` would haul along.
+    """
+    return _join_chunks(corpus_chunks_repo().list_text_for_file(file_id))
 
 
 @router.get("/{collection_id}/files/{file_id}/preview")
 async def preview_file(
     collection_id: str,
     file_id: str,
+    offset: int = 0,
+    limit: int = _PREVIEW_MAX_CHARS,
     user=Depends(get_current_user),
 ):
     """What to show for this file, and how — the modal's single fetch.
@@ -2365,14 +2584,28 @@ async def preview_file(
     * ``image`` / ``pdf`` — fetch ``raw_url`` and let the browser draw it.
     * ``text`` — ``text`` holds the preview (source for textual uploads, the
       ingested text for formats whose bytes aren't readable), ``truncated``
-      says a glance is all this is.
+      says this response is not the end of the text.
     * ``none`` — nothing to show yet; ``reason`` says why, in the words the
       modal shows the caller.
+
+    The text is paged. ``offset`` (characters, default ``0``) and ``limit``
+    (default and maximum ``_PREVIEW_MAX_CHARS``; both clamped, never a 422)
+    select one page; the response echoes the ``offset`` it used and adds
+    ``next_offset`` (``null`` when the page reaches the end) and
+    ``total_chars``. A caller wanting the whole file chains
+    ``offset=next_offset`` until it is ``null``. The modal sends no
+    parameters and gets the first page, exactly as before. For a textual
+    upload the text is what fits in ``_PREVIEW_READ_MAX_BYTES`` of the
+    file: ``total_chars`` counts that window and, when the file continues
+    past it, the last page is still ``truncated: true`` with no
+    ``next_offset`` — the byte cap is reported, never hidden by paging.
 
     Deliberately one endpoint for every format: the client should not have to
     know which extensions are streamable, which are text and which are only
     previewable once ingestion has run.
     """
+    offset = _clamp_preview_offset(offset)
+    limit = _clamp_preview_limit(limit)
     row = _readable_file_or_404(collection_id, file_id, user)
     ext = (row.get("file_type") or "").lower()
     base = {
@@ -2384,6 +2617,9 @@ async def preview_file(
         "raw_url": None,
         "text": None,
         "truncated": False,
+        "offset": offset,
+        "next_offset": None,
+        "total_chars": 0,
         "source": None,
         "reason": None,
     }
@@ -2439,16 +2675,19 @@ async def preview_file(
             return {
                 **base,
                 "kind": "text",
-                "text": media_text[:_PREVIEW_MAX_CHARS],
-                "truncated": len(media_text) > _PREVIEW_MAX_CHARS,
+                **_text_page(media_text, offset, limit),
                 "source": "extracted",
             }
+        page = _text_page(media_text, offset, limit)
         return {
             **base,
             "kind": "image" if ext != "pdf" else "pdf",
             "raw_url": f"/api/collections/{collection_id}/files/{file_id}/raw",
-            "text": media_text[:_PREVIEW_MAX_CHARS] or None,
-            "truncated": len(media_text) > _PREVIEW_MAX_CHARS,
+            **page,
+            # `null` only when the medium has NO text (the modal's contract);
+            # an empty page of a medium that has text is an offset past the
+            # end, and `""` lets a paging reader tell the two apart.
+            "text": page["text"] if media_text else None,
             "source": "extracted" if media_text else None,
             # A text-less image/PDF must still say why: a bare `text: null`
             # gives a non-browser caller nothing to relay.
@@ -2470,12 +2709,10 @@ async def preview_file(
             data = fh.read(_PREVIEW_READ_MAX_BYTES + 1)
         clipped = len(data) > _PREVIEW_READ_MAX_BYTES
         text = data[:_PREVIEW_READ_MAX_BYTES].decode("utf-8", errors="replace")
-        truncated = clipped or len(text) > _PREVIEW_MAX_CHARS
         return {
             **base,
             "kind": "text",
-            "text": text[:_PREVIEW_MAX_CHARS],
-            "truncated": truncated,
+            **_text_page(text, offset, limit, continues_beyond=clipped),
             "source": "file",
         }
 
@@ -2484,8 +2721,7 @@ async def preview_file(
         return {
             **base,
             "kind": "text",
-            "text": text[:_PREVIEW_MAX_CHARS],
-            "truncated": len(text) > _PREVIEW_MAX_CHARS,
+            **_text_page(text, offset, limit),
             "source": "extracted",
         }
 

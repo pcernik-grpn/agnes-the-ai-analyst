@@ -172,6 +172,27 @@ class ChatSessionPgRepository:
                 {"id": chat_id},
             )
 
+    def last_message_at_for(self, session_ids: list[str]) -> dict:
+        """``{session_id: last_message_at}`` for the ids that have one.
+
+        The conversation-corpus push sink asks this before rebuilding a
+        record the LATE-FEEDBACK sweep selected: that sweep picks sessions
+        by when their feedback changed, which says nothing about whether
+        the conversation itself has settled, and a thumbs verdict on an old
+        answer must not ship a transcript whose newest turn is still being
+        written (design 2026-09-08 §3.12, settle window).
+        """
+        if not session_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT id, last_message_at FROM chat_sessions WHERE id = ANY(:ids) AND last_message_at IS NOT NULL"
+                ),
+                {"ids": list(session_ids)},
+            ).all()
+        return {r[0]: r[1] for r in rows}
+
     def hard_delete_session(self, chat_id: str) -> bool:
         """Permanently delete ONE session; returns whether a row existed.
 
@@ -180,8 +201,26 @@ class ChatSessionPgRepository:
         migration 0015, ``chat_session_participants`` in 0017), so the deletes
         the DuckDB sibling has to spell out happen here for free — the
         observable contract is identical.
+
+        The two tables migration 0117 added carry no such cascade and are
+        handled explicitly, in the SAME transaction, because they are not
+        the same kind of data: ``chat_message_feedback`` holds a person's
+        free-text comment ABOUT this conversation and must not outlive it,
+        while ``llm_calls`` is the spend record — deleting those rows would
+        rewrite cost history retroactively, so the row stays and only its
+        identity (session, turn, user) is scrubbed.
         """
         with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("DELETE FROM chat_message_feedback WHERE session_id = :id"),
+                {"id": chat_id},
+            )
+            conn.execute(
+                sa.text(
+                    "UPDATE llm_calls SET session_id = NULL, turn_id = NULL, user_id = NULL WHERE session_id = :id"
+                ),
+                {"id": chat_id},
+            )
             result = conn.execute(
                 sa.text("DELETE FROM chat_sessions WHERE id = :id"),
                 {"id": chat_id},
@@ -261,7 +300,24 @@ class ChatSessionPgRepository:
                 ).scalar()
                 or 0
             )
-            # ON DELETE CASCADE removes child chat_messages automatically.
+            # ON DELETE CASCADE removes child chat_messages automatically;
+            # migration 0117's tables have no cascade, so they are handled
+            # here (see `hard_delete_session` for why one is deleted and the
+            # other only loses its identity columns).
+            conn.execute(
+                sa.text(
+                    "DELETE FROM chat_message_feedback WHERE session_id IN "
+                    "(SELECT id FROM chat_sessions WHERE user_email = :ue)"
+                ),
+                {"ue": user_email},
+            )
+            conn.execute(
+                sa.text(
+                    "UPDATE llm_calls SET session_id = NULL, turn_id = NULL, user_id = NULL "
+                    "WHERE session_id IN (SELECT id FROM chat_sessions WHERE user_email = :ue)"
+                ),
+                {"ue": user_email},
+            )
             conn.execute(
                 sa.text("DELETE FROM chat_sessions WHERE user_email = :ue"),
                 {"ue": user_email},
@@ -360,3 +416,57 @@ class ChatSessionPgRepository:
                 .all()
             )
         return [_row_to_session(r) for r in rows]
+
+    def list_completed_between(
+        self,
+        since: datetime,
+        until: datetime,
+        *,
+        surfaces: Optional[tuple[str, ...]] = None,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        after: Optional[tuple[datetime, str]] = None,
+    ) -> list[dict]:
+        """One page of sessions "completed" in ``[since, until)`` -- the
+        conversation-corpus export's cursor source (design 2026-09-08 §3.12).
+
+        A session counts as completed for the window purely by
+        ``last_message_at`` falling in it, regardless of ``archived``: the
+        export reads what happened, not what is still open in a sidebar.
+        Ordered ``(last_message_at, id)`` ascending -- deterministic
+        regardless of how many sessions share a timestamp -- and ``after``
+        (from a prior page's last row) resumes strictly past that position,
+        the same keyset shape ``corpus_file_events_pg.py::list_for_corpus_ids``
+        uses. Returns lean rows (id/surface/agent_id/user_email/
+        last_message_at), not a full :class:`ChatSession` -- the export never
+        needs the other columns and a ``SELECT *`` would carry them for
+        nothing.
+
+        ``surfaces`` (a tuple, ``surface = ANY(:surfaces)``) filters IN the
+        query itself -- one or many surfaces, or ``None``/empty for no
+        filter -- rather than the caller fetching every surface and
+        discarding rows client-side after the fact: a client-side filter on
+        a resumable walk lets an excluded row's position get skipped
+        without ever being reflected in what the caller can safely resume
+        from (push-sink defect fix, design 2026-09-08 §3.12).
+        """
+        clauses = ["last_message_at IS NOT NULL", "last_message_at >= :since", "last_message_at < :until"]
+        params: dict = {"since": since, "until": until, "limit": limit}
+        if surfaces:
+            clauses.append("surface = ANY(:surfaces)")
+            params["surfaces"] = list(surfaces)
+        if agent_id is not None:
+            clauses.append("agent_id = :agent_id")
+            params["agent_id"] = agent_id
+        if after is not None:
+            after_ts, after_id = after
+            clauses.append("(last_message_at, id) > (:after_ts, :after_id)")
+            params["after_ts"] = after_ts
+            params["after_id"] = after_id
+        query = (
+            "SELECT id, surface, agent_id, user_email, last_message_at FROM chat_sessions "
+            "WHERE " + " AND ".join(clauses) + " ORDER BY last_message_at ASC, id ASC LIMIT :limit"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(query), params).mappings().all()
+        return [dict(r) for r in rows]

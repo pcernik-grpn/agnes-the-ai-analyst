@@ -248,3 +248,66 @@ class TestPricingIsTheSharedOne:
         as_cached = cost_usd(model="claude-sonnet-5", cache_read_tokens=10_000_000)
         as_uncached = cost_usd(model="claude-sonnet-5", input_tokens=10_000_000)
         assert as_cached < as_uncached / 5
+
+
+class TestCompletionTiming:
+    """Measured LLM latency rides the same rows as the measured cost: how many
+    completions a session's turns made, their summed wall time and summed
+    time-to-first-byte, with the same never-a-fake-zero discipline."""
+
+    @staticmethod
+    def _row(**overrides):
+        base = {
+            "session_id": "s1",
+            "user_email": "a@test.com",
+            "model": "claude-sonnet-5",
+            "messages": 4,
+            "cache_recorded_messages": 4,
+            "tokens_in": 10,
+            "tokens_out": 10,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "last_message_at": None,
+            "llm_calls": 8,
+            "llm_duration_ms": 24_000,
+            "llm_ttfb_ms": 4_000,
+            "timing_recorded_messages": 4,
+        }
+        base.update(overrides)
+        return base
+
+    def test_row_exposes_calls_duration_ttfb_and_per_call_averages(self, seeded_app):
+        body, _ = TestPayload._get(seeded_app, [self._row()])
+        row = body["sessions"][0]
+        assert row["llm_calls"] == 8
+        assert row["llm_duration_ms"] == 24_000
+        assert row["llm_ttfb_ms"] == 4_000
+        assert row["avg_completion_ms"] == 3_000
+        assert row["avg_ttfb_ms"] == 500
+        assert row["timing_accounting"] == "recorded"
+        assert body["totals"]["llm_calls"] == 8
+        assert body["totals"]["llm_duration_ms"] == 24_000
+        assert body["totals"]["llm_ttfb_ms"] == 4_000
+        assert body["totals"]["avg_completion_ms"] == 3_000
+
+    def test_unrecorded_timing_is_unavailable_not_zero(self, seeded_app):
+        rows = [self._row(llm_calls=0, llm_duration_ms=0, llm_ttfb_ms=0, timing_recorded_messages=0)]
+        body, _ = TestPayload._get(seeded_app, rows)
+        row = body["sessions"][0]
+        assert row["timing_accounting"] == "unavailable"
+        assert row["avg_completion_ms"] is None
+        assert body["totals"]["avg_completion_ms"] is None
+        assert any("timing" in note.lower() for note in body["notes"])
+
+    def test_partial_timing_is_labelled_partial(self, seeded_app):
+        body, _ = TestPayload._get(seeded_app, [self._row(timing_recorded_messages=2)])
+        assert body["sessions"][0]["timing_accounting"] == "partial"
+
+    def test_repository_rows_without_timing_keys_still_serve(self, seeded_app):
+        """A stub or an older repository shape that carries no timing keys
+        must not break the readout — it is reported as unavailable."""
+        row = self._row()
+        for key in ("llm_calls", "llm_duration_ms", "llm_ttfb_ms", "timing_recorded_messages"):
+            row.pop(key)
+        body, _ = TestPayload._get(seeded_app, [row])
+        assert body["sessions"][0]["timing_accounting"] == "unavailable"

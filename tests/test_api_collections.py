@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import io
+from datetime import UTC
 
 import pytest
 
@@ -866,7 +867,7 @@ class TestSearch:
         """#898: without the embeddings extra the ranking silently degrades to
         lexical-only — the response must say so instead of leaving clients to
         read server logs."""
-        import src.ingest.retrieval as retrieval
+        from src.ingest import retrieval
 
         monkeypatch.setattr(retrieval, "embedding_capability", lambda: False)
         c = seeded_app["client"]
@@ -882,7 +883,7 @@ class TestSearch:
     def test_search_response_labels_hybrid_retrieval(self, seeded_app, monkeypatch):
         """#898: with an embedding model available the response labels the
         ranking as hybrid."""
-        import src.ingest.retrieval as retrieval
+        from src.ingest import retrieval
 
         monkeypatch.setattr(retrieval, "embedding_capability", lambda: True)
         # Keep ranking deterministic without a real model — the label reflects
@@ -902,7 +903,7 @@ class TestSearch:
         """P0 OOM fix, 2026-09: an additive `candidates_capped: true` on the
         response when the bounded candidate scan hit its configured limit —
         never present (and never `false`) when it did not."""
-        import src.ingest.retrieval as retrieval
+        from src.ingest import retrieval
 
         c = seeded_app["client"]
         cid = self._seed_corpus_with_chunk(seeded_app, "CapOne", "widget revenue widget revenue", grant=True)
@@ -979,6 +980,340 @@ def test_delete_file_removes_its_chunks(seeded_app):
     r = c.delete(f"/api/collections/{cid}/files/{fid}", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 204, r.text
     assert corpus_chunks_repo().list_for_file(fid) == []
+
+
+def test_move_file_rehomes_its_chunks_for_search(seeded_app):
+    """Moving a file must carry its body chunks to the target collection.
+
+    Body search scopes candidates on ``corpus_chunks.corpus_id``, not on the
+    file row's current collection — so a moved file whose chunks stayed
+    behind kept answering under the SOURCE collection: readable to a reader
+    granted only the collection the file just left, and invisible under the
+    target. Asserted from both sides, and the leak side as a non-admin
+    reader who was granted the source only.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Move Src Chunks"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Move Dst Chunks"}, headers=admin).json()["id"]
+    _seed_collection_grant(src_id, "analyst1")  # the analyst can read the SOURCE only
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="moved.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many(
+        [{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "the quokka sentence lives here"}]
+    )
+    # A second file keeps the source alive after the move (a single-file
+    # source is soft-deleted, which would take it out of the searchable set
+    # and make the source-side assertions below vacuous).
+    _seed_files_direct(src_id, ["stays.txt"])
+
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["source_emptied"] is False
+
+    def _hits(token: str, corpus_id: str | None = None) -> list[str]:
+        params = {"q": "quokka sentence"}
+        if corpus_id:
+            params["corpus_id"] = corpus_id
+        resp = c.get("/api/collections/search", params=params, headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        return [res["file_id"] for res in resp.json()["results"]]
+
+    # Under the target: found. Under the source: gone — for the admin
+    # narrowing to it, and for the reader who holds the source grant only.
+    assert fid in _hits(seeded_app["admin_token"], dst_id)
+    assert fid not in _hits(seeded_app["admin_token"], src_id)
+    assert _hits(seeded_app["analyst_token"]) == []
+    # And the chunk rows themselves now point at the target.
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
+def test_move_file_chunk_failure_leaves_nothing_behind_in_the_source(seeded_app, monkeypatch):
+    """A failure re-homing the chunks must never leave the file moved with its
+    body still answering under the source.
+
+    The two writes commit separately (different repositories, and on the
+    frozen DuckDB backend different connections), so one can land without the
+    other. The chunks move FIRST for that reason: a failure then stops the
+    move before the file row is touched, so the content is never stranded in
+    the collection the caller is taking it OUT of — the exact leak this
+    endpoint is being fixed for. The half-done state is also replayable: the
+    file row still sits in the source, so the same request retries cleanly.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Fail Src"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Fail Dst"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="halfway.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "half moved body"}])
+
+    real_chunks_repo = corpus_chunks_repo
+    faulty = {"on": True}
+
+    def _maybe_exploding_chunks_repo():
+        repo = real_chunks_repo()
+        if not faulty["on"]:
+            return repo
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "reassign_file_corpus":
+                    raise RuntimeError("simulated chunk re-home failure")
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_chunks_repo", _maybe_exploding_chunks_repo)
+    with pytest.raises(RuntimeError, match="simulated chunk re-home failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": dst_id},
+            headers=admin,
+        )
+
+    # The file did not move, so its body is not stranded under a collection
+    # the file has left — file and chunks are both still in the source.
+    assert corpus_files_repo().get(fid)["corpus_id"] == src_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [src_id]
+
+    # And the same request replays to completion once the fault clears.
+    # (Clearing the fault by flag, not `monkeypatch.undo()` — that would also
+    # revert the fixture's own patches and log the caller out.)
+    faulty["on"] = False
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert corpus_files_repo().get(fid)["corpus_id"] == dst_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
+def test_move_file_file_row_failure_puts_the_content_back(seeded_app, monkeypatch):
+    """The mirror of the test above: when the FILE-ROW write is the one that
+    fails, the already-committed content move is compensated back.
+
+    Re-homing the content first is what keeps a failure from stranding the
+    body in the collection the file is leaving, but on its own it left the
+    opposite split: content under the target, file still in the source. That
+    is the benign direction — the caller has proven access to the target and
+    the request replays — but it is still a split nobody asked for, so the
+    endpoint undoes it before surfacing the error.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Undo Src"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Undo Dst"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="rolled-back.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "rolled back body"}])
+
+    real_files_repo = corpus_files_repo
+    faulty = {"on": True}
+
+    def _maybe_exploding_files_repo():
+        repo = real_files_repo()
+        if not faulty["on"]:
+            return repo
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+                    raise RuntimeError("simulated file-row move failure")
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _maybe_exploding_files_repo)
+    with pytest.raises(RuntimeError, match="simulated file-row move failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": dst_id},
+            headers=admin,
+        )
+
+    # Compensated: the content is back with the file it belongs to, and the
+    # target never keeps the body of a file that did not arrive.
+    assert corpus_files_repo().get(fid)["corpus_id"] == src_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [src_id]
+    assert corpus_chunks_repo().list_for_corpus(dst_id) == []
+
+    faulty["on"] = False
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
+def test_move_file_rollback_never_undoes_a_concurrent_successful_move(seeded_app, monkeypatch):
+    """A failed move's compensation must not drag back content that a
+    concurrent, SUCCESSFUL move of the same file has since claimed.
+
+    Two moves of one file overlap: ours re-homes the content, then its
+    file-row write fails; in that window the other request completes to a
+    different collection. Putting the content back unconditionally would
+    leave the file under the winner with its body under our source — the
+    exact leak this endpoint exists to close, produced by the cleanup for it.
+    The compensation is a compare-and-set: it reverts only rows still under
+    the target of the attempt that failed.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Race Src"}, headers=admin).json()["id"]
+    mine_id = c.post("/api/collections", json={"name": "Race Mine"}, headers=admin).json()["id"]
+    winner_id = c.post("/api/collections", json={"name": "Race Winner"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="contested.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "contested body"}])
+
+    real_files_repo = corpus_files_repo
+
+    def _losing_files_repo():
+        repo = real_files_repo()
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+
+                    def _fail(*_a, **_kw):
+                        # The competing request completes while we are here.
+                        corpus_chunks_repo().reassign_file_corpus(fid, winner_id)
+                        repo.move_to_corpus(fid, winner_id)
+                        raise RuntimeError("simulated file-row move failure")
+
+                    return _fail
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _losing_files_repo)
+    with pytest.raises(RuntimeError, match="simulated file-row move failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": mine_id},
+            headers=admin,
+        )
+
+    # The winner's move stands whole — file and body together, nothing of it
+    # left under the source our failed attempt started from.
+    assert corpus_files_repo().get(fid)["corpus_id"] == winner_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [winner_id]
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []
+
+
+def test_two_concurrent_moves_leave_the_file_and_its_body_together(seeded_app, monkeypatch):
+    """Two moves of one file to DIFFERENT collections must not split it.
+
+    Both requests validate the source before writing, so both reach the
+    file-row write. Without a guard the later one silently overwrites the
+    earlier, while the loser's body sits at ITS target — file in one
+    collection, content in another, which is the split this whole endpoint
+    exists to prevent. The file-row write is a compare-and-set on the source
+    the caller validated: the loser is refused, and its content is moved to
+    wherever the file actually ended up rather than back to a source the file
+    has left.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Both Src"}, headers=admin).json()["id"]
+    mine_id = c.post("/api/collections", json={"name": "Both Mine"}, headers=admin).json()["id"]
+    other_id = c.post("/api/collections", json={"name": "Both Other"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="raced.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "raced body"}])
+
+    real_files_repo = corpus_files_repo
+    other_done = {"yet": False}
+
+    def _interleaving_files_repo():
+        repo = real_files_repo()
+
+        class _Interleave:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+
+                    def _with_a_competitor(*args, **kwargs):
+                        # The competing move completes in full — content and
+                        # file row — just before ours writes its file row.
+                        if not other_done["yet"]:
+                            other_done["yet"] = True
+                            corpus_chunks_repo().reassign_file_corpus(fid, other_id)
+                            repo.move_to_corpus(fid, other_id)
+                        return repo.move_to_corpus(*args, **kwargs)
+
+                    return _with_a_competitor
+                return getattr(repo, name)
+
+        return _Interleave()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _interleaving_files_repo)
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": mine_id},
+        headers=admin,
+    )
+
+    # Our move lost the race and says so, rather than reporting a success it
+    # did not achieve.
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "move_conflict"
+
+    # Whoever won, the file and its body are in the SAME collection, and it is
+    # not the source they both left.
+    row = corpus_files_repo().get(fid)
+    chunk_homes = {ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)}
+    assert chunk_homes == {row["corpus_id"]}, "the file and its body must not be split"
+    assert row["corpus_id"] == other_id
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []
 
 
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
@@ -1171,7 +1506,7 @@ def test_reingest_stale_processing_is_recoverable(seeded_app, tmp_path):
     must be treated as crash-abandoned, not in-flight, so reingest proceeds
     (202) instead of 409 — otherwise a crash mid-ingest would permanently
     block the only recovery path for the stuck row."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from app.api.collections import REINGEST_STALE_PROCESSING_MINUTES
     from src.repositories import corpus_files_repo, file_corpora_repo
@@ -1191,7 +1526,7 @@ def test_reingest_stale_processing_is_recoverable(seeded_app, tmp_path):
 
     # Backdate updated_at past the threshold — simulates a crash mid-ingest,
     # where the row never got a chance to move past 'processing'.
-    stale_at = datetime.now(timezone.utc) - timedelta(minutes=REINGEST_STALE_PROCESSING_MINUTES + 5)
+    stale_at = datetime.now(UTC) - timedelta(minutes=REINGEST_STALE_PROCESSING_MINUTES + 5)
     conn = get_system_db()
     conn.execute(
         "UPDATE corpus_files SET updated_at = ? WHERE id = ?",
@@ -1886,6 +2221,88 @@ class TestFilePreview:
         assert body["kind"] == "text"
         assert body["truncated"] is True
         assert len(body["text"]) == _PREVIEW_MAX_CHARS
+        # The glance is a page, not a wall: the response says where the next
+        # one starts and how much text there is in all.
+        assert body["offset"] == 0
+        assert body["next_offset"] == _PREVIEW_MAX_CHARS
+        assert body["total_chars"] == _PREVIEW_MAX_CHARS + 5000
+
+    def test_preview_without_params_is_the_modal_contract(self, seeded_app):
+        """The modal sends no query string and must see exactly what it
+        always saw — plus the paging fields, which it ignores."""
+        cid = self._collection(seeded_app, "Preview Default")
+        fid = self._upload(seeded_app, cid, "notes.md", b"short body", "text/markdown")
+
+        body = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", headers=_auth(seeded_app["admin_token"]))
+            .json()
+        )
+        assert body["text"] == "short body"
+        assert body["truncated"] is False
+        assert body["offset"] == 0
+        assert body["next_offset"] is None
+        assert body["total_chars"] == len("short body")
+
+    def test_textual_file_pages_within_the_byte_window(self, seeded_app, monkeypatch):
+        """A textual file is read off disk up to `_PREVIEW_READ_MAX_BYTES`.
+        Pages walk that window; when the file continues past it the last
+        page still says `truncated: true` — with no `next_offset`, because
+        the endpoint cannot reach further — and `total_chars` counts only
+        what is reachable. A byte cap that paging silently hid would turn a
+        prefix into "the file"."""
+        monkeypatch.setattr("app.api.collections._PREVIEW_READ_MAX_BYTES", 64)
+        cid = self._collection(seeded_app, "Preview Window")
+        fid = self._upload(seeded_app, cid, "big.log", b"a" * 200, "text/plain")
+        url = f"/api/collections/{cid}/files/{fid}/preview"
+        tok = _auth(seeded_app["admin_token"])
+
+        first = seeded_app["client"].get(url, params={"limit": 50}, headers=tok).json()
+        assert first["text"] == "a" * 50
+        assert first["next_offset"] == 50
+        assert first["truncated"] is True
+        assert first["total_chars"] == 64
+
+        last = seeded_app["client"].get(url, params={"offset": 50, "limit": 50}, headers=tok).json()
+        assert last["text"] == "a" * 14
+        assert last["next_offset"] is None, "nothing past the byte window is reachable here"
+        assert last["truncated"] is True, "…but the file DOES continue, and the response must say so"
+        assert last["total_chars"] == 64
+
+    def test_textual_file_inside_the_byte_window_ends_cleanly(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.api.collections._PREVIEW_READ_MAX_BYTES", 64)
+        cid = self._collection(seeded_app, "Preview Window Fits")
+        fid = self._upload(seeded_app, cid, "small.log", b"b" * 60, "text/plain")
+
+        body = (
+            seeded_app["client"]
+            .get(
+                f"/api/collections/{cid}/files/{fid}/preview",
+                params={"offset": 50},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            .json()
+        )
+        assert body["text"] == "b" * 10
+        assert body["next_offset"] is None
+        assert body["truncated"] is False
+        assert body["total_chars"] == 60
+
+    def test_a_textless_preview_still_carries_the_paging_fields(self, seeded_app):
+        """One shape for every `kind`, so a paging client never branches on
+        whether the fields exist."""
+        cid = self._collection(seeded_app, "Preview None Paging")
+        fid = self._upload(seeded_app, cid, "deck.pptx", b"PK\x03\x04 fake", "application/octet-stream")
+
+        body = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", headers=_auth(seeded_app["admin_token"]))
+            .json()
+        )
+        assert body["kind"] == "none"
+        assert body["offset"] == 0
+        assert body["next_offset"] is None
+        assert body["total_chars"] == 0
 
     def test_image_previews_through_the_raw_endpoint(self, seeded_app):
         png = b"\x89PNG\r\n\x1a\n" + b"0" * 40

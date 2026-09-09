@@ -10,9 +10,10 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 # `runner` is imported for the stdin-protocol constants it defines (the
@@ -29,13 +30,15 @@ from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
-from app.chat.turn_usage import drain_turn_usage
+from app.chat.turn_context import TurnRecord, publish_turn, read_turn, workload_for_surface
+from app.chat.turn_usage import drain_turn_timing, drain_turn_usage
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
 from app.chat.workdir import WorkdirManager
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.coordination.leases import default_holder_id
 from src.llm_pricing import cost_usd
+from src.observability import otel as _otel
 from src.repositories import (
     RequiresPostgresBackend,
     agents_repo,
@@ -339,6 +342,25 @@ class SessionNotFound(Exception):
 #: delegate further.
 _MAX_DELEGATION_DEPTH = 1
 
+#: Frame types that carry the turn's id to the client (spec 3.2). Only the
+#: frames a reader can act on: the client needs the id to send feedback about
+#: an answer (3.5) and to group a turn's cards, and a `token` frame carries it
+#: too so a client that renders streaming text can attribute it before the
+#: assistant frame lands. Envelope-only frames (ready, session_renamed,
+#: approval cards) are left alone — they are not part of a turn's output.
+_TURN_FRAME_TYPES = frozenset(
+    {
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+        "error",
+        "done",
+        "token",
+        "cancelled",
+        "confirmation_required",
+    }
+)
+
 #: Bounded wait for a delegated agent's turn to complete
 #: (``ChatManager.handle_delegation``). Kept comfortably under the idle-turn
 #: watchdog's default ``AGNES_TURN_IDLE_SECONDS`` (300s, ``app/chat/runner.py``)
@@ -356,6 +378,17 @@ class SinkEntry:
 
     participant_email: str
     sink: object
+
+
+def _producer_stamp(frame: dict) -> float | None:
+    """The frame's ``emitted_at`` — a monotonic reading from the clock of
+    whichever process built the frame — or ``None`` when absent or not a
+    number. Only ever used as a DIFFERENCE between two frames of the same
+    producer; never compared with this process's clock."""
+    value = frame.get("emitted_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 @dataclass
@@ -411,7 +444,32 @@ class LiveSession:
     #: retirement and unattended-resolution must broadcast/deliver
     #: question-typed frames, not approval-typed ones.
     pending_questions: dict = field(default_factory=dict)
+    #: ``chat.tool_call`` audit rows waiting for their ``tool_result``, keyed
+    #: by ``tool_use_id`` → ``(perf_counter at the call frame's arrival, the
+    #: producer's own ``emitted_at`` stamp or None, params)``.
+    #: The row is written when the result arrives so it can carry the
+    #: tool's measured duration (``_audit_tool_call_finished``); whatever is
+    #: still here at turn end / kill / pump exit is written without one
+    #: (``_flush_pending_tool_audits``) so the attempt is never lost.
+    pending_tool_audits: dict[str, tuple[float, float | None, dict]] = field(default_factory=dict)
     turn_in_flight: bool = False
+    #: Observability (spec 3.2). The id minted for the turn currently in
+    #: flight — stamped onto every frame the turn broadcasts, written to
+    #: ``usage_turns.turn_uuid``, and published under ``chat:turn:{id}`` so
+    #: the broker can attribute the completions it forwards to this turn.
+    #: Survives the turn's end: the next delivery replaces it.
+    turn_id: str | None = None
+    #: The open ``agnes.chat.turn`` span, or ``None`` between turns (and
+    #: whenever OTLP export is off — then it is a non-recording stub).
+    turn_span: Any = None
+    turn_tool_calls: int = 0
+    #: Tool spans opened but not yet closed by their ``tool_result``, keyed
+    #: on the tool-use id. Drained when the turn closes, so a turn that ends
+    #: with a tool still running still exports the tool's span.
+    turn_tool_spans: dict[str, Any] = field(default_factory=dict)
+    #: The ``kind`` of this turn's error frame, if one arrived — the turn
+    #: span's status. A label, never the message.
+    turn_error_kind: str | None = None
     #: Track C7 (@delegation MVP) — depth-1 guard. 0 for an ordinary,
     #: user-driven session; set to 1 by ``ChatManager.handle_delegation``
     #: (via ``_pending_child_delegation_depth`` / ``_spawn_live``) for a
@@ -849,10 +907,14 @@ class ChatManager:
                         # The value `chat_sessions.surface` holds — web /
                         # slack_dm / slack_thread / telegram / api.
                         "surface": live.surface,
-                        # A fresh id per turn: chat turns are written exactly
-                        # once, live, so this is a unique key rather than the
-                        # dedup key it is for the (re-runnable) jsonl walker.
-                        "turn_uuid": str(uuid4()),
+                        # The turn's own id (spec 3.2) — the same value the
+                        # trace, the frames and the call ledger use, so the
+                        # token table can be joined to them. One id per turn,
+                        # written exactly once, so it is still the unique key
+                        # it has always been; the fallback covers a frame
+                        # arriving with no delivered turn behind it (a
+                        # post-restart replay).
+                        "turn_uuid": live.turn_id or str(uuid4()),
                         "model": frame.get("model"),
                         "input_tokens": int(frame.get("tokens_in") or 0),
                         "output_tokens": int(frame.get("tokens_out") or 0),
@@ -893,7 +955,19 @@ class ChatManager:
         the ``usage_turns`` row. ``drain_turn_usage`` never raises; a
         coordination outage leaves the frame untouched and the turn records
         exactly as before this feature existed.
+
+        Completion TIMING (``drain_turn_timing``) is hydrated on its own
+        rule: no frame producer reports it — only the broker, which forwards
+        every completion, can measure a completion's wall time — so it is
+        stamped whenever the counters hold any, even on a frame that carries
+        its own tokens. No double count is possible: nothing else ever
+        writes it.
         """
+        timing = drain_turn_timing(live.chat_id)
+        if timing is not None and frame.get("llm_calls") is None:
+            frame["llm_calls"] = timing["llm_calls"]
+            frame["llm_duration_ms"] = timing["llm_duration_ms"]
+            frame["llm_ttfb_ms"] = timing["llm_ttfb_ms"]
         drained = drain_turn_usage(live.chat_id)
         if drained is None:
             return
@@ -906,6 +980,153 @@ class ChatManager:
         frame["cache_creation_tokens"] = drained["cache_creation_tokens"]
         if not frame.get("model") and drained.get("model"):
             frame["model"] = drained["model"]
+
+    # --- turn structure for tracing (spec 3.2) ---------------------------
+    #
+    # A turn is a span: opened where the user message is delivered, closed
+    # where the answer lands, with one child span per tool call and the
+    # broker's completion spans parented under it from whatever replica
+    # forwarded them (``app/chat/turn_context.py``). Every call below is
+    # wrapped: the pump drains the runner's stdout, so an exception raised
+    # here would cost the session its answer — a measurement is never worth
+    # that.
+
+    def _open_turn(self, live: LiveSession, *, message_id: str | None) -> None:
+        """Open the turn span and publish the turn record. Never raises."""
+        try:
+            user_id = None
+            with contextlib.suppress(Exception):
+                # Best-effort, like every other identity read on this path:
+                # a turn from an address with no `users` row is still worth
+                # tracing, just unattributed.
+                user_id = (users_repo().get_by_email(live.user_email) or {}).get("id")
+            agent_id = None
+            with contextlib.suppress(Exception):
+                agent_id = getattr(self._repo.get_session(live.chat_id), "agent_id", None)
+            surface = str(getattr(live.surface, "value", live.surface) or "")
+            workload = workload_for_surface(surface)
+            live.turn_span = _otel.start_turn_span(
+                session_id=live.chat_id,
+                turn_id=live.turn_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                surface=surface,
+                workload=workload,
+            )
+            trace_id, span_id = _otel.span_ids(live.turn_span)
+            publish_turn(
+                live.chat_id,
+                TurnRecord(
+                    turn_id=str(live.turn_id),
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    started_at=datetime.now(UTC).isoformat(),
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    surface=surface,
+                    workload=workload,
+                    message_id=message_id,
+                ),
+            )
+        except Exception:
+            logger.debug("turn open failed for %s (non-fatal)", live.chat_id, exc_info=True)
+
+    @staticmethod
+    def _tool_key(frame: dict, live: LiveSession) -> str:
+        """Pairing key for a tool call and its result. The engine's
+        ``tool_use_id`` when it sent one; otherwise the call's ordinal in the
+        turn, which pairs correctly for the sequential case and is at worst a
+        mis-paired span for a provider that both omits ids and interleaves."""
+        tool_use_id = frame.get("tool_use_id")
+        return str(tool_use_id) if tool_use_id else f"#{live.turn_tool_calls}"
+
+    def _open_tool_span(self, live: LiveSession, frame: dict) -> None:
+        try:
+            live.turn_tool_calls += 1
+            live.turn_tool_spans[self._tool_key(frame, live)] = _otel.start_tool_span(
+                tool=str(frame.get("tool")),
+                # The same digest the `chat.tool_call` audit record carries —
+                # the arguments themselves never leave the instance.
+                args_hash=hash_args(frame.get("args", {})),
+                parent=live.turn_span,
+            )
+        except Exception:
+            logger.debug("tool span open failed for %s (non-fatal)", live.chat_id, exc_info=True)
+
+    def _close_tool_span(self, live: LiveSession, frame: dict) -> None:
+        try:
+            span = live.turn_tool_spans.pop(self._tool_key(frame, live), None)
+            if span is not None:
+                _otel.end_tool_span(span, is_error=bool(frame.get("is_error")))
+        except Exception:
+            logger.debug("tool span close failed for %s (non-fatal)", live.chat_id, exc_info=True)
+
+    def _close_turn(self, live: LiveSession, frame: dict) -> None:
+        """End the turn span with what the turn cost. Idempotent (the span is
+        taken off the session first, so a ``done`` following an
+        ``assistant_message`` closes nothing twice) and never raises."""
+        try:
+            span, live.turn_span = live.turn_span, None
+            if span is None:
+                return
+            # A tool still open at turn end (the turn was cancelled, or the
+            # provider never sent the result) would otherwise never be
+            # exported at all — an unended span is invisible.
+            for tool_span in live.turn_tool_spans.values():
+                _otel.end_tool_span(tool_span, is_error=False)
+            live.turn_tool_spans = {}
+            usage = None
+            cost = None
+            # Not spelled as the `assistant_message` persist branch below:
+            # tests/test_chat_sources_verdict.py locates that branch by its
+            # first occurrence in this file.
+            is_assistant = frame.get("type") == "assistant_message"
+            if is_assistant:
+                usage = {
+                    "model": frame.get("model"),
+                    "input_tokens": int(frame.get("tokens_in") or 0),
+                    "output_tokens": int(frame.get("tokens_out") or 0),
+                    "cache_read_tokens": int(frame.get("cache_read_tokens") or 0),
+                    "cache_creation_tokens": int(frame.get("cache_creation_tokens") or 0),
+                }
+                cost = round(
+                    cost_usd(
+                        model=frame.get("model"),
+                        input_tokens=usage["input_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        cache_read_tokens=usage["cache_read_tokens"],
+                        cache_creation_tokens=usage["cache_creation_tokens"],
+                    ),
+                    6,
+                )
+            _otel.end_turn_span(
+                span,
+                tool_calls=live.turn_tool_calls,
+                usage=usage,
+                cost_usd=cost,
+                error_kind=live.turn_error_kind,
+            )
+            self._mark_turn_closed(live)
+        except Exception:
+            logger.debug("turn close failed for %s (non-fatal)", live.chat_id, exc_info=True)
+
+    def _mark_turn_closed(self, live: LiveSession) -> None:
+        """Re-publish the turn record with ``ended_at`` set (same key, same
+        TTL, every other field unchanged) so a reader outside this turn —
+        memory provenance is the one that matters (finding B) — can tell the
+        turn is over instead of assuming it is still live. Never deletes the
+        record: the broker's late-completion linkage (finding A) still needs
+        a closed turn's ids for a completion that lands after this point.
+
+        Best-effort and non-fatal, like every other step in ``_close_turn``:
+        a read/publish failure just leaves the record looking open, which is
+        the same degraded (not wrong) behavior this feature did not exist
+        without.
+        """
+        record = read_turn(live.chat_id)
+        if record is None or record.turn_id != str(live.turn_id):
+            return  # already overwritten by a newer turn; nothing to close
+        publish_turn(live.chat_id, replace(record, ended_at=datetime.now(UTC).isoformat()))
 
     @staticmethod
     def _msg_window_key(sender: str) -> str:
@@ -2289,7 +2510,16 @@ class ChatManager:
         author = getattr(last, "sender_email", None) or live.user_email
         if live.participant_emails and author not in set(live.participant_emails):
             return  # SR-11
-        await self._deliver_local_user_message(live, last.content)
+        # Reuse the persisted row's turn_id/id (#2365 review) so the
+        # redelivered question joins the SAME turn as the answer that
+        # follows it -- exactly like every other delivery path this PR
+        # touched (the direct send, the role-split producer, the
+        # interrupted _partial_save). A legacy row written before the
+        # turn_id column existed, and every row on the frozen DuckDB
+        # backend (which drops the column on write, A3), carries
+        # turn_id=None -- _deliver_local_user_message mints a fresh one in
+        # that case exactly as it always has.
+        await self._deliver_local_user_message(live, last.content, turn_id=last.turn_id, message_id=last.id)
 
     async def _spawn_runner(self, session: ChatSession, session_dir: Path):
         from app.auth.access import mint_co_session_jwt, mint_session_jwt
@@ -2546,6 +2776,16 @@ class ChatManager:
 
     async def _pump_subprocess_to_ws(self, live: LiveSession) -> None:
         assert live.handle is not None
+        try:
+            await self._pump_frames(live)
+        finally:
+            # The pump leaving — EOF from a dead sandbox, a cancel on
+            # respawn or teardown — means no further tool_result will ever
+            # pair with a call still in flight; record those attempts now.
+            self._flush_pending_tool_audits(live)
+
+    async def _pump_frames(self, live: LiveSession) -> None:
+        assert live.handle is not None
         while True:
             line = await live.handle.stdout.readline()
             if not line:
@@ -2554,6 +2794,11 @@ class ChatManager:
                 frame = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # Arrival mark for the chat.tool_call duration fallback — taken
+            # before the fan-out below, so a slow sink on THIS frame never
+            # reads as tool time (the producers' own ``emitted_at`` stamps
+            # are preferred; see _audit_tool_call_finished).
+            arrived = time.perf_counter()
             live.last_activity = datetime.now(UTC)
             if frame.get("type") in ("approval_request", "question_request"):
                 # Stamped BEFORE the fan-out so every sink sees the same
@@ -2653,6 +2898,10 @@ class ChatManager:
                     live.pending_questions[rid] = frame
             elif ftype == "question_resolved":
                 live.pending_questions.pop(frame.get("request_id"), None)
+            elif ftype == "error":
+                # The turn span's status (spec 3.2). The KIND only — an error
+                # message can quote a model, a file or a user.
+                live.turn_error_kind = str(frame.get("kind") or "error")
             if ftype in ("approval_request", "question_request"):
                 # `attended` is stamped BEFORE the fan-out (the frame_seq
                 # contract wants one envelope for every sink), but _broadcast
@@ -2692,7 +2941,11 @@ class ChatManager:
                     tokens_out=frame.get("tokens_out"),
                     cache_read_tokens=frame.get("cache_read_tokens"),
                     cache_creation_tokens=frame.get("cache_creation_tokens"),
+                    llm_calls=frame.get("llm_calls"),
+                    llm_duration_ms=frame.get("llm_duration_ms"),
+                    llm_ttfb_ms=frame.get("llm_ttfb_ms"),
                     model=frame.get("model"),
+                    turn_id=live.turn_id,
                 )
                 # Feed the turn's token delta into the shared daily-spend
                 # counters _daily_token_totals checks in send_user_message.
@@ -2706,6 +2959,10 @@ class ChatManager:
                 # counter above: that counter gates the user's next turn, so
                 # it must never queue behind a telemetry write.
                 self._record_turn_usage(live, frame)
+                self._flush_pending_tool_audits(live)
+                # ...and close the turn's span with the same figures, so the
+                # trace and the usage row price one turn identically.
+                self._close_turn(live, frame)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
                 # Auto-title backstop: the primary trigger is the first
@@ -2719,6 +2976,10 @@ class ChatManager:
                 if not live.auto_title_started:
                     self._retry_auto_title_if_untitled(live)
             elif ftype == "done":
+                self._flush_pending_tool_audits(live)
+                # Closes a turn that ended without an assistant frame (a
+                # cancelled or errored turn); a no-op after one.
+                self._close_turn(live, frame)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
                 # #2268: copy this turn's deliverables OUT of the sandbox
@@ -2726,15 +2987,96 @@ class ChatManager:
                 # see _schedule_artifact_harvest.
                 self._schedule_artifact_harvest(live)
             if ftype == "tool_call":
-                write_audit(
-                    user_email=live.user_email,
-                    action="chat.tool_call",
-                    details={
-                        "session_id": live.chat_id,
-                        "tool": frame.get("tool"),
-                        "args_hash": hash_args(frame.get("args", {})),
-                    },
-                )
+                self._audit_tool_call_started(live, frame, arrived)
+                self._open_tool_span(live, frame)
+            elif ftype == "tool_result":
+                self._close_tool_span(live, frame)
+                self._audit_tool_call_finished(live, frame, arrived)
+
+    # ------------------------------------------------------------------
+    # chat.tool_call audit — one row per call, timed call → result
+    # ------------------------------------------------------------------
+
+    def _audit_tool_call_started(self, live: LiveSession, frame: dict, arrived: float) -> None:
+        """Hold a ``tool_call`` frame's audit row until its result arrives.
+
+        The row used to be written right here, before the tool had run, so
+        its ``duration_ms`` was always NULL and the observability KPIs could
+        say nothing about how long chat tools take. Both frame producers
+        (``app/chat/runner.py``, ``app/chat/kai_engine_provider.py``) stamp
+        ``tool_use_id`` on the call AND on its ``tool_result``, so the pair
+        is correlated on it and ``_audit_tool_call_finished`` writes the row
+        with the duration — an approval wait included, which is the latency
+        the user actually sat through. A frame with no pairing id cannot be
+        matched to a result and is written at once, exactly as before,
+        rather than given an invented duration. ``params`` is unchanged:
+        identifiers and an argument hash, never the arguments.
+
+        ``arrived`` is this frame's ``perf_counter`` at decode time — the
+        fallback clock; the producers' own ``emitted_at`` stamps are what
+        the duration is normally taken from (see the sibling below).
+        """
+        details = {
+            "session_id": live.chat_id,
+            "tool": frame.get("tool"),
+            "args_hash": hash_args(frame.get("args", {})),
+        }
+        tool_use_id = str(frame.get("tool_use_id") or "")
+        if not tool_use_id:
+            # Explicit None: nothing was measured, and the repository must
+            # not autofill a request age this pump task may have inherited.
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details, duration_ms=None)
+            return
+        live.pending_tool_audits[tool_use_id] = (arrived, _producer_stamp(frame), details)
+
+    def _audit_tool_call_finished(self, live: LiveSession, frame: dict, arrived: float) -> None:
+        """Write the paired ``chat.tool_call`` row for a ``tool_result``,
+        with the measured duration and the result frame's own verdict.
+
+        The duration is the difference between the two frames' ``emitted_at``
+        stamps when both carry one — the producer's own monotonic clock,
+        read where the frames are born, so nothing that happens on the way
+        here counts: this pump is one sequential loop, and a slow sink on
+        the call frame delays even READING the result frame, which no
+        manager-side clock can tell apart from tool time. Without a stamp on
+        both sides (an older producer, or a stamp on only one of them — a
+        stamp is only comparable with one from the same clock) it falls back
+        to the frames' arrival at the pump, taken before each fan-out.
+        """
+        pending = live.pending_tool_audits.pop(str(frame.get("tool_use_id") or ""), None)
+        if pending is None:
+            return  # no call on record for this result (unpaired producer)
+        call_arrived, call_stamp, details = pending
+        result_stamp = _producer_stamp(frame)
+        if call_stamp is not None and result_stamp is not None and result_stamp >= call_stamp:
+            duration_ms = int((result_stamp - call_stamp) * 1000)
+        else:
+            duration_ms = int((arrived - call_arrived) * 1000)
+        write_audit(
+            user_email=live.user_email,
+            action="chat.tool_call",
+            details=details,
+            duration_ms=duration_ms,
+            result="error" if frame.get("is_error") else "success",
+        )
+
+    def _flush_pending_tool_audits(self, live: LiveSession) -> None:
+        """Record every call still awaiting a result — without a duration.
+
+        Runs when a turn ends (``assistant_message`` / ``done``), on a forced
+        kill, and when the pump exits: the attempt stays in the trail even
+        when the sandbox died mid-tool, and a NULL duration says honestly
+        that nobody measured one.
+        """
+        if not live.pending_tool_audits:
+            return
+        for _arrived, _stamp, details in live.pending_tool_audits.values():
+            # ``duration_ms=None`` on purpose (a real NULL, never the
+            # autofill): this task may have been created inside the HTTP
+            # request that spawned the session, and an unfinished call
+            # flushed later must not be stamped with that request's age.
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details, duration_ms=None)
+        live.pending_tool_audits.clear()
 
     # ------------------------------------------------------------------
     # Turn-end artifact harvest (#2268)
@@ -2929,6 +3271,13 @@ class ChatManager:
         """
         dead: list[SinkEntry] = []
         async with live._broadcast_lock:
+            # The turn's id rides the same envelope as its seq (spec 3.2), so
+            # a client can group a turn's frames and name the turn it is
+            # giving feedback about. `setdefault`: a frame that already
+            # carries an id (a replay of a buffered frame from an earlier
+            # turn) keeps its own.
+            if live.turn_id and frame.get("type") in _TURN_FRAME_TYPES:
+                frame.setdefault("turn_id", live.turn_id)
             stamp_frame(live.chat_id, frame)
             for entry in list(live.sinks):
                 try:
@@ -3135,7 +3484,14 @@ class ChatManager:
             on_limit = _notify
         await enforce_sender_limits(self._repo, self._config, sender, chat_id, on_limit=on_limit)
 
-    async def _deliver_local_user_message(self, live: LiveSession, text: str) -> None:
+    async def _deliver_local_user_message(
+        self,
+        live: LiveSession,
+        text: str,
+        *,
+        message_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
         """Write ``text`` as a ``user_msg`` stdin frame to ``live``'s runner
         and update local turn-state.
 
@@ -3145,11 +3501,61 @@ class ChatManager:
         the turn-state bookkeeping (turn_buffer/turn_in_flight/
         last_activity/state) that follows a send, regardless of whether the
         text arrived via a direct call or the chat-in:{chat_id} stream.
+
+        This is also where a turn BEGINS for observability (spec 3.2): the
+        turn id is minted here, next to ``turn_in_flight`` — unless the
+        caller already minted one for the user row it just persisted
+        (``send_user_message``, so the row and this turn agree on the same
+        id), in which case it is passed in as ``turn_id`` and reused as-is.
+        ``message_id`` is that same persisted user row's id when the caller
+        has one — ``send_user_message``'s direct-owner path always does,
+        and ``_inbound_consumer_loop``'s forwarded-delivery path does too
+        once ``produce_inbound_user_message`` published it on the entry
+        (#2365 review); an entry from an older replica carries neither key
+        and this stays ``None``, same as before.
+
+        The turn context (id, span, published record) is established BEFORE
+        the stdin write, not after (review finding on #2365): a fast runner
+        can call the broker inside the gap between the write and this
+        method's bookkeeping, and that first completion must find the turn
+        record already published and the span already open, not a race
+        against them. ``turn_in_flight``/``turn_buffer`` stay set only once
+        the drain actually succeeds, same as before — nothing outside this
+        method may see a turn "in flight" that was never handed to the
+        runner. A write/drain failure ends the turn span this call just
+        opened (so it is never left dangling and unexported) and re-raises;
+        it does not resurrect the previous turn, whose span this call
+        already closed as part of establishing the new one.
         """
         payload = json.dumps({"type": "user_msg", "text": text}) + "\n"
-        async with live._stdin_lock:
-            live.handle.stdin.write(payload.encode("utf-8"))
-            await live.handle.stdin.drain()
+        # A previous turn still open here (a co-driver's message landing
+        # mid-turn) would otherwise have its span orphaned — an unended span
+        # is never exported at all. Closing it first is a no-op in the
+        # ordinary case, where the answer already closed it.
+        self._close_turn(live, {"type": "done"})
+        live.turn_id = turn_id or str(uuid4())
+        live.turn_tool_calls = 0
+        live.turn_tool_spans = {}
+        live.turn_error_kind = None
+        # Open the span and publish the turn record BEFORE the runner can
+        # see the message (#2365 review) — a completion racing the drain
+        # below must find a turn to join, not an empty key.
+        self._open_turn(live, message_id=message_id)
+        try:
+            async with live._stdin_lock:
+                live.handle.stdin.write(payload.encode("utf-8"))
+                await live.handle.stdin.drain()
+        except Exception:
+            # The message never reached the runner. `turn_in_flight` and
+            # `turn_buffer` were never touched (they are only set below,
+            # after a successful drain), so the only thing this call leaves
+            # behind is the span/record just opened above -- close it the
+            # same way an ordinary answer-less turn end does (a "done" with
+            # no assistant frame) so it is never left dangling and
+            # unexported, then let the caller see the original failure.
+            live.turn_error_kind = "delivery_failed"
+            self._close_turn(live, {"type": "done"})
+            raise
         live.turn_buffer.clear()
         live.turn_in_flight = True
         live.last_activity = datetime.now(UTC)
@@ -3913,7 +4319,19 @@ class ChatManager:
                         # webhook handler never attaches one).
                         await self._ensure_slack_sink(live, slack_origin)
                     try:
-                        await self._deliver_local_user_message(live, text)
+                        # entry["turn_id"] (present since
+                        # produce_inbound_user_message started minting it
+                        # before persisting the user row) is threaded
+                        # through so this turn agrees with the persisted
+                        # row; entry["message_id"] (that same row's own id,
+                        # #2365 review) is threaded the same way so memory
+                        # provenance can record source_message_id for a
+                        # forwarded turn too. An entry from an older replica
+                        # carries neither, and _deliver_local_user_message
+                        # mints a fresh turn id exactly as it always has.
+                        await self._deliver_local_user_message(
+                            live, text, turn_id=entry.get("turn_id"), message_id=entry.get("message_id")
+                        )
                     except Exception:
                         logger.exception("inbound consumer: delivery failed for %s seq %s; skipping", chat_id, seq)
                     live.inbound_last_seq = seq
@@ -4093,12 +4511,20 @@ class ChatManager:
                 client_msg_id,
             )
             return
+        # Minted HERE, before the user row is persisted, so the row, the
+        # turn span, the frames, the assistant row and usage_turns all agree
+        # on one id (spec 3.2) — this is the one delivery path that persists
+        # the user row itself, so it is the only place that CAN mint before
+        # persist. ``_deliver_local_user_message`` reuses it instead of
+        # minting its own.
+        turn_id = str(uuid4())
         try:
-            self._repo.append_message(
+            user_message = self._repo.append_message(
                 session_id=chat_id,
                 role="user",
                 content=text,
                 sender_email=sender_email or live.user_email,
+                turn_id=turn_id,
             )
         except Exception:
             # Hand the claim back: the row does not exist, so the client's
@@ -4117,7 +4543,13 @@ class ChatManager:
             details={"session_id": chat_id, "chars": len(text)},
         )
         self._emit_chat_message_event(chat_id=chat_id, surface=live.surface, sender=sender)
-        await self._deliver_local_user_message(live, text)
+        # The persisted user row's id goes onto the turn record (spec 3.2);
+        # the forwarded (produce_inbound_user_message) path threads the
+        # same id through its own persisted row via the chat-in entry's
+        # message_id (#2365 review).
+        await self._deliver_local_user_message(
+            live, text, message_id=getattr(user_message, "id", None), turn_id=turn_id
+        )
 
     async def leave_session(self, chat_id: str, participant_email: str) -> None:
         """SR-9: atomically stamp left_at, remove+close the leaver's sink,
@@ -4325,11 +4757,25 @@ class ChatManager:
                 tokens_in=None,
                 tokens_out=None,
                 model=None,
+                # #2365 review: the user row of this same turn was persisted
+                # with a turn_id (send_user_message / produce_inbound_user_
+                # message mint one before persist) -- the partial answer must
+                # share it, or a reload can never rate it or join it to its
+                # own turn in the corpus export. None when a caller reaches
+                # here with no live turn ever delivered (turn_id defaults to
+                # None); the frozen DuckDB backend accepts and drops the
+                # value regardless (A3, same as the normal assistant write
+                # above this method).
+                turn_id=live.turn_id,
             )
         except Exception:
             # Teardown is best-effort throughout — a failed partial-save must
             # not abort the rest of the kill (sandbox destroy, lease release).
             logger.exception("partial-save failed for %s", live.chat_id)
+        self._flush_pending_tool_audits(live)
+        # This path clears `turn_in_flight` outside the pump, so it owes the
+        # turn span its end too — an unended span is never exported at all.
+        self._close_turn(live, {"type": "done"})
         live.turn_buffer.clear()
         live.turn_in_flight = False
 
@@ -4538,6 +4984,7 @@ class ChatManager:
                         getattr(self._config, "vertex_project_id", ""),
                         getattr(self._config, "vertex_region", ""),
                     ),
+                    session_id=live.chat_id,
                 )
             except asyncio.CancelledError:
                 # A pause or a kill cancels every task in ``live.tasks``, this
@@ -5490,6 +5937,16 @@ async def produce_inbound_user_message(
     deployment: this function is the persist for a message that arrived on a
     replica which does not host the session, so a claim made only in the
     manager's process-local set would not have covered it.
+
+    Minted HERE, before the user row is persisted -- same placement and
+    reasoning as ``ChatManager.send_user_message``'s ``turn_id`` (see that
+    method's comment): this is the thin-producer's own persist of the user
+    row, so it is the only place on THIS path that can mint before persist.
+    It rides the published ``chat-in:{chat_id}`` entry so the owning
+    gateway's ``_inbound_consumer_loop`` can hand the SAME id to
+    ``_deliver_local_user_message`` instead of minting a fresh one there --
+    closing the gap where a forwarded turn's user row and assistant row used
+    to disagree on their turn_id.
     """
     session = repo.get_session(chat_id)
     if session is None:
@@ -5503,12 +5960,20 @@ async def produce_inbound_user_message(
             client_msg_id,
         )
         return
+    turn_id = str(uuid4())
     try:
-        repo.append_message(
+        # #2365 review: the returned row used to be discarded here, so a
+        # forwarded turn's message id never reached the chat-in entry below
+        # (unlike the direct-owner path's send_user_message, which already
+        # threads its own persisted row's id through _deliver_local_user_
+        # message) -- a memory written during that turn could record
+        # source_turn_id but never source_message_id.
+        user_message = repo.append_message(
             session_id=chat_id,
             role="user",
             content=text,
             sender_email=sender,
+            turn_id=turn_id,
         )
     except Exception:
         await release_user_message_claim(chat_id, client_msg_id)
@@ -5527,4 +5992,10 @@ async def produce_inbound_user_message(
         surface=getattr(session.surface, "value", str(session.surface)),
         sender=sender,
     )
-    await inbound.publish_inbound(chat_id, text, slack=slack_origin)
+    await inbound.publish_inbound(
+        chat_id,
+        text,
+        slack=slack_origin,
+        turn_id=turn_id,
+        message_id=getattr(user_message, "id", None),
+    )

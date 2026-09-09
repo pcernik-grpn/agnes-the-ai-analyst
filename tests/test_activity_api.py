@@ -1,12 +1,13 @@
 """Activity Center read API."""
 
+from datetime import UTC, datetime
+
 import pytest
-from datetime import datetime, timezone
 
 
 @pytest.fixture(autouse=True)
 def _reset_activity_dedup():
-    from app.api.activity import _RECENT_AUDITS, _HEALTH_CACHE
+    from app.api.activity import _HEALTH_CACHE, _RECENT_AUDITS
 
     _RECENT_AUDITS.clear()
     _HEALTH_CACHE["data"] = None
@@ -87,9 +88,10 @@ def test_activity_timeline_folds_in_sync_llm_and_agent_scope_trails(seeded_app, 
     """E3 slice 2: the timeline is a unified projection over audit_log +
     sync_history + llm_usage + agent_scope_snapshots — not audit_log alone."""
     import uuid
+
     from src.db import get_system_db
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     conn = get_system_db()
     conn.execute(
         "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
@@ -128,6 +130,7 @@ def test_activity_timeline_folds_in_sync_llm_and_agent_scope_trails(seeded_app, 
 
 def test_activity_timeline_trail_filter_narrows_to_audit_only(seeded_app, admin_user):
     import uuid
+
     from src.db import get_system_db
     from src.repositories.audit import AuditRepository
 
@@ -136,7 +139,7 @@ def test_activity_timeline_trail_filter_narrows_to_audit_only(seeded_app, admin_
     conn.execute(
         "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [str(uuid.uuid4()), "t1", datetime.now(timezone.utc), 1, 1, "ok", None],
+        [str(uuid.uuid4()), "t1", datetime.now(UTC), 1, 1, "ok", None],
     )
     conn.close()
 
@@ -158,6 +161,7 @@ def test_activity_timeline_never_surfaces_chat_messages(seeded_app, admin_user):
     """Privacy regression: chat transcript content must never leak into the
     unified Activity Center timeline (docs/observability.md)."""
     import uuid
+
     from src.db import get_system_db
 
     secret = "customer churn is 4.2 percent, keep this confidential"
@@ -165,11 +169,11 @@ def test_activity_timeline_never_surfaces_chat_messages(seeded_app, admin_user):
     session_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO chat_sessions (id, user_email, surface, started_at) VALUES (?, ?, ?, ?)",
-        [session_id, "leak-probe@example.com", "web", datetime.now(timezone.utc)],
+        [session_id, "leak-probe@example.com", "web", datetime.now(UTC)],
     )
     conn.execute(
         "INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-        [str(uuid.uuid4()), session_id, "user", secret, datetime.now(timezone.utc)],
+        [str(uuid.uuid4()), session_id, "user", secret, datetime.now(UTC)],
     )
     conn.close()
 
@@ -194,9 +198,10 @@ def test_activity_health_returns_pulse(seeded_app, admin_user):
 
 def test_activity_sync_returns_recent(seeded_app, admin_user):
     import uuid
+
     from src.db import get_system_db
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     conn = get_system_db()
     conn.execute(
         "INSERT INTO sync_history (id, table_id, synced_at, rows, duration_ms, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -297,7 +302,7 @@ class TestKpiTableParity:
 
     def _seed(self):
         import uuid
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from src.db import get_system_db
         from src.repositories.audit import AuditRepository
@@ -309,7 +314,7 @@ class TestKpiTableParity:
         repo.log(user_id="alice", action="query.run", result="error.400", client_kind="web")
         repo.log(user_id="bob", action="query.run", result="denied", client_kind="cli")
         repo.log(user_id="sched-user", action="run_session_processor:usage", result="success")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # One row per non-audit trail — sync_history/agent_scope_snapshots
         # carry no user_id (system/agent-runtime actors); the llm_usage row
         # reuses "alice" as the owning user so the pre-existing
@@ -421,14 +426,14 @@ def test_sessions_kpis_match_adoption_kpis(seeded_app, admin_user):
     """Glossary pin (consistency spec Phase D): the sessions browser and the
     adoption dashboard read the same table with the same anchor — their
     headline numbers must be equal for an equivalent window."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from src.db import get_system_db
     from src.repositories.usage import UsageRepository
 
     conn = get_system_db()
     repo = UsageRepository(conn)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for i, (user, sid) in enumerate([("ann", "s1"), ("ann", "s2"), ("ben", "s3")]):
         repo.upsert_summary(
             {
@@ -467,7 +472,7 @@ def test_sessions_kpis_match_adoption_kpis(seeded_app, admin_user):
 def test_health_reconciles_uploads_vs_ingested(seeded_app, admin_user):
     """Health pulse: uploaded session files without a summary row show as a
     yellow ingest gap; complete ingest is green. Join on file basename."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from src.db import get_system_db
     from src.repositories.audit import AuditRepository
@@ -490,7 +495,7 @@ def test_health_reconciles_uploads_vs_ingested(seeded_app, admin_user):
                 "session_id": f"content-id-{sid}",  # differs from file stem on purpose
                 "username": "ann@example.com",
                 "user_id": "u-1",
-                "started_at": datetime.now(timezone.utc),
+                "started_at": datetime.now(UTC),
             },
             processor_version=1,
         )
@@ -502,3 +507,304 @@ def test_health_reconciles_uploads_vs_ingested(seeded_app, admin_user):
     assert field["value"] == "3 up / 2 ingested"
     assert field["color"] == "yellow"
     assert field["raw"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cursor pagination — window pinning (PR #2400 review, Finding B)
+#
+# since_minutes computes `since = now() - since_minutes` fresh on every
+# call. A paged read spans several calls; if wall-clock time advances
+# between them, that floor drifts forward and a row that was inside the
+# caller's original window can fall out between two pages — appearing on
+# neither. next_cursor now carries the floor the FIRST call computed
+# (since_ts) so a continuation can pin the window instead of recomputing it.
+# ---------------------------------------------------------------------------
+
+
+class _FrozenDatetime(datetime):
+    """A `datetime` subclass whose `.now()` returns a settable fixed value,
+    monkeypatched over `app.api.activity.datetime` to control "now" without
+    a real clock dependency (same pattern as tests/test_kai_host.py)."""
+
+    _fixed: "datetime"
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+
+def test_pinned_floor_survives_a_wall_clock_advance_between_pages(seeded_app, admin_user, monkeypatch):
+    import app.api.activity as activity_mod
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    t0 = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+    _FrozenDatetime._fixed = t0
+    monkeypatch.setattr(activity_mod, "datetime", _FrozenDatetime)
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    recent_id = repo.log(action="test.winpin.recent", result="success")
+    edge_id = repo.log(action="test.winpin.edge", result="success")
+    # since_minutes=60 -> floor at t0 is t0 - 60min. The "recent" row sits
+    # well inside the window; the "edge" row sits only 30s inside it — close
+    # enough to fall below a floor recomputed after more than 30s pass.
+    from datetime import timedelta as _td
+
+    conn.execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [t0 - _td(minutes=1), recent_id])
+    conn.execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [t0 - _td(minutes=59, seconds=30), edge_id])
+    conn.close()
+
+    c = seeded_app["client"]
+    page1 = c.get(
+        "/api/admin/activity",
+        params={"since_minutes": 60, "limit": 1, "action_prefix": "test.winpin."},
+        headers=admin_user,
+    ).json()
+    assert [r["action"] for r in page1["rows"]] == ["test.winpin.recent"]
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+    assert "since_ts" in cursor
+
+    # Wall clock advances 5 minutes between the two page requests — long
+    # enough that a floor recomputed at page-2 time (t0 + 5min - 60min)
+    # would sit past the edge row's timestamp and exclude it.
+    _FrozenDatetime._fixed = t0 + _td(minutes=5)
+
+    page2 = c.get(
+        "/api/admin/activity",
+        params={
+            "since_minutes": 60,
+            "limit": 1,
+            "action_prefix": "test.winpin.",
+            "cursor_ts": cursor["ts"],
+            "cursor_id": cursor["id"],
+            "since_ts": cursor["since_ts"],
+        },
+        headers=admin_user,
+    ).json()
+    assert [r["action"] for r in page2["rows"]] == ["test.winpin.edge"], (
+        "the edge row fell out of the paged read when the clock advanced between "
+        "calls — pagination must run over the floor pinned at the first call, not "
+        "a freshly recomputed one"
+    )
+
+
+def test_omitting_since_ts_falls_back_to_recomputing_the_floor(seeded_app, admin_user):
+    """Backward compatibility: a caller that reconstructs cursor_ts/cursor_id
+    by hand without since_ts (e.g. the Activity Center web page before its
+    own forwarding fix, or any other pre-existing integration) must keep
+    working exactly as before this field existed."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={
+            "since_minutes": 60,
+            "limit": 1,
+            "cursor_ts": "2026-01-01T00:00:00+00:00",
+            "cursor_id": "does-not-exist",
+        },
+        headers=admin_user,
+    )
+    assert r.status_code == 200
+
+
+def test_cursor_without_since_ts_still_pages_correctly(seeded_app, admin_user):
+    """The pre-change cursor shape (cursor_ts + cursor_id, no since_ts) must
+    keep paging through REAL rows correctly, not merely return 200 — a
+    caller that never forwards since_ts (an old integration, or a hand-built
+    cursor) must still reach page two, not silently restart at page one."""
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    repo.log(action="test.nosincets.first", result="success")
+    repo.log(action="test.nosincets.second", result="success")
+    conn.close()
+
+    c = seeded_app["client"]
+    page1 = c.get(
+        "/api/admin/activity",
+        params={"action_prefix": "test.nosincets.", "limit": 1},
+        headers=admin_user,
+    ).json()
+    assert page1["rows"][0]["action"] == "test.nosincets.second"
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+
+    page2 = c.get(
+        "/api/admin/activity",
+        params={
+            "action_prefix": "test.nosincets.",
+            "limit": 1,
+            "cursor_ts": cursor["ts"],
+            "cursor_id": cursor["id"],
+        },
+        headers=admin_user,
+    ).json()
+    assert page2["rows"][0]["action"] == "test.nosincets.first"
+
+
+# ---------------------------------------------------------------------------
+# Cursor / since_ts validation hardening (PR #2400 second review round)
+#
+# since_ts riding back in next_cursor let `since = since_ts if since_ts is
+# not None else ...` accept ANY absolute floor unconditionally — a caller
+# could pass a floor years back and scan the whole archive regardless of the
+# since_minutes ceiling (`ge=1, le=43200`). since_ts is now continuation-only
+# (requires a complete cursor) and bounded to at most since_minutes before
+# cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond
+# what since_minutes already allows. A half cursor (exactly one of
+# cursor_ts/cursor_id) is rejected the same way the MCP tool and CLI already
+# reject it, instead of silently restarting the timeline at page one.
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_since_ts_without_cursor_is_rejected(seeded_app, admin_user):
+    """A fresh (uncursored) read that sets since_ts directly must be
+    refused, not silently ignored — a silently ignored parameter is its own
+    trap (the caller believes the floor is pinned; it silently isn't)."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"since_ts": "2020-01-01T00:00:00+00:00"},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "since_ts" in r.json()["detail"]
+
+
+def test_since_ts_predating_the_window_is_rejected(seeded_app, admin_user):
+    """A hand-built cursor cannot use since_ts to widen a single read's scan
+    beyond what since_minutes bounds — since_ts more than since_minutes
+    before cursor_ts must be refused, not silently honoured."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={
+            "since_minutes": 60,
+            "cursor_ts": "2026-09-09T12:00:00+00:00",
+            "cursor_id": "abc-123",
+            "since_ts": "2020-01-01T00:00:00+00:00",
+        },
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "since_ts" in r.json()["detail"]
+
+
+def test_half_cursor_ts_only_is_rejected_at_endpoint(seeded_app, admin_user):
+    """The MCP tool and CLI already reject a half cursor — the endpoint
+    itself must too, rather than silently returning page one for a REST
+    caller supplying only one half."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_ts": "2026-09-09T12:00:00+00:00"},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_id" in r.json()["detail"]
+
+
+def test_half_cursor_id_only_is_rejected_at_endpoint(seeded_app, admin_user):
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_id": "abc-123"},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_ts" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Empty/whitespace cursor_id — row loss, not just a half-cursor pair
+#
+# "" and "   " are not None, so `(cursor_ts is None) != (cursor_id is None)`
+# waves them through as a "complete" cursor. Keyset pagination then compares
+# `(timestamp, id) < (cursor_ts, cursor_id)` — no real id is ever less than
+# an empty (or whitespace-only) string, so every row sharing cursor_ts's
+# exact timestamp silently vanishes from every remaining page. This is
+# silent row loss, not a 4xx: the response looks like a normal, valid page.
+# ---------------------------------------------------------------------------
+
+
+def test_blank_cursor_id_would_silently_drop_every_row_tied_on_cursor_ts(seeded_app, admin_user):
+    """Prove the row-loss mechanism itself, then prove the endpoint now
+    refuses to ever let a caller reach it.
+
+    Two rows share the exact same timestamp. At the repository layer, a
+    cursor whose id is "" excludes BOTH of them — real, demonstrated data
+    loss, not a hypothetical (`id < ""` is false for every real id, so the
+    tie-break the id half exists to resolve can never fire). The endpoint
+    must reject a blank cursor_id outright rather than let this call shape
+    ever reach the repository.
+    """
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    id_a = repo.log(action="test.tied.a", result="success")
+    id_b = repo.log(action="test.tied.b", result="success")
+    tied_ts = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+    conn.execute("UPDATE audit_log SET timestamp = ? WHERE id IN (?, ?)", [tied_ts, id_a, id_b])
+
+    # The mechanism: a cursor with an empty id, pinned at the exact tied
+    # timestamp, excludes BOTH rows that share it.
+    rows, _ = repo.query_unified(action_prefix="test.tied.", cursor=(tied_ts, ""), limit=10)
+    assert rows == [], (
+        "sanity check on the row-loss mechanism failed — if this fires, the repository "
+        "changed its tie-break semantics and the rest of this test no longer proves anything"
+    )
+
+    # Confirm the rows are real and reachable with a genuine id — the
+    # emptiness of the id above, not the rows' absence, is what caused
+    # the loss.
+    rows_with_real_cursor, _ = repo.query_unified(action_prefix="test.tied.", cursor=(tied_ts, "￿"), limit=10)
+    conn.close()
+    returned = {r["action"] for r in rows_with_real_cursor}
+    assert {"test.tied.a", "test.tied.b"} <= returned
+
+    # The endpoint must never let a caller reach the empty-id call shape —
+    # loud 400, not a silent 200 that drops both tied rows.
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"action_prefix": "test.tied.", "cursor_ts": tied_ts.isoformat(), "cursor_id": ""},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_id" in r.json()["detail"]
+
+
+def test_whitespace_only_cursor_id_is_rejected_at_endpoint(seeded_app, admin_user):
+    """Same defect, different degenerate value — a whitespace-only id is
+    also not None and is lexicographically ahead of every alphanumeric id,
+    so it silently drops tied rows the same way "" does. Must be rejected
+    the same way, not merely the exact-empty-string case."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_ts": "2026-09-09T12:00:00+00:00", "cursor_id": "   "},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_id" in r.json()["detail"]
+
+
+def test_cursor_ts_cannot_arrive_as_an_empty_string(seeded_app, admin_user):
+    """Unlike cursor_id (a plain str), cursor_ts is typed as a datetime —
+    FastAPI/pydantic rejects an empty-string value with 422 before this
+    endpoint's own validation ever runs, so there is no equivalent
+    empty-string degenerate form to guard here. This test pins that
+    verified behavior rather than leaving it assumed."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_ts": "", "cursor_id": "abc-123"},
+        headers=admin_user,
+    )
+    assert r.status_code == 422

@@ -9,7 +9,11 @@ its own 365-day default, unchanged by this module's generalization.
 Track E3 Slice 1 generalizes the *pattern* — short-circuit on a non-positive
 window, delete only the trail's own table, return a deleted-row count — to
 the other unbounded trails: ``sync_history``, ``llm_usage``, and
-``agent_scope_snapshots``. Each is dispatched through :func:`prune_trail` /
+``agent_scope_snapshots``. ``llm_calls`` (the LLM observability ledger,
+design 2026-09-08) joined the same sweep later, Postgres-only — its pruner
+resolves the repo itself (no ``src/repositories`` factory call site to
+inject one) and returns ``0`` on a DuckDB-backed instance instead of
+raising. Each is dispatched through :func:`prune_trail` /
 :func:`run_retention_sweep`, wired to the scheduler as one daily
 ``retention-prune`` job (``POST /api/admin/run-retention-prune``) that
 iterates every registered trail. Every trail's window defaults to **0 = keep
@@ -94,6 +98,28 @@ def _prune_agent_scope_snapshots(days: int, repo: Optional[Any] = None) -> int:
     return repo.prune_scope_snapshots_older_than(days)
 
 
+def _prune_chat_feedback(days: int, repo: Optional[Any] = None) -> int:
+    if repo is None:
+        from src.repositories import RequiresPostgresBackend, chat_message_feedback_repo
+
+        try:
+            repo = chat_message_feedback_repo()
+        except RequiresPostgresBackend:
+            return 0  # the feedback table is Postgres-only; nothing to prune on DuckDB
+    return repo.prune_older_than(days)
+
+
+def _prune_llm_calls(days: int, repo: Optional[Any] = None) -> int:
+    if repo is None:
+        from src.repositories import RequiresPostgresBackend, llm_calls_repo
+
+        try:
+            repo = llm_calls_repo()
+        except RequiresPostgresBackend:
+            return 0  # the ledger is Postgres-only; nothing to prune on DuckDB
+    return repo.prune_older_than(days)
+
+
 # ``{trail: prune_fn(days, repo=None) -> deleted_count}``. ``audit_log`` is
 # deliberately NOT here — it keeps its own standalone job/endpoint
 # (``prune_audit_log`` above); folding it in would change nothing
@@ -104,6 +130,8 @@ _TRAIL_PRUNERS: Dict[str, Callable[..., int]] = {
     "sync_history": _prune_sync_history,
     "llm_usage": _prune_llm_usage,
     "agent_scope_snapshots": _prune_agent_scope_snapshots,
+    "llm_calls": _prune_llm_calls,
+    "chat_feedback": _prune_chat_feedback,
 }
 
 

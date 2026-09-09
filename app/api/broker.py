@@ -37,11 +37,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
 import random
+import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
 
@@ -56,6 +59,7 @@ from app.api.broker_agent_policy import (
     check_model,
     check_model_value,
     parse_usage,
+    parse_usage_from_edges,
     usage_accumulator,
 )
 from app.api.broker_vertex import (
@@ -69,8 +73,13 @@ from app.api.broker_vertex import (
 )
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
-from app.chat.turn_usage import add_turn_usage
+from app.chat.turn_context import TurnRecord, read_turn, started_no_later_than
+from app.chat.turn_usage import add_turn_timing, add_turn_usage
+from src.observability import content_policy as _content_policy
 from src.observability import otel as _otel
+from src.observability.llm_context import LlmCallContext
+from src.observability.llm_record import LlmCallRecord, build_record
+from src.observability.otlp_scrub import OtlpBatchUndecodable, empty_logs_response, scrub_logs, scrub_traces
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
     access_token_repo,
@@ -85,9 +94,17 @@ from src.repositories import (
 logger = logging.getLogger(__name__)
 
 #: Cap on the SSE bytes mirrored for streaming usage recording — a
-#: completion body far past this is pathological; usage recording is then
-#: skipped (logged) rather than holding unbounded memory per request.
+#: completion body far past this is pathological; the full mirror stops
+#: growing past this point (logged), but usage still survives via the
+#: bounded head/tail edges below.
 _SSE_USAGE_COLLECT_MAX_BYTES = 8 * 1024 * 1024
+#: Size of the head and tail edge buffers kept for EVERY streamed completion,
+#: on top of the full mirror above. Anthropic puts usage in ``message_start``
+#: (the stream's first bytes) and ``message_delta`` (its last), so 64 KiB at
+#: each end is enough to recover tokens, cost, model and stop reason from a
+#: stream whose full body blew past the mirror cap — only the content
+#: summary is then lost.
+_SSE_EDGE_BYTES = 64 * 1024
 
 router = APIRouter(prefix="/api/broker", tags=["broker"])
 
@@ -902,35 +919,163 @@ def _completion_request_hints(raw_body: bytes, vertex_target: Any) -> "tuple[Opt
     return model, stream
 
 
+def _turn_for_row(row: Dict[str, Any], *, started_at: datetime) -> Optional[TurnRecord]:
+    """The live chat turn for the ticket's session, if one was published.
+
+    ``None`` when the ticket carries no session, when no turn is in flight,
+    when the coordination backend cannot say, and when the record IS there
+    but its own turn started AFTER ``started_at`` — a completion whose turn
+    is unknown, or whose only candidate record cannot possibly be the turn
+    that caused it (a co-driver's next turn landing mid-completion, see the
+    module notes on overlap), is a root span with a null ``turn_id``, never
+    a failed forward, and never a wrong attribution (spec 3.2, finding A).
+    """
+    try:
+        session_id = row.get("session_id")
+        if not session_id:
+            return None
+        turn = read_turn(session_id)
+        if turn is None:
+            return None
+        if not started_no_later_than(turn, started_at):
+            logger.debug(
+                "broker: turn %s for session %s started after this completion began; not attributing",
+                turn.turn_id,
+                session_id,
+            )
+            return None
+        return turn
+    except Exception:  # noqa: BLE001 - a measurement never costs a forward
+        logger.debug("broker: could not read the turn record", exc_info=True)
+        return None
+
+
+def _completion_context(
+    row: Dict[str, Any],
+    *,
+    agent_row: Optional[Dict[str, Any]],
+    caller_user_id: Optional[str],
+    turn: Optional[TurnRecord] = None,
+) -> LlmCallContext:
+    """The labels for one brokered completion: what work it is, whose it is.
+
+    Everything the broker knows first-hand from the ticket it just
+    validated — no session read, no email. The identity is the resolved
+    user id (never the address, spec 3.6) and the bound agent's id when
+    there is one; an agent-less session is labelled all the same, because a
+    call nobody can attribute is exactly the one a cost report must not
+    lose.
+
+    ``turn`` is the chat turn that caused the call (``_turn_for_row``). It
+    supplies what the ticket cannot: which turn this is, whether the
+    session is agent-API or chat work, and — only where the ticket has
+    nothing of its own — the user and agent ChatManager resolved when the
+    turn opened. The ticket's own resolution always wins: it is first-hand,
+    and the turn record may be one turn stale.
+    """
+    return LlmCallContext(
+        workload=turn.workload if turn else "chat",
+        purpose="completion",
+        session_id=row.get("session_id"),
+        turn_id=turn.turn_id if turn else None,
+        user_id=caller_user_id or (turn.user_id if turn else None),
+        agent_id=(agent_row.get("id") if agent_row else (turn.agent_id if turn else None)),
+    )
+
+
+def _record_completion(
+    *,
+    context: LlmCallContext,
+    span: Any,
+    upstream: str,
+    model_requested: Optional[str],
+    usage: Optional[Dict[str, Any]],
+    status_code: Optional[int],
+    latency_ms: Optional[int],
+    summary: "_otel.CompletionSummary",
+    error: Optional[BaseException] = None,
+    response_truncated: bool = False,
+) -> Optional[LlmCallRecord]:
+    """Build, price and buffer the ``llm_calls`` row for one completion.
+
+    Runs for EVERY completion — export on or off, agent-bound or not, and
+    for a failure too (a zero-cost error row, never a gap in the ledger).
+    The span's ids go on the row when a span was opened, so the row and the
+    exported span describe the same call. Returns the record so the caller
+    can finish the span with the price it just computed; returns ``None``
+    if anything went wrong, because a measurement never costs a forward.
+    ``response_truncated`` marks a streamed completion whose usage was
+    recovered from the head/tail edges after the full-body mirror
+    overflowed — the tokens and price are still real (spec 3.1).
+    """
+    try:
+        trace_id, span_id = _otel.span_ids(span) if span is not None else (None, None)
+        failed = error is not None or (status_code is not None and status_code >= 400)
+        # A STREAM that never reached a stop reason -- the client walked
+        # away, the upstream cut the connection mid-answer -- returned a
+        # perfectly good HTTP 200, so a status derived from the status code
+        # alone would file a half-delivered answer under "ok" and quietly
+        # flatter every error and quality summary built on this ledger.
+        # It gets its own status instead. `stream_complete` is None for a
+        # non-streaming call (only `text/event-stream` sets it), so nothing
+        # but a real interrupted stream can land here.
+        incomplete = not failed and summary.stream_complete is False
+        record = build_record(
+            kind="completion",
+            context=context,
+            provider="gcp.vertex_ai" if upstream == "vertex" else "anthropic",
+            upstream=upstream,
+            model_requested=model_requested,
+            model_response=(usage or {}).get("model") or summary.model,
+            usage=usage,
+            latency_ms=latency_ms,
+            status=("error" if failed else "incomplete" if incomplete else "ok"),
+            error_type=(
+                type(error).__name__
+                if error is not None
+                else (str(status_code) if failed else ("stream_incomplete" if incomplete else None))
+            ),
+            http_status=status_code,
+            prompt_chars=summary.prompt_chars,
+            completion_chars=summary.completion_chars,
+            stop_reason=summary.stop_reason,
+            stream_complete=summary.stream_complete,
+            response_truncated=response_truncated,
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+        usage_accumulator.add_call(record.to_row())
+        return record
+    except Exception:  # noqa: BLE001 - a measurement never costs a forward
+        logger.debug("broker: could not record the completion", exc_info=True)
+        return None
+
+
 async def _start_otel_completion_span(
     *,
     row: Dict[str, Any],
     raw_body: bytes,
     vertex_target: Any,
     upstream: str,
-    agent_row: Optional[Dict[str, Any]],
-    caller_user_id: Optional[str],
-    session: Any,
+    context: LlmCallContext,
+    parent_context: Any = None,
 ) -> Any:
-    """Open the broker's completion span. The session row is read only when
-    export is on (the caller checks) and not already in hand — one extra
-    read per completion, off the event loop, never on the path when tracing
-    is off. Identity is a label here, never a reason to fail the call."""
+    """Open the broker's completion span, labelled by the call context the
+    caller already built. No session read on this path: identity comes from
+    the ticket's own resolution, so tracing costs no extra query — and never
+    the user's email, which is personal data with no join value off-instance
+    (spec 3.6). ``parent_context`` is the chat turn's span when one is known."""
     model, stream = _completion_request_hints(raw_body, vertex_target)
-    if session is None:
-        try:
-            session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
-        except Exception:  # noqa: BLE001
-            session = None
     return _otel.start_completion_span(
         upstream=upstream,
         model=model,
         stream=stream,
         session_id=row.get("session_id"),
         ticket_scope=row.get("scope"),
-        user_email=getattr(session, "user_email", None),
-        user_id=caller_user_id,
-        agent_id=agent_row.get("id") if agent_row else None,
+        user_id=context.user_id,
+        agent_id=context.agent_id,
+        context=context,
+        parent_context=parent_context,
     )
 
 
@@ -955,7 +1100,9 @@ _OTLP_MAX_BODY_BYTES = 8 * 1024 * 1024
 _OTLP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 #: Inbound headers worth forwarding: the wire format and its compression. The
 #: relay already dropped the credential/hop-by-hop sets; everything else is
-#: the sandbox's business, not the collector's.
+#: the sandbox's business, not the collector's. ``content-encoding`` survives
+#: only when the batch is forwarded as received — a batch the content policy
+#: decoded and re-serialised leaves here uncompressed, and says so.
 _OTLP_FORWARDED_REQUEST_HEADERS = frozenset({"content-type", "content-encoding"})
 
 
@@ -981,10 +1128,30 @@ async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depend
     batch instead of silently swallowing telemetry — the turn itself is
     unaffected, the SDK's exporter just logs the refusal.
 
-    The body is the SDK's protobuf batch, forwarded byte-for-byte with its
-    wire-format and compression headers; the collector's 2xx body comes back
-    as-is (the OTLP success response), its error text never does — the status
-    (and ``Retry-After``, which the exporter's retry honours) is enough.
+    The body is the SDK's protobuf batch. It is forwarded under the
+    instance's content-export policy (``observability.content_export`` —
+    :mod:`src.observability.content_policy`), the same record the broker's
+    own completion spans obey, because the sandbox's spans carry the prompt
+    and the answer in their attributes:
+
+    - ``full`` — forwarded byte-for-byte with its compression header.
+    - ``pseudonymized`` — traces and log bodies rewritten through the
+      instance anonymizer; the batch is re-serialised uncompressed.
+    - ``off`` (the default) — the content attributes are stripped from
+      traces (the structural turn/step/tool spans still flow) and a logs
+      batch is accepted and dropped, so the exporter sees a 2xx rather than
+      retrying a decision the operator made.
+
+    Metrics carry counts, never content, and are always forwarded as sent.
+
+    **The relay fails closed on content:** under ``off`` / ``pseudonymized``
+    a batch it cannot decode is refused with ``400 otlp_batch_undecodable``,
+    never forwarded unstripped — a relay that cannot read a batch cannot
+    claim the batch is free of content.
+
+    The collector's 2xx body comes back as-is (the OTLP success response),
+    its error text never does — the status (and ``Retry-After``, which the
+    exporter's retry honours) is enough.
     """
     _require_scope(row, "kai_otlp")
     if signal not in _OTLP_SIGNALS:
@@ -1001,8 +1168,32 @@ async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depend
     body = await request.body()
     if len(body) > _OTLP_MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
+
+    # The relay is workload `chat` by definition (spec 3.6): the engine's
+    # sandbox exports one turn's own spans, so its content obeys the same
+    # `chat` allowlist entry as the broker's own completion spans, never a
+    # different one.
+    mode = _content_policy.content_export_mode(workload="chat")
+    encoding: Optional[str] = request.headers.get("content-encoding")
+    try:
+        if signal == "traces" and mode != "full":
+            body = scrub_traces(body, mode=mode, content_encoding=encoding)
+            encoding = None
+        elif signal == "logs" and mode != "full":
+            if mode == "off":
+                return Response(content=empty_logs_response(), status_code=200, media_type="application/x-protobuf")
+            body = scrub_logs(body, mode=mode, content_encoding=encoding) or b""
+            encoding = None
+    except OtlpBatchUndecodable as exc:
+        logger.warning("broker: refused an undecodable %s batch under content mode %s", signal, mode)
+        raise HTTPException(status_code=400, detail={"code": "otlp_batch_undecodable"}) from exc
+
     headers = {k: v for k, v in request.headers.items() if k.lower() in _OTLP_FORWARDED_REQUEST_HEADERS}
     headers.setdefault("content-type", "application/x-protobuf")
+    if encoding is None:
+        # The batch was decoded and re-serialised — whatever the sandbox
+        # compressed, what leaves here is plain protobuf.
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-encoding"}
     headers.update(operator_headers)
     try:
         async with httpx.AsyncClient(timeout=_OTLP_TIMEOUT) as client:
@@ -1071,10 +1262,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # traffic is the busy path, so it keeps paying nothing. Offloaded because a
     # synchronous DB read must not run on the event loop.
     # Found by Devin Review on this PR.
-    otel_session = None
+    llm_scope_session = None
     if row.get("scope") == "llm":
-        otel_session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
-        if otel_session is None:
+        llm_scope_session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
+        if llm_scope_session is None:
             raise HTTPException(status_code=401, detail="ticket_session_gone")
     raw_body = await request.body()
     headers = {
@@ -1343,22 +1534,60 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # here, after every gate that could refuse the call, and closed where
     # the forward ends — in the stream's ``finally`` or after the buffered
     # read below — so its duration is the upstream's, not the gates'.
+    #
+    # The call's LABELS, on the other hand, are built for every completion
+    # whether or not the export is on: the `llm_calls` ledger row below is
+    # written either way (spec 3.1), and it is the on-instance record — the
+    # OTLP span is the optional copy of it, not the other way round.
+    upstream_label = "dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic")
+    completion_context: Optional[LlmCallContext] = None
+    requested_model: Optional[str] = None
+    # Which chat turn this call belongs to (spec 3.2). The engine propagates
+    # no trace context, so the turn announces itself over the coordination
+    # backend and the broker reads it here — one small read per completion.
+    # A `traceparent` request header would be preferred if the engine ever
+    # sent one; until then this is the only link that exists.
+    turn: Optional[TurnRecord] = None
+    if is_completion:
+        # The completion's own start, wall-clock — the reference finding A
+        # compares the turn record's ``started_at`` against. Captured here,
+        # before the coordination read, rather than reusing the monotonic
+        # ``forward_started`` below (that clock has no wall-clock epoch to
+        # compare against a published ISO timestamp with).
+        completion_started_at = datetime.now(timezone.utc)
+        turn = _turn_for_row(row, started_at=completion_started_at)
+        completion_context = _completion_context(row, agent_row=agent_row, caller_user_id=caller_user_id, turn=turn)
+        requested_model, _requested_stream = _completion_request_hints(raw_body, vertex_target)
     otel_span = None
-    if is_completion and _otel.is_enabled():
+    if completion_context is not None and _otel.is_enabled():
         try:
+            # The turn's span normally lives in another process, so the
+            # parent is a remote, non-recording context; the collector
+            # stitches the two on the trace id.
+            parent_context = _otel.remote_parent_context(turn.trace_id, turn.span_id) if turn else None
             otel_span = await _start_otel_completion_span(
                 row=row,
                 raw_body=raw_body,
                 vertex_target=vertex_target,
-                upstream="dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic"),
-                agent_row=agent_row,
-                caller_user_id=caller_user_id,
-                session=otel_session,
+                upstream=upstream_label,
+                context=completion_context,
+                parent_context=parent_context,
             )
         except Exception:  # noqa: BLE001 - a measurement must never cost a forward
             logger.debug("broker: could not open the completion span", exc_info=True)
             otel_span = None
+    # The clock the record's `latency_ms` reads: wall time from just before
+    # the upstream request to the end of the forward (stream end or buffered
+    # read), so it measures the provider, not this instance's own gates.
+    forward_started = time.monotonic()
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
+    # Completion timing (app/chat/turn_usage.py::add_turn_timing): measured
+    # from HERE — the first attempt's send, after every gate — to the last
+    # upstream byte, so a retried 429 counts as the wait the caller really
+    # sat through and a refused call counts for nothing. Recorded next to
+    # the token usage below; tokens said what a turn cost, never how long
+    # the model took.
+    forward_started = time.perf_counter()
     # Retry loop for upstream rate limiting. A provider 429 (a Vertex
     # per-minute token/request quota is the usual one) means the request was
     # refused WITHOUT being processed, so replaying it is safe and normally
@@ -1413,6 +1642,29 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             except Exception:
                 # Audit logging must never break the deny path itself.
                 pass
+            # The same record every other outcome gets: a call that never
+            # reached the provider is a zero-cost error row, and its span is
+            # finished here rather than abandoned mid-flight (an unended span
+            # is never exported at all, so this branch used to drop the whole
+            # completion from the trace as well as from the ledger).
+            if completion_context is not None:
+                _record_completion(
+                    context=completion_context,
+                    span=otel_span,
+                    upstream=upstream_label,
+                    model_requested=requested_model,
+                    usage=None,
+                    status_code=None,
+                    latency_ms=int((time.monotonic() - forward_started) * 1000),
+                    summary=_otel.CompletionSummary(),
+                    error=exc,
+                )
+            if otel_span is not None:
+                _otel.end_completion_span(
+                    otel_span,
+                    error=exc,
+                    workload=completion_context.workload if completion_context is not None else None,
+                )
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1423,8 +1675,27 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             ) from exc
         except BaseException as _exc:
             await client.aclose()
+            if completion_context is not None:
+                # A call that never returned is still a call: a zero-cost
+                # error row, so a burst of them shows up in the ledger
+                # instead of looking like traffic that simply stopped.
+                _record_completion(
+                    context=completion_context,
+                    span=otel_span,
+                    upstream=upstream_label,
+                    model_requested=requested_model,
+                    usage=None,
+                    status_code=None,
+                    latency_ms=int((time.monotonic() - forward_started) * 1000),
+                    summary=_otel.CompletionSummary(),
+                    error=_exc,
+                )
             if otel_span is not None:
-                _otel.end_completion_span(otel_span, error=_exc)
+                _otel.end_completion_span(
+                    otel_span,
+                    error=_exc,
+                    workload=completion_context.workload if completion_context is not None else None,
+                )
             raise
         if resp.status_code not in _RETRYABLE_UPSTREAM_STATUSES or attempt >= _MAX_UPSTREAM_RETRIES:
             break
@@ -1443,9 +1714,32 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             await asyncio.sleep(delay)
         except BaseException as _exc:
             await client.aclose()
+            if completion_context is not None:
+                # A call that never returned is still a call: a zero-cost
+                # error row, so a burst of them shows up in the ledger
+                # instead of looking like traffic that simply stopped.
+                _record_completion(
+                    context=completion_context,
+                    span=otel_span,
+                    upstream=upstream_label,
+                    model_requested=requested_model,
+                    usage=None,
+                    status_code=None,
+                    latency_ms=int((time.monotonic() - forward_started) * 1000),
+                    summary=_otel.CompletionSummary(),
+                    error=_exc,
+                )
             if otel_span is not None:
-                _otel.end_completion_span(otel_span, error=_exc)
+                _otel.end_completion_span(
+                    otel_span,
+                    error=_exc,
+                    workload=completion_context.workload if completion_context is not None else None,
+                )
             raise
+    # The response head is the first upstream byte of a buffered reply, and
+    # the fallback first-byte mark for a stream that ends before its first
+    # chunk arrives.
+    upstream_head_at = time.perf_counter()
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
     if vertex_mode and resp.status_code == 401:
@@ -1491,58 +1785,136 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         turn_session_id = row.get("session_id") if is_completion else None
         collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
-        state = {"overflow": False}
+        state: dict[str, Any] = {"overflow": False, "first_byte_at": None, "exhausted": False}
+        # The bounded edges kept for EVERY streamed completion regardless of
+        # the full mirror's own overflow state: a 64 KiB append-only head and
+        # a 64 KiB rolling tail (whole chunks, so the cap is approximate, not
+        # exact). Anthropic's usage lives in `message_start` (first bytes)
+        # and `message_delta` (last bytes), so these two windows are what a
+        # completion whose body blew past `_SSE_USAGE_COLLECT_MAX_BYTES`
+        # falls back to (`parse_usage_from_edges` below) — tokens, cost,
+        # model and stop reason survive; only the content summary is lost.
+        head = bytearray()
+        tail: collections.deque[bytes] = collections.deque()
+        tail_bytes = 0
+        # Mirror the passthrough bytes when SOMETHING downstream reads them:
+        # the budget ledger, the span, or the call record (which is built for
+        # every completion, export on or off).
+        mirror_body = collect_usage or otel_span is not None or completion_context is not None
 
         async def _passthrough():
+            nonlocal tail_bytes
             try:
                 async for chunk in resp.aiter_bytes():
-                    if (collect_usage or otel_span is not None) and not state["overflow"]:
-                        if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
-                            collected.extend(chunk)
-                        else:
-                            state["overflow"] = True
+                    if state["first_byte_at"] is None:
+                        state["first_byte_at"] = time.perf_counter()
+                    if mirror_body:
+                        if len(head) < _SSE_EDGE_BYTES:
+                            head.extend(chunk[: _SSE_EDGE_BYTES - len(head)])
+                        tail.append(chunk)
+                        tail_bytes += len(chunk)
+                        while len(tail) > 1 and tail_bytes - len(tail[0]) >= _SSE_EDGE_BYTES:
+                            tail_bytes -= len(tail.popleft())
+                        if not state["overflow"]:
+                            if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
+                                collected.extend(chunk)
+                            else:
+                                state["overflow"] = True
                     yield chunk
+                # Reached only when the upstream ran to its natural end AND
+                # the client consumed all of it — a drop on either side
+                # leaves this False and the timing below unrecorded.
+                state["exhausted"] = True
             finally:
                 await resp.aclose()
                 await client.aclose()
+                body = bytes(collected)
+                # Parsed ONCE for all three consumers below (budget ledger,
+                # call record, span) — the same figures, by construction. An
+                # overflowed stream recovers usage from the edges instead of
+                # losing it outright (spec 3.1).
+                if state["overflow"]:
+                    usage = parse_usage_from_edges(bytes(head), b"".join(tail), ctype)
+                else:
+                    usage = parse_usage(body, ctype)
                 if collect_usage:
                     try:
                         if state["overflow"]:
                             logger.warning(
-                                "SSE usage recording skipped for session %s: stream exceeded %d bytes",
+                                "usage recovered from stream edges; content summary truncated "
+                                "(session %s, stream exceeded %d bytes)",
                                 row.get("session_id"),
                                 _SSE_USAGE_COLLECT_MAX_BYTES,
                             )
-                        else:
-                            usage = parse_usage(bytes(collected), ctype)
-                            if usage and agent_row is not None:
-                                usage_accumulator.add(
-                                    {
-                                        **usage,
-                                        "id": str(uuid.uuid4()),
-                                        "agent_id": agent_row["id"],
-                                        "user_id": agent_row.get("owner_user_id"),
-                                        "caller_user_id": caller_user_id,
-                                        "session_id": row.get("session_id"),
-                                    },
-                                    budget_ttl_s=budget_ttl_s,
-                                )
-                            if usage and turn_session_id:
-                                add_turn_usage(turn_session_id, usage)
+                        if usage and agent_row is not None:
+                            usage_accumulator.add(
+                                {
+                                    **usage,
+                                    "id": str(uuid.uuid4()),
+                                    "agent_id": agent_row["id"],
+                                    "user_id": agent_row.get("owner_user_id"),
+                                    "caller_user_id": caller_user_id,
+                                    "session_id": row.get("session_id"),
+                                },
+                                budget_ttl_s=budget_ttl_s,
+                            )
+                        if usage and turn_session_id:
+                            add_turn_usage(turn_session_id, usage)
                     except Exception:
                         logger.exception(
                             "llm usage recording failed for agent %s (stream already forwarded)",
                             agent_row.get("id"),
                         )
+                summary = None
+                record = None
+                if completion_context is not None:
+                    summary = _otel.describe_completion(
+                        request_body=raw_body,
+                        response_body=bytes(head) if state["overflow"] else body,
+                        content_type=ctype,
+                        response_truncated=state["overflow"],
+                    )
+                    if state["overflow"] and usage:
+                        # `describe_completion` never re-parses a truncated
+                        # body — stop reason and stream-completeness come
+                        # from the tail's own `message_delta` instead.
+                        summary.stop_reason = usage.get("stop_reason")
+                        summary.stream_complete = bool(usage.get("stop_reason"))
+                    record = _record_completion(
+                        context=completion_context,
+                        span=otel_span,
+                        upstream=upstream_label,
+                        model_requested=requested_model,
+                        usage=usage,
+                        status_code=resp.status_code,
+                        latency_ms=int((time.monotonic() - forward_started) * 1000),
+                        summary=summary,
+                        response_truncated=state["overflow"],
+                    )
+                if turn_session_id and resp.status_code == 200 and state["exhausted"]:
+                    # Independent of the usage parse above (an over-long
+                    # stream still took its time), but NOT of the stream
+                    # finishing: a completion cut short — the upstream
+                    # dropping, the client walking away — is not a
+                    # completion, and its truncated wall time would pull
+                    # every latency average toward whatever aborted it.
+                    # The partial usage above is still recorded: tokens
+                    # were spent either way, time was not fully measured.
+                    _record_completion_timing(
+                        turn_session_id, forward_started, state["first_byte_at"] or upstream_head_at
+                    )
                 if otel_span is not None:
                     _otel.end_completion_span(
                         otel_span,
                         status_code=resp.status_code,
-                        usage=None if state["overflow"] else parse_usage(bytes(collected), ctype),
+                        usage=usage,
                         request_body=raw_body,
-                        response_body=bytes(collected),
+                        response_body=body,
                         content_type=ctype,
                         response_truncated=state["overflow"],
+                        summary=summary,
+                        cost_usd=record.cost_usd if record is not None else None,
+                        workload=completion_context.workload if completion_context is not None else None,
                     )
 
         return StreamingResponse(
@@ -1575,9 +1947,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # than written here. Must never break the response path: any parse/add
     # failure is caught and logged, not raised.
     turn_session_id = row.get("session_id") if is_completion else None
+    # Parsed ONCE for all three consumers below (budget ledger, call record,
+    # span) — the same figures, by construction.
+    usage = parse_usage(resp.content, ctype) if resp.status_code == 200 else None
+    if turn_session_id and resp.status_code == 200:
+        _record_completion_timing(turn_session_id, forward_started, upstream_head_at)
     if (agent_row is not None or turn_session_id is not None) and resp.status_code == 200:
         try:
-            usage = parse_usage(resp.content, resp.headers.get("content-type", ""))
             if usage and turn_session_id:
                 add_turn_usage(turn_session_id, usage)
             if usage and agent_row is not None:
@@ -1596,14 +1972,35 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             logger.exception(
                 "llm usage recording failed for agent %s (response already forwarded)", agent_row.get("id")
             )
+    summary = None
+    record = None
+    if completion_context is not None:
+        summary = _otel.describe_completion(
+            request_body=raw_body,
+            response_body=resp.content,
+            content_type=ctype,
+        )
+        record = _record_completion(
+            context=completion_context,
+            span=otel_span,
+            upstream=upstream_label,
+            model_requested=requested_model,
+            usage=usage,
+            status_code=resp.status_code,
+            latency_ms=int((time.monotonic() - forward_started) * 1000),
+            summary=summary,
+        )
     if otel_span is not None:
         _otel.end_completion_span(
             otel_span,
             status_code=resp.status_code,
-            usage=parse_usage(resp.content, ctype) if resp.status_code == 200 else None,
+            usage=usage,
             request_body=raw_body,
             response_body=resp.content,
             content_type=ctype,
+            summary=summary,
+            cost_usd=record.cost_usd if record is not None else None,
+            workload=completion_context.workload if completion_context is not None else None,
         )
 
     return _to_response(resp, budget_headers)
@@ -1634,6 +2031,20 @@ def _anthropic_error_message(resp: httpx.Response) -> str:
         return resp.text[:500]
     except Exception:
         return ""
+
+
+def _record_completion_timing(session_id: str, started: float, first_byte_at: float) -> None:
+    """Hand one 2xx completion's wall time and first-byte latency to the
+    session's turn counters (``app/chat/turn_usage.py``), where ChatManager
+    sums them per turn onto the assistant message. ``started`` /
+    ``first_byte_at`` are ``time.perf_counter()`` marks; "now" is the last
+    upstream byte. Never raises — ``add_turn_timing`` swallows everything."""
+    now = time.perf_counter()
+    add_turn_timing(
+        session_id,
+        duration_ms=int((now - started) * 1000),
+        ttfb_ms=int((first_byte_at - started) * 1000),
+    )
 
 
 def _record_llm_health(app_state: Any, resp: httpx.Response) -> None:

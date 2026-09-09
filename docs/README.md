@@ -41,7 +41,8 @@ Deploying, configuring, and running an Agnes instance.
 - [`sharepoint-extraction.md`](sharepoint-extraction.md) — operator walkthrough: SharePoint from zero to the first crawl (enable, connect, preview redaction, run, scale, optional LLM stages)
 - [`anonymization.md`](anonymization.md) — file-source anonymize-in-front pipeline: what the connect wizard's checkbox does, the per-instance key, and "requested" vs. "declared" badge semantics
 - [`unstructured-data-permissions.md`](unstructured-data-permissions.md) — permissions on documents: Collections as the permission unit, per-file grants, audience classes, SharePoint ACL mirroring, Entra/Agnes groups, and the limits to state up front
-- [`auth-google-oauth.md`](auth-google-oauth.md) — Google OAuth setup + operator gotchas
+- [`auth-google-oauth.md`](auth-google-oauth.md) — Google OAuth setup + operator gotchas, incl. Internal vs. External audience
+- [`auth-google-oauth-customer-setup.md`](auth-google-oauth-customer-setup.md) — Google sign-in registered by the customer in their own Cloud project: what to exchange with their Google admin
 - [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md) — Microsoft Entra ID OAuth setup, single-tenant enforcement + trust model
 - [`auth-sso-entra.md`](auth-sso-entra.md) — external SSO sign-in (runtime-configured Entra ID OIDC): setup checklist, trust model, identity capture
 - [`auth-groups.md`](auth-groups.md) — Google Workspace group sync

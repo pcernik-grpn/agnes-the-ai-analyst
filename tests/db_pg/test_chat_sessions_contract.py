@@ -13,14 +13,27 @@ Also ``archive_session`` / ``restore_session``, whose contract is not just the
 my list" and archiving means "this is not in my list". Two UPDATE statements in
 two dialects, one invariant — exactly the drift this file exists to catch.
 
+Also ``list_completed_between`` -- the conversation-corpus export's cursor
+source (design 2026-09-08 §3.12): the ``[since, until)`` window, the
+``surfaces``/``agent_id`` filters, and keyset paging on
+``(last_message_at, id)``. DuckDB has no stored ``last_message_at`` column
+(see ``app/chat/persistence.py``'s module docstring) so the seeding helper
+below writes the underlying ``chat_messages``/``chat_sessions`` rows
+directly on whichever backend ``repo`` is bound to, the same way
+``tests/db_pg/test_conversation_export_pg.py``'s ``_seed_session`` does for
+Postgres alone.
+
 Follows the pattern of ``test_jobs_contract.py``.
 """
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 
 from app.chat.types import Surface
 
@@ -125,3 +138,110 @@ def test_archiving_an_unpinned_session_is_unremarkable(repo):
     repo.archive_session(s.id)
     got = repo.get_session(s.id)
     assert got.archived is True and got.pinned_at is None
+
+
+# ── list_completed_between ────────────────────────────────────────────────
+
+
+def _seed_message(repo, session_id: str, ts: datetime, content: str = "hi") -> None:
+    """Insert one ``chat_messages`` row with an explicit ``created_at`` --
+    what makes ``last_message_at`` deterministic for the keyset assertions
+    below, on whichever backend ``repo`` is bound to. Postgres maintains
+    ``chat_sessions.last_message_at`` on append (module docstring), so it is
+    stamped here too; DuckDB has no such column and derives it from
+    ``chat_messages`` at read time.
+    """
+    msg_id = f"msg_{uuid.uuid4().hex[:8]}"
+    if hasattr(repo, "_engine"):
+        with repo._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO chat_messages (id, session_id, role, content, created_at) "
+                    "VALUES (:id, :sid, 'user', :content, :ts)"
+                ),
+                {"id": msg_id, "sid": session_id, "content": content, "ts": ts},
+            )
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": ts, "id": session_id},
+            )
+    else:
+        repo._conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)",
+            [msg_id, session_id, content, ts],
+        )
+
+
+_BASE = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_list_completed_between_filters_by_window(repo):
+    s_before = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    s_in = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    s_after = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    _seed_message(repo, s_before.id, _BASE - timedelta(days=1))
+    _seed_message(repo, s_in.id, _BASE + timedelta(minutes=1))
+    _seed_message(repo, s_after.id, _BASE + timedelta(days=1))
+
+    rows = repo.list_completed_between(_BASE, _BASE + timedelta(hours=1), limit=50)
+
+    assert [r["id"] for r in rows] == [s_in.id]
+
+
+def test_list_completed_between_filters_by_surfaces(repo):
+    web = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    slack = repo.create_session(user_email="u@x.com", surface=Surface.SLACK_DM)
+    _seed_message(repo, web.id, _BASE + timedelta(minutes=1))
+    _seed_message(repo, slack.id, _BASE + timedelta(minutes=2))
+
+    rows = repo.list_completed_between(_BASE, _BASE + timedelta(hours=1), surfaces=("web",), limit=50)
+
+    assert [r["id"] for r in rows] == [web.id]
+
+
+def test_list_completed_between_filters_by_agent_id(repo):
+    a1 = repo.create_session(user_email="u@x.com", surface=Surface.WEB, agent_id="agent-1")
+    a2 = repo.create_session(user_email="u@x.com", surface=Surface.WEB, agent_id="agent-2")
+    _seed_message(repo, a1.id, _BASE + timedelta(minutes=1))
+    _seed_message(repo, a2.id, _BASE + timedelta(minutes=2))
+
+    rows = repo.list_completed_between(_BASE, _BASE + timedelta(hours=1), agent_id="agent-1", limit=50)
+
+    assert [r["id"] for r in rows] == [a1.id]
+
+
+def test_list_completed_between_keyset_pages_three_pages_of_two(repo):
+    sessions = [repo.create_session(user_email="u@x.com", surface=Surface.WEB) for _ in range(6)]
+    for i, s in enumerate(sessions, start=1):
+        _seed_message(repo, s.id, _BASE + timedelta(minutes=i))
+
+    seen: list[str] = []
+    after = None
+    pages = 0
+    while True:
+        page = repo.list_completed_between(_BASE, _BASE + timedelta(hours=1), limit=2, after=after)
+        if not page:
+            break
+        pages += 1
+        seen.extend(r["id"] for r in page)
+        last = page[-1]
+        after = (last["last_message_at"], last["id"])
+        if len(page) < 2:
+            break
+
+    assert pages == 3
+    assert seen == [s.id for s in sessions]  # ascending order, no dupes/gaps
+
+
+def test_list_completed_between_after_is_exclusive(repo):
+    s1 = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    s2 = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    _seed_message(repo, s1.id, _BASE + timedelta(minutes=1))
+    _seed_message(repo, s2.id, _BASE + timedelta(minutes=2))
+
+    first_page = repo.list_completed_between(_BASE, _BASE + timedelta(hours=1), limit=50)
+    assert [r["id"] for r in first_page] == [s1.id, s2.id]
+
+    cursor = (first_page[0]["last_message_at"], first_page[0]["id"])
+    rest = repo.list_completed_between(_BASE, _BASE + timedelta(hours=1), limit=50, after=cursor)
+    assert [r["id"] for r in rest] == [s2.id]  # s1 itself never reappears

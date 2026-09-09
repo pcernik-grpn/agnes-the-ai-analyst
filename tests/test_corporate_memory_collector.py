@@ -260,6 +260,25 @@ class TestCheckSensitivity:
         item = {"id": "km_z", "title": "T", "content": "C", "tags": []}
         assert check_sensitivity(ErrorExtractor(), item) is False
 
+    def test_the_check_labels_its_own_call(self):
+        """The sensitivity check is a second call per item — one that a cost
+        report should be able to name, rather than folding into the catalog
+        refresh that produced the item."""
+        from src.observability.llm_context import current_llm_context
+        from services.corporate_memory.collector import check_sensitivity
+
+        seen = {}
+
+        class _RecordingExtractor:
+            def extract_json(self, *args, **kwargs):
+                seen["context"] = current_llm_context()
+                return {"safe": True}
+
+        item = {"id": "km_x", "title": "T", "content": "C", "tags": []}
+        assert check_sensitivity(_RecordingExtractor(), item) is True
+        ctx = seen["context"]
+        assert (ctx.workload, ctx.purpose) == ("corporate_memory", "sensitivity_check")
+
 
 # ---------------------------------------------------------------------------
 # Integration-style: collect_all with mocked I/O
@@ -395,6 +414,36 @@ class TestCollectAllDbSync:
         mock_repo.create.assert_called_once()
         call_kwargs = mock_repo.create.call_args
         assert call_kwargs.kwargs["title"] == "Use indexes"
+
+    def test_the_catalog_refresh_labels_its_own_call(self, tmp_path, monkeypatch):
+        """The refresh is the expensive call of the pass (the whole catalog
+        plus every changed note); it is recorded under its own purpose so it
+        can be told apart from the per-item sensitivity checks."""
+        from src.observability.llm_context import current_llm_context
+
+        collector = _make_collect_all_env(tmp_path, monkeypatch, self._ITEM_RESPONSE)
+
+        seen: list = []
+
+        class _RecordingExtractor(MockLLMProvider):
+            def extract_json(self, *args, **kwargs):
+                seen.append(current_llm_context())
+                return super().extract_json(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "connectors.llm.create_extractor_from_env_or_config",
+            lambda *a, **kw: _RecordingExtractor(self._ITEM_RESPONSE),
+            raising=False,
+        )
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=self._make_mock_repo()),
+        ):
+            collector.collect_all(dry_run=False)
+
+        assert seen, "the catalog refresh never ran"
+        assert (seen[0].workload, seen[0].purpose) == ("corporate_memory", "catalog_refresh")
 
     def test_updates_existing_items_in_db(self, tmp_path, monkeypatch):
         """When an item already exists in DB, repo.update() is called instead."""

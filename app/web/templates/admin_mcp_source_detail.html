@@ -352,6 +352,66 @@
     </div>
   </div>
 
+  <!-- OAuth client registration card — auth_method='oauth' sources only.
+       No analyst can connect their own account (the card below) until an
+       admin registers an OAuth client here — either via RFC 7591 dynamic
+       client registration (POST …/oauth/register, the same call
+       `agnes admin mcp-source oauth-register` makes) or by pasting one
+       already created upstream (PUT …/oauth/client, for an authorization
+       server that doesn't support DCR). -->
+  <div class="src-card" id="oauth-client-card" hidden>
+    <div class="src-card-head">
+      <h3>OAuth client</h3>
+      <span id="oauthclient-status" style="font-size: 12px; color: var(--ds-text-secondary);">…</span>
+    </div>
+    <div class="src-card-body">
+      <p style="margin: 0 0 12px; font-size: 13px; color: var(--ds-text-secondary);">
+        Register an OAuth client for this source's authorization server before
+        any analyst can connect their own account. Auto-discovery (RFC 9728 +
+        RFC 8414 + dynamic client registration) works for most servers; use
+        manual entry for one that doesn't support DCR.
+      </p>
+      <div id="oauthclient-registered" style="display:none; margin-bottom: 12px;">
+        {# `<thead></thead>` (empty — this is a key/value summary, not a data
+           grid with a header row) keeps this table self-contained for
+           test_design_system_contract.py's admin-table scan, which pairs
+           each `<table>` with the NEXT `</thead>` in the file: without one
+           here, that pairing would skip past this table and wrongly latch
+           onto the "Registered tools" table's own thead below, misreporting
+           THIS table's (unpinned, correctly so — it has no actions column)
+           attributes against THAT one's "Actions" column. #}
+        <table class="cfg-table">
+          <thead></thead>
+          <tr><th>Issuer</th><td id="oauthclient-issuer">—</td></tr>
+          <tr><th>Client ID</th><td id="oauthclient-clientid">—</td></tr>
+          <tr><th>Client secret</th><td id="oauthclient-hassecret">—</td></tr>
+        </table>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        {{ ds.button('Register OAuth client', variant='primary', id='oauthclient-register-btn') }}
+        {{ ds.button('Re-register', variant='secondary', id='oauthclient-reregister-btn') }}
+        {{ ds.button('Enter manually instead', variant='secondary', id='oauthclient-manual-toggle') }}
+      </div>
+      <div id="oauthclient-manual-form" style="display:none; margin-top: 12px; flex-direction:column; gap:8px; max-width: 480px;">
+        <input id="oauthclient-manual-client-id" type="text" placeholder="Client ID"
+               style="padding:8px 11px; border:1px solid var(--ds-border); border-radius:6px; font-size:13px; box-sizing:border-box;">
+        <input id="oauthclient-manual-client-secret" type="password" autocomplete="new-password"
+               placeholder="Client secret (leave blank for a public/PKCE-only client)"
+               style="padding:8px 11px; border:1px solid var(--ds-border); border-radius:6px; font-size:13px; box-sizing:border-box;">
+        <input id="oauthclient-manual-authz" type="text" placeholder="Authorization endpoint (https://…)"
+               style="padding:8px 11px; border:1px solid var(--ds-border); border-radius:6px; font-size:13px; box-sizing:border-box;">
+        <input id="oauthclient-manual-token" type="text" placeholder="Token endpoint (https://…)"
+               style="padding:8px 11px; border:1px solid var(--ds-border); border-radius:6px; font-size:13px; box-sizing:border-box;">
+        <input id="oauthclient-manual-issuer" type="text" placeholder="Issuer (optional — defaults to the authorization endpoint's origin)"
+               style="padding:8px 11px; border:1px solid var(--ds-border); border-radius:6px; font-size:13px; box-sizing:border-box;">
+        <input id="oauthclient-manual-scopes" type="text" placeholder="Scopes (optional, space-separated)"
+               style="padding:8px 11px; border:1px solid var(--ds-border); border-radius:6px; font-size:13px; box-sizing:border-box;">
+        {{ ds.button('Save manual client', variant='primary', id='oauthclient-manual-save-btn') }}
+      </div>
+      <div id="oauthclient-result" class="test-result"></div>
+    </div>
+  </div>
+
   <!-- Your connection card — per_user sources only. Same my-secret API the
        /me/connections page uses, surfaced inline so an admin can register,
        connect their own token, and introspect without leaving this page.
@@ -386,6 +446,9 @@
         {{ ds.button('Save', variant='primary', id='myconn-save-btn') }}
         {{ ds.button('Test', variant='secondary', id='myconn-test-btn') }}
         {{ ds.button('Disconnect', variant='danger', id='myconn-clear-btn') }}
+      </div>
+      <div id="myconn-oauth-noclient" style="display:none; font-size: 13px; color: var(--ds-accent-warn-ink);">
+        No OAuth client is registered for this source yet — register one above before connecting.
       </div>
       <div id="myconn-oauth-controls" style="display:none; gap:8px; align-items:center; flex-wrap:wrap;">
         <a id="myconn-oauth-connect-link" class="btn btn-primary btn-sm" href="#">Connect your account</a>
@@ -552,6 +615,7 @@ function renderConfigSummary() {
   document.getElementById("cfg-enabled").textContent = (source.enabled === false) ? "no" : "yes";
   renderSecretStatus();
   renderPerUserCoverage();
+  renderOauthClientCard();
   renderMyConnection();
 }
 
@@ -819,6 +883,138 @@ document.getElementById("clear-secret-btn").addEventListener("click", async () =
   }
 });
 
+function isOauthSource() {
+  return !!source && (source.auth_method || "") === "oauth";
+}
+
+// ── OAuth client registration (auth_method='oauth' sources) ────────────
+// Admin-only prerequisite for the "Your connection" card below and for
+// every analyst's "Connect your account" on /me/connections — DCR
+// (POST …/oauth/register) or manual entry (PUT …/oauth/client).
+const OAUTHCLIENT_REGISTER_API = `${SOURCE_API}/oauth/register`;
+const OAUTHCLIENT_MANUAL_API = `${SOURCE_API}/oauth/client`;
+
+function showOauthClientResult(msg, kind) {
+  const out = document.getElementById("oauthclient-result");
+  out.className = "test-result " + (kind === "ok" ? "ok" : "err");
+  out.textContent = msg || "";
+}
+
+function renderOauthClientCard() {
+  const card = document.getElementById("oauth-client-card");
+  if (!card || !source) return;
+  const oauth = isOauthSource();
+  card.hidden = !oauth;
+  if (!oauth) return;
+
+  const client = source.oauth_client;
+  const status = document.getElementById("oauthclient-status");
+  const registeredBlock = document.getElementById("oauthclient-registered");
+  const registerBtn = document.getElementById("oauthclient-register-btn");
+  const reregisterBtn = document.getElementById("oauthclient-reregister-btn");
+
+  if (client) {
+    status.textContent = "Registered";
+    status.style.color = "var(--ds-accent-success-ink)";
+    registeredBlock.style.display = "block";
+    document.getElementById("oauthclient-issuer").textContent = client.issuer || "—";
+    document.getElementById("oauthclient-clientid").textContent = client.client_id || "—";
+    document.getElementById("oauthclient-hassecret").textContent =
+      client.has_client_secret ? "set (confidential client)" : "none (public/PKCE-only client)";
+    registerBtn.style.display = "none";
+    reregisterBtn.style.display = "";
+  } else {
+    status.textContent = "Not registered — analysts cannot connect yet";
+    status.style.color = "var(--ds-accent-warn-ink)";
+    registeredBlock.style.display = "none";
+    registerBtn.style.display = "";
+    reregisterBtn.style.display = "none";
+  }
+}
+
+async function registerOauthClient(btnId) {
+  const btn = document.getElementById(btnId);
+  showOauthClientResult("");
+  btn.disabled = true;
+  try {
+    const r = await fetch(OAUTHCLIENT_REGISTER_API, {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      toast("OAuth client registered", "success");
+      showOauthClientResult("Registered client_id " + (body.client_id || ""), "ok");
+      document.getElementById("oauthclient-manual-form").style.display = "none";
+      await loadSource();
+    } else {
+      showOauthClientResult(body.detail || r.statusText, "err");
+    }
+  } catch (e) {
+    showOauthClientResult("Failed: " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById("oauthclient-register-btn").addEventListener("click", () => registerOauthClient("oauthclient-register-btn"));
+document.getElementById("oauthclient-reregister-btn").addEventListener("click", () => registerOauthClient("oauthclient-reregister-btn"));
+
+document.getElementById("oauthclient-manual-toggle").addEventListener("click", () => {
+  const form = document.getElementById("oauthclient-manual-form");
+  form.style.display = form.style.display === "flex" ? "none" : "flex";
+});
+
+document.getElementById("oauthclient-manual-save-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("oauthclient-manual-save-btn");
+  const clientId = document.getElementById("oauthclient-manual-client-id").value.trim();
+  const authzEndpoint = document.getElementById("oauthclient-manual-authz").value.trim();
+  const tokenEndpoint = document.getElementById("oauthclient-manual-token").value.trim();
+  if (!clientId || !authzEndpoint || !tokenEndpoint) {
+    showOauthClientResult("Client ID, authorization endpoint and token endpoint are required.", "err");
+    return;
+  }
+  const payload = {
+    client_id: clientId,
+    authorization_endpoint: authzEndpoint,
+    token_endpoint: tokenEndpoint,
+  };
+  // Always send the secret field, even blank: the backend treats an omitted
+  // (`None`) client_secret as "leave the stored one alone" but an explicit ""
+  // as "clear it — this is now a public PKCE-only client" (see
+  // set_oauth_client_config). Omitting it here for a blank input would make
+  // it impossible to ever demote a confidential client to public via this form.
+  payload.client_secret = document.getElementById("oauthclient-manual-client-secret").value;
+  const issuer = document.getElementById("oauthclient-manual-issuer").value.trim();
+  if (issuer) payload.issuer = issuer;
+  const scopes = document.getElementById("oauthclient-manual-scopes").value.trim();
+  if (scopes) payload.scopes = scopes;
+
+  showOauthClientResult("");
+  btn.disabled = true;
+  try {
+    const r = await fetch(OAUTHCLIENT_MANUAL_API, {
+      method: "PUT", credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      toast("OAuth client saved", "success");
+      showOauthClientResult("Saved client_id " + (body.client_id || ""), "ok");
+      document.getElementById("oauthclient-manual-client-secret").value = "";
+      document.getElementById("oauthclient-manual-form").style.display = "none";
+      await loadSource();
+    } else {
+      showOauthClientResult(body.detail || r.statusText, "err");
+    }
+  } catch (e) {
+    showOauthClientResult("Failed: " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 // ── Your connection (per_user sources) ─────────────────────────────────
 // Same API the /me/connections page uses; admin grant short-circuit means
 // this always works for the operator viewing this page.
@@ -828,10 +1024,6 @@ function showMyConnResult(msg, kind) {
   const out = document.getElementById("myconn-result");
   out.className = "test-result " + (kind === "ok" ? "ok" : "err");
   out.textContent = msg;
-}
-
-function isOauthSource() {
-  return !!source && (source.auth_method || "") === "oauth";
 }
 
 async function renderMyConnection() {
@@ -845,8 +1037,22 @@ async function renderMyConnection() {
   document.getElementById("myconn-desc-secret").style.display = oauth ? "none" : "block";
   document.getElementById("myconn-desc-oauth").style.display = oauth ? "block" : "none";
   document.getElementById("myconn-secret-controls").style.display = oauth ? "none" : "flex";
-  document.getElementById("myconn-oauth-controls").style.display = oauth ? "flex" : "none";
-  if (oauth) {
+
+  // Presenting "Connect your account" when no OAuth client is registered is
+  // doomed to fail — the authorize call 303-redirects to
+  // connect_error=client_registration_missing with no further UI feedback.
+  // Gate the whole control on the same fact the card above surfaces, and
+  // point the admin at it instead of a dead-end link.
+  const hasClient = oauth && !!source.oauth_client;
+  document.getElementById("myconn-oauth-noclient").style.display = (oauth && !hasClient) ? "block" : "none";
+  document.getElementById("myconn-oauth-controls").style.display = hasClient ? "flex" : "none";
+  if (oauth && !hasClient) {
+    const el = document.getElementById("myconn-status");
+    el.textContent = "Register an OAuth client above before connecting";
+    el.style.color = "var(--ds-text-secondary)";
+    return;
+  }
+  if (hasClient) {
     document.getElementById("myconn-oauth-connect-link").href =
       `/api/mcp/sources/${encodeURIComponent(SOURCE_ID)}/oauth/authorize`;
   }

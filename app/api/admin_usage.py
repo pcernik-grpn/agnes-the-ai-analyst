@@ -31,6 +31,7 @@ from connectors.llm.exceptions import (
     LLMTimeoutError,
 )
 from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
+from src.audit_helpers import log_safe
 from src.llm_pricing import cost_usd, resolve_price
 from src.repositories import (
     audit_repo,
@@ -224,6 +225,8 @@ def ask_usage(
         )
 
     dialect = "postgresql" if use_pg() else "duckdb"
+    from src.observability.llm_context import llm_context
+
     try:
         # Constructed inside the error boundary: the SDK import is deferred
         # to first use, so client construction is a failure point too — an
@@ -236,13 +239,14 @@ def ask_usage(
         else:
             extractor = AnthropicExtractor(api_key=api_key, model=_ASK_MODEL)
         t0 = time.monotonic()
-        llm_out = extractor.extract_json(
-            prompt=build_prompt(question),
-            max_tokens=1024,
-            json_schema=RESPONSE_SCHEMA,
-            schema_name="usage_ask_response",
-            system=system_prompt(dialect),
-        )
+        with llm_context(workload="admin_ask", purpose="telemetry_ask", user_id=user.get("id")):
+            llm_out = extractor.extract_json(
+                prompt=build_prompt(question),
+                max_tokens=1024,
+                json_schema=RESPONSE_SCHEMA,
+                schema_name="usage_ask_response",
+                system=system_prompt(dialect),
+            )
     except LLMAuthError:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is invalid")
     except LLMRateLimitError:
@@ -470,6 +474,13 @@ def chat_cost(
     zero is not a measurement: rows written before migration 0092 carry no
     cache figures at all, and a "0 cached tokens" that means "unrecorded" is
     exactly the mistake this route exists to stop.
+
+    The same rows carry the session's measured LLM latency — ``llm_calls``,
+    ``llm_duration_ms`` (request start → last upstream byte, summed) and
+    ``llm_ttfb_ms`` (request start → first upstream byte, summed), as the
+    secret broker measured them per completion — with the per-call
+    averages derived here and ``timing_accounting`` playing the same
+    honesty role for them (migration 0117: NULL is unknown, not instant).
     """
     if window not in _CHAT_COST_WINDOWS:
         raise HTTPException(status_code=400, detail=f"window must be one of {sorted(_CHAT_COST_WINDOWS)}")
@@ -494,6 +505,10 @@ def chat_cost(
         "cache_read_tokens": 0,
         "cache_creation_tokens": 0,
         "cost_usd": 0.0,
+        "timing_recorded_messages": 0,
+        "llm_calls": 0,
+        "llm_duration_ms": 0,
+        "llm_ttfb_ms": 0,
     }
     for r in rows:
         row_cost = cost_usd(
@@ -511,6 +526,16 @@ def chat_cost(
             accounting = "partial"
         else:
             accounting = "recorded"
+        timing_recorded = int(r.get("timing_recorded_messages") or 0)
+        llm_calls = int(r.get("llm_calls") or 0)
+        llm_duration_ms = int(r.get("llm_duration_ms") or 0)
+        llm_ttfb_ms = int(r.get("llm_ttfb_ms") or 0)
+        if timing_recorded == 0:
+            timing_accounting = "unavailable"
+        elif timing_recorded < messages:
+            timing_accounting = "partial"
+        else:
+            timing_accounting = "recorded"
         price = resolve_price(r.get("model"))
         sessions.append(
             {
@@ -531,9 +556,20 @@ def chat_cost(
                 "cache_read_tokens": int(r.get("cache_read_tokens") or 0),
                 "cache_creation_tokens": int(r.get("cache_creation_tokens") or 0),
                 "cost_usd": round(row_cost, 6),
+                "timing_recorded_messages": timing_recorded,
+                "timing_accounting": timing_accounting,
+                "llm_calls": llm_calls,
+                "llm_duration_ms": llm_duration_ms,
+                "llm_ttfb_ms": llm_ttfb_ms,
+                "avg_completion_ms": round(llm_duration_ms / llm_calls) if llm_calls else None,
+                "avg_ttfb_ms": round(llm_ttfb_ms / llm_calls) if llm_calls else None,
                 "last_message_at": r.get("last_message_at"),
             }
         )
+        totals["timing_recorded_messages"] += timing_recorded
+        totals["llm_calls"] += llm_calls
+        totals["llm_duration_ms"] += llm_duration_ms
+        totals["llm_ttfb_ms"] += llm_ttfb_ms
         totals["messages"] += messages
         totals["cache_recorded_messages"] += recorded
         totals["input_tokens"] += int(r.get("tokens_in") or 0)
@@ -548,13 +584,26 @@ def chat_cost(
     # A high share is the signal that a per-turn context re-read is cheap —
     # the term a hand-built cost model is most likely to price at 10x.
     totals["cached_input_share"] = round(totals["cache_read_tokens"] / read_input, 4) if read_input else None
+    calls = totals["llm_calls"]
+    totals["avg_completion_ms"] = round(totals["llm_duration_ms"] / calls) if calls else None
+    totals["avg_ttfb_ms"] = round(totals["llm_ttfb_ms"] / calls) if calls else None
 
-    notes = []
+    notes = [
+        "Chat only. For every workload (builders, extraction, corporate memory, …) see "
+        "GET /api/admin/telemetry/llm-cost."
+    ]
     if totals["messages"] and totals["cache_recorded_messages"] < totals["messages"]:
         notes.append(
             f"{totals['messages'] - totals['cache_recorded_messages']} of {totals['messages']} assistant "
             "messages carry no prompt-cache figures (written before migration 0092). Their cached tokens "
             "are unknown, NOT zero, so cost_usd for those rows is a floor rather than a measurement."
+        )
+    if totals["messages"] and totals["timing_recorded_messages"] < totals["messages"]:
+        notes.append(
+            f"{totals['messages'] - totals['timing_recorded_messages']} of {totals['messages']} assistant "
+            "messages carry no completion timing (written before migration 0117, or by a turn whose "
+            "completions never transited the broker). Their LLM latency is unknown, NOT zero; the "
+            "averages describe only the timed messages."
         )
     if not rows:
         notes.append("No assistant messages in this window.")
@@ -577,3 +626,186 @@ def chat_cost(
         "sessions": sessions,
         "notes": notes,
     }
+
+
+_LLM_COST_GROUPS = ("workload", "agent", "user", "model", "purpose")
+
+
+def _llm_calls_repo() -> Any:
+    """Resolve the Postgres-only ledger repository AS A DEPENDENCY.
+
+    Not inside the handler body: FastAPI resolves dependencies before it
+    validates query parameters, so raising here is what makes a DuckDB-backed
+    instance answer the typed ``501`` before ``window``/``by`` (or any other
+    parameter) is even looked at — the same pattern
+    ``app/api/semantic_feedback.py::_feedback_repo`` established.
+    """
+    from src.repositories import llm_calls_repo
+
+    return llm_calls_repo()
+
+
+def _feedback_repo() -> Any:
+    """Resolve the Postgres-only ``chat_message_feedback`` repository AS A
+    DEPENDENCY — same reasoning as :func:`_llm_calls_repo` above."""
+    from src.repositories import chat_message_feedback_repo
+
+    return chat_message_feedback_repo()
+
+
+@router.get("/llm-cost")
+def llm_cost(
+    window: str = Query("7d", description="1d|7d|30d|all"),
+    by: str = Query("workload", description="workload|agent|user|model|purpose"),
+    admin: dict = Depends(require_admin),
+    repo: Any = Depends(_llm_calls_repo),
+):
+    """Cost of every LLM call this instance made, by workload / agent / user /
+    model / purpose — measured on-instance from ``llm_calls`` (priced at
+    write time, the rates stored beside each row), so the same figure the
+    exported span carries. ``chat-cost`` stays the per-session chat view;
+    this is the cross-workload one. Postgres-backed instances only (typed
+    501 otherwise, since the repo dependency above is resolved first).
+    """
+    if window not in _CHAT_COST_WINDOWS:
+        raise HTTPException(status_code=400, detail=f"window must be one of {sorted(_CHAT_COST_WINDOWS)}")
+    if by not in _LLM_COST_GROUPS:
+        raise HTTPException(status_code=400, detail=f"by must be one of {list(_LLM_COST_GROUPS)}")
+    days = _CHAT_COST_WINDOWS[window]
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+
+    groups: list[dict[str, Any]] = []
+    totals: dict[str, Any] = {
+        k: 0 for k in ("calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")
+    }
+    totals["cost_usd"] = 0.0
+    for g in repo.cost_summary(since=since, by=by):
+        read_input = g["input_tokens"] + g["cache_read_tokens"] + g["cache_creation_tokens"]
+        groups.append(
+            {
+                **g,
+                "cost_usd": round(float(g["cost_usd"]), 6),
+                "cached_input_share": round(g["cache_read_tokens"] / read_input, 4) if read_input else None,
+            }
+        )
+        for k in totals:
+            totals[k] += g[k] if k != "cost_usd" else float(g[k])
+    totals["cost_usd"] = round(totals["cost_usd"], 6)
+    read_input = totals["input_tokens"] + totals["cache_read_tokens"] + totals["cache_creation_tokens"]
+    totals["cached_input_share"] = round(totals["cache_read_tokens"] / read_input, 4) if read_input else None
+
+    notes = [
+        "cost_usd is priced at write time with the rates stored on each row (priced_as); a group whose "
+        "priced_models include an unknown model was priced at the default tier."
+    ]
+    if not groups:
+        notes.append("No LLM calls recorded in this window.")
+
+    log_safe(
+        user_id=admin.get("id"),
+        action="usage.llm_cost",
+        params={"window": window, "by": by, "group_count": len(groups)},
+        result="success",
+        client_kind="web",
+    )
+
+    return {"window": window, "by": by, "groups": groups, "totals": totals, "notes": notes}
+
+
+@router.get("/llm-calls")
+def llm_calls(
+    session_id: Optional[str] = Query(None),
+    turn_id: Optional[str] = Query(None),
+    job_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    before: Optional[str] = Query(None, description="ISO timestamp cursor; fetch rows older than this."),
+    before_id: Optional[str] = Query(
+        None, description="Row-id tiebreaker for `before`; pass the previous page's `next_before_id`."
+    ),
+    admin: dict = Depends(require_admin),
+    repo: Any = Depends(_llm_calls_repo),
+):
+    """Detail rows for one session/turn/job/user from the ``llm_calls``
+    ledger, newest first — the drill-down under ``llm-cost``'s aggregates.
+
+    Requires at least one of ``session_id``/``turn_id``/``job_id``/
+    ``user_id`` so this never becomes an unbounded dump of every call the
+    instance ever made. ``before``/``before_id`` are the pagination cursor:
+    pass the previous page's ``next_before``/``next_before_id`` together to
+    fetch the next older page via the composite keyset — rows sharing the
+    exact boundary timestamp are never skipped between pages. ``before``
+    alone still works (single-column cursor, kept for compatibility).
+    """
+    if not any([session_id, turn_id, job_id, user_id]):
+        raise HTTPException(status_code=400, detail="one of session_id, turn_id, job_id, user_id is required")
+    before_dt = None
+    if before:
+        try:
+            before_dt = datetime.fromisoformat(before.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"invalid before: {before}")
+
+    rows = repo.list_calls(
+        session_id=session_id,
+        turn_id=turn_id,
+        job_id=job_id,
+        user_id=user_id,
+        limit=limit,
+        before=before_dt,
+        before_id=before_id,
+    )
+    next_before = rows[-1]["created_at"] if rows else None
+    next_before_id = rows[-1]["id"] if rows else None
+
+    notes = []
+    if not rows:
+        notes.append("No LLM calls recorded for that id — is this instance Postgres-backed? See docs/observability.md.")
+
+    log_safe(
+        user_id=admin.get("id"),
+        action="usage.llm_calls",
+        params={
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "job_id": job_id,
+            "user_id": user_id,
+            "row_count": len(rows),
+        },
+        result="success",
+        client_kind="web",
+    )
+
+    return {"rows": rows, "next_before": next_before, "next_before_id": next_before_id, "notes": notes}
+
+
+@router.get("/feedback")
+def feedback(
+    window: str = Query("7d", description="1d|7d|30d|all"),
+    verdict: Optional[str] = Query(None, description="up|down"),
+    limit: int = Query(100, ge=1, le=1000),
+    admin: dict = Depends(require_admin),
+    repo: Any = Depends(_feedback_repo),
+):
+    """The chat-turn thumbs feedback queue — every ``chat_message_feedback``
+    row in the window, newest first, optionally narrowed to one verdict.
+    Postgres-backed instances only (typed 501 otherwise).
+    """
+    if window not in _CHAT_COST_WINDOWS:
+        raise HTTPException(status_code=400, detail=f"window must be one of {sorted(_CHAT_COST_WINDOWS)}")
+    if verdict is not None and verdict not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="verdict must be one of ['up', 'down']")
+    days = _CHAT_COST_WINDOWS[window]
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+
+    rows = repo.list_feedback(since=since, verdict=verdict, limit=limit)
+
+    log_safe(
+        user_id=admin.get("id"),
+        action="usage.feedback_list",
+        params={"window": window, "verdict": verdict, "row_count": len(rows)},
+        result="success",
+        client_kind="web",
+    )
+
+    return {"window": window, "verdict": verdict, "rows": rows}

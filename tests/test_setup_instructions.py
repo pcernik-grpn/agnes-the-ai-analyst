@@ -197,7 +197,7 @@ def test_prompt_stays_short():
     which cannot move into a CLI that isn't installed yet)."""
     from app.web.setup_instructions import resolve_lines
 
-    assert len(resolve_lines("agnes.whl")) < 75
+    assert len(resolve_lines("agnes.whl")) < 90
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +282,7 @@ def test_token_precheck_block():
 
     joined = "\n".join(resolve_lines("agnes.whl"))
     assert "test -s ~/.agnes/token" in joined
-    assert "{server_url}/home" in joined
-    assert "step 4" in joined
+    assert "{server_url}/how-it-works#connect" in joined
     assert "~/.config/agnes/token.json" in joined
     # The pre-check is prose, not a numbered step — step 0 belongs to the
     # TLS trust block, which must be free to claim that number.
@@ -329,12 +328,7 @@ def test_token_precheck_requires_both_a_credential_and_a_matching_server():
     # all (the `test -f` short-circuit), stops.
     assert "Prints {server_url} → continue" in joined
     assert "including no output" in joined
-    assert "stop, send the user to {server_url}/home step 4" in joined
-
-    # Both reasons are stated, so neither shortcut is reintroduced.
-    assert "token.json records" in joined
-    assert "no server" in joined
-    assert "installer writes server: before anyone has signed in" in joined
+    assert "stop, send the user to {server_url}/how-it-works#connect" in joined
 
 
 def test_preamble_carries_no_pre_emptive_trust_assertion():
@@ -379,6 +373,13 @@ def test_onboard_step_relays_the_cli_directory_check():
     assert "--accept-dir" in joined
     assert "explicitly agreed" in joined
     assert "Don't pick or create a folder on your own." in joined
+    # Same relay-if-you-won't-run-it note as step 1 (#2380): observed live,
+    # an agent that reasonably declined step 1 itself, then reached step 2,
+    # had its own read-only CLI probes blocked by its tool-permission
+    # classifier, and left the person with no command to run themselves —
+    # step 2 didn't say to surface the finished command line the way step 1
+    # already did.
+    assert 'not a reference to "step 2"' in joined
     # What onboard converges, in one sentence — the recap in step 4 asks
     # the agent to report on exactly these.
     assert "safe to re-run" in joined

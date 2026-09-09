@@ -304,6 +304,7 @@ def _generate_title_sync(
     api_key: str | None = None,
     auth_token: str | None = None,
     vertex: tuple[str, str] | None = None,
+    session_id: str | None = None,
 ) -> str | None:
     """Synchronous Haiku call. Returns the trimmed title or ``None``.
 
@@ -316,7 +317,9 @@ def _generate_title_sync(
     (``Authorization: Bearer`` + the oauth beta header OAuth-style tokens
     need); or, when ``vertex=(project_id, region)`` is passed, through
     ``anthropic.AnthropicVertex`` with Google ADC and the Vertex spelling of
-    the title model.
+    the title model. ``session_id`` (the chat this call titles) rides the
+    LLM call context as the record's ``subject_id`` — see
+    ``src/observability/llm_context.py``.
     """
     try:
         import anthropic  # local import keeps test envs without the SDK clean
@@ -338,12 +341,25 @@ def _generate_title_sync(
             )
         else:
             client = anthropic.Anthropic(api_key=api_key, timeout=8.0)
-        resp = client.messages.create(
-            model=model,
-            max_tokens=_TITLE_MAX_TOKENS,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _title_request(user_message)}],
-        )
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
+        with (
+            llm_context(workload="auto_title", subject_id=session_id),
+            trace_generation(
+                provider=provider_label("vertex" if vertex is not None else "anthropic"),
+                model=model,
+                purpose="auto_title",
+            ) as cap,
+        ):
+            cap.set_input(user_message)
+            resp = client.messages.create(
+                model=model,
+                max_tokens=_TITLE_MAX_TOKENS,
+                system=_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": _title_request(user_message)}],
+            )
+            cap.set_output_from_anthropic(resp)
     except Exception:
         logger.exception("auto-title model call failed; returning no title (the caller falls back)")
         return None
@@ -361,6 +377,7 @@ async def generate_title(
     llm_auth: str = "api_key",
     llm_provider: str = "anthropic",
     vertex: tuple[str, str] | None = None,
+    session_id: str | None = None,
 ) -> str | None:
     """Ask Haiku for a short title for a conversation. Best-effort.
 
@@ -370,7 +387,9 @@ async def generate_title(
     presence — otherwise a stale ``ANTHROPIC_API_KEY`` left set in
     ``workload_identity`` or ``vertex`` mode would silently authenticate
     auto-title with the wrong credential while the broker correctly uses
-    the keyless path.
+    the keyless path. ``session_id`` is the chat this title is for —
+    threaded straight through to :func:`_generate_title_sync` so the call
+    record names it (see that function's docstring).
 
     Returns the cleaned title string, or ``None`` if the API key is
     missing, the SDK isn't installed, the call fails, or the reply is
@@ -396,12 +415,12 @@ async def generate_title(
         if vertex is None:
             _warn_no_credential(RuntimeError("chat.llm.provider=vertex but no vertex project/region resolvable"))
             return None
-        return await asyncio.to_thread(_generate_title_sync, user_message, vertex=vertex)
+        return await asyncio.to_thread(_generate_title_sync, user_message, vertex=vertex, session_id=session_id)
 
     if llm_auth != "workload_identity":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if api_key:
-            return await asyncio.to_thread(_generate_title_sync, user_message, api_key=api_key)
+            return await asyncio.to_thread(_generate_title_sync, user_message, api_key=api_key, session_id=session_id)
     # Keyless (workload_identity), or no static key configured: mint a
     # short-lived federated token the same way the broker does. If neither a
     # static key nor a valid WIF configuration is present,
@@ -420,4 +439,4 @@ async def generate_title(
         else:
             _warn_no_credential(exc)
         return None
-    return await asyncio.to_thread(_generate_title_sync, user_message, auth_token=token)
+    return await asyncio.to_thread(_generate_title_sync, user_message, auth_token=token, session_id=session_id)

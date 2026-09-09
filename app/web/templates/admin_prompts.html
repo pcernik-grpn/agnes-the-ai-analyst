@@ -124,9 +124,10 @@
     <div data-pane="editor">
       <div class="prompt-editor"><textarea data-role="editor"></textarea></div>
       <div class="prompt-actions">
-        <button type="button" class="btn btn-primary" data-action="save">Save</button>
+        <button type="button" class="btn btn-primary" data-action="save" disabled>Save</button>
         <button type="button" class="btn btn-secondary" data-action="reset">Reset to default</button>
         <button type="button" class="btn btn-secondary" data-action="preview">Preview</button>
+        <button type="button" class="btn btn-secondary" data-action="copy">Copy rendered</button>
         <span class="prompt-status" data-role="status"></span>
       </div>
       <div class="prompt-meta" data-role="meta"></div>
@@ -236,6 +237,38 @@
     return 'Request failed';
   }
 
+  // Mirrors install.html's copyToClipboard: Clipboard API when available in
+  // a secure context, else the execCommand('copy') fallback (e.g. plain
+  // HTTP admin access over a LAN, which is not a secure context). A secure
+  // context does not guarantee the write succeeds — e.g. a browser can still
+  // deny clipboard-write permission — so a rejection falls back too, instead
+  // of leaving the admin with a silently failed copy and no fallback path.
+  function copyViaTextarea(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    return new Promise(function (resolve, reject) {
+      try {
+        document.execCommand('copy') ? resolve() : reject(new Error('execCommand failed'));
+      } finally {
+        document.body.removeChild(ta);
+      }
+    });
+  }
+  function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).catch(function () {
+        return copyViaTextarea(text);
+      });
+    }
+    return copyViaTextarea(text);
+  }
+
   // The IWT file list is repo-global (same repo backs both cards). Fetch it
   // once and share the promise across every card's picker. #622 Slice 3.
   let _iwtFilesPromise = null;
@@ -263,16 +296,28 @@
     const gitPathSelect = card.querySelector('[data-role="git-path-select"]');
     const manualLink = card.querySelector('[data-action="toggle-manual"]');
     const toggleBtns = card.querySelectorAll('.prompt-toggle button');
+    const saveBtn = card.querySelector('[data-action="save"]');
 
     let cm = CodeMirror.fromTextArea(card.querySelector('[data-role="editor"]'), {
       mode: 'jinja2', theme: 'material-darker', lineNumbers: true, lineWrapping: true,
     });
     let state = { source_mode: 'editor', git_path: null, default: '' };
+    cm.on('change', function () { updateSaveState(); });
 
     function setStatus(el, msg, ok) {
       el.textContent = msg || '';
       el.classList.toggle('is-ok', ok === true);
       el.classList.toggle('is-err', ok === false);
+    }
+
+    // Save stays disabled until the editor actually diverges from the
+    // last-loaded value (the saved override, or the shipped default when no
+    // override exists) — nothing to lose by clicking otherwise, but a
+    // permanently-blue Save read as "there's a pending change" even when
+    // there wasn't one.
+    function updateSaveState() {
+      if (state.source_mode !== 'editor') { saveBtn.disabled = true; return; }
+      saveBtn.disabled = cm.getValue() === (state.content || state.default || '');
     }
 
     function applyMode(mode) {
@@ -292,6 +337,7 @@
       if (!r.ok) { setStatus(statusEl, detailHint(r.data), false); return; }
       state = r.data;
       cm.setValue(state.content || state.default || '');
+      updateSaveState();
       applyMode(state.source_mode);
       divEl.classList.add('hidden');
       if (state.source_mode === 'git') {
@@ -357,7 +403,19 @@
       });
     });
 
-    card.querySelector('[data-action="save"]').addEventListener('click', async function () {
+    saveBtn.addEventListener('click', async function () {
+      // Same confirm-before-mutate idiom as Reset below: this save is live
+      // for every analyst who fetches the prompt from now on, and there is
+      // no "undo" short of retyping it.
+      const ok = window.confirmModal
+        ? await window.confirmModal({
+            title: 'Save this override?',
+            message: 'Replaces what every analyst gets from now on '
+              + '(the /setup page and the clipboard CTA both read this override).',
+            confirmText: 'Save',
+          })
+        : true;
+      if (!ok) return;
       const r = await api('PUT', base, { content: cm.getValue() });
       if (!r.ok) { setStatus(statusEl, detailHint(r.data), false); return; }
       setStatus(statusEl, 'Saved', true);
@@ -391,6 +449,21 @@
       if (w) { w.document.body.innerText = r.data.content; }
       setStatus(statusEl, 'Preview opened', true);
     });
+    card.querySelector('[data-action="copy"]').addEventListener('click', async function () {
+      // Copies the RENDERED text (the same /preview render Save/Reset above
+      // display), not the raw editor content — this is what an analyst
+      // actually pastes into Claude Code, so a copy of unrendered Jinja
+      // source (or the un-substituted single-brace placeholders — #2329)
+      // would be a broken thing to hand someone to test with.
+      const r = await api('POST', base + '/preview', { content: cm.getValue() });
+      if (!r.ok) { setStatus(statusEl, detailHint(r.data), false); return; }
+      try {
+        await copyToClipboard(r.data.content);
+        setStatus(statusEl, 'Copied rendered prompt to clipboard', true);
+      } catch (e) {
+        setStatus(statusEl, 'Clipboard blocked — use Preview and copy manually', false);
+      }
+    });
     // Picker → hidden input mirror (the Bind handler reads gitPathInput).
     gitPathSelect.addEventListener('change', function () {
       gitPathInput.value = gitPathSelect.value;
@@ -403,7 +476,17 @@
     });
 
     card.querySelector('[data-action="bind"]').addEventListener('click', async function () {
-      const r = await api('POST', base + '/bind-git', { git_path: gitPathInput.value.trim() });
+      const path = gitPathInput.value.trim();
+      const ok = window.confirmModal
+        ? await window.confirmModal({
+            title: 'Bind to this repo file?',
+            message: 'Every analyst gets the rendered content of "' + path + '" from now '
+              + 'on, replacing whatever this prompt currently serves.',
+            confirmText: 'Bind',
+          })
+        : true;
+      if (!ok) return;
+      const r = await api('POST', base + '/bind-git', { git_path: path });
       if (!r.ok) { setStatus(gitStatusEl, detailHint(r.data), false); return; }
       setStatus(gitStatusEl, 'Bound', true);
       await load();

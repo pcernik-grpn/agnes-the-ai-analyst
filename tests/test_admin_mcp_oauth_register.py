@@ -337,7 +337,6 @@ def test_register_translates_ssrf_rejection_to_400(seeded_app, monkeypatch):
     """A discovery target resolving to a blocked address must produce an
     actionable 400, not an opaque 500 (Devin Review on #1124)."""
     import connectors.mcp.oauth_client as oc
-
     from src.net.ssrf_safe_client import SSRFRejected
 
     async def _boom(source_url, *, client):
@@ -406,7 +405,6 @@ def test_reregister_revokes_old_only_after_new_registration_succeeds(seeded_app,
     must leave the OLD stored registration intact and un-revoked, so
     connected users keep working (Devin Review on #1124)."""
     import connectors.mcp.oauth_client as oc
-
     from src.repositories import mcp_source_oauth_clients_repo
 
     monkeypatch.setenv("PUBLIC_URL", "https://agnes.example.com")
@@ -1000,7 +998,7 @@ def test_a_failed_purge_leaves_the_source_pointing_at_the_old_host(seeded_app, m
     )
     per_user_secrets_repo().upsert(sid, "admin1", "tok-for-h1")
 
-    import app.api.admin_mcp as admin_mcp
+    from app.api import admin_mcp
 
     def _boom():
         raise RuntimeError("vault backend went away mid-purge")
@@ -1125,7 +1123,7 @@ def test_a_failed_token_purge_leaves_the_client_row_on_the_old_provider(seeded_a
     )
     mcp_user_oauth_tokens_repo().upsert(sid, "admin1", "at-old", refresh_token="rt-old", expires_at=None)
 
-    import app.api.admin_mcp as admin_mcp
+    from app.api import admin_mcp
 
     real = admin_mcp.mcp_sources_repo
 
@@ -1530,3 +1528,43 @@ def test_a_scopes_only_edit_still_keeps_the_secret(seeded_app, monkeypatch):
     assert row["scopes"] == "read write"
     assert row["client_secret"] == "new-secret"
     assert row["registration_access_token"] == "new-rat"
+
+
+# ---------------------------------------------------------------------------
+# GET …/mcp-sources/{id} — oauth_client status (admin detail page's
+# register-vs-connect gate reads this instead of a second round trip)
+# ---------------------------------------------------------------------------
+
+
+def test_get_source_reports_no_oauth_client_before_registration(seeded_app):
+    source_id = _seed_oauth_source(source_id="src_detail_unregistered")
+    r = seeded_app["client"].get(f"/api/admin/mcp-sources/{source_id}", headers=_hdr(seeded_app))
+    assert r.status_code == 200, r.text
+    assert r.json()["oauth_client"] is None
+
+
+def test_get_source_reports_oauth_client_after_registration(seeded_app, monkeypatch):
+    monkeypatch.setenv("PUBLIC_URL", "https://agnes.example.com")
+    source_id = _seed_oauth_source(source_id="src_detail_registered")
+    _patch_discovery_success(monkeypatch)
+    assert (
+        seeded_app["client"]
+        .post(f"/api/admin/mcp-sources/{source_id}/oauth/register", headers=_hdr(seeded_app))
+        .status_code
+        == 200
+    )
+
+    r = seeded_app["client"].get(f"/api/admin/mcp-sources/{source_id}", headers=_hdr(seeded_app))
+    assert r.status_code == 200, r.text
+    client = r.json()["oauth_client"]
+    assert client is not None
+    assert client["client_id"] == "new-client-id"
+    assert client["has_client_secret"] is True
+    assert "client_secret" not in client
+
+
+def test_get_source_reports_no_oauth_client_field_for_non_oauth_source(seeded_app):
+    source_id = _seed_non_oauth_source(source_id="src_detail_bearer")
+    r = seeded_app["client"].get(f"/api/admin/mcp-sources/{source_id}", headers=_hdr(seeded_app))
+    assert r.status_code == 200, r.text
+    assert r.json()["oauth_client"] is None

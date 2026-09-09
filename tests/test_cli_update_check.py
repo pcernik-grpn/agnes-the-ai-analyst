@@ -16,17 +16,19 @@ def tmp_config(tmp_path, monkeypatch):
     monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path))
     # Point CLI at a fake server so get_server_url() returns something stable.
     monkeypatch.setenv("AGNES_SERVER", "http://server.test:8000")
+    # `agnes onboard` / `agnes update` set AGNES_NO_UPDATE_CHECK=1 in their
+    # own process on purpose, so any test that ran either command in-process
+    # earlier on this xdist worker leaves `check()` short-circuiting. Start
+    # every test here from the switch's absence rather than from whatever
+    # the worker inherited.
+    monkeypatch.delenv("AGNES_NO_UPDATE_CHECK", raising=False)
     yield tmp_path
 
 
-def test_check_returns_none_when_disabled(tmp_config):
-    import os
-    os.environ["AGNES_NO_UPDATE_CHECK"] = "1"
-    try:
-        from cli import update_check
-        assert update_check.check("http://server.test:8000") is None
-    finally:
-        del os.environ["AGNES_NO_UPDATE_CHECK"]
+def test_check_returns_none_when_disabled(tmp_config, monkeypatch):
+    monkeypatch.setenv("AGNES_NO_UPDATE_CHECK", "1")
+    from cli import update_check
+    assert update_check.check("http://server.test:8000") is None
 
 
 def test_check_returns_none_when_server_url_missing(tmp_config):

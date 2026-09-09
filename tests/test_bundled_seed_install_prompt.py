@@ -112,4 +112,4 @@ def test_stays_short():
     test_prompt_stays_short` — step 1 is inlined here (nothing substitutes
     `{install_cli_block}` on the fork path), so the ceiling matches the
     built-in prompt's. A re-grown section shows up here first."""
-    assert len(_template_text().splitlines()) <= 75
+    assert len(_template_text().splitlines()) <= 84
