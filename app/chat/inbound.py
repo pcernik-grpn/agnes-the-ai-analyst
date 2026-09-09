@@ -171,7 +171,9 @@ async def _publish_entry(chat_id: str, payload: dict) -> int:
     return seq
 
 
-async def publish_inbound(chat_id: str, text: str, *, slack: Optional[dict] = None) -> int:
+async def publish_inbound(
+    chat_id: str, text: str, *, slack: Optional[dict] = None, turn_id: Optional[str] = None
+) -> int:
     """Append a user message to ``chat_id``'s inbound stream and best-effort
     notify any subscribed owner. Returns the assigned seq.
 
@@ -184,12 +186,24 @@ async def publish_inbound(chat_id: str, text: str, *, slack: Optional[dict] = No
     channel before delivering, so the runner's reply actually reaches
     Slack (``ChatManager._ensure_slack_sink``). Empty values are dropped
     from the marker; a fully-empty marker is omitted.
+
+    ``turn_id``, when given, is the id the caller already minted BEFORE
+    persisting the user row it corresponds to (mirroring the direct-owner
+    path's ``send_user_message`` -- see
+    ``app.chat.manager.produce_inbound_user_message``), so the owning
+    gateway's consumer can reuse the SAME id for the turn instead of
+    minting a fresh one that would leave the user row and the assistant
+    row disagreeing. Omitted entirely when not given, so an entry
+    published by an older replica (before this field existed) round-trips
+    unchanged and the consumer falls back to minting its own, as before.
     """
     payload: dict = {"type": "user_message", "text": text}
     if slack:
         origin = {k: v for k, v in slack.items() if v}
         if origin:
             payload["slack"] = origin
+    if turn_id:
+        payload["turn_id"] = turn_id
     return await _publish_entry(chat_id, payload)
 
 

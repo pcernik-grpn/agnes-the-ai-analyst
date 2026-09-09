@@ -4131,7 +4131,14 @@ class ChatManager:
                         # webhook handler never attaches one).
                         await self._ensure_slack_sink(live, slack_origin)
                     try:
-                        await self._deliver_local_user_message(live, text)
+                        # entry["turn_id"] (present since
+                        # produce_inbound_user_message started minting it
+                        # before persisting the user row) is threaded
+                        # through so this turn agrees with the persisted
+                        # row; an entry from an older replica carries none,
+                        # and _deliver_local_user_message mints a fresh one
+                        # exactly as it always has.
+                        await self._deliver_local_user_message(live, text, turn_id=entry.get("turn_id"))
                     except Exception:
                         logger.exception("inbound consumer: delivery failed for %s seq %s; skipping", chat_id, seq)
                     live.inbound_last_seq = seq
@@ -5725,6 +5732,16 @@ async def produce_inbound_user_message(
     deployment: this function is the persist for a message that arrived on a
     replica which does not host the session, so a claim made only in the
     manager's process-local set would not have covered it.
+
+    Minted HERE, before the user row is persisted -- same placement and
+    reasoning as ``ChatManager.send_user_message``'s ``turn_id`` (see that
+    method's comment): this is the thin-producer's own persist of the user
+    row, so it is the only place on THIS path that can mint before persist.
+    It rides the published ``chat-in:{chat_id}`` entry so the owning
+    gateway's ``_inbound_consumer_loop`` can hand the SAME id to
+    ``_deliver_local_user_message`` instead of minting a fresh one there --
+    closing the gap where a forwarded turn's user row and assistant row used
+    to disagree on their turn_id.
     """
     session = repo.get_session(chat_id)
     if session is None:
@@ -5738,12 +5755,14 @@ async def produce_inbound_user_message(
             client_msg_id,
         )
         return
+    turn_id = str(uuid4())
     try:
         repo.append_message(
             session_id=chat_id,
             role="user",
             content=text,
             sender_email=sender,
+            turn_id=turn_id,
         )
     except Exception:
         await release_user_message_claim(chat_id, client_msg_id)
@@ -5762,4 +5781,4 @@ async def produce_inbound_user_message(
         surface=getattr(session.surface, "value", str(session.surface)),
         sender=sender,
     )
-    await inbound.publish_inbound(chat_id, text, slack=slack_origin)
+    await inbound.publish_inbound(chat_id, text, slack=slack_origin, turn_id=turn_id)
