@@ -11,8 +11,13 @@
   membership-mode aware (`in_stack: always | if_subscribed`), applies the stack
   resolver's draft / coming-soon rules to the per-group view, reads the table
   inventory from the admin registry (the catalog narrows a stack-surface admin
-  credential to their own stack), and says when a list was capped. See
-  `docs/RBAC.md` → *Admin workflows → MCP (agents)*.
+  credential to their own stack), says when a list was capped, and takes a
+  `section` (`packages` / `by_group` / `unreachable`) so a large instance can
+  be read one part at a time. See `docs/RBAC.md` → *Admin workflows → MCP
+  (agents)*.
+- `GET /api/admin/registry` carries `packaged_read_ok` so a consumer can tell
+  a genuinely unpackaged table from the all-`false` stamps the endpoint falls
+  back to when its package-membership read fails.
 - `GET /api/admin/data-packages` accepts `?limit=` (1–5000, default 200 as
   before) so a reader can ask for the whole package inventory instead of
   silently losing every package past the 200th.

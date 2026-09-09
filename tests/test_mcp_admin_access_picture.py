@@ -251,7 +251,10 @@ def test_by_group_shows_the_non_admin_view_and_marks_admin_bypass():
     # sees. The draft (hidden from analysts) and the coming-soon package
     # (browsable, never deliverable) are NOT in the reach — the same rule
     # StackResolver.stack applies.
-    assert sorted((p["id"], p["via"]) for p in fin["packages"]) == [("pkg_mkt", "everyone"), ("pkg_rev", "group")]
+    assert sorted((p["id"], tuple(p["via"])) for p in fin["packages"]) == [
+        ("pkg_mkt", ("everyone",)),
+        ("pkg_rev", ("group",)),
+    ]
 
     admin = by_group["g_admin"]
     assert admin["bypasses_grants"] is True
@@ -352,6 +355,109 @@ def test_reads_the_three_admin_wide_endpoints_not_the_caller_scoped_catalog():
     # The catalog narrows a stack-surface admin to their own stack — the one
     # set of tables that is never orphaned — so it must not be the inventory.
     assert not any("/api/catalog/tables" in u or "/api/v2/catalog" in u for u in urls)
+
+
+def test_a_direct_available_grant_never_hides_a_required_everyone_grant():
+    """StackResolver's precedence: a package in `required_ids` is in the stack
+    regardless of any weaker grant on it. Deduplicating by package id used to
+    let a group's own `available` grant suppress the Everyone `required`
+    entry, so classic mode reported `if_subscribed` for a package every member
+    already has."""
+    overview = {
+        **_OVERVIEW,
+        "grants": _OVERVIEW["grants"]
+        + [
+            {
+                "id": "gr6",
+                "group_id": "g_fin",
+                "resource_type": "data_package",
+                "resource_id": "pkg_mkt",
+                "requirement": "available",
+                "audience": "g_fin",
+                "scope": None,
+            }
+        ],
+    }
+
+    def dispatch(url: str, **_kwargs):
+        if "/api/admin/access-overview" in url:
+            return _mock_resp(overview)
+        return _dispatch(url)
+
+    result, _ = _call(auto_membership=False, dispatch=dispatch)
+
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    mkt = next(p for p in fin["packages"] if p["id"] == "pkg_mkt")
+    # The Everyone grant on pkg_mkt in the fixture is `available`; make the
+    # test's premise explicit by checking the merge keeps the STRONGEST tier
+    # once one of the two is required.
+    assert mkt["via"] == ["everyone", "group"]
+    assert mkt["requirement"] == "available"
+    assert mkt["in_stack"] == "if_subscribed"
+
+    overview["grants"][1] = {**overview["grants"][1], "requirement": "required"}
+    result, _ = _call(auto_membership=False, dispatch=dispatch)
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    mkt = next(p for p in fin["packages"] if p["id"] == "pkg_mkt")
+    assert mkt["via"] == ["everyone", "group"]
+    assert mkt["requirement"] == "required"
+    assert mkt["in_stack"] == "always"
+    assert [p["id"] for p in fin["packages"]].count("pkg_mkt") == 1
+
+
+def test_a_failed_registry_membership_read_falls_back_to_the_package_union():
+    """`/api/admin/registry` stamps `packaged=false` on EVERY row when its
+    bulk membership read fails and says so with `packaged_read_ok: false`.
+    Trusting the rows then would report every distributable table as
+    orphaned — the picture must fall back to the package page instead and
+    say that it did."""
+    registry = {
+        "tables": [{**t, "packaged": False} for t in _REGISTRY["tables"]],
+        "count": 7,
+        "packaged_read_ok": False,
+    }
+
+    def dispatch(url: str, **_kwargs):
+        if "/api/admin/registry" in url:
+            return _mock_resp(registry)
+        return _dispatch(url)
+
+    result, _ = _call(dispatch=dispatch)
+
+    assert [t["id"] for t in result["unreachable"]["tables_in_no_package"]] == ["t_orphan"]
+    assert any("packaged_read_ok" in n for n in result["notes"])
+
+
+def test_section_narrows_the_response_to_one_part():
+    """`include_tables=False` is not enough on a large instance: packages are
+    repeated in `packages` and in every `by_group` entry. `section` is the
+    real narrowing step, and the completeness metadata rides along."""
+    for section, present, absent in (
+        ("unreachable", ("unreachable",), ("packages", "by_group", "groups")),
+        ("packages", ("packages", "groups"), ("by_group", "unreachable")),
+        ("by_group", ("by_group", "groups"), ("packages", "unreachable")),
+    ):
+        result, _ = _call(section=section)
+        for key in present:
+            assert key in result, (section, key)
+        for key in absent:
+            assert key not in result, (section, key)
+        for key in ("source", "captured_at", "membership_mode", "account_total", "packages_truncated", "notes"):
+            assert key in result, (section, key)
+        assert result["section"] == section
+
+
+def test_section_all_is_the_default_and_carries_everything():
+    result, _ = _call()
+
+    assert result["section"] == "all"
+    for key in ("groups", "packages", "by_group", "unreachable"):
+        assert key in result
+
+
+def test_an_unknown_section_is_refused():
+    with pytest.raises(ValueError):
+        _call(section="everything")
 
 
 def test_declares_itself_read_only():

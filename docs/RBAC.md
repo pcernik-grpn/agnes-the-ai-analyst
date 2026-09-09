@@ -524,7 +524,10 @@ Admin group flagged as bypassing grants; drafts and coming-soon packages
 excluded exactly as the stack resolver excludes them; `in_stack` marks an
 `available` grant as `if_subscribed` under classic membership), and what
 nobody can reach — distributable tables in no package and packages granted to
-no group, folded the same way as the `/admin` gap cards. The table inventory
+no group, folded the same way as the `/admin` gap cards. On a large instance
+ask for one `section` at a time (`packages` / `by_group` / `unreachable`);
+`include_tables=False` alone cannot bound a response that repeats every
+package per group. The table inventory
 is the admin registry rather than the catalog on purpose: agent credentials
 are stack-surface, and for that surface the catalog narrows even an admin to
 their own stack — the one set of tables that is never orphaned. It is the tool behind the chat landing

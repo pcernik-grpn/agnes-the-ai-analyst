@@ -120,6 +120,13 @@ _ACCESS_PICTURE_PACKAGE_LIMIT = 5000
 #: capped and the true total rides beside it.
 _ACCESS_PICTURE_LIST_CAP = 200
 
+#: The parts of the picture a caller can ask for on their own. `include_tables=
+#: False` only drops table arrays; packages are still repeated in `packages`
+#: and in every `by_group` entry, so on a large instance the real narrowing
+#: step is one section at a time. The completeness metadata rides with every
+#: section.
+_ACCESS_PICTURE_SECTIONS = ("all", "packages", "by_group", "unreachable")
+
 
 def _stack_auto_membership() -> bool:
     """The instance's stack membership mode — a config flag, read in-process.
@@ -141,6 +148,7 @@ def _compose_access_picture(
     include_tables: bool,
     auto_membership: bool,
     packages_truncated: bool,
+    section: str = "all",
 ) -> dict:
     """Fold the three admin reads behind ``admin_access_picture`` into one picture.
 
@@ -159,6 +167,9 @@ def _compose_access_picture(
     from app.services.stack_resolver import HIDDEN_STATUSES, UNDELIVERABLE_STATUSES
     from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
     from src.grant_scopes import EVERYONE_TARGET_ID
+
+    if section not in _ACCESS_PICTURE_SECTIONS:
+        raise ValueError(f"section must be one of {', '.join(_ACCESS_PICTURE_SECTIONS)}, got {section!r}")
 
     account_total = int(overview.get("account_total") or 0)
     groups = [
@@ -203,7 +214,11 @@ def _compose_access_picture(
     # membership read over every package -- the authority, and immune to the
     # package page below being truncated. The union over the page is only the
     # fallback for a payload that lacks the flag.
-    registry_knows_packaging = any("packaged" in t for t in tables_by_id.values())
+    # ...unless the registry says its own read failed: it then stamps `false`
+    # on every row (`packaged_read_ok: false`), which read naively would call
+    # every distributable table orphaned. Fall back to the page union and say so.
+    packaged_read_ok = registry.get("packaged_read_ok", True) is not False
+    registry_knows_packaging = packaged_read_ok and any("packaged" in t for t in tables_by_id.values())
     packaged_union: set[str] = set()
     pkgs_out: list[dict] = []
     for p in packages:
@@ -262,19 +277,49 @@ def _compose_access_picture(
             return "always"
         return "if_subscribed"
 
-    everyone_pkgs = [
-        {
-            "id": p["id"],
-            "name": p["name"],
-            "requirement": g["requirement"],
-            "via": EVERYONE_TARGET_ID,
-            "in_stack": _in_stack(g["requirement"], EVERYONE_TARGET_ID),
-        }
-        for p in pkgs_out
-        if _reachable(p)
-        for g in p["granted_to"]
-        if g["audience"] == EVERYONE_TARGET_ID
-    ]
+    def _merge(entries: list[dict]) -> list[dict]:
+        """One entry per package, keeping the STRONGEST grant.
+
+        A package can reach a member twice -- a direct grant on their group
+        and an everyone-scoped one -- and ``StackResolver.stack`` puts it in
+        ``required_ids`` if EITHER is required. Deduplicating by id used to let
+        the weaker grant win when it happened to come first, so classic mode
+        reported ``if_subscribed`` for a package every member already has.
+        ``via`` lists every source, sorted, so nothing is attributed to one.
+        """
+        by_id: dict[str, dict] = {}
+        for e in entries:
+            cur = by_id.get(e["id"])
+            if cur is None:
+                by_id[e["id"]] = {**e, "via": [e["via"]]}
+                continue
+            if e["via"] not in cur["via"]:
+                cur["via"].append(e["via"])
+            if e["requirement"] == "required":
+                cur["requirement"] = "required"
+            if e["in_stack"] == "always":
+                cur["in_stack"] = "always"
+        out = []
+        for e in by_id.values():
+            e["via"] = sorted(e["via"])
+            out.append(e)
+        return out
+
+    everyone_pkgs = _merge(
+        [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "requirement": g["requirement"],
+                "via": EVERYONE_TARGET_ID,
+                "in_stack": _in_stack(g["requirement"], EVERYONE_TARGET_ID),
+            }
+            for p in pkgs_out
+            if _reachable(p)
+            for g in p["granted_to"]
+            if g["audience"] == EVERYONE_TARGET_ID
+        ]
+    )
     by_group: list[dict] = [
         {
             "group_id": EVERYONE_TARGET_ID,
@@ -290,7 +335,7 @@ def _compose_access_picture(
         is_admin = g["is_system"] and g["name"] == SYSTEM_ADMIN_GROUP
         if is_admin:
             reach = [
-                {"id": p["id"], "name": p["name"], "requirement": None, "via": "admin", "in_stack": "always"}
+                {"id": p["id"], "name": p["name"], "requirement": None, "via": ["admin"], "in_stack": "always"}
                 for p in pkgs_out
             ]
         else:
@@ -307,8 +352,11 @@ def _compose_access_picture(
                 for gr in p["granted_to"]
                 if gr["audience"] == "group" and gr["group_id"] == g["id"]
             ]
-            seen = {d["id"] for d in direct}
-            reach = direct + [e for e in everyone_pkgs if e["id"] not in seen]
+            # Everyone entries are already merged; flatten their `via` back to
+            # single sources so the merge below can union them with the direct
+            # grants per package.
+            everyone_flat = [{**e, "via": v} for e in everyone_pkgs for v in e["via"]]
+            reach = _merge(direct + everyone_flat)
         by_group.append(
             {
                 "group_id": g["id"],
@@ -356,23 +404,40 @@ def _compose_access_picture(
             else f"packages_truncated=true: the package inventory filled a {_ACCESS_PICTURE_PACKAGE_LIMIT}-row page, "
             "so packages, by_group AND tables_in_no_package are incomplete."
         )
-    return {
+    if not packaged_read_ok:
+        notes.append(
+            "packaged_read_ok=false: the registry could not read package membership, so tables_in_no_package "
+            "is derived from the package page instead"
+            + (" -- and is incomplete because that page was truncated." if packages_truncated else ".")
+        )
+    if section != "all":
+        notes.append(
+            f"section={section}: only that part of the picture is included; call with section='all' for the rest."
+        )
+
+    out: dict[str, Any] = {
         "source": "server",
+        "section": section,
         "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "membership_mode": "auto" if auto_membership else "classic",
         "account_total": account_total,
-        "groups": groups,
-        "packages": pkgs_out,
         "packages_truncated": packages_truncated,
-        "by_group": by_group,
-        "unreachable": {
+    }
+    if section in ("all", "packages", "by_group"):
+        out["groups"] = groups
+    if section in ("all", "packages"):
+        out["packages"] = pkgs_out
+    if section in ("all", "by_group"):
+        out["by_group"] = by_group
+    if section in ("all", "unreachable"):
+        out["unreachable"] = {
             "tables_in_no_package": unpackaged,
             "tables_in_no_package_total": len(unpackaged_all),
             "tables_in_no_package_truncated": len(unpackaged_all) > len(unpackaged),
             "packages_granted_to_no_group": ungranted,
-        },
-        "notes": notes,
-    }
+        }
+    out["notes"] = notes
+    return out
 
 
 FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
@@ -2793,7 +2858,10 @@ def register_foundation_tools(
             return {"connections": r.json()}
 
     @tool(read_only=True)
-    async def admin_access_picture(include_tables: bool = True) -> dict:
+    async def admin_access_picture(
+        include_tables: bool = True,
+        section: Literal["all", "packages", "by_group", "unreachable"] = "all",
+    ) -> dict:
         """Admin-only access picture: every data package, which groups are granted it and how many accounts each holds, what nobody can reach (distributable tables in no package, packages granted to no group), and what each group can see. Answers "who has access to which data", "what is shared with no one" and "what does a non-admin see" from the real grants -- call it instead of guessing from the catalog.
 
         Composes three admin-wide reads -- ``GET /api/admin/access-overview``
@@ -2812,10 +2880,18 @@ def register_foundation_tools(
             include_tables: Include each package's table list (default). Pass
                 ``False`` on a large instance when the response trips the
                 output cap -- ``table_count`` and the unreachable tray stay.
+            section: ``all`` (default) or ONE of ``packages`` / ``by_group`` /
+                ``unreachable``. The real narrowing step on a large instance:
+                packages are repeated in ``packages`` and in every ``by_group``
+                entry, so asking for one section at a time bounds the response
+                where ``include_tables=False`` alone cannot. The completeness
+                metadata (``packages_truncated``, ``notes``) rides with every
+                section.
 
-        Returns ``{"source": "server", "captured_at", "membership_mode",
-        "account_total", "groups", "packages", "packages_truncated",
-        "by_group", "unreachable", "notes"}``:
+        Returns ``{"source": "server", "section", "captured_at",
+        "membership_mode", "account_total", "packages_truncated", "notes"}``
+        plus the requested sections -- ``groups`` + ``packages``, ``groups`` +
+        ``by_group``, ``unreachable``, or all of them:
 
         - ``membership_mode``: ``auto`` (the default -- every granted package
           is in a member's stack at once) or ``classic`` (only ``required``
@@ -2837,8 +2913,10 @@ def register_foundation_tools(
           came back full -- the package half is then incomplete.
         - ``by_group``: what a member of each group can reach -- an
           ``everyone`` baseline entry first, then every group with its direct
-          grants plus that baseline (``via``: ``group`` | ``everyone`` |
-          ``admin``). Drafts and coming-soon packages are excluded exactly as
+          grants merged with that baseline, one entry per package keeping the
+          strongest grant (``via`` lists every source: ``group`` /
+          ``everyone`` / ``admin``; ``requirement`` is ``required`` if any
+          source is). Drafts and coming-soon packages are excluded exactly as
           ``StackResolver.stack`` excludes them; ``bypasses_grants`` is true
           for the Admin group, which reaches everything regardless. This is
           the "what would a non-admin see" answer: pick the group, read its
@@ -2849,7 +2927,9 @@ def register_foundation_tools(
           server-side without a package and ``internal`` rows have no
           parquet, so neither is listed. Capped at 200 entries;
           ``tables_in_no_package_total`` / ``_truncated`` say whether more
-          exist. Fix: add the table to a package.
+          exist. Derived from the registry's own ``packaged`` stamp; when the
+          registry reports ``packaged_read_ok: false`` the fold falls back to
+          the package page and a note says so. Fix: add the table to a package.
         - ``unreachable.packages_granted_to_no_group``: analyst-visible
           packages no analyst can see (drafts are not gaps). Fix: grant the
           package to a group on ``/admin/access``.
@@ -2878,9 +2958,11 @@ def register_foundation_tools(
                 include_tables=include_tables,
                 auto_membership=_stack_auto_membership(),
                 packages_truncated=len(packages) >= limit,
+                section=section,
             ),
             "admin_access_picture",
-            hint="call again with include_tables=False",
+            hint="call again with include_tables=False, or one section at a time: "
+            "section='unreachable' | 'packages' | 'by_group'",
         )
 
     @tool(read_only=False)
