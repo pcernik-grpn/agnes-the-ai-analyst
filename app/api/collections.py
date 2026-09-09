@@ -2393,13 +2393,19 @@ def _join_chunks(texts: list[str]) -> str:
     verbatim join repeats every boundary passage once — a whole-file read
     of a long document was about an eighth duplicate text. When a chunk's
     head is exactly the previous chunk's tail (at least
-    ``_CHUNK_OVERLAP_MIN_MATCH`` characters, probed up to twice the window
-    so an older overlap setting still matches), the shared part is dropped
+    ``_CHUNK_OVERLAP_MIN_MATCH`` characters), the shared part is dropped
     and the two are joined seamlessly, which is what the source looked
     like. Chunks that share no edge — element-based chunks, where each
     element is windowed on its own — are joined with a blank line, as
     before. A piece shorter than the threshold is never merged; a tiny
     trailing window can therefore still repeat, which is the safe side.
+
+    The probe never looks further back than ``_OVERLAP_CHARS``: the chunker
+    overlaps by exactly that much, so a longer shared edge is not the
+    window but the document repeating itself (a table of identical rows,
+    a footer on every slide), and merging it would delete real content.
+    Within the window the longest match is the overlap itself, give or
+    take the whitespace ``strip`` removed at the seam.
     """
     from src.ingest.chunking import _OVERLAP_CHARS
 
@@ -2413,7 +2419,7 @@ def _join_chunks(texts: list[str]) -> str:
             head = text[:_CHUNK_OVERLAP_MIN_MATCH]
             shared = 0
             if len(head) == _CHUNK_OVERLAP_MIN_MATCH:
-                probe = min(len(prev), len(text), 2 * _OVERLAP_CHARS)
+                probe = min(len(prev), len(text), _OVERLAP_CHARS)
                 pos = prev.find(head, len(prev) - probe)
                 while pos != -1:
                     candidate = len(prev) - pos

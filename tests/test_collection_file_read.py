@@ -263,6 +263,22 @@ class TestEndpointBehaviourItWraps:
 
         assert _join_chunks(pieces) == full
 
+    def test_repetitive_text_loses_nothing_at_the_seams(self):
+        """A document that repeats itself — identical table rows, a footer
+        on every slide — has the next chunk's head occurring EARLIER in the
+        previous chunk's tail than the real overlap. A probe that reaches
+        past the window takes that earlier match and deletes genuine
+        content (Devin Review on this PR); bounded to the window, the
+        longest match IS the overlap."""
+        from app.api.collections import _join_chunks
+        from src.ingest.chunking import _OVERLAP_CHARS, _TARGET_CHARS, _window
+
+        full = ("| n/a | n/a | n/a | n/a |\n" * 900).strip()  # 17-char period, ~23k chars
+        pieces = _window(full, _TARGET_CHARS, _OVERLAP_CHARS)
+        assert len(pieces) >= 8
+
+        assert _join_chunks(pieces) == full
+
     def test_chunks_without_a_shared_edge_keep_the_blank_line_join(self):
         """Element-based chunks never overlap; a short coincidence at the
         edge is not the window and must not be merged away."""
