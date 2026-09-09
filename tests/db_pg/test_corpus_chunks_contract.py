@@ -994,7 +994,7 @@ def test_search_candidates_fills_its_window_when_only_one_term_matches(repo, mon
     documents and said nothing. Exactly the fail-quiet failure this change
     set exists to remove, reintroduced one layer down.
 
-    (Devin Review on #2420. The DuckDB sibling had its top-up from the
+    (PR review on #2420. The DuckDB sibling had its top-up from the
     start, so this is a contract both backends must satisfy.)
     """
     import src.repositories.corpus_chunks as duck_mod

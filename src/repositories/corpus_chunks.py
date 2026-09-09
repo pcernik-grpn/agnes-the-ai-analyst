@@ -60,7 +60,7 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 # ranking at all while PG ranks with ``ts_rank_cd`` over a stored tsvector —
 # and what the cross-engine contract tests pin is the observable properties
 # (multi-word selection, per-term fairness, window filling, scoping), not an
-# identical row order. (Devin Review on #2420.)
+# identical row order. (PR review on #2420.)
 _MAX_ILIKE_TERMS = 16
 
 
@@ -372,7 +372,7 @@ class CorpusChunksRepository:
         ``[:limit]`` slice charged all the overflow to the LAST terms, and
         it is exactly the DISTINCTIVE term that tends to sit late in a
         natural-language question. One row per term per round spreads the
-        loss across rounds instead. (Devin Review on #2420.)
+        loss across rounds instead. (PR review on #2420.)
 
         What that does NOT fix, stated plainly: when ``limit`` is smaller
         than the term count there is only ONE round, so the slice still

@@ -476,7 +476,7 @@ class TestTheResponseCarriesTheTruncationSourceAsAField:
         `truncated_source` — so the field has to exist for it to read.
 
         It was computed and used only to format `truncated_note`, which made
-        that guidance point at nothing. (Devin Review on #2420.)
+        that guidance point at nothing. (PR review on #2420.)
         """
         import src.ingest.retrieval as retrieval
 
@@ -509,7 +509,7 @@ class TestFolderScopingForANonAdminCaller:
     admin is a god-mode short-circuit on every authorization check — so
     those tests never exercise `accessible_collection_ids` at all. These
     drive the same filter through a non-admin caller, where the granted set
-    is really computed. (Devin Review on #2420.)
+    is really computed. (PR review on #2420.)
     """
 
     def test_a_non_admin_owner_can_scope_to_a_folder(self, seeded_app):

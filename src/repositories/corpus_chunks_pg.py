@@ -645,7 +645,7 @@ class CorpusChunksPgRepository:
         ``limit``, so the window always fills from whichever term actually
         has the matches while the per-term legs keep the rare term
         represented. Bounded by ``rank_cap + limit`` rows, one query.
-        (Devin Review on #2420; the DuckDB sibling had this top-up from the
+        (PR review on #2420; the DuckDB sibling had this top-up from the
         start, so this also closes a parity gap between the two.)
         """
         if limit <= 0 or not terms:
@@ -665,7 +665,7 @@ class CorpusChunksPgRepository:
         # throws away: the top-up comes back short of the window while
         # unread matches remain, and the caller reads a short result as "the
         # scan was not capped". Same fail-quiet shape as the under-fill this
-        # leg was added to fix, one level down. (Devin Review on #2420.)
+        # leg was added to fix, one level down. (PR review on #2420.)
         exclude_leg_sql = ""
         if exclude_ids:
             exclude_leg_sql = " AND id <> ALL(:exclude_ids) "
