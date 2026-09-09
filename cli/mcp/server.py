@@ -32,9 +32,8 @@ tool sandbox, which blocks outbound HTTP. Credentials are read from
 
 from __future__ import annotations
 
-from typing import Literal
-
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -722,10 +721,14 @@ def data_apps_list(kind: Literal["", "hosted", "linked"] = "") -> dict:
               lists both.
 
     Mirrors ``GET /api/data-apps[?kind=]`` and ``agnes app list [--linked]``.
+    Returns a friendly ``data_apps_disabled`` payload (not an error) if data
+    apps are disabled on this instance, like the render-directive tools below.
     """
     try:
         return api_get_json("/api/data-apps", **({"kind": kind} if kind else {}))
     except V2ClientError as exc:
+        if _is_data_apps_disabled(exc):
+            return _data_apps_disabled_payload()
         raise ValueError(_mcp_error("data_apps_list", exc)) from exc
 
 

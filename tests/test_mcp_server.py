@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
@@ -341,9 +340,8 @@ class TestQueryLocalTool:
         with duckdb.connect(str(db_path)) as conn:
             conn.execute("CREATE TABLE t (x INTEGER)")
 
-        with patch.dict("os.environ", {"AGNES_LOCAL_DIR": str(tmp_path)}):
-            with pytest.raises(Exception):
-                srv.query_local("SELECT x FROM t; SELECT 1;")
+        with patch.dict("os.environ", {"AGNES_LOCAL_DIR": str(tmp_path)}), pytest.raises(Exception):
+            srv.query_local("SELECT x FROM t; SELECT 1;")
 
     def test_table_miss_hints_at_query_tool(self, tmp_path):
         import duckdb
@@ -435,9 +433,9 @@ class TestPullTool:
         with (
             patch("cli.mcp.server.get_server_url", return_value="http://localhost:8000"),
             patch("cli.mcp.server.get_token", return_value=None),
+            pytest.raises(ValueError, match="No Agnes token"),
         ):
-            with pytest.raises(ValueError, match="No Agnes token"):
-                srv.pull()
+            srv.pull()
 
 
 class TestServerInfoTool:
@@ -459,6 +457,53 @@ class TestServerInfoTool:
         assert result["server_url"] == "http://localhost:8000"
         assert result["authenticated"] is True
         assert result["user_email"] == "analyst@test.com"
+
+
+# ── data_apps_list tool (stdio twin of the SSE/streamable tool — this file's
+# _is_data_apps_disabled/_data_apps_disabled_payload helpers already exist
+# and are used by agnes_data_app_preview/agnes_data_app_credentials, but were
+# never wired into data_apps_list itself, so a disabled instance surfaced a
+# raw tool error here too, same class as the SSE-side bug) ──────────────────
+
+
+class TestDataAppsListTool:
+    def test_disabled_feature_gets_a_clean_answer_not_an_error(self):
+        srv = _import_server()
+        from cli.v2_client import V2ClientError
+
+        with patch(
+            "cli.mcp.server.api_get_json",
+            side_effect=V2ClientError(404, {"detail": "data_apps_disabled"}),
+        ):
+            result = srv.data_apps_list()
+
+        assert result == {
+            "error": "data_apps_disabled",
+            "message": "Data apps are disabled on this instance.",
+        }
+
+    def test_enabled_returns_the_real_list(self):
+        srv = _import_server()
+        data = [{"slug": "app1", "kind": "hosted"}]
+
+        with patch("cli.mcp.server.api_get_json", return_value=data) as m:
+            result = srv.data_apps_list()
+
+        m.assert_called_once_with("/api/data-apps")
+        assert result == data
+
+    def test_an_unrelated_404_still_raises(self):
+        srv = _import_server()
+        from cli.v2_client import V2ClientError
+
+        with (
+            patch(
+                "cli.mcp.server.api_get_json",
+                side_effect=V2ClientError(404, {"detail": "not_found"}),
+            ),
+            pytest.raises(ValueError, match="data_apps_list"),
+        ):
+            srv.data_apps_list()
 
 
 # ── tool_docs + progressive descriptions + output guard ─────────────────────

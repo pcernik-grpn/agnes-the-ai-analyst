@@ -810,7 +810,12 @@ class TestEffectiveAccessTool:
         assert result["table_id"] == "orders"
         assert result["policy"]["reason"] == "empty_slice"
 
-    def test_unknown_table_raises_structured_not_found_with_hint(self):
+    def test_unknown_table_returns_a_not_granted_answer_not_an_error(self):
+        """A table absent from the caller's effective-access list — wrong id,
+        or a real table the caller cannot access — is a legitimate answer
+        ("you have no access"), not a tool failure (live incident,
+        2026-09-09: a caller asking about an ungranted table got a raw
+        'Error executing tool' card instead of a plain no)."""
         mod = _import_mod()
 
         with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
@@ -818,8 +823,33 @@ class TestEffectiveAccessTool:
             MC.return_value.__aenter__.return_value.get = AsyncMock(
                 return_value=_mock_resp(_effective_access_payload())
             )
-            with pytest.raises(ValueError, match="catalog"):
-                _run(mod.effective_access(table="does-not-exist"))
+            result = _run(mod.effective_access(table="does-not-exist"))
+
+        assert result["table_id"] == "does-not-exist"
+        assert result["granted"] is False
+        assert "catalog" in result["note"]
+
+    def test_unknown_table_note_does_not_reveal_existence(self):
+        """The same not-granted answer must come back whether the table is
+        registered-but-ungranted or does not exist at all — the note may
+        not vary by that distinction, or the tool becomes an existence
+        oracle for tables the caller cannot otherwise learn about."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(
+                return_value=_mock_resp(_effective_access_payload())
+            )
+            registered_but_ungranted = _run(mod.effective_access(table="bi_chargeability"))
+            never_registered = _run(mod.effective_access(table="totally-made-up"))
+
+        assert registered_but_ungranted["granted"] is False
+        assert never_registered["granted"] is False
+        # Same shape, same wording template — only the echoed table id differs.
+        assert registered_but_ungranted["note"].replace("bi_chargeability", "X") == never_registered["note"].replace(
+            "totally-made-up", "X"
+        )
 
 
 # ── stack tools (issue #621) ──────────────────────────────────────────────────────
@@ -1385,6 +1415,172 @@ class TestActivityTool:
         # server-side guard is the layer actually doing the rejecting.
         params = get_mock.call_args.kwargs["params"]
         assert params["cursor_id"] == "   "
+
+    def test_over_cap_since_minutes_is_clamped_and_disclosed(self):
+        """A caller can ask for a window past the server's cap (`le=43200`,
+        app/api/activity.py:82) — clamp locally and disclose the clamp in
+        the response, instead of forwarding the raw value and surfacing the
+        server's 422 validation dump as a tool error (live incident,
+        2026-09-09: three retries with since_minutes=525600 — one year —
+        each one a raw error, no hint at the actual limit)."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            result = _run(mod.activity(since_minutes=525600))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["since_minutes"] == 43200
+        assert result["since_minutes_clamped"] == {"requested": 525600, "used": 43200}
+
+    def test_within_cap_since_minutes_is_forwarded_unchanged(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            result = _run(mod.activity(since_minutes=1440))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["since_minutes"] == 1440
+        assert "since_minutes_clamped" not in result
+
+    def test_exactly_at_cap_is_not_clamped(self):
+        """The boundary itself (`le=43200`) is valid — clamping it would be
+        a no-op that still (wrongly) claimed a clamp happened."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            result = _run(mod.activity(since_minutes=43200))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["since_minutes"] == 43200
+        assert "since_minutes_clamped" not in result
+
+
+# ── admin_source_connections_list tool (issue #731 / live incident 2026-09-09) ──
+
+
+class TestAdminSourceConnectionsListTool:
+    def test_non_admin_gets_a_clean_admin_required_answer_not_an_error(self):
+        """Two different non-admin callers hit this tool today and got a
+        raw ``403 Forbidden — Admin access required`` tool-execution error.
+        A non-admin caller cannot be filtered out of the static MCP tool
+        list (registered once at server startup, not per-caller), so the
+        tool itself must answer cleanly instead."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "Admin access required"}, status=403)
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+            result = _run(mod.admin_source_connections_list())
+
+        assert result["connections"] == []
+        assert result["admin_required"] is True
+        assert "admin" in result["note"].lower()
+
+    def test_paused_elevation_names_the_real_reason(self):
+        """An admin who has paused their own elevation is not the same case
+        as a non-admin caller — the answer must say so, not claim they lack
+        admin access outright."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "admin_elevation_paused"}, status=403)
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+            result = _run(mod.admin_source_connections_list())
+
+        assert result["admin_required"] is True
+        assert result["reason"] == "admin_elevation_paused"
+        assert "elevation" in result["note"].lower()
+
+    def test_admin_gets_the_real_list(self):
+        mod = _import_mod()
+        data = [{"id": "conn_1", "source_type": "keboola"}]
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(data))
+            result = _run(mod.admin_source_connections_list())
+
+        assert result == {"connections": data}
+
+    def test_an_unrecognized_403_still_raises(self):
+        """Only the two known admin-gate denials are swallowed into a clean
+        answer — any other 403 detail must still surface as a loud error."""
+        import httpx
+
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "something_else"}, status=403)
+            resp.text = '{"detail": "something_else"}'
+            resp.reason_phrase = "Forbidden"
+            resp.request = httpx.Request("GET", "http://server/api/admin/source-connections")
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+
+            with pytest.raises(httpx.HTTPStatusError):
+                _run(mod.admin_source_connections_list())
+
+
+# ── data_apps_list tool (issue live 2026-09-09) ──────────────────────────────
+
+
+class TestDataAppsListTool:
+    def test_disabled_feature_gets_a_clean_answer_not_an_error(self):
+        """Listed even when ``data_apps.enabled`` is off (same static
+        registration constraint as the admin tool above) — a caller hit
+        this today and got a raw ``404 — data_apps_disabled`` tool error."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "data_apps_disabled"}, status=404)
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+            result = _run(mod.data_apps_list())
+
+        assert result == {
+            "error": "data_apps_disabled",
+            "message": "Data apps are disabled on this instance.",
+        }
+
+    def test_enabled_returns_the_real_list(self):
+        mod = _import_mod()
+        data = [{"slug": "app1", "kind": "hosted"}]
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(data))
+            result = _run(mod.data_apps_list())
+
+        assert result == data
+
+    def test_an_unrelated_404_still_raises(self):
+        """Only the specific ``data_apps_disabled`` 404 is swallowed into a
+        clean answer — any other 404 must still surface as a loud error."""
+        import httpx
+
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "not_found"}, status=404)
+            resp.text = '{"detail": "not_found"}'
+            resp.reason_phrase = "Not Found"
+            resp.request = httpx.Request("GET", "http://server/api/data-apps")
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+
+            with pytest.raises(httpx.HTTPStatusError):
+                _run(mod.data_apps_list())
 
 
 # ── my_secret_test tool ──────────────────────────────────────────────────────
