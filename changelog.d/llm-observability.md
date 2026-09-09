@@ -31,6 +31,12 @@
   content-export policy as the OTel export. Postgres-only; a pull is refused
   with `403 content_export_disabled` when the policy is off, has no recorded
   basis, or excludes the `chat` workload.
+- **The corpus can also be pushed on a schedule.**
+  `observability.conversation_export` (`endpoint`, `headers_secret_env`,
+  `interval_minutes`, `surfaces`) turns on a `conversation-export` worker job
+  that delivers newline-delimited JSON batches to the endpoint, advancing a
+  Postgres-persisted watermark only after a 2xx, under the same
+  content-export policy as the pull. Migration `0114_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and
   `agnes.subject_id`; the `llm_generation` log line gains `workload`, `purpose`
