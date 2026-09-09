@@ -786,7 +786,7 @@ async def list_messages(
             # parsed it as local time, shifting every reloaded bubble's
             # timestamp by the viewer's UTC offset.
             "created_at": m.created_at,
-            # NULL on a row written before migration 0113, and always NULL on
+            # NULL on a row written before migration 0114, and always NULL on
             # the frozen DuckDB backend (PG-only column, dropped on write —
             # the `chat_messages` cache-token precedent). What the web client
             # stamps onto the reloaded article so the feedback thumbs

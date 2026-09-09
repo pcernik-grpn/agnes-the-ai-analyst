@@ -147,7 +147,7 @@ class ChatMessage(Base):
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     sender_email: Mapped[str | None] = mapped_column(String, nullable=True)
     #: The chat turn that produced this row — the same id `usage_turns.
-    #: turn_uuid` and `llm_calls.turn_id` carry (migration 0113). Postgres-
+    #: turn_uuid` and `llm_calls.turn_id` carry (migration 0114). Postgres-
     #: only (A3): the frozen DuckDB backend has no matching column and drops
     #: the value on write.
     turn_id: Mapped[str | None] = mapped_column(String, nullable=True)

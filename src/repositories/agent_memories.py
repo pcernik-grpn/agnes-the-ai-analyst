@@ -44,7 +44,7 @@ class AgentMemoriesRepository:
         source_turn_id: Optional[str] = None,
         source_message_id: Optional[str] = None,
     ) -> None:
-        # `source_turn_id`/`source_message_id` (migration 0113, design
+        # `source_turn_id`/`source_message_id` (migration 0114, design
         # 2026-09-08 §3.5) are Postgres-only — the frozen DuckDB app-state
         # backend has no matching columns (A3), so both are accepted and
         # silently dropped here rather than refused, the same accept-and-drop

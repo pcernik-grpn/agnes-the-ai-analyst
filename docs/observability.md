@@ -176,7 +176,7 @@ in *LLM call ledger* below.
 
 ## LLM call ledger — every call, priced once
 
-`llm_calls` (Postgres-only, migration `0113_llm_observability`, A3 ratchet —
+`llm_calls` (Postgres-only, migration `0114_llm_observability`, A3 ratchet —
 see *Dual-backend discipline* in `CLAUDE.md`) is the single place "an LLM
 call happened" is recorded. The chat broker writes one row per forwarded
 completion, and `trace_generation` (`src/observability/llm_tracing.py`)

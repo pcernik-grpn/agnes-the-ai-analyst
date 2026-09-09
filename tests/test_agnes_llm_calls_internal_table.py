@@ -7,7 +7,7 @@ design: ``docs/superpowers/specs/2026-09-08-llm-observability-design.md``
 pattern established for ``agnes_turns``).
 
 ``llm_calls`` arrived after the A3 freeze, so it exists on the Postgres
-app-state backend only (Alembic revision ``0113_llm_observability``, no
+app-state backend only (Alembic revision ``0114_llm_observability``, no
 ``src/db.py`` ladder step). Its internal projection therefore must not be
 registered on a DuckDB-backed instance: a ``table_registry`` row there would
 point at a table that does not exist — the "broken row" this file pins
@@ -98,7 +98,7 @@ def test_agnes_llm_calls_is_declared_in_internal_tables():
     assert table.filter_column == "user_id"
     assert table.filter_kind == "user_id"
     assert table.display_name == "Agnes LLM calls"
-    # `llm_calls` has no `username` column at all (migration 0113), so there
+    # `llm_calls` has no `username` column at all (migration 0114), so there
     # is no pre-v45 legacy identity to fall back on — the OR fallback the
     # older internal tables carry would be a Binder error here.
     assert table.legacy_username_column is None

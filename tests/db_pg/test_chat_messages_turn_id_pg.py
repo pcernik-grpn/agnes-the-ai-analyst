@@ -1,5 +1,5 @@
 """``chat_messages.turn_id`` — the chat turn a message was produced in
-(design 2026-09-08 §3.2, §3.7, migration 0113).
+(design 2026-09-08 §3.2, §3.7, migration 0114).
 
 Postgres writes and reads the column; the frozen DuckDB app-state backend
 accepts the keyword and drops it (the same ``chat_messages`` cache-token

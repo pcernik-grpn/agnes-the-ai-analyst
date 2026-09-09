@@ -150,7 +150,7 @@ def test_delete_for_agent_with_no_rows_is_a_noop(repo):
 
 
 def test_create_accepts_turn_provenance_on_both_backends(repo):
-    """Memory provenance (design 2026-09-08 §3.5, migration 0113): the PG
+    """Memory provenance (design 2026-09-08 §3.5, migration 0114): the PG
     side stores ``source_turn_id``/``source_message_id``, the frozen DuckDB
     side accepts and silently drops both — the same accept-and-drop pattern
     as the chat_messages cache columns (migration 0092)."""

@@ -25,7 +25,7 @@
 - **Tests:** builders run ONLY their own test files plus the specific guards named in their task. Never a lane, never the full suite (one host, many parallel builders). The integrator runs `--lane impacted` once; CI runs everything on the push.
 - **Worktree hygiene:** a builder in an isolated worktree must NOT create a venv; symlink the main checkout's `.venv` into the worktree first (`ln -sfn <main-checkout>/.venv .venv`) and use `.venv/bin/pytest`.
 - **Postgres tests** (`tests/db_pg/`) run locally through the bundled `pixeltable_pgserver` (default `AGNES_TEST_PG_BACKEND=pgserver`); they are slow to boot (one shared server per run) — run them once per task, not per edit.
-- Spec vocabulary, verbatim: workloads `chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`, `knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`, `auto_title`, `readiness`, `store_guardrails`, `verification`, `admin_ask`; content modes `off | pseudonymized | full`; placements `operator | third_party`; coordination key `chat:turn:{session_id}` with a 24 h TTL; span names `agnes.chat.turn`, `agnes.chat.tool <tool>`, `agnes.chat.feedback`; span event `agnes.feedback`; audit actions `chat.feedback`, `observability.content_export`; migration `0113_llm_observability`; config keys `observability.content_export.{mode,placement,basis,approved_by,approved_at}` and `retention.llm_calls_days`.
+- Spec vocabulary, verbatim: workloads `chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`, `knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`, `auto_title`, `readiness`, `store_guardrails`, `verification`, `admin_ask`; content modes `off | pseudonymized | full`; placements `operator | third_party`; coordination key `chat:turn:{session_id}` with a 24 h TTL; span names `agnes.chat.turn`, `agnes.chat.tool <tool>`, `agnes.chat.feedback`; span event `agnes.feedback`; audit actions `chat.feedback`, `observability.content_export`; migration `0114_llm_observability`; config keys `observability.content_export.{mode,placement,basis,approved_by,approved_at}` and `retention.llm_calls_days`.
 
 ---
 
@@ -50,7 +50,7 @@
 | `src/observability/content_policy.py` (new) | 5 | policy record, `content_export_mode()`, `export_text()`, startup announce + audit |
 | `src/observability/otlp_scrub.py` (new) | 5 | protobuf strip/pseudonymise for traces and logs, gzip |
 | `config/instance.yaml.example` | 5, 6 | `observability.content_export` block; `retention.llm_calls_days` |
-| `migrations/versions/0113_llm_observability.py` (new) | 6 | `llm_calls`, `chat_message_feedback`, `chat_messages.turn_id`, `agent_memories.source_turn_id/source_message_id` |
+| `migrations/versions/0114_llm_observability.py` (new) | 6 | `llm_calls`, `chat_message_feedback`, `chat_messages.turn_id`, `agent_memories.source_turn_id/source_message_id` |
 | `src/models/llm_observability.py` (new), `src/models/chat.py`, `src/models/agents.py`, `src/models/__init__.py` | 6 | models |
 | `src/repositories/llm_calls_pg.py`, `src/repositories/chat_message_feedback_pg.py` (new), `src/repositories/__init__.py` | 6 | PG-only repos + registry |
 | `src/repositories/chat_messages_pg.py`, `app/chat/persistence.py`, `app/chat/types.py` | 6 | `turn_id` column (PG writes, DuckDB drops) |
@@ -2425,7 +2425,7 @@ git commit -m "observability: content export policy with placement and consent, 
 ### Task 6: Schema, repositories, ledger end-to-end, memory provenance, `agnes_llm_calls`, retention
 
 **Files:**
-- Create: `migrations/versions/0113_llm_observability.py`
+- Create: `migrations/versions/0114_llm_observability.py`
 - Create: `src/models/llm_observability.py`; Modify: `src/models/chat.py` (`ChatMessage.turn_id`), `src/models/agents.py` (`AgentMemory.source_turn_id`, `source_message_id`), `src/models/__init__.py`
 - Create: `src/repositories/llm_calls_pg.py`, `src/repositories/chat_message_feedback_pg.py`; Modify: `src/repositories/__init__.py` (`__all__`, `_REGISTRY`, factories `llm_calls_repo`, `chat_message_feedback_repo`)
 - Modify: `src/repositories/chat_messages_pg.py` (`append_message(turn_id=)`, `list_messages`/`list_recent_messages` SELECT + `ChatMessage(turn_id=)`), `app/chat/persistence.py` (`append_message(turn_id=)` — PG passes it, DuckDB drops it), `app/chat/types.py` (`ChatMessage.turn_id: Optional[str] = None`), `app/chat/manager.py` (`append_message(..., turn_id=live.turn_id)` at the assistant persist ~2685)
@@ -2546,9 +2546,9 @@ class ChatMessageFeedback(Base):
     )
 ```
 
-`src/models/chat.py` `ChatMessage`: add `turn_id: Mapped[str | None] = mapped_column(String, nullable=True)` (comment: the chat turn that produced the row — the same id `usage_turns.turn_uuid` and `llm_calls.turn_id` carry; PG-only, migration 0113) and `Index("idx_chat_messages_turn", "turn_id")` in `__table_args__`. `src/models/agents.py` `AgentMemory`: `source_turn_id`, `source_message_id` (both `String`, nullable). `src/models/__init__.py`: import `LlmCall, ChatMessageFeedback` and add to `__all__`.
+`src/models/chat.py` `ChatMessage`: add `turn_id: Mapped[str | None] = mapped_column(String, nullable=True)` (comment: the chat turn that produced the row — the same id `usage_turns.turn_uuid` and `llm_calls.turn_id` carry; PG-only, migration 0114) and `Index("idx_chat_messages_turn", "turn_id")` in `__table_args__`. `src/models/agents.py` `AgentMemory`: `source_turn_id`, `source_message_id` (both `String`, nullable). `src/models/__init__.py`: import `LlmCall, ChatMessageFeedback` and add to `__all__`.
 
-`migrations/versions/0113_llm_observability.py` (`down_revision = "0112_jobs_idem_pattern_index"`): `op.create_table("llm_calls", ...)` + the six indexes; `op.create_table("chat_message_feedback", ...)` + unique + two indexes; `op.add_column("chat_messages", sa.Column("turn_id", sa.String(), nullable=True))` + `op.create_index("idx_chat_messages_turn", "chat_messages", ["turn_id"])`; `op.add_column("agent_memories", sa.Column("source_turn_id", ...))`, `op.add_column("agent_memories", sa.Column("source_message_id", ...))`. `downgrade()` is the exact inverse. Docstring names the design and the PG-only rule (mirror `0092`'s wording).
+`migrations/versions/0114_llm_observability.py` (`down_revision = "0113_data_apps_data_identity"`): `op.create_table("llm_calls", ...)` + the six indexes; `op.create_table("chat_message_feedback", ...)` + unique + two indexes; `op.add_column("chat_messages", sa.Column("turn_id", sa.String(), nullable=True))` + `op.create_index("idx_chat_messages_turn", "chat_messages", ["turn_id"])`; `op.add_column("agent_memories", sa.Column("source_turn_id", ...))`, `op.add_column("agent_memories", sa.Column("source_message_id", ...))`. `downgrade()` is the exact inverse. Docstring names the design and the PG-only rule (mirror `0092`'s wording).
 
 Run: `.venv/bin/pytest tests/db_pg/test_alembic_roundtrip.py tests/db_pg/test_alembic_skeleton.py tests/test_db_schema_version_frozen.py -q` → PASS (drift test empty).
 
@@ -2648,7 +2648,7 @@ Run: `.venv/bin/pytest tests/db_pg/test_llm_calls_pg.py tests/db_pg/test_chat_me
 
 - `app/chat/types.py`: `ChatMessage.turn_id: Optional[str] = None` (after `cache_creation_tokens`, documented like it).
 - `src/repositories/chat_messages_pg.py`: `append_message(..., turn_id: Optional[str] = None)` → INSERT column + bind + returned dataclass; `list_messages` / `list_recent_messages` SELECT `turn_id` and pass it to `ChatMessage`.
-- `app/chat/persistence.py::append_message(..., turn_id=None)`: forward to `_messages_pg` when present; on the DuckDB path do not write it (comment: PG-only column, migration 0113 — the same accept-and-drop as the cache columns).
+- `app/chat/persistence.py::append_message(..., turn_id=None)`: forward to `_messages_pg` when present; on the DuckDB path do not write it (comment: PG-only column, migration 0114 — the same accept-and-drop as the cache columns).
 - `app/chat/manager.py` ~2685: `turn_id=live.turn_id`.
 - `tests/db_pg/test_chat_messages_turn_id_pg.py`: through `ChatMessagePgRepository(pg_engine)` after `alembic upgrade head`, `append_message(..., turn_id="t1")` then `list_messages(...)[0].turn_id == "t1"`; and the DuckDB `ChatRepository` (as in `tests/test_chat_api.py::_make_app`) accepts `turn_id="t1"` and returns a message whose `turn_id is None`.
 - `tests/test_chat_usage_turns.py` or `tests/test_chat_turn_spans.py`: assert the persisted assistant row's `turn_id` equals `live.turn_id` when the repo is PG-backed (a recording fake for `_messages_pg` is enough: `monkeypatch.setattr(manager._repo, "_messages_pg", _Recording())`).
@@ -2708,7 +2708,7 @@ registered as `"llm_calls"` in `_TRAIL_PRUNERS`; `app/api/admin.py::run_retentio
 Run: the files listed under **Test** → PASS; plus `tests/db_pg/test_repo_method_parity.py` and `tests/test_chat_api.py`.
 
 ```bash
-git add migrations/versions/0113_llm_observability.py src/models/llm_observability.py src/models/chat.py src/models/agents.py \
+git add migrations/versions/0114_llm_observability.py src/models/llm_observability.py src/models/chat.py src/models/agents.py \
   src/models/__init__.py src/repositories/llm_calls_pg.py src/repositories/chat_message_feedback_pg.py src/repositories/__init__.py \
   src/repositories/chat_messages_pg.py app/chat/persistence.py app/chat/types.py app/chat/manager.py \
   src/repositories/agent_memories.py src/repositories/agent_memories_pg.py app/api/agent_memory.py \
@@ -3300,7 +3300,7 @@ apply unchanged.
 
 **Files:**
 - Create: `app/worker/kinds_conversation_export.py` (or extend `app/worker/kinds.py`): job kind `conversation-export`, LIGHT lane, idempotency key `conversation-export:<instance>`; reads the watermark, calls `iter_conversations`, POSTs newline-delimited JSON batches (≤ 200 records / ≤ 8 MiB) with headers from `os.environ[headers_secret_env]` parsed like `OTEL_EXPORTER_OTLP_HEADERS`, retries 3× with backoff on 5xx/connection errors, advances the watermark only after 2xx, audits `conversations.export` with `delivery: "push"`, `count`, `endpoint_host` (never headers)
-- Create: migration `0114_export_watermarks.py` — table `export_watermarks (name text pk, watermark timestamptz, updated_at timestamptz)`; model; PG-only repo `export_watermarks_pg.py`; registry entry
+- Create: migration `0115_export_watermarks.py` — table `export_watermarks (name text pk, watermark timestamptz, updated_at timestamptz)`; model; PG-only repo `export_watermarks_pg.py`; registry entry
 - Modify: `services/scheduler/__main__.py` (an interval tick that enqueues the job when `observability.conversation_export.endpoint` is set; `interval_minutes` default 60), `config/instance.yaml.example` (`observability.conversation_export` block), `app/instance_config.py` (typed reader), `docs/observability.md`
 - Test: `tests/db_pg/test_conversation_export_push_pg.py` (fake HTTP server via `httpx.MockTransport`; watermark advances only on 2xx; a 500 leaves it; batches split at 200), `tests/test_scheduler_conversation_export_tick.py`
 
@@ -3313,7 +3313,7 @@ apply unchanged.
 | `app/api/broker.py` (SSE mirror edges), `app/api/broker_agent_policy.py` (`parse_usage_from_edges`) | 2b | usage survives an oversized stream |
 | `src/observability/content_policy.py` (`workloads`), producers pass workload | 5b | per-workload content classes |
 | `src/conversation_export.py`, `app/api/conversations_export.py`, `cli/commands/admin_conversations.py` (new); repo read helpers | 10 | corpus export, pull |
-| `app/worker/kinds_conversation_export.py`, `migrations/versions/0114_export_watermarks.py`, `src/repositories/export_watermarks_pg.py` (new) | 11 | corpus export, push |
+| `app/worker/kinds_conversation_export.py`, `migrations/versions/0115_export_watermarks.py`, `src/repositories/export_watermarks_pg.py` (new) | 11 | corpus export, push |
 
 ### Execution-notes additions
 
