@@ -34,6 +34,11 @@ STDIO_TOOLS = ROOT / "cli" / "mcp" / "server.py"
 TOOL = "collection_file_read"
 runner = CliRunner()
 
+# Rich styles each hyphen of a flag separately under a colour-forcing CI
+# terminal, so the literal ``--offset`` never appears in the raw bytes of a
+# help page or a usage error. Assert on what a reader sees.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -701,7 +706,9 @@ class TestCliCatPagesThroughTheFile:
         with patch("cli.commands.collections.api_get_json", side_effect=fake):
             r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", *argv])
         assert r.exit_code == 2, r.output
-        assert argv[0] in r.output
+        plain = _ANSI.sub("", r.output)
+        assert argv[0] in plain, plain
+        assert "not in the range" in plain, plain
         assert calls == [], "a rejected flag must not reach the server"
 
     def test_does_not_loop_on_a_server_that_does_not_advance(self):
