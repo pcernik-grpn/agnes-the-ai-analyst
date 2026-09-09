@@ -1674,6 +1674,25 @@ const _NEXT_ACTIONS_OPEN_RE = /```next_actions[ \t]*\r?\n/i;
 const _NEXT_ACTIONS_CLOSE = "```";
 const _NEXT_ACTIONS_MAX = 3;
 
+//: A fill-in-the-blank marker the model left in a suggested follow-up
+//: instead of a concrete value — `[client name]`, `<title>`, `{{amount}}`,
+//: or a bare `TBD`. Sending one of these verbatim is a guaranteed dead
+//: turn: the reader clicks expecting a real answer, the model receives its
+//: own template back, and (per the render-time bracket refusal on documents)
+//: often cannot even act on it. Measured on a live instance: three lost
+//: round-trips in one session, the model's own reply naming the mechanism
+//: ("those one-click suggestions send verbatim, and I keep writing them
+//: with fill-in-the-blank brackets"). Deliberately NOT applied to
+//: `extractNextActions` below — dropping the action here would silently
+//: remove a genuinely useful suggestion; `renderNextActions`'s click
+//: handler is the one place that needs to know, since pre-filling the
+//: composer without auto-submitting still gives the reader the shortcut.
+const _PLACEHOLDER_RE = /\[[^\]]*\]|<[^<>]+>|\{\{[^}]*\}\}|\bTBD\b/i;
+
+function _hasUnfilledPlaceholder(text) {
+  return _PLACEHOLDER_RE.test(text || "");
+}
+
 function extractNextActions(markdown) {
   let out = markdown || "";
   const actions = [];
@@ -1826,6 +1845,14 @@ function renderNextActions(bubble, actions, pending = false) {
       if (!ta) return;
       ta.value = action;
       ta.focus();
+      if (_hasUnfilledPlaceholder(action)) {
+        // A template, not an answer — hand it to the reader to complete
+        // rather than sending the model's own placeholder back to it (a
+        // guaranteed dead turn, see `_PLACEHOLDER_RE`). The chip still did
+        // its job: the composer is pre-filled, cursor focused, one edit
+        // away from send.
+        return;
+      }
       const form = $("chat-form");
       if (form) form.dispatchEvent(new SubmitEvent("submit", { cancelable: true }));
     });
