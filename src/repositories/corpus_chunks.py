@@ -319,16 +319,24 @@ class CorpusChunksRepository:
         does no NLP of its own, just an OR'd ``ILIKE`` per term.
         Column-pruned (``embedding`` always ``None``) like every candidate
         fetch here. Empty ``corpus_ids``/``terms`` → ``[]``.
+
+        Scoped on both sides of the join — the file row's current
+        ``corpus_id`` as well as the chunk's — mirroring the PG sibling
+        (see its docstring for the index path this enables there and for
+        the fail-closed reading: a file moved to a collection outside the
+        caller's scope no longer answers by name under the one it left,
+        even while stale chunk rows still carry the old ``corpus_id``).
         """
         if not corpus_ids or not terms:
             return []
         placeholders = ", ".join("?" for _ in corpus_ids)
         term_clause = " OR ".join("cf.filename ILIKE ?" for _ in terms)
-        params: List[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + [limit]
+        params: List[Any] = list(corpus_ids) + list(corpus_ids) + [f"%{t}%" for t in terms] + [limit]
         rows = self.conn.execute(
             f"SELECT {_SELECT_CC_NO_EMBED} FROM corpus_chunks cc "
             f"JOIN corpus_files cf ON cf.id = cc.file_id "
-            f"WHERE cc.corpus_id IN ({placeholders}) AND ({term_clause}) "
+            f"WHERE cc.corpus_id IN ({placeholders}) AND cf.corpus_id IN ({placeholders}) "
+            f"AND ({term_clause}) "
             f"ORDER BY cc.file_id, cc.ordinal LIMIT ?",
             params,
         ).fetchall()
