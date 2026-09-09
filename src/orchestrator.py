@@ -50,6 +50,7 @@ from src.orchestrator_security import (
     is_token_env_allowed,
     resolve_remote_attach_token,
 )
+from src.parquet_publish import partition_dir_supersedes_flat, retire_superseded_parquet
 from src.sql_ident import quote_ident
 
 logger = logging.getLogger(__name__)
@@ -1780,67 +1781,58 @@ class SyncOrchestrator:
                 rejected: list[str] = []
                 out_size = size_bytes or 0
                 # #1339: a table can have BOTH a flat `<table>.parquet` file
-                # AND a `<table>/` partition directory at once — e.g. a
-                # partitioned-pull migration that wrote fresh parts but left
-                # the old flat file in place. TODO(#1339): whether the flat
-                # file should keep winning (as it does below, unchanged) or
-                # the directory should, and whether the stale sibling should
-                # be deleted, are open human decisions this fix does not
-                # make — it only stops the collision from being invisible.
-                both_layouts = pq_path.exists() and table_dir.is_dir()
-                if both_layouts:
+                # AND a `<table>/` partition directory at once — a
+                # `sync_strategy` flip writes the new layout and nothing removes
+                # the old one, in EITHER direction. The flat file used to win
+                # unconditionally, which froze distribution SILENTLY whenever
+                # the directory was the fresh one: the manifest advertised a
+                # single-file table hashed from the STALE parquet, so `agnes
+                # pull` downloaded it and the md5 MATCHED — analysts kept
+                # getting pre-conversion data indefinitely while the server's
+                # own view read the fresh partitions.
+                #
+                # So the winner is decided by FRESHNESS, through the one
+                # comparator both precedence sites share
+                # (`src/parquet_publish.py::partition_dir_supersedes_flat` —
+                # read its docstring for the mtime caveats and the `>=` tie).
+                # `app/utils.py`'s resolvers apply the identical verdict for the
+                # read surfaces; the two MUST agree, or the manifest and
+                # `/api/v2/*` serve different data. mtime is evidence, not a
+                # clock: when it is wrong both sides are wrong TOGETHER, which
+                # is the property that matters here.
+                #
+                # `collision` requires a part actually on disk: an empty
+                # `<table>/` is the pending-first-sync case, not fresher data,
+                # and letting it win would unpublish a healthy single-file
+                # table. Existence probe only — deliberately NOT
+                # `_hash_table_parts`, which full-MD5s every part just to yield
+                # a truthy value, and `rebuild_source` runs on every Jira
+                # webhook. The OSError guard matters because this sits inside
+                # the try/except wrapping the WHOLE meta_rows loop, where a
+                # raise would skip sync_state for every remaining table in the
+                # source.
+                collision = pq_path.exists() and table_dir.is_dir()
+                if collision:
+                    try:
+                        collision = next(table_dir.rglob("*.parquet"), None) is not None
+                    except OSError:
+                        collision = False
+                dir_wins = collision and partition_dir_supersedes_flat(pq_path, table_dir)
+                if collision:
                     logger.error(
-                        "Table %r in source %r has BOTH a flat parquet (%s) "
-                        "and a partition directory (%s) — serving the flat "
-                        "file (precedence unchanged), which may be stale "
-                        "relative to the partitioned data. See #1339.",
+                        "Table %r in source %r has BOTH a flat parquet (%s) and a "
+                        "partition directory (%s) — serving the %s (it is the fresher "
+                        "of the two by mtime)%s. See #1339.",
                         table_name,
                         source_name,
                         pq_path,
                         table_dir,
+                        "partition directory" if dir_wins else "flat parquet",
+                        " and reclaiming the stale flat parquet"
+                        if dir_wins
+                        else "; the stale partition directory is left in place",
                     )
-                if pq_path.exists():
-                    # TODO(#1339): the flat file winning is a precedence choice, not a
-                    # verdict — when both layouts are present the partitioned
-                    # data is almost certainly the fresh one. Flipping it (and
-                    # the matching `app/utils.py::resolve_local_parquet_glob`,
-                    # which prefers the single file the same way) plus removing
-                    # the stale sibling server-side needs a decision about
-                    # in-flight readers, so for now this only warns.
-                    # Existence probe only — deliberately NOT `_hash_table_parts`,
-                    # which full-MD5s every part just to yield a truthy value.
-                    # Two reasons: the dual-layout state can persist
-                    # indefinitely, and `rebuild_source` runs on every Jira
-                    # webhook, so that would re-hash the whole partition dir per
-                    # event while holding `rebuild_mutex()`. And this sits inside
-                    # the try/except wrapping the WHOLE meta_rows loop, so a raise
-                    # here would skip sync_state for every remaining table in the
-                    # source — a diagnostic must never break what it diagnoses,
-                    # hence the OSError guard around a mid-scan prune.
-                    try:
-                        both_layouts = next(table_dir.rglob("*.parquet"), None) is not None
-                    except OSError:
-                        both_layouts = False
-                    if both_layouts:
-                        # Both layouts on disk. Distribution silently freezes:
-                        # the manifest advertises this as a single-file table
-                        # hashed from the STALE parquet, so `agnes pull`
-                        # downloads it and the md5 MATCHES — analysts keep
-                        # getting pre-conversion data indefinitely while the
-                        # server's own view reads the fresh partitions. No
-                        # error surfaces anywhere, which is why this warns
-                        # loudly. Nothing removes the sibling: a Keboola table
-                        # flipped to `sync_strategy: partitioned` leaves the
-                        # old `<table>.parquet` behind, and the client-side
-                        # `_drop_stale_layout` has no server equivalent.
-                        logger.warning(
-                            "%s has BOTH a flat parquet (%s) and a partition dir (%s); "
-                            "serving the flat file — the partitioned data is NOT being "
-                            "distributed. Remove the stale flat parquet.",
-                            table_name,
-                            pq_path,
-                            table_dir,
-                        )
+                if pq_path.exists() and not dir_wins:
                     # Single-file table: full content MD5 (see docstring), after
                     # a structural PAR1/footer check (#1364) — reusing this same
                     # open handle, not a second open. A corrupt file is refused:
@@ -1911,19 +1903,74 @@ class SyncOrchestrator:
                     hash=file_hash,
                     parts=parts,
                 )
-                if both_layouts:
-                    # Record it on the row too — not just the log — so it
-                    # stops being invisible to `GET /api/admin/registry` /
-                    # `agnes admin list-tables`. Same set_error() contract
-                    # every other per-table sync failure uses; it only
-                    # flips status/error and leaves the rows/hash just
-                    # written above untouched, so the bytes served here stay
-                    # byte-for-byte identical to the flat-only case.
+                if dir_wins:
+                    # #1339, reclaim half — ONLY in the direction where the
+                    # directory won. Strictly AFTER `update_sync` above:
+                    # publish the winner, then remove the loser, the same
+                    # ordering `atomic_publish` uses on the write side. That is
+                    # also why `parts` (not `dir_wins`) gates the call: `parts`
+                    # is None when nothing was publishable this pass (every
+                    # part corrupt, #1364), and dropping the flat file in
+                    # favour of data that never reached the manifest would
+                    # leave the table with no distributable copy at all.
+                    #
+                    # Either failure below leaves the collision ON DISK: the
+                    # manifest points at the parts, but a reader that does not
+                    # go through the resolvers can still find the stale flat
+                    # file. So flag it the same way every other per-table sync
+                    # failure is flagged — `GET /api/admin/registry` /
+                    # `agnes admin list-tables` surface it as
+                    # `last_sync_error`. Only status/error move; the
+                    # rows/hash/parts just written stay untouched. (A corrupt
+                    # part also sets `rejected` below, whose message names the
+                    # exact bad path and deliberately replaces this one — same
+                    # specific-message-wins ordering as `count_unavailable`.)
+                    if not parts:
+                        repo.set_error(
+                            sync_key,
+                            f"Both a flat parquet ({pq_path}) and a partition "
+                            f"directory ({table_dir}) exist for this table; the "
+                            f"directory published nothing this pass, so the flat "
+                            f"parquet was kept rather than reclaimed. See #1339.",
+                        )
+                    elif not retire_superseded_parquet(pq_path, root=extracts_dir / source_name / "data"):
+                        repo.set_error(
+                            sync_key,
+                            f"Both a flat parquet ({pq_path}) and a partition "
+                            f"directory ({table_dir}) exist for this table; "
+                            f"serving the partition directory, but the stale flat "
+                            f"parquet could not be removed. See #1339.",
+                        )
+                    else:
+                        logger.warning(
+                            "Reclaimed stale flat parquet %s for table %r in source %r — "
+                            "superseded by the partition directory %s. See #1339.",
+                            pq_path,
+                            table_name,
+                            source_name,
+                            table_dir,
+                        )
+                elif collision:
+                    # The MIRROR direction: the flat parquet is the fresher one
+                    # and wins (its hash was just published above). NOTHING is
+                    # deleted here — not the stale directory (a rebuild may
+                    # remove at most the one flat sibling it can replace
+                    # atomically) and above all not the flat file, which is the
+                    # only copy of the current data; reclaiming it would put
+                    # the table in a loop, the extractor rewriting it and the
+                    # next rebuild removing it again, forever.
+                    #
+                    # So this state PERSISTS and is not self-healing, which is
+                    # exactly why it must not look healthy: same set_error()
+                    # contract, naming both paths, so an operator can remove
+                    # the stale directory deliberately.
                     repo.set_error(
                         sync_key,
                         f"Both a flat parquet ({pq_path}) and a partition "
-                        f"directory ({table_dir}) exist for this table; "
-                        f"serving the flat file, which may be stale. See #1339.",
+                        f"directory ({table_dir}) exist for this table; the flat "
+                        f"parquet is the fresher one and is being served, so the "
+                        f"partition directory is stale and can be removed. "
+                        f"See #1339.",
                     )
                 # Both of the checks below can fire on the SAME pass for the SAME
                 # table — a corrupt part is typically exactly why the extractor's

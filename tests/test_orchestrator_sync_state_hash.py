@@ -8,6 +8,7 @@ Keboola local-mode table fails with `hash mismatch: expected … got …`.
 
 import hashlib
 import logging
+import os
 from unittest.mock import patch
 
 import duckdb
@@ -115,18 +116,16 @@ def test_update_sync_state_empty_hash_when_parquet_missing(system_db_path, tmp_p
     assert state["hash"] == ""
 
 
-def test_update_sync_state_warns_when_both_layouts_present(system_db_path, parquet_with_known_md5, tmp_path, caplog):
-    """A flat parquet sitting beside a partition dir freezes distribution
-    SILENTLY, so it has to be logged.
+def test_update_sync_state_logs_when_both_layouts_present(system_db_path, parquet_with_known_md5, tmp_path, caplog):
+    """A flat parquet sitting beside a partition dir froze distribution
+    SILENTLY, so the transition has to be logged even now that it self-heals.
 
-    `_update_sync_state` prefers the flat file, which means the manifest
-    advertises the table as single-file hashed from the STALE parquet. The
-    client downloads it and the md5 MATCHES — `agnes pull` reports success
-    while the analyst keeps receiving pre-conversion data indefinitely and the
-    server's own view reads the fresh partitions. Nothing else surfaces this,
-    and nothing removes the stale sibling (a Keboola table flipped to
-    `sync_strategy: partitioned` leaves it behind; the client-side
-    `_drop_stale_layout` has no server equivalent).
+    `_update_sync_state` used to prefer the flat file, which meant the manifest
+    advertised the table as single-file hashed from the STALE parquet. The
+    client downloaded it and the md5 MATCHED — `agnes pull` reported success
+    while the analyst kept receiving pre-conversion data indefinitely and the
+    server's own view read the fresh partitions. The directory now wins and the
+    stale flat sibling is reclaimed (#1339).
     """
     pq_path, _ = parquet_with_known_md5
     # Same table, now ALSO partitioned: extracts/keboola/data/orders/<part>.
@@ -141,23 +140,18 @@ def test_update_sync_state_warns_when_both_layouts_present(system_db_path, parqu
             data_dir=tmp_path,
         )
 
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any("BOTH a flat parquet" in w and "orders" in w for w in warnings), (
-        f"both-layouts-on-disk must warn — it is otherwise invisible; got {warnings!r}"
+    logged = [r.getMessage() for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+    assert any("BOTH a flat parquet" in m and "orders" in m for m in logged), (
+        f"both-layouts-on-disk must be logged — it is otherwise invisible; got {logged!r}"
     )
 
-    # Logging only: the warning must not change what gets written. Precedence
-    # is unchanged (flat file still wins, `parts` still NULL) — flipping it is
-    # the deferred follow-up the TODO in `_update_sync_state` describes.
     conn = duckdb.connect(str(system_db_path))
     try:
         state = SyncStateRepository(conn).get_table_state("orders")
     finally:
         conn.close()
-    assert state["hash"] == hashlib.md5(pq_path.read_bytes()).hexdigest(), (
-        "the flat file must still win — this change only reports the condition"
-    )
-    assert not state.get("parts"), "parts must still be NULL when the flat file wins"
+    assert state["parts"], "the partition directory wins, so `parts` must be populated (#1339)"
+    assert not pq_path.exists(), "the stale flat sibling must be reclaimed"
 
 
 def test_update_sync_state_silent_when_only_one_layout_present(
@@ -184,7 +178,7 @@ def test_update_sync_state_silent_when_only_one_layout_present(
 # today (no single `{table}.parquet` for the single-file path to find).
 # ---------------------------------------------------------------------------
 
-from src.orchestrator import _hash_table_parts, _parts_rollup_hash  # noqa: E402
+from src.orchestrator import _hash_table_parts, _parts_rollup_hash
 
 
 def test_hash_table_parts_hive_layout(tmp_path):
@@ -676,17 +670,30 @@ def test_update_sync_state_single_file_valid_real_writer_parquet_still_passes(sy
 
 # ---------------------------------------------------------------------------
 # Both-layouts collision (#1339): a flat `<table>.parquet` file AND a
-# `<table>/` partition directory present at the same time. The flat file
-# silently wins today — unchanged by this fix (precedence + stale-sibling
-# cleanup are open human decisions, see the TODO(#1339) in the source) — but
-# until now the collision was invisible: the manifest kept advertising the
-# flat file's (possibly stale) hash with nothing to say a fresher directory
-# sat right beside it. This must be loud, not silent.
+# `<table>/` partition directory present at the same time. The flat file used
+# to win, which froze distribution SILENTLY — the manifest advertised the
+# table as single-file hashed from the STALE parquet, `agnes pull` verified
+# that md5 successfully, and analysts kept receiving pre-conversion data while
+# the server's own view read the fresh partitions.
+#
+# Decided in #1339: the partition DIRECTORY wins (it is the fresher data — the
+# collision is reached by a `sync_strategy: partitioned` flip that leaves the
+# previous strategy's flat file behind), and the stale flat sibling is
+# reclaimed so no other reader can find it. This precedence MUST match
+# `app/utils.py::resolve_local_parquet_glob`, which decides what the read
+# surfaces serve — `tests/test_utils_parquet_layout_collision.py` pins that
+# half. If the two disagree, the manifest and the read surfaces serve
+# different data, which is worse than the bug #1339 describes.
 # ---------------------------------------------------------------------------
 
 
-def _write_both_layouts(tmp_path):
-    """Flat `orders.parquet` + a sibling `orders/` partition directory."""
+def _write_both_layouts(tmp_path, *, flat_mtime: float = 1000.0, part_mtime: float = 2000.0):
+    """Flat `orders.parquet` + a sibling `orders/` partition directory.
+
+    mtimes are set explicitly because the WINNER is decided by freshness, not
+    by file shape (see `src/parquet_publish.py::partition_dir_supersedes_flat`).
+    Default: the partition part is newer — the direction #1339 reported.
+    """
     extracts = tmp_path / "extracts" / "keboola" / "data"
     extracts.mkdir(parents=True)
     flat_bytes = b"PAR1" + b"stale" * 50 + b"PAR1"
@@ -694,7 +701,10 @@ def _write_both_layouts(tmp_path):
     pq_path.write_bytes(flat_bytes)
     table_dir = extracts / "orders"
     table_dir.mkdir()
-    (table_dir / "2025_11.parquet").write_bytes(b"fresh-partitioned-bytes")
+    part = table_dir / "2025_11.parquet"
+    part.write_bytes(b"PAR1fresh-partitioned-bytesPAR1")
+    os.utime(pq_path, (flat_mtime, flat_mtime))
+    os.utime(part, (part_mtime, part_mtime))
     return pq_path, table_dir, flat_bytes
 
 
@@ -722,10 +732,12 @@ def test_both_layouts_collision_logs_error_naming_both_paths_and_table(system_db
     )
 
 
-def test_both_layouts_collision_flags_sync_state_but_keeps_flat_hash(system_db_path, tmp_path):
-    """The served bytes must stay byte-for-byte identical to the flat-only
-    case (the flat file still wins) — only the flagging is new."""
+def test_both_layouts_collision_publishes_the_partitioned_data(system_db_path, tmp_path):
+    """The manifest must describe the DIRECTORY: `parts` populated (it was
+    NULL, which is exactly what made `agnes pull` ship the stale flat copy),
+    hashed from the parts, sized from the parts."""
     pq_path, table_dir, flat_bytes = _write_both_layouts(tmp_path)
+    part = table_dir / "2025_11.parquet"
 
     _run_update(
         system_db_path,
@@ -740,21 +752,216 @@ def test_both_layouts_collision_flags_sync_state_but_keeps_flat_hash(system_db_p
         conn.close()
 
     assert state is not None
-    # Bytes served: identical to the flat-only case — precedence unchanged.
-    assert state["hash"] == hashlib.md5(flat_bytes).hexdigest()
-    assert state["parts"] is None
+    assert state["parts"], "`parts` must be populated — a NULL here IS the distribution freeze"
+    assert [p["path"] for p in state["parts"]] == ["2025_11.parquet"]
+    assert state["parts"][0]["hash"] == hashlib.md5(part.read_bytes()).hexdigest()
+    assert state["hash"] != hashlib.md5(flat_bytes).hexdigest(), "the stale flat hash must not be published"
+    assert state["file_size_bytes"] == part.stat().st_size
     assert state["rows"] == 100
-    # No longer invisible: flagged via the existing sync_state error
-    # mechanism (the same set_error() `GET /api/admin/registry` already
-    # surfaces as `last_sync_error`).
+
+
+def test_both_layouts_collision_reclaims_the_stale_flat_sibling(system_db_path, tmp_path):
+    """The flat file is deleted, so readers that do NOT go through the flipped
+    resolvers cannot find it either. The partition directory is untouched."""
+    pq_path, table_dir, _ = _write_both_layouts(tmp_path)
+
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    assert not pq_path.exists(), "the stale flat parquet must be gone"
+    assert (table_dir / "2025_11.parquet").read_bytes() == b"PAR1fresh-partitioned-bytesPAR1"
+    # No residue under a served name: the reclaim stages through a `.tmp` name
+    # no reader globs (see src/parquet_publish.py).
+    assert [p.name for p in pq_path.parent.glob("*.parquet")] == []
+
+
+def test_both_layouts_collision_is_healthy_once_reclaimed(system_db_path, tmp_path):
+    """Once the sibling is gone the table is in a normal, single-layout state —
+    flagging it `error` would leave a permanent scar on a self-healed row."""
+    pq_path, _, _ = _write_both_layouts(tmp_path)
+
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["status"] == "ok"
+    assert not state.get("error")
+
+
+def test_both_layouts_collision_is_flagged_when_the_reclaim_fails(system_db_path, tmp_path):
+    """If the flat file cannot be removed the collision PERSISTS on disk, so it
+    must keep surfacing as `last_sync_error` naming both paths — the manifest
+    already points at the parts, but another reader can still find the stale
+    file."""
+    pq_path, table_dir, _ = _write_both_layouts(tmp_path)
+
+    with patch("src.orchestrator.retire_superseded_parquet", return_value=False):
+        _run_update(
+            system_db_path,
+            meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+            data_dir=tmp_path,
+        )
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["parts"], "precedence must not depend on the reclaim succeeding"
     assert state["status"] == "error"
     assert str(pq_path) in (state["error"] or "")
     assert str(table_dir) in (state["error"] or "")
 
 
+def test_nothing_is_reclaimed_before_the_partitioned_data_is_publishable(system_db_path, tmp_path):
+    """Publish first, reclaim second — the atomic-publish ordering. Every part
+    corrupt means nothing publishable this pass, so the flat file must SURVIVE
+    rather than be deleted in favour of data that never made the manifest."""
+    extracts = tmp_path / "extracts" / "keboola" / "data"
+    extracts.mkdir(parents=True)
+    pq_path = extracts / "orders.parquet"
+    pq_path.write_bytes(b"PAR1" + b"stale" * 50 + b"PAR1")
+    table_dir = extracts / "orders"
+    table_dir.mkdir()
+    (table_dir / "2025_11.parquet").write_bytes(b"not-a-parquet-at-all")
+
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    assert pq_path.exists(), "the last copy of anything must not be dropped for unpublishable data"
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["status"] == "error"
+
+
+def test_the_tie_goes_to_the_partition_directory(system_db_path, tmp_path):
+    """Equal mtimes pin `>=`, not `>`: a genuine flip can land the flat file
+    and its first part in the same filesystem tick, and a tie must keep the
+    #1339 behavior rather than silently reverting to flat-wins."""
+    pq_path, _, _ = _write_both_layouts(tmp_path, flat_mtime=2000.0, part_mtime=2000.0)
+
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    assert not pq_path.exists(), "a tie must resolve the same way a fresher directory does"
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["parts"]
+
+
+# ---------------------------------------------------------------------------
+# The MIRROR direction: a stale partition directory beside a FRESHER flat
+# parquet — a table flipped back from `sync_strategy: partitioned` to a flat
+# write, leaving the old directory behind. No writer in the tree removes the
+# other layout in either direction, so this is exactly as reachable as the
+# direction #1339 reported.
+#
+# Here the flat file is the fresher data, so it wins and NOTHING is deleted.
+# Deleting it would be the severe case: the extractor rewrites it, the next
+# rebuild deletes it again, forever, and the table never distributes.
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_direction_the_fresher_flat_parquet_wins_and_survives(system_db_path, tmp_path):
+    pq_path, table_dir, flat_bytes = _write_both_layouts(tmp_path, flat_mtime=9000.0, part_mtime=1000.0)
+
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    assert pq_path.exists(), "the FRESHER flat parquet must never be reclaimed"
+    assert pq_path.read_bytes() == flat_bytes
+    assert (table_dir / "2025_11.parquet").exists(), "nothing is deleted in this direction"
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["hash"] == hashlib.md5(flat_bytes).hexdigest(), "the manifest must describe the flat file"
+    assert not state["parts"], "`parts` must be absent — the directory did not win"
+    # The two-layout state persists here (only the flat sibling is ever
+    # reclaimable), so it must stay visible rather than look healthy.
+    assert state["status"] == "error"
+    assert str(pq_path) in (state["error"] or "")
+    assert str(table_dir) in (state["error"] or "")
+
+
+def test_mirror_direction_survives_repeated_rebuild_passes(system_db_path, tmp_path):
+    """The severe failure mode is a LOOP — extractor rewrites the flat file,
+    rebuild deletes it, forever. Drive consecutive passes and assert both
+    layouts are still on disk after each one."""
+    pq_path, table_dir, flat_bytes = _write_both_layouts(tmp_path, flat_mtime=9000.0, part_mtime=1000.0)
+
+    for pass_no in (1, 2, 3):
+        _run_update(
+            system_db_path,
+            meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+            data_dir=tmp_path,
+        )
+        assert pq_path.exists(), f"flat parquet vanished on rebuild pass {pass_no}"
+        assert pq_path.read_bytes() == flat_bytes
+        assert (table_dir / "2025_11.parquet").exists(), f"partition dir pruned on pass {pass_no}"
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["hash"] == hashlib.md5(flat_bytes).hexdigest()
+    assert not state["parts"]
+
+
+def test_an_empty_sibling_directory_does_not_supersede_the_flat_file(system_db_path, parquet_with_known_md5, tmp_path):
+    """A partition directory holding no part yet is the pending-first-sync
+    case, not fresher data. The flat file keeps winning and survives."""
+    pq_path, expected_md5 = parquet_with_known_md5
+    (pq_path.parent / "orders").mkdir()
+
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, pq_path.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    assert pq_path.exists()
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["hash"] == expected_md5
+    assert not state["parts"]
+
+
 def test_flat_only_layout_is_not_flagged_as_a_collision(system_db_path, parquet_with_known_md5, tmp_path, caplog):
-    """Regression pin: the ordinary single-file case must keep behaving
-    exactly as before — no ERROR log, no sync_state error flip."""
+    """Regression pin: the ordinary single-file case — the common one — must
+    keep behaving exactly as before: no ERROR log, no sync_state error flip,
+    parquet intact."""
     pq_path, expected_md5 = parquet_with_known_md5
     with caplog.at_level(logging.ERROR, logger="src.orchestrator"):
         _run_update(
@@ -771,8 +978,10 @@ def test_flat_only_layout_is_not_flagged_as_a_collision(system_db_path, parquet_
     finally:
         conn.close()
     assert state["hash"] == expected_md5
+    assert state["parts"] is None
     assert state["status"] == "ok"
     assert not state.get("error")
+    assert pq_path.exists(), "a single-layout table must never lose its parquet"
 
 
 def test_dir_only_layout_is_not_flagged_as_a_collision(system_db_path, tmp_path, caplog):
@@ -794,6 +1003,7 @@ def test_dir_only_layout_is_not_flagged_as_a_collision(system_db_path, tmp_path,
         conn.close()
     assert state["status"] == "ok"
     assert not state.get("error")
+    assert state["parts"], "the partitioned-only manifest is unchanged"
 
 
 # ---------------------------------------------------------------------------
