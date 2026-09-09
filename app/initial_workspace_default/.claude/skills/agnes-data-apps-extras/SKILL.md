@@ -118,6 +118,31 @@ redeploy (HMR does not pick those up); ordinary `src/**`/`server/**` edits
 don't need it. Call `agnes_data_app_close(slug)` before tearing down a draft
 (`data_app_delete_draft`) so the pane never points at a deleted app.
 
+## 3b. After Publish: who should see it
+
+Right after promote (`references/promote-flow.md`), check who can already see
+the app: `data_app_share_get(<prod_slug>)` returns `{visibility, group_ids,
+groups, pending_group_ids, available_groups}` — `groups`/`available_groups`
+are `{id, name}` (`available_groups` also flags `is_everyone`). **Never share
+on your own initiative** — always ask first, via `AskUserQuestion`, offering
+the names from `available_groups` plus "Everyone" and "Only me". Apply the
+answer with `data_app_share(slug, groups: [...], everyone: <bool>)`.
+
+Say what sharing means in one plain sentence before asking — granting a group
+means everyone in it sees the app's data exactly as it renders today, under
+the app's own credentials, not their own. If the user wants viewers to see
+only what *they* individually have access to, that's a separate switch — data
+identity (below), not sharing.
+
+One more thing worth mentioning once, not re-explained every time: a hosted
+app reads data as its **owner** by default (`data_identity: owner` — every
+viewer sees the same rendered output, whoever they are). Switching an app to
+`data_identity: viewer` (`data_app_set_data_identity(slug, "viewer")`) makes
+each viewer's own grants bind live, narrowed by the owner's — but it
+redeploys the app, and only works on a Postgres-backed Agnes instance. Bring
+this up only if the user asks for per-viewer personalization; don't offer it
+unprompted.
+
 ## 4. Visual-quality bar, chat voice, jargon ban
 
 - Real React + Vite + Tailwind. Charting libraries come from npm
@@ -156,6 +181,17 @@ Where a figure corresponds to a defined business metric, read the metric's
 definition and run *its* SQL instead of writing your own — see the
 "Metrics before hand-written SQL" section of that reference.
 
+### Who is viewing
+
+The scaffold also ships `server/agnesViewer.ts`. Its `getViewer(req)` helper
+verifies the `X-Agnes-Viewer` header the Agnes proxy attaches to every
+request and returns `{sub, email, name?, groups, via, exp}` (or `null` when
+it can't be verified). Use it to personalize a page ("Hi, {name}") or gate a
+section by `groups` (e.g. only render an admin panel when `groups` contains
+`"Admin"`) — it is the one trustworthy source of "who is looking at this
+right now" available to the app. See `references/agnes-query.md` for the
+full claim list and the Python equivalent for a Flask/Streamlit app.
+
 ## 8. What the app must never expose
 
 Everything the app serves is reachable by everyone holding a grant on it — with
@@ -188,6 +224,14 @@ put the environment itself, or an error object that closes over it, into a
 response body. The same scan separately flags the token itself being echoed
 back on a response line (`DA005`) and debug mode left on (`DA006`,
 informational only).
+
+**Never echo `AGNES_VIEWER_SECRET`, `AGNES_TOKEN`, or the
+`X-Agnes-Viewer-Token` header value back to the browser.** Same failure mode
+as `DA005`, two more names: `AGNES_VIEWER_SECRET` signs every viewer
+assertion for this app, and the viewer token is a live bearer credential —
+either one landing in a response, a log line the app itself renders, or a
+debug page hands a caller the means to forge or replay a viewer's identity.
+`DA005` covers all three names, not just `AGNES_TOKEN`.
 
 The scaffold's error handling is a worked example: it returns the upstream
 response text on failure, never the request headers it sent.

@@ -937,9 +937,14 @@ workbook (#1977); an image built before one of those was added has no way to
 obtain it at runtime (`docker_egress_mode: none`, or an allowlist without
 PyPI, puts package installs out of reach), so the agent either falls back to
 prose or a markdown table, or the skill simply fails, with nothing in the
-logs to say why. After upgrading Agnes, rebuild the image —
+logs to say why. Since contract `4` the image also pins `mcp` below 2.0: an
+older image resolved `mcp` 2.x through `claude-agent-sdk`'s floor-only
+requirement, the `agnes` stdio MCP server the runner registers failed to
+import, and the agent ran with no Agnes foundation or passthrough tools at
+all. The runner now writes a `mcp server 'agnes' did not connect` line to
+the sandbox log when that happens. After upgrading Agnes, rebuild the image —
 `docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox`
-— and confirm the contract label reads `3`:
+— and confirm the contract label reads `4`:
 `docker inspect -f '{{ index .Config.Labels "agnes.chat-sandbox.contract" }}'`.
 
 ### Per-user workspace size

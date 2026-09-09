@@ -218,6 +218,25 @@ app, and sharing is their call to publish that view. Admins retain full
 oversight: every grant is visible and revocable in `/admin/access`, and grant
 writes are audited like any other.
 
+**Sharing itself has three surfaces**, all thin wrappers over the same
+owner-scoped `GET/PUT /api/sharing/data_app/<slug>` (+ `GET
+/api/sharing/groups`) this section describes: `agnes app share <slug>`
+(CLI), MCP `data_app_share_get`/`data_app_share` (the authoring agent's path
+— `agnes-data-apps-extras` SKILL.md §3b prompts the user for who should see
+a just-published app rather than deciding on its own), and a Share control
+on `/apps/detail/<slug>`.
+
+**A narrower knob sits below sharing: `data_identity`.** The governance note
+above is unconditional for the *default* mode — a hosted app always
+publishes the owner's view of the data to whoever it's granted to. An owner
+may opt an app into `data_identity: viewer` so each viewer's *own* grants
+additionally bound the app's queries (evaluated as owner ∩ viewer, live, no
+admin god-mode on either side) — this narrows what a grant exposes, it never
+widens it, and it changes nothing about the grant mechanism itself: sharing
+the app still requires the same `resource_grants(data_app, …)` row as
+always. Postgres-backed instances only (A3 ratchet); see
+[`docs/superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md`](superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md).
+
 ### Auto-share for admin uploads (opt-in)
 
 Collections are private to their creator by default — without a grant, only
@@ -493,6 +512,29 @@ All subcommands authenticate via PAT and exit non-zero on API errors.
 | `/api/admin/resource-types` | GET | enumerate the StrEnum |
 
 Every mutation writes an audit log entry (`user_group.created`, `resource_grant.deleted`, …).
+
+### MCP (agents)
+
+An agent asked "who has access to which data?" has one read-only tool for the
+whole picture: **`admin_access_picture`** (admin identity required). It composes
+`GET /api/admin/access-overview`, `GET /api/admin/data-packages?include_table_ids=true&limit=5000`
+and `GET /api/admin/registry` into every data package with the groups granted
+it and their member counts, a per-group view of what a member can reach (the
+Admin group flagged as bypassing grants; drafts and coming-soon packages
+excluded exactly as the stack resolver excludes them; `in_stack` marks an
+`available` grant as `if_subscribed` under classic membership), and what
+nobody can reach — distributable tables in no package and packages granted to
+no group, folded the same way as the `/admin` gap cards. On a large instance
+ask for one `section` at a time (`packages` / `by_group` / `unreachable`);
+`include_tables=False` alone cannot bound a response that repeats every
+package per group. The table inventory
+is the admin registry rather than the catalog on purpose: agent credentials
+are stack-surface, and for that surface the catalog narrows even an admin to
+their own stack — the one set of tables that is never orphaned. It is the tool behind the chat landing
+page's admin starters; before it existed no MCP tool exposed groups, grants or
+admin-side package membership, so an agent could only decline them. There is
+deliberately no MCP tool that *writes* a grant — `stack_browse` /
+`effective_access` stay caller-scoped, and grant mutations remain UI/CLI/REST.
 
 ---
 

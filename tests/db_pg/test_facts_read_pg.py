@@ -901,6 +901,307 @@ def test_search_applies_a_statement_timeout(pg_env, repo):
 
 
 # ---------------------------------------------------------------------------
+# Bounded candidate selection for `q` (live finding, 2026-09): on a graph of
+# ~830k facts the planner had no selectivity estimate for the ILIKE-driven
+# `EXISTS (... fact_aliases ...)` filter, estimated `candidates` at ~416k rows
+# (actual: 122) and chose full scans of `claims` and `fact_aliases` over 122
+# index probes — 5.3 s, i.e. the 5 s statement timeout, for `q="llr"`. The fix
+# ranks and CAPS the candidate set inside the statement (`MATERIALIZED` +
+# `LIMIT`), which hands the planner a hard cardinality ceiling; hitting the
+# cap is disclosed (`candidates_capped`), never silently ranked as complete.
+# ---------------------------------------------------------------------------
+
+
+def _bulk_seed_matching_facts(
+    pg_engine,
+    *,
+    n: int,
+    slug_template: str,
+    fact_type: str = "organization",
+    corpus_id: str = CORPUS_A,
+    file_id: str = "cf_a1",
+    id_prefix: str = "f_bulk",
+) -> list:
+    """Seed ``n`` facts of ``fact_type``, each with ONE alias
+    ``<type>:<slug_template.format(i=i)>`` (provenance ``corpus_id``) and
+    ONE claim in ``corpus_id`` — as four bulk INSERTs rather than ``3n``
+    repository write calls. A candidate-cap test needs MORE rows than
+    ``SEARCH_CANDIDATE_CAP`` and the per-row path costs seconds here while
+    adding nothing ``search()`` reads (the collection-stats bump it also
+    performs is consulted by the facets/type-map readers, not by search).
+    Returns the seeded fact ids in seed order."""
+    import sqlalchemy as sa
+
+    ids = [f"{id_prefix}_{i}" for i in range(n)]
+    keys = [f"{fact_type}:{slug_template.format(i=i)}" for i in range(n)]
+    params = {"ids": ids, "keys": keys, "type": fact_type, "corpus": corpus_id, "file_id": file_id}
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text("INSERT INTO facts (id, type) SELECT u.id, :type FROM unnest(CAST(:ids AS text[])) AS u(id)"),
+            params,
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO fact_aliases (fact_id, type, natural_key) "
+                "SELECT u.id, :type, u.key FROM unnest(CAST(:ids AS text[]), CAST(:keys AS text[])) AS u(id, key)"
+            ),
+            params,
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO fact_alias_sources (type, natural_key, corpus_id) "
+                "SELECT :type, u.key, :corpus FROM unnest(CAST(:keys AS text[])) AS u(key)"
+            ),
+            params,
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO claims (id, fact_id, corpus_file_id, corpus_id, file_sha256, attrs, quote, quote_hash) "
+                "SELECT 'c_' || u.id, u.id, :file_id, :corpus, 'sha1', '{}'::jsonb, 'Quote for ' || u.id, md5(u.id) "
+                "FROM unnest(CAST(:ids AS text[])) AS u(id)"
+            ),
+            params,
+        )
+    return ids
+
+
+def _seed_named_org(repo, slug: str, *, corpus_id: str = CORPUS_A, file_id: str = "cf_a1") -> str:
+    fact_id = repo.create_fact(type="organization")
+    repo.add_alias(fact_id=fact_id, type="organization", natural_key=f"organization:{slug}", corpus_id=corpus_id)
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha1", quote=f"{slug} is a client."
+    )
+    return fact_id
+
+
+def _grant_alice(pg_env, user_id: str = "alice") -> dict:
+    from src.repositories import users_repo
+
+    users_repo().create(id=user_id, email=f"{user_id}@test.com", name=user_id.title())
+    _make_group_with_grant(pg_env, group_name=f"group-{user_id}", collection_id=CORPUS_A, member_user_id=user_id)
+    return _dict_user(user_id)
+
+
+def test_q_candidate_selection_is_bounded_ranked_and_disclosed(pg_env, repo):
+    """More facts match the substring than the candidate cap. The call must
+    still (a) finish — the cap IS the fix for the statement timeout — (b)
+    rank honestly: the exact-slug match first, the slug-prefix match second,
+    ahead of every plain-substring filler, exactly as `alias_rank` ordered
+    an uncapped result, and (c) disclose the cap with the additive
+    `candidates_capped: true`, alongside the caller's own `limit_applied`.
+    Fails on the pre-fix code, which has no `candidates_capped` at all."""
+    from src.repositories.facts_pg import SEARCH_CANDIDATE_CAP
+
+    _seed_full_fixture()
+    # Tier-2 (plain substring) fillers, more of them than the cap admits.
+    _bulk_seed_matching_facts(pg_env, n=SEARCH_CANDIDATE_CAP + 25, slug_template="acme-widget-{i}")
+    exact = _seed_named_org(repo, "widget")  # tier 0 — slug == q
+    prefix = _seed_named_org(repo, "widget-labs")  # tier 1 — slug starts with q
+    alice = _grant_alice(pg_env)
+
+    result = repo.search(alice, type="organization", q="widget", limit=5)
+
+    ids = [s["id"] for s in result["subjects"]]
+    assert len(ids) == 5
+    assert ids[:2] == [exact, prefix], ids
+    assert result["limit_applied"] is True
+    assert result["candidates_capped"] is True
+
+
+def test_q_candidate_cap_is_absent_when_the_selection_did_not_fill(pg_env, repo):
+    """The disclosure is additive (the same convention `collections_search`
+    and knowledge search use): a query whose match set fits under the cap
+    carries no `candidates_capped` key at all, and `limit_applied` keeps its
+    own, unchanged meaning (the caller's OWN visible set exceeds `limit`)."""
+    _seed_full_fixture()
+    _bulk_seed_matching_facts(pg_env, n=12, slug_template="acme-widget-{i}")
+    prefix = _seed_named_org(repo, "widget-labs")
+    alice = _grant_alice(pg_env)
+
+    narrowed = repo.search(alice, type="organization", q="widget-labs", limit=5)
+    assert [s["id"] for s in narrowed["subjects"]] == [prefix]
+    assert narrowed["limit_applied"] is False
+    assert "candidates_capped" not in narrowed
+
+    paged = repo.search(alice, type="organization", q="widget", limit=5)
+    assert len(paged["subjects"]) == 5
+    assert paged["subjects"][0]["id"] == prefix
+    assert paged["limit_applied"] is True
+    assert "candidates_capped" not in paged
+
+
+def test_q_candidate_cap_never_admits_an_unreadable_alias(pg_env, repo):
+    """The cap counts READABLE matches only — the same restriction the match
+    itself has (S9). A caller who cannot read the collection that minted
+    the fillers' aliases sees neither the fillers nor a `candidates_capped`
+    flag derived from them, so the flag can never become an oracle for how
+    many restricted names match `q`."""
+    from src.repositories.facts_pg import SEARCH_CANDIDATE_CAP
+
+    _seed_full_fixture()
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+    _bulk_seed_matching_facts(
+        pg_env, n=SEARCH_CANDIDATE_CAP + 25, slug_template="acme-widget-{i}", corpus_id=CORPUS_B, file_id="cf_b1"
+    )
+    mine = _seed_named_org(repo, "widget-labs")
+    alice = _grant_alice(pg_env)  # CORPUS_A only
+
+    result = repo.search(alice, type="organization", q="widget", limit=5)
+    assert [s["id"] for s in result["subjects"]] == [mine]
+    assert result["limit_applied"] is False
+    assert "candidates_capped" not in result
+
+
+def test_short_q_matches_only_the_start_of_a_name_token(pg_env, repo):
+    """A 2–3 character `q` is a substring of a large share of any real
+    alias set (`%ing%` hit 225k of 830k facts on a live graph), so it would
+    fill the candidate cap with noise on every call. Below
+    `SHORT_Q_TOKEN_PREFIX_LENGTH` normalized characters the query must
+    therefore start a name TOKEN (the slug itself, or a hyphen/punctuation-
+    delimited part of it): `llr` matches `llr-corp` and `acme-llr`, never
+    `fullrange`. Longer queries keep the plain substring semantics."""
+    _seed_full_fixture()
+    llr_corp = _seed_named_org(repo, "llr-corp")  # tier 1 — slug prefix
+    acme_llr = _seed_named_org(repo, "acme-llr")  # tier 2 — token start inside the slug
+    fullrange = _seed_named_org(repo, "fullrange")  # contains "llr" mid-token only
+    alice = _grant_alice(pg_env)
+
+    short = repo.search(alice, type="organization", q="llr")
+    assert [s["id"] for s in short["subjects"]] == [llr_corp, acme_llr]
+
+    # Four characters and up: unchanged substring matching — `lran` sits
+    # mid-token in `fullrange` and still matches.
+    longer = repo.search(alice, type="organization", q="lran")
+    assert [s["id"] for s in longer["subjects"]] == [fullrange]
+
+
+def test_short_q_is_matched_against_the_slug_not_the_type_prefix(pg_env, repo):
+    """The token rule looks at the slug after `<type>:` only — otherwise a
+    short `q` equal to the start of the type name (`org`) would match every
+    alias of that type at position 0 and fill the cap with everything."""
+    _seed_full_fixture()
+    _seed_named_org(repo, "widget-labs")
+    orgo = _seed_named_org(repo, "orgo-foods")
+    alice = _grant_alice(pg_env)
+
+    result = repo.search(alice, type="organization", q="org")
+    assert [s["id"] for s in result["subjects"]] == [orgo]
+
+
+def test_search_statement_timeout_is_a_typed_hinted_error(pg_env, repo, monkeypatch):
+    """A statement that outlives `_STATEMENT_TIMEOUT_MS` must surface as
+    the repository's own `FactsQueryTimeout` carrying the next step (narrow
+    `q`, add `type`), never as the raw driver error — the live failure this
+    closes read `(psycopg.errors.QueryCanceled) canceling statement due to
+    statement timeout` in the model's tool result, which tells it nothing
+    it can act on. The slow statement is produced deterministically: a
+    second connection holds an ACCESS EXCLUSIVE lock on `facts`, so the
+    search blocks until its own statement timeout cancels it (lock waits
+    count toward `statement_timeout`)."""
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+    from src.repositories.facts_pg import FactsQueryTimeout
+
+    _seed_full_fixture()
+    alice = _grant_alice(pg_env)
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 200)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts IN ACCESS EXCLUSIVE MODE"))
+        with pytest.raises(FactsQueryTimeout) as excinfo:
+            repo.search(alice, type="organization", q="anything")
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    message = str(excinfo.value)
+    assert "narrow" in message.lower() and "`q`" in message and "`type`" in message, message
+    assert "canceling statement" not in message and "psycopg" not in message, message
+    assert excinfo.value.reason == "facts_search_timeout"
+
+
+def test_neighbors_and_summary_timeouts_are_typed_and_budgeted(pg_env, repo, monkeypatch):
+    """`neighbors` and `collection_facts_summary` run several statements per
+    transaction under ONE `_ReadBudget`: a blocked statement is cancelled at
+    the budget (not 20 s per statement) and surfaces as the typed, hinted
+    `FactsQueryTimeout` with a read-specific reason, never the raw driver
+    text. Same deterministic blocker as the search test."""
+    import time
+
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+    from src.repositories.facts_pg import FactsQueryTimeout
+
+    _seed_full_fixture()
+    alice = _grant_alice(pg_env)
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 300)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts, claims, fact_collection_stats IN ACCESS EXCLUSIVE MODE"))
+        for call, reason in (
+            (lambda: repo.neighbors(alice, "f_anything"), "facts_neighbors_timeout"),
+            (lambda: repo.collection_facts_summary(alice, CORPUS_A), "facts_summary_timeout"),
+        ):
+            started = time.monotonic()
+            with pytest.raises(FactsQueryTimeout) as excinfo:
+                call()
+            assert time.monotonic() - started < 5.0
+            assert excinfo.value.reason == reason
+            message = str(excinfo.value)
+            assert "canceling statement" not in message and "psycopg" not in message, message
+            assert "retry" in message
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_aggregate_reads_keep_their_own_fail_fast_guard(pg_env, repo, monkeypatch):
+    """The per-page-view aggregate reads (`approximate_counts_for_collections`,
+    `facet_top_values_for_collections`) run under `_AGGREGATE_STATEMENT_
+    TIMEOUT_MS`, NOT the interactive `_STATEMENT_TIMEOUT_MS` — raising the
+    interactive guard must never let an aggregate scan hold a pooled
+    connection longer (the pool-starvation incident their docstrings
+    record). Proven behaviourally: with the interactive guard left long and
+    only the aggregate guard shortened, a blocked aggregate read is
+    cancelled at the aggregate bound."""
+    import time
+
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+
+    assert facts_pg._AGGREGATE_STATEMENT_TIMEOUT_MS < facts_pg._STATEMENT_TIMEOUT_MS
+
+    _seed_full_fixture()
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 60_000)
+    monkeypatch.setattr(facts_pg, "_AGGREGATE_STATEMENT_TIMEOUT_MS", 200)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts, claims, fact_collection_stats IN ACCESS EXCLUSIVE MODE"))
+        for call in (
+            lambda: repo.approximate_counts_for_collections([CORPUS_A]),
+            lambda: repo.facet_top_values_for_collections([CORPUS_A], types=["organization"]),
+        ):
+            started = time.monotonic()
+            with pytest.raises(Exception) as excinfo:
+                call()
+            elapsed = time.monotonic() - started
+            assert "canceling statement" in str(excinfo.value) or isinstance(
+                excinfo.value, facts_pg.FactsQueryTimeout
+            ), excinfo.value
+            assert elapsed < 5.0, f"aggregate read waited {elapsed:.1f}s — ran under the interactive guard"
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+# ---------------------------------------------------------------------------
 # S8 (read side) — corrections enforced at read time.
 # ---------------------------------------------------------------------------
 

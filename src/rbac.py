@@ -142,15 +142,24 @@ def can_access_table(
     if isinstance(user, PRINCIPAL_TYPES):
         from connectors.internal.access import is_internal_table
 
-        # Deliberate carve-out (spec §2): a restricted principal has no
-        # personal stack, so "is the package in the caller's stack" has no
-        # answer for it. Internal tables stay reachable — the principal's
-        # authority is already bounded by owner grants ∩ scope, the row
-        # filter yields only rows it is entitled to, and removing them
-        # would break delegation for no governance gain. Pinned by
-        # tests/test_agent_scope_seams.py, tests/test_copresence_datapath.py
-        # and tests/test_query_internal_session_principal.py.
-        if is_internal_table(table_id):
+        # Deliberate carve-out (spec §2) for the CHAT principals (co-session
+        # / agent-session): they have no personal stack, so "is the package
+        # in the caller's stack" has no answer for them. Internal tables stay
+        # reachable — the principal's authority is already bounded by owner
+        # grants ∩ scope, the row filter yields only rows it is entitled to,
+        # and removing them would break delegation for no governance gain.
+        # Pinned by tests/test_agent_scope_seams.py,
+        # tests/test_copresence_datapath.py and
+        # tests/test_query_internal_session_principal.py.
+        #
+        # Each principal kind opts in via `internal_tables_reachable`; the
+        # default is False, so a kind that says nothing gets NO carve-out. A
+        # `DataAppViewerPrincipal` (a hosted app querying as its viewer) is
+        # the one that must not: it runs inside owner-authored code, and a
+        # usage table absent from both the owner's and the viewer's grants
+        # would otherwise be readable through the app (Devin Review on
+        # #2383). Its intersection is the whole authority.
+        if is_internal_table(table_id) and getattr(user, "internal_tables_reachable", False):
             return True
 
         from app.auth.access import can_access_session
@@ -290,24 +299,27 @@ def get_accessible_tables(
     ``agnes-usage`` package and therefore arrive through the same package
     membership as any other table (spec §2, **BREAKING**).
 
-    For a ``Principal`` (co-session or agent-session), returns the
-    intersection table-ids plus internal tables — the carve-out documented
-    in :func:`can_access_table`, which this branch must keep mirroring or a
-    principal would be told a table is unreadable that ``can_access_table``
-    still waves through. NEVER ``None`` — ``None`` is the admin "all"
-    sentinel, and a restricted principal must always get a concrete list,
-    even when its intersection is empty.
+    For a ``Principal``, returns the intersection table-ids — plus internal
+    tables ONLY for a kind that opts into the carve-out
+    (``internal_tables_reachable``, see :func:`can_access_table`; the two
+    branches must keep mirroring each other or a principal would be told a
+    table is unreadable that ``can_access_table`` still waves through, or
+    vice versa). NEVER ``None`` — ``None`` is the admin "all" sentinel, and a
+    restricted principal must always get a concrete list, even when its
+    intersection is empty.
     """
     from app.auth.session_principal import PRINCIPAL_TYPES
 
     if isinstance(user, PRINCIPAL_TYPES):
         from app.resource_types import ResourceType
-        from connectors.internal.access import INTERNAL_TABLES
 
         result = list(user.intersection.get(ResourceType.TABLE.value, frozenset()))
-        for t in INTERNAL_TABLES:
-            if t.registry_id not in result:
-                result.append(t.registry_id)
+        if getattr(user, "internal_tables_reachable", False):
+            from connectors.internal.access import INTERNAL_TABLES
+
+            for t in INTERNAL_TABLES:
+                if t.registry_id not in result:
+                    result.append(t.registry_id)
         return result
 
     user_id = user.get("id")

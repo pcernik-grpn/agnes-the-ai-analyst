@@ -36,32 +36,27 @@ middleware.
 
 from __future__ import annotations
 
-import time
+from src.audit_helpers import WindowedAuditGate
+
 
 # (user_id, slug) -> the monotonic time of the last audited access. Module
 # level (one map per process, like the fallback middleware's contextvars) —
-# bounded so a churn of distinct users/apps can't leak memory forever.
-_seen: dict[tuple[str, str], float] = {}
+# bounded so a churn of distinct users/apps can't leak memory forever. The
+# mechanism is `src.audit_helpers.WindowedAuditGate`, shared with the
+# `data_app.viewer_query` debounce in `app/auth/data_app_viewer.py`; `_seen`
+# stays bound to the gate's own map so nothing that peeks at it breaks.
 _SEEN_WINDOW_MINUTES = 15
 _SEEN_TTL_S = _SEEN_WINDOW_MINUTES * 60
 _SEEN_MAX_ENTRIES = 10_000
+_ACCESS_GATE = WindowedAuditGate(window_s=_SEEN_TTL_S, max_entries=_SEEN_MAX_ENTRIES)
+_seen: dict[tuple[str, str], float] = _ACCESS_GATE._seen
 
 
 def _should_audit_access(user_id: str, slug: str) -> bool:
     """True the first time ``(user_id, slug)`` is seen in the current
-    ``_SEEN_TTL_S`` window, False for a repeat within it. Evicts the oldest
-    entry once the map hits ``_SEEN_MAX_ENTRIES`` (checked before insert, so
-    the map never exceeds the cap by more than the one entry being added)."""
-    now = time.monotonic()
-    key = (user_id, slug)
-    last = _seen.get(key)
-    if last is not None and now - last < _SEEN_TTL_S:
-        return False
-    if key not in _seen and len(_seen) >= _SEEN_MAX_ENTRIES:
-        oldest_key = min(_seen, key=_seen.__getitem__)
-        _seen.pop(oldest_key, None)
-    _seen[key] = now
-    return True
+    ``_SEEN_TTL_S`` window, False for a repeat within it (eviction of the
+    oldest entry at ``_SEEN_MAX_ENTRIES`` — see ``WindowedAuditGate``)."""
+    return _ACCESS_GATE.should_log((user_id, slug))
 
 
 def _user_from_session_cookie(scope) -> "str | None":

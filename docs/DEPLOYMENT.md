@@ -1244,6 +1244,16 @@ for the Caddy snippet to append to your reverse proxy.
   whatever data the app fetches under the owner's rights, even where their
   own grants are narrower (spec §10). Deactivating the owner revokes the
   app's token until an admin reassigns ownership.
+- Every proxied request also carries a **viewer identity assertion**
+  (`X-Agnes-Viewer`, always on, a signed short-lived header the app can read
+  via the scaffold's `agnesViewer.ts`) so an app can personalize or gate a
+  section by who is actually looking, independent of data access. Owners can
+  additionally opt an app into `data_identity: viewer`
+  (`PATCH /api/data-apps/{slug}`, `agnes app set-identity`, Postgres-backed
+  instances only — `501` on DuckDB) so its REST calls run as **owner ∩
+  viewer** instead of the owner alone, narrowing rather than widening
+  access. Full design:
+  [`docs/superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md`](superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md).
 
 **Draft iteration.** A draft is a registry sibling of a prod app pinned to an
 iteration branch on the *same* git repo (no second repo, no copy) — create one
