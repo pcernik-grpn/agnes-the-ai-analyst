@@ -283,6 +283,37 @@ def _interrupted_reason(message: Mapping[str, Any] | None) -> str | None:
     return None
 
 
+def _was_cancelled(message: Mapping[str, Any] | None) -> bool:
+    """Whether ``message`` is the assistant row a CANCEL left behind.
+
+    ``ChatManager.cancel`` persists ``tool_calls=[{"cancelled": True}]`` on a
+    real assistant row so the agent's history reflects the stop. It is not
+    the ``interrupted`` marker ``_partial_save`` writes, and without this the
+    corpus would report a cancelled answer as a complete one (#2365 review).
+    """
+    if not isinstance(message, Mapping):
+        return False
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    return any(isinstance(call, Mapping) and call.get("cancelled") for call in tool_calls)
+
+
+def _fold_cancelled_marker(totals: dict[str, Any], cancelled: bool) -> dict[str, Any]:
+    """Say that the conversation ended in a cancel.
+
+    Its own status, not folded into ``interrupted``: a person pressing stop
+    is a different fact from a turn the system lost, and an evaluation
+    pipeline reading "the answer was incomplete" needs to know which. Unlike
+    an interruption it is NOT an error -- nothing went wrong.
+    """
+    if not cancelled:
+        return totals
+    folded = dict(totals)
+    folded["last_run_status"] = "cancelled"
+    return folded
+
+
 def _fold_interrupted_marker(totals: dict[str, Any], reason: str | None) -> dict[str, Any]:
     """Fold the transcript-level interrupted marker into the ``llm_calls``-
     sourced error figures. The killed turn's own completion may never have
@@ -467,10 +498,18 @@ def build_conversation_record(
             )
 
     turn_ids = {m.get("turn_id") for m in ordered if m.get("turn_id")}
+    # A conversation written before `turn_id` existed carries none at all,
+    # and counting only the ids would report a long multi-turn transcript as
+    # ZERO turns -- false metadata for an evaluation pipeline, which is
+    # worse than a derived figure (#2365 review). Each USER message opens a
+    # turn, so the transcript itself answers for those rows: count the
+    # distinct ids, plus every user message that carries none.
+    turn_count = len(turn_ids) + sum(1 for m in ordered if m.get("role") == "user" and not m.get("turn_id"))
     first_user = next((m for m in ordered if m.get("role") == "user"), None)
     first_user_message = _text(first_user.get("content")) if first_user is not None else None
     last_message = ordered[-1] if ordered else None
     interrupted_reason = _interrupted_reason(last_message)
+    cancelled = _was_cancelled(last_message)
 
     conversation_start = _iso(ordered[0].get("created_at")) if ordered else None
     conversation_end = _iso(ordered[-1].get("created_at")) if ordered else None
@@ -481,6 +520,7 @@ def build_conversation_record(
 
     totals, cost_status = _totals(calls, ordered)
     totals = _fold_interrupted_marker(totals, interrupted_reason)
+    totals = _fold_cancelled_marker(totals, cancelled and interrupted_reason is None)
 
     return {
         "thread_id": session.get("id"),
@@ -492,7 +532,7 @@ def build_conversation_record(
         "conversation_start": conversation_start,
         "conversation_end": conversation_end,
         "duration_seconds": duration_seconds,
-        "turn_count": len(turn_ids),
+        "turn_count": turn_count,
         "message_count": len(ordered),
         "tool_call_count": len(tool_calls_json),
         "tool_calls_sequence": [c["tool_name"] for c in tool_calls_json],
@@ -510,7 +550,10 @@ def build_conversation_record(
         "first_user_message": first_user_message,
         "last_message_role": last_message.get("role") if last_message is not None else None,
         "final_assistant_message_complete": bool(
-            last_message is not None and last_message.get("role") == "assistant" and interrupted_reason is None
+            last_message is not None
+            and last_message.get("role") == "assistant"
+            and interrupted_reason is None
+            and not cancelled
         ),
         "last_run_status": totals["last_run_status"],
         "has_error": totals["has_error"],

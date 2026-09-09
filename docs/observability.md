@@ -868,7 +868,7 @@ One record per session:
 | `messages_json` | `[{role, content, turn_id, created_at, parts}]` — complete, tool_use and tool_result blocks included, in order |
 | `tool_calls_json` | `[{turn_id, tool_name, input, output, is_error, started_at}]` |
 | `first_user_message`, `last_message_role`, `final_assistant_message_complete` | derived |
-| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames — a call is `ok`, `error` (the upstream refused or was unreachable) or `incomplete` (a stream that returned HTTP 200 but never reached its stop reason, i.e. a half-delivered answer), and `has_error` counts everything that is not `ok` |
+| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames, plus the transcript's own last word (`interrupted` when the turn was lost, `cancelled` when a person stopped it — the second is not an error) — a call is `ok`, `error` (the upstream refused or was unreachable) or `incomplete` (a stream that returned HTTP 200 but never reached its stop reason, i.e. a half-delivered answer), and `has_error` counts everything that is not `ok` |
 | `feedback_json` | `[{turn_id, user_id, verdict, comment, created_at}]` |
 | `memory_writes_json` | `[{memory_id, turn_id, status, content_length}]` — the memory's own content is never included, only its length |
 | `content_mode` | `full` or `pseudonymized` — what this record's text went through |

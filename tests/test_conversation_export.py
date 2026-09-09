@@ -268,6 +268,70 @@ class TestToolCallsFlattening:
         assert record["tool_calls_json"][0]["input"] == {"cmd": "REDACTED(echo bob@example.com)"}
 
 
+class TestLegacyAndCancelledTranscripts:
+    """Two review findings about conversations the corpus described wrongly:
+    one written before `turn_id` existed, and one a person cancelled."""
+
+    def test_a_pre_turn_id_transcript_reports_its_real_turn_count(self):
+        """Every message of a historical conversation has `turn_id=None`, so
+        counting ids alone reported a long transcript as ZERO turns -- false
+        metadata for an evaluation pipeline."""
+        messages = [
+            _msg(role="user", content="first question", turn_id=None, created_at=_dt("2026-01-01T10:00:00")),
+            _msg(role="assistant", content="first answer", turn_id=None, created_at=_dt("2026-01-01T10:00:05")),
+            _msg(role="user", content="second question", turn_id=None, created_at=_dt("2026-01-01T10:01:00")),
+            _msg(role="assistant", content="second answer", turn_id=None, created_at=_dt("2026-01-01T10:01:05")),
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["turn_count"] == 2
+
+    def test_a_mixed_transcript_counts_ids_and_legacy_turns_once_each(self):
+        messages = [
+            _msg(role="user", content="legacy question", turn_id=None, created_at=_dt("2026-01-01T10:00:00")),
+            _msg(role="assistant", content="legacy answer", turn_id=None, created_at=_dt("2026-01-01T10:00:05")),
+            _msg(role="user", content="new question", turn_id="t9", created_at=_dt("2026-01-01T10:02:00")),
+            _msg(role="assistant", content="new answer", turn_id="t9", created_at=_dt("2026-01-01T10:02:05")),
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["turn_count"] == 2
+
+    def test_a_cancelled_answer_is_not_a_complete_one(self):
+        """`ChatManager.cancel` persists `tool_calls=[{"cancelled": True}]` on
+        a real assistant row. Without reading it the corpus called a
+        cancelled answer complete."""
+        messages = [
+            _msg(role="user", content="question", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                parts=None,
+                tool_calls=[{"cancelled": True}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+            ),
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["final_assistant_message_complete"] is False
+        assert record["last_run_status"] == "cancelled"
+        assert record["has_error"] is False, "a person pressing stop is not an error"
+
+    def test_an_interrupted_answer_still_wins_over_the_cancel_status(self):
+        messages = [
+            _msg(
+                role="assistant",
+                content="partial",
+                parts=None,
+                tool_calls=[{"interrupted": True, "reason": "killed"}, {"cancelled": True}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+            )
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["final_assistant_message_complete"] is False
+        assert record["last_run_status"] == "interrupted"
+        assert record["has_error"] is True
+
+
 class TestFeedbackAndMemoryJoins:
     def test_feedback_rows_map_to_the_spec_shape(self):
         feedback = [

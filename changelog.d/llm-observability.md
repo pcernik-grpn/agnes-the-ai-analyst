@@ -28,7 +28,10 @@
   message that started them, and so does a question redelivered after a
   restart. The turn is published before the message reaches the runner, so a
   fast first completion cannot land before the turn it belongs to exists. A conversation written before messages carried structured parts
-  still reports its tool calls, read from the legacy column.
+  still reports its tool calls, read from the legacy column, and its turn
+  count, derived from the transcript rather than read as zero. An answer a
+  person cancelled is reported as `cancelled` and not complete, distinct
+  from a turn the system lost.
 - **A real trace per chat turn.** ChatManager mints a `turn_id` per user message,
   opens an `agnes.chat.turn` span with one `agnes.chat.tool <tool>` child per tool
   call, and the broker parents its completion spans under it via a coordination
