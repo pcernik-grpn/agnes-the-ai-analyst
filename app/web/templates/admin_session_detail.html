@@ -345,9 +345,25 @@
 
   fetch('/api/admin/sessions/' + encodeURIComponent(username) + '/' +
         encodeURIComponent(sessionFile) + '/transcript', { credentials: 'same-origin' })
-    .then(r => r.json())
-    .then(d => {
+    .then(r => r.json().then(body => ({ ok: r.ok, status: r.status, body })))
+    .then(({ ok, status, body }) => {
       loading.remove();
+      if (!ok) {
+        // A non-2xx (typically 404) must never render as "an empty
+        // transcript" -- that read as "the session has nothing" when it
+        // actually meant "not exported yet" or "no such session", and an
+        // operator investigating a live incident couldn't tell the two
+        // apart. `detail` is either a plain string (legacy path-safety
+        // errors) or our structured {error, hint} body (chat-session
+        // freshness -- app/api/admin_sessions.py::transcript).
+        const detail = body && body.detail;
+        const message = (detail && typeof detail === 'object' && detail.hint)
+          || (typeof detail === 'string' ? detail : null)
+          || ('Failed to load transcript (HTTP ' + status + ')');
+        eventsRoot.innerHTML = '<div class="obs-empty">' + escapeHtml(message) + '</div>';
+        return;
+      }
+      const d = body;
       renderMeta(d.summary, d.tokens, d.counts);
       const events = d.events || [];
       let errorCount = 0;

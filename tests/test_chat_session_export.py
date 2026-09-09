@@ -14,15 +14,29 @@ Covers:
 - the session-pipeline pre-scan sweep (``services/session_pipeline/runner.py``
   ``_sweep_chat_session_exports``) discovering and exporting a session with
   no prior explicit call, and skipping an already-current export.
+- ``is_chat_export_stale()`` / ``ensure_chat_transcript_current()`` — the
+  freshness gap an operator hit on a production instance (measured
+  2026-09-09): the sweep is the only thing that (re-)writes a chat
+  session's jsonl while it stays live, so a transcript viewed between the
+  last message and the next sweep tick used to read as "session not
+  found" — indistinguishable from a session that never had a transcript
+  at all. These two functions are the ONE shared staleness definition the
+  sweep and the on-demand admin transcript viewer
+  (``app/api/admin_sessions.py::transcript``) both use.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.api.admin_sessions import _render_transcript
-from app.chat.session_export import export_chat_session_jsonl, messages_to_turns
+from app.chat.session_export import (
+    ensure_chat_transcript_current,
+    export_chat_session_jsonl,
+    is_chat_export_stale,
+    messages_to_turns,
+)
 from app.chat.types import ChatMessage, Surface
 from services.session_pipeline.lib import parse_jsonl
 
@@ -37,7 +51,7 @@ def _msg(**kw) -> ChatMessage:
         tokens_in=None,
         tokens_out=None,
         model=None,
-        created_at=datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc),
+        created_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
         sender_email=None,
         parts=None,
     )
@@ -360,3 +374,155 @@ class TestSessionPipelineSweep:
 
         assert _sweep_chat_session_exports(session_dir) == 0
         assert not session_dir.exists()
+
+
+class TestIsChatExportStale:
+    """The one staleness rule shared by the periodic sweep and the
+    on-demand admin transcript viewer."""
+
+    def test_missing_file_is_stale(self, tmp_path):
+        assert is_chat_export_stale(tmp_path / "nope.jsonl", datetime.now(UTC))
+
+    def test_no_last_message_at_is_never_stale(self, tmp_path):
+        assert not is_chat_export_stale(tmp_path / "nope.jsonl", None)
+
+    def test_file_newer_than_last_message_is_current(self, tmp_path):
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        assert not is_chat_export_stale(f, datetime.now(UTC) - timedelta(hours=1))
+
+    def test_file_older_than_last_message_is_stale(self, tmp_path):
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        assert is_chat_export_stale(f, datetime.now(UTC) + timedelta(hours=1))
+
+
+class TestOnDemandTranscriptFreshness:
+    """The freshness gap measured on a production instance (2026-09-09): the
+    export sweep only (re-)writes a chat session's jsonl on its own cadence
+    (``SCHEDULER_USAGE_PROCESSOR_INTERVAL``, default 10 minutes), so an
+    operator opening the admin transcript viewer in the window between the
+    last message and the next tick used to get an indistinguishable "session
+    not found" whether the transcript was merely pending or genuinely never
+    existed. ``GET .../transcript`` now brings a stale-or-missing chat
+    export current on demand (``ensure_chat_transcript_current``) and, when
+    it genuinely cannot, returns a structured 404 that names *why*.
+    """
+
+    def _get_transcript(self, seeded_app, username: str, session_file: str):
+        return seeded_app["client"].get(
+            f"/api/admin/sessions/{username}/{session_file}/transcript",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+
+    def test_serves_a_session_that_was_never_exported_yet(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        assert not session_dir.exists()  # sweep has never run
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["events"]
+        assert (session_dir / "analyst1" / f"chat-{chat_id}.jsonl").is_file()
+
+    def test_serves_fresh_content_when_the_export_is_stale(self, seeded_app, tmp_path, monkeypatch):
+        from src.repositories import chat_message_repo
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        first = export_chat_session_jsonl(chat_id)
+        assert first is not None
+
+        # A new message lands after that export -- the sweep hasn't ticked
+        # again, so the file on disk is now stale.
+        chat_message_repo().append_message(session_id=chat_id, role="user", content="one more thing")
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        texts = [e.get("text") for e in resp.json()["events"] if e.get("kind") == "text"]
+        assert any("one more thing" in (t or "") for t in texts), texts
+
+    def test_current_export_is_served_without_reexporting(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        first = export_chat_session_jsonl(chat_id)
+        assert first is not None
+        mtime_before = first.stat().st_mtime
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        # Already current -- no pointless re-export/re-write.
+        assert first.stat().st_mtime == mtime_before
+
+    def test_404_names_export_disabled_and_does_no_pointless_work(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        monkeypatch.setenv("AGNES_SESSIONS_INCLUDE_CHAT", "false")
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert detail["error"] == "chat_transcript_export_disabled"
+        assert not session_dir.exists()  # never attempted a write
+
+    def test_404_names_unknown_session_not_found(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+
+        resp = self._get_transcript(seeded_app, "analyst1", "chat-does-not-exist.jsonl")
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error"] == "session_not_found"
+
+    def test_non_chat_filename_keeps_the_plain_404(self, seeded_app, tmp_path, monkeypatch):
+        """A legacy CLI-collector filename never matches the ``chat-*``
+        pattern, so it never triggers the chat lookaside at all -- the
+        original, unstructured 404 stays exactly as it was."""
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+
+        resp = self._get_transcript(seeded_app, "analyst1", "session-001.jsonl")
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "session not found"
+
+
+class TestEnsureChatTranscriptCurrent:
+    def test_unknown_chat_id_reports_session_not_found(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        freshness = ensure_chat_transcript_current("chat_does_not_exist")
+        assert freshness.session_found is False
+        assert freshness.path is None
+
+    def test_disabled_flag_reports_export_disabled_without_writing(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        monkeypatch.setenv("AGNES_SESSIONS_INCLUDE_CHAT", "false")
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        freshness = ensure_chat_transcript_current(chat_id)
+
+        assert freshness.session_found is True
+        assert freshness.export_disabled is True
+        assert freshness.path is None
+        assert not session_dir.exists()
+
+    def test_missing_export_is_created_and_reported_fresh(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        freshness = ensure_chat_transcript_current(chat_id)
+
+        assert freshness.session_found is True
+        assert freshness.export_disabled is False
+        assert freshness.path is not None
+        assert freshness.path.is_file()

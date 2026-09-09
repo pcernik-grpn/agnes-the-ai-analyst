@@ -21,7 +21,7 @@ pipeline has always stored and admins have always been able to browse at
 no-materialized-copy behavior for an instance that wants chat kept out of
 the filesystem session store entirely.
 
-Called from three places, all best-effort (never raises):
+Called from four places, all best-effort (never raises):
   - ``app.chat.manager.ChatManager._kill_locked`` — the session-end/kill
     path every teardown route (archive, delete, idle reaper) funnels
     through.
@@ -30,6 +30,17 @@ Called from three places, all best-effort (never raises):
   - the session-pipeline sweep (``services/session_pipeline/runner.py``) —
     catches anything the two hooks above missed (a crash before ``kill()``
     ran, or a still-active session an admin wants to inspect early).
+  - ``app.api.admin_sessions.transcript`` (on demand, via
+    :func:`ensure_chat_transcript_current` below) — the sweep above only
+    (re-)writes a still-live session's jsonl on its own scheduler cadence
+    (``SCHEDULER_USAGE_PROCESSOR_INTERVAL``, default 10 minutes), so an
+    operator opening the transcript viewer inside that window used to see
+    a stale file or a bare "session not found" — indistinguishable from a
+    session that never had a transcript at all (measured on a production
+    instance, 2026-09-09). The on-demand path shares this module's exact
+    staleness rule (:func:`is_chat_export_stale`) so "is this transcript
+    current" has one definition regardless of which of the four callers
+    asks.
 """
 
 from __future__ import annotations
@@ -37,9 +48,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from app.chat.types import ChatMessage
 from app.instance_config import feature_enabled
@@ -162,7 +174,7 @@ def messages_to_turns(chat_id: str, messages: list[ChatMessage]) -> list[dict]:
     """
     turns: list[dict] = []
     for m in messages:
-        created = m.created_at or datetime.now(timezone.utc)
+        created = m.created_at or datetime.now(UTC)
         ts = created.isoformat()
 
         if m.role == "assistant":
@@ -222,7 +234,7 @@ def messages_to_turns(chat_id: str, messages: list[ChatMessage]) -> list[dict]:
     return turns
 
 
-def export_chat_session_jsonl(chat_id: str) -> Optional[Path]:
+def export_chat_session_jsonl(chat_id: str) -> Path | None:
     """Write ``chat_id``'s messages to
     ``${SESSION_DATA_DIR}/<users.id>/chat-<chat_id>.jsonl`` (atomic:
     ``.tmp`` then ``os.replace``) and return the path — or ``None``,
@@ -292,3 +304,121 @@ def export_chat_session_jsonl(chat_id: str) -> Optional[Path]:
         result="success",
     )
     return target
+
+
+def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime | None) -> bool:
+    """True when a chat session's exported jsonl is missing, unreadable, or
+    older than the session's last message.
+
+    The ONE staleness rule shared by the periodic sweep
+    (``services/session_pipeline/runner.py::_sweep_chat_session_exports``)
+    and the on-demand admin transcript viewer
+    (:func:`ensure_chat_transcript_current`) — kept in a single function so
+    "is this transcript current" never drifts between the two callers.
+
+    ``last_message_at=None`` (a session with no messages yet) is never
+    stale: there is nothing to export, so re-checking on every call would
+    be pointless work for a session that will never produce a file.
+    """
+    if last_message_at is None:
+        return False
+    if existing_path is None or not existing_path.is_file():
+        return True
+    try:
+        file_mtime = datetime.fromtimestamp(existing_path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return True
+    last_active = last_message_at if last_message_at.tzinfo is not None else last_message_at.replace(tzinfo=UTC)
+    return last_active > file_mtime
+
+
+@dataclass
+class ChatTranscriptFreshness:
+    """What :func:`ensure_chat_transcript_current` learned about one chat
+    session, for a caller (``app/api/admin_sessions.py::transcript``) that
+    needs to either render a current transcript or explain, honestly, why
+    there isn't one — rather than a bare 404 indistinguishable from "this
+    session never had a transcript at all".
+
+    ``path`` is the current, on-disk export when one exists or was just
+    created; ``None`` otherwise. The remaining fields say why not:
+    ``session_found=False`` means the chat id itself doesn't resolve;
+    ``export_disabled=True`` means ``sessions.include_chat`` is off (the
+    session may well have messages, but this instance never materializes
+    them to disk); ``message_count``/``last_message_at`` describe a
+    session that DOES exist but produced no file for some other reason
+    (owner unresolvable, or the write itself failed).
+    """
+
+    path: Path | None
+    session_found: bool
+    export_disabled: bool
+    message_count: int
+    last_message_at: datetime | None
+
+
+def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
+    """On-demand counterpart to the periodic sweep: bring ``chat_id``'s
+    exported jsonl current right now if it is missing or stale
+    (:func:`is_chat_export_stale`), reusing the same idempotent writer
+    (:func:`export_chat_session_jsonl`) the sweep and the kill/archive hooks
+    already call.
+
+    Used by the admin transcript viewer so an operator investigating a live
+    incident sees the current transcript immediately, rather than waiting
+    up to the sweep's own scheduler cadence for the next tick. Never
+    raises: every failure mode (unknown session, disabled feature,
+    unresolvable owner, a write error inside ``export_chat_session_jsonl``)
+    comes back as ``path=None`` with enough context on the returned
+    :class:`ChatTranscriptFreshness` for the caller to explain *why*.
+    """
+    export_disabled = not feature_enabled(
+        "sessions", "include_chat", env_var="AGNES_SESSIONS_INCLUDE_CHAT", default=True
+    )
+
+    from src.repositories import chat_session_repo, users_repo
+
+    try:
+        session = chat_session_repo().get_session(chat_id)
+    except Exception:
+        logger.warning("chat transcript freshness: session lookup failed for %s", chat_id, exc_info=True)
+        session = None
+
+    if session is None:
+        return ChatTranscriptFreshness(
+            path=None,
+            session_found=False,
+            export_disabled=export_disabled,
+            message_count=0,
+            last_message_at=None,
+        )
+
+    freshness = ChatTranscriptFreshness(
+        path=None,
+        session_found=True,
+        export_disabled=export_disabled,
+        message_count=session.message_count or 0,
+        last_message_at=session.last_message_at,
+    )
+
+    # Respect the flag even though the session itself resolved fine — an
+    # instance with chat export disabled must never write to disk just
+    # because an admin opened the viewer.
+    if export_disabled:
+        return freshness
+
+    try:
+        owner = users_repo().get_by_email(session.user_email)
+    except Exception:
+        logger.warning("chat transcript freshness: owner lookup failed for %s", chat_id, exc_info=True)
+        owner = None
+    if not owner:
+        return freshness
+
+    existing = _session_data_dir() / owner["id"] / f"chat-{chat_id}.jsonl"
+    if existing.is_file() and not is_chat_export_stale(existing, session.last_message_at):
+        freshness.path = existing
+        return freshness
+
+    freshness.path = export_chat_session_jsonl(chat_id)
+    return freshness
