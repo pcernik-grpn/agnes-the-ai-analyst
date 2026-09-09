@@ -530,3 +530,51 @@ def test_accumulator_flush_after_size_trigger_leaves_no_pending_timer(monkeypatc
     acc.add(_usage_row(2))  # hits the size threshold; flush() must clear the timer
     assert len(fake_repo.batches) == 1
     assert acc._pending_timer is None
+
+
+def test_a_failed_ledger_flush_holds_the_rows_for_the_next_flush(monkeypatch):
+    """Review finding: a transient ledger write failure used to erase every
+    buffered call row. The ledger's contract is one row per call, so the
+    rows go back into the buffer and the next flush retries them
+    (`insert_batch` is idempotent on the row id)."""
+    import app.api.broker_agent_policy as pol
+
+    attempts: list[int] = []
+
+    class _Repo:
+        def insert_batch(self, rows):
+            attempts.append(len(rows))
+            if len(attempts) == 1:
+                raise RuntimeError("ledger down")
+            return len(rows)
+
+    repo = _Repo()
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr("src.repositories.llm_calls_repo", lambda: repo, raising=False)
+
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    acc.add_call({"id": "call_1"})
+
+    assert attempts == [1], "the first flush should have been attempted"
+    acc.flush()
+    assert attempts == [1, 1], "the held row should be retried by the next flush"
+
+
+def test_a_ledger_that_stays_down_sheds_the_oldest_rows(monkeypatch):
+    """Holding rows must not grow without limit: past the cap the OLDEST are
+    shed and the newest history is kept."""
+    import app.api.broker_agent_policy as pol
+
+    class _AlwaysDown:
+        def insert_batch(self, rows):
+            raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(pol, "use_pg", lambda: True)
+    monkeypatch.setattr("src.repositories.llm_calls_repo", lambda: _AlwaysDown(), raising=False)
+    monkeypatch.setattr(pol, "MAX_BUFFERED_CALL_ROWS", 3)
+
+    acc = pol.UsageAccumulator(flush_size=1, flush_interval_s=3600)
+    for i in range(5):
+        acc.add_call({"id": f"call_{i}"})
+
+    assert [r["id"] for r in acc._call_rows] == ["call_2", "call_3", "call_4"]

@@ -63,6 +63,13 @@ _USAGE_FIELD_MAP = (
 )
 
 DEFAULT_FLUSH_SIZE = 20
+#: How many `llm_calls` rows a process will hold while the ledger is
+#: refusing writes. The ledger's promise is one row per call, so a transient
+#: database failure returns its rows to the buffer for the next flush rather
+#: than dropping them — but a database that stays down must not grow the
+#: buffer without limit, so past this many the OLDEST rows are shed and the
+#: newest history is kept.
+MAX_BUFFERED_CALL_ROWS = 5000
 DEFAULT_FLUSH_INTERVAL_S = 30.0
 
 
@@ -527,7 +534,23 @@ class UsageAccumulator:
                 # its absence is expected, not an incident.
                 logger.debug("llm_calls ledger unavailable; %d call rows dropped", len(call_rows))
             except Exception:
-                logger.exception("llm_calls batch flush failed; %d call rows dropped", len(call_rows))
+                # NOT the same posture as `llm_usage` above: that one is a
+                # best-effort budget counter, this is the ledger every cost
+                # read and every "what did the model do" answer is built
+                # from, and its contract is a row per call. A transient
+                # write failure therefore returns the rows to the buffer
+                # for the next flush (size, timer or shutdown) instead of
+                # erasing them; `insert_batch` is idempotent on the row id,
+                # so a partially-applied batch does not duplicate on retry.
+                with self._lock:
+                    self._call_rows = (call_rows + self._call_rows)[-MAX_BUFFERED_CALL_ROWS:]
+                    kept = len(self._call_rows)
+                logger.exception(
+                    "llm_calls batch flush failed; %d call row(s) held for the next flush (%d buffered)",
+                    len(call_rows),
+                    kept,
+                )
+                self._arm_timer_if_needed()
 
 
 usage_accumulator = UsageAccumulator()

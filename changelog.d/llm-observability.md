@@ -12,7 +12,9 @@
   purpose), `GET /api/admin/telemetry/llm-calls` (`agnes admin usage llm-calls`,
   the rows of one session / turn / job / user, paged with a `before` +
   `before_id` keyset cursor so rows sharing a timestamp are never skipped;
-  buffered rows reach the ledger within 30 s even on an idle instance; a
+  buffered rows reach the ledger within 30 s even on an idle instance, and a
+  transient ledger write failure holds its rows for the next flush instead
+  of dropping them; a
   streamed completion that never reached its stop reason is recorded as
   `incomplete` rather than `ok`, and the corpus's `has_error` counts it),
   the new "LLM cost" section on
