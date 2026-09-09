@@ -4,8 +4,9 @@
   brokered chat completion AND every server-side generation (the five builder
   endpoints, document fact extraction including batch results, OCR, vision
   captioning, the NER anonymizer, auto-title, chat readiness probes, corporate
-  memory, knowledge digests, table autodoc, ontology, memory-curator profiling,
-  session verification, and the store guardrails), with the rates stored beside
+  memory, knowledge digests, table autodoc, ontology, session verification, the
+  store guardrails, and the admin usage question assistant under its own
+  `admin_ask` workload), with the rates stored beside
   the figure (`priced_as`). Read it with `GET /api/admin/telemetry/llm-cost`
   (`agnes admin usage llm-cost`, grouped by workload / agent / user / model /
   purpose), `GET /api/admin/telemetry/llm-calls` (`agnes admin usage llm-calls`,
@@ -17,7 +18,9 @@
   opens an `agnes.chat.turn` span with one `agnes.chat.tool <tool>` child per tool
   call, and the broker parents its completion spans under it via a coordination
   record — no engine-side propagation needed. The same `turn_id` rides every
-  frame, `chat_messages.turn_id`, `usage_turns.turn_uuid` and `llm_calls.turn_id`.
+  frame, `chat_messages.turn_id` (on the user row and the assistant row, so a
+  question and its answer pair up — `GET /api/chat/sessions/{id}/messages` rows
+  carry it too), `usage_turns.turn_uuid` and `llm_calls.turn_id`.
 - **Thumbs on chat answers.** `POST /api/chat/sessions/{id}/feedback` (`up`/`down`
   plus an optional comment, one row per turn and user; audited as `chat.feedback`),
   rendered on every completed assistant bubble in the web chat; admins read the
@@ -72,9 +75,12 @@
 ### Internal
 - Every LLM call site is now traced with `trace_generation`, including ones that
   previously bypassed it entirely (document fact extraction, OCR, vision, the
-  NER anonymizer, auto-title) — closed by a static coverage guard
-  (`tests/test_llm_coverage_guard.py`) that scans the call sites named in the
-  design and fails CI on a new bypass.
+  NER anonymizer, auto-title, the admin usage assistant) — closed by a static
+  coverage guard (`tests/test_llm_coverage_guard.py`) that scans every module
+  the design names plus the LLM providers, requires every `extract_json` call to
+  set an `llm_context`, and fails CI on a new bypass. Extraction rows carry the
+  document's id as `subject_id`; Vertex-hosted generations are labelled
+  `gcp.vertex_ai` everywhere, matching the chat broker.
 - The worker runtime binds `job_id` into the LLM call context so every
   generation inside a background job is attributed without per-handler code.
 - New Alembic migration `0113_llm_observability` (`llm_calls`,
