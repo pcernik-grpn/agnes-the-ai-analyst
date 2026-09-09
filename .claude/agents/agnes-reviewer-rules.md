@@ -89,28 +89,42 @@ them, so never report them:
 
 Report any OTHER claim of AI authorship: in a commit subject, in a commit
 BODY outside that trailer, in the PR title or prose, or in added code,
-comments or docs.
+comments or docs. One pattern finds all three — it matches an authorship
+CLAIM rather than a name:
 
-    # 1. commit subjects AND bodies, with the two accepted forms filtered out
-    git log --format='%s%n%b' <base>..HEAD \
-      | grep -ivE '^Co-Authored-By: Claude|^🤖 Generated with \[Claude Code\]' \
-      | grep -inE '(generated|written|authored|created) (with|by) (claude|copilot|chatgpt|an? (ai|llm))|ai[- ]generated|🤖'
+    CLAIM='(generated|written|authored|created) (with|by) (claude|copilot|chatgpt|an? (ai|llm))|ai[- ]generated|🤖'
+
+    # 1a. commit SUBJECTS — neither accepted form belongs in a subject, so
+    #     scan them whole, with nothing filtered out.
+    git log --format='%s' <base>..HEAD | grep -inE "$CLAIM"
+
+    # 1b. commit BODIES — drop the two accepted lines in their EXACT form
+    #     (a complete trailer ending in an angle-bracket address; the footer
+    #     with its real URL), then scan what is left. The exactness matters:
+    #     a prefix match also swallows a subject or a prose line that merely
+    #     opens with "Co-Authored-By: Claude …".
+    git log --format='%b' <base>..HEAD \
+      | grep -ivE '^Co-Authored-By: Claude [^<]*<[^>]+>$|^_?🤖 Generated with \[Claude Code\]\(https://claude\.com/claude-code\)_?$' \
+      | grep -inE "$CLAIM"
 
     # 2. added lines, EXCLUDING the files that define this convention — they
     #    quote the accepted strings on purpose, so scanning them makes every
     #    edit to the convention itself self-report.
     git diff <base>..HEAD -- . ':!CHANGELOG.md' ':!docs/archive' \
       ':!CLAUDE.md' ':!.claude/agents/agnes-reviewer-rules.md' \
-      | grep -inE '^\+.*(co-authored-by:[[:space:]]*claude|🤖 generated with)'
+      | grep -inE "^\+.*($CLAIM)"
 
-Expected: zero matches for both. Both patterns are deliberately narrow —
-they match an authorship CLAIM, not the product name: "Claude Code" is a
-first-class subject of this repo (hooks, marketplace, the CLI) and appears
-in ordinary code and docs, and `claude/*` shows up in branch names inside
-merge-commit subjects. A bare `claude` grep reports those as violations.
-Also read the PR title and body yourself: the footer is fine, an
-"AI-generated" claim in the title or prose is Missing — main agent must
-remove it before opening the PR.
+Expected: zero matches from all three. The pattern is deliberately narrow
+about the product name: "Claude Code" is a first-class subject of this repo
+(hooks, marketplace, the CLI) and appears in ordinary code and docs, and
+`claude/*` shows up in branch names inside merge-commit subjects — a bare
+`claude` grep reports those as violations. Measured on this repo, the three
+commands above return nothing across the last 300 commits on `main` while
+still catching a planted claim in a subject, a body, or an added line.
+
+They are aids, not the verdict: read the PR title and body yourself too.
+The footer is fine there; an "AI-generated" claim in the title or prose is
+Missing — main agent must remove it before opening the PR.
 
 ### 4. Issue economy
 
