@@ -9,7 +9,6 @@ still works there.
 
 from __future__ import annotations
 
-import pytest
 import yaml
 
 from src.data_apps.runner_client import RunnerUnavailable
@@ -201,6 +200,13 @@ def test_duckdb_answers_a_typed_501_and_changes_nothing(tmp_path, monkeypatch, p
     got = client.get("/api/data-apps/ident-app", headers=_auth(owner_token)).json()
     assert got["data_identity"] == "owner"
     assert got["effective_description"] == ""
+
+    # Even the implicit default is refused: `'owner'` equals what the row
+    # reads as, but the instance cannot HOLD the setting, and a 200 here
+    # would tell a caller the feature works (Devin Review on #2383).
+    r = client.patch("/api/data-apps/ident-app", json={"data_identity": "owner"}, headers=_auth(owner_token))
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
 
     # The description-only PATCH is untouched by the ratchet.
     r = client.patch("/api/data-apps/ident-app", json={"description": "fine"}, headers=_auth(owner_token))

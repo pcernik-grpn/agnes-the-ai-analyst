@@ -1446,6 +1446,15 @@ async def patch_data_app(
         _reject_linked(row)
         if row.get("is_draft"):
             raise HTTPException(status_code=400, detail="draft_has_no_data_identity")
+        # The column is Postgres-only. Refuse HERE, before the no-op check
+        # below: on DuckDB a request for `'owner'` matches the implicit
+        # default and would otherwise skip `set_data_identity` (the only
+        # other place the backend is checked) and report success for a
+        # setting this instance cannot hold at all (Devin Review on #2383).
+        from src.repositories import RequiresPostgresBackend, use_pg
+
+        if not use_pg():
+            raise RequiresPostgresBackend("data_app.data_identity")
         previous = data_identity_of(row)
         if payload.data_identity != previous:
             # The op lease is taken BEFORE the column write, so a concurrent

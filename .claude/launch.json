@@ -107,24 +107,6 @@
         ".env"
       ],
       "port": 8001
-    },
-    {
-      "name": "kai-engine-3011",
-      "runtimeExecutable": "bash",
-      "runtimeArgs": [
-        "-lc",
-        "cd /Users/adamvyborny/Code/ui/apps/kai-agent && ./node_modules/.bin/tsx --env-file=/Users/adamvyborny/Code/ui/apps/kai-agent/.env.jwt src/index.ts"
-      ],
-      "port": 3011
-    },
-    {
-      "name": "agnes-e2e-compose",
-      "runtimeExecutable": "bash",
-      "runtimeArgs": [
-        "-lc",
-        "set -a && source /private/tmp/claude-501/-Users-adamvyborny-Code-agnes-the-ai-analyst--claude-worktrees-tcrd-291-linear-task-7a9e79/8a5d92d4-c49a-4e17-889b-e87e68f4152f/scratchpad/e2e.env && set +a && exec docker compose -f docker-compose.yml -f /private/tmp/claude-501/-Users-adamvyborny-Code-agnes-the-ai-analyst--claude-worktrees-tcrd-291-linear-task-7a9e79/8a5d92d4-c49a-4e17-889b-e87e68f4152f/scratchpad/e2e-override.yml --profile apps up app apps-runner"
-      ],
-      "port": 8001
     }
   ]
 }

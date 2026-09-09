@@ -153,13 +153,15 @@
     </div>
   </div>
 
+  {# One source for both the server-rendered note and the script that
+     re-renders it after a save — neutral wording, because an Admin may be
+     managing someone else's app: the data is read under the OWNER's grants,
+     not the reader's. #}
+  {% set identity_note_owner = "Viewers see data under the app owner's grants (" ~ app.owner_email ~ "). Sharing this app publishes what it fetches." %}
+  {% set identity_note_viewer = "Each viewer sees only what their own grants allow (admins included)." %}
   {% if app.kind == 'hosted' %}
-  <p class="dda-identity-note">
-    {% if app.data_identity == 'viewer' %}
-    Each viewer sees only what their own grants allow (admins included).
-    {% else %}
-    Viewers see data under YOUR grants. Sharing this app publishes what it fetches.
-    {% endif %}
+  <p class="dda-identity-note" id="dda-identity-note">
+    {% if app.data_identity == 'viewer' %}{{ identity_note_viewer }}{% else %}{{ identity_note_owner }}{% endif %}
   </p>
   {% endif %}
 
@@ -167,7 +169,7 @@
   <form id="dda-identity-form" class="dda-identity-form">
     <label for="dda-identity">Data identity</label>
     <select id="dda-identity">
-      <option value="owner"{% if app.data_identity != 'viewer' %} selected{% endif %}>Owner — runs under your grants</option>
+      <option value="owner"{% if app.data_identity != 'viewer' %} selected{% endif %}>Owner — runs under the app owner's grants</option>
       <option value="viewer"{% if app.data_identity == 'viewer' %} selected{% endif %}>Viewer — runs under each viewer's own grants</option>
     </select>
     {{ ds.button('Save', variant='primary', id='dda-identity-save', type='submit') }}
@@ -222,6 +224,8 @@
   const form = document.getElementById("dda-identity-form");
   const select = document.getElementById("dda-identity");
   const resultEl = document.getElementById("dda-identity-result");
+  const noteEl = document.getElementById("dda-identity-note");
+  const NOTES = { owner: {{ identity_note_owner | tojson }}, viewer: {{ identity_note_viewer | tojson }} };
   const btn = document.getElementById("dda-identity-save");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -260,6 +264,12 @@
       }
       resultEl.textContent = msg;
       resultEl.hidden = false;
+      // The explanation must describe the mode the server now HOLDS, not the
+      // one the page was rendered with — a failed save above returned
+      // early, so the previous text survives there.
+      if (noteEl && NOTES[body.data_identity]) {
+        noteEl.textContent = NOTES[body.data_identity];
+      }
     } catch (e) {
       await alertModal("Network error: " + e.message);
     } finally {

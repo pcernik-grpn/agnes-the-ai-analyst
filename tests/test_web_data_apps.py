@@ -334,8 +334,21 @@ def test_detail_page_owner_mode_shows_publishing_warning(web_env):
     c = web_env["client"]
     resp = c.get("/apps/detail/ownermode", headers=_auth(web_env["owner_pat"]))
     assert resp.status_code == 200
-    assert "Sharing this app publishes what it fetches." in resp.text
-    assert "Each viewer sees only what their own grants allow" not in resp.text
+    # The RENDERED note, not the whole page: the save script legitimately
+    # carries both texts so it can re-render the note after a mode flip.
+    note = _identity_note(resp.text)
+    assert "Sharing this app publishes what it fetches." in note
+    assert "Each viewer sees only what their own grants allow" not in note
+
+
+def _identity_note(page_html: str) -> str:
+    """Text of the server-rendered ``#dda-identity-note`` paragraph, entities decoded."""
+    import html as _html
+    import re
+
+    m = re.search(r'<p class="dda-identity-note" id="dda-identity-note">(.*?)</p>', page_html, re.S)
+    assert m, "identity note not rendered"
+    return _html.unescape(" ".join(m.group(1).split()))
 
 
 def test_detail_linked_app_share_control_is_admin_only(web_env):
@@ -607,3 +620,44 @@ def test_detail_page_does_not_link_the_url_when_the_deployment_cannot_serve_apps
     assert resp.status_code == 200
     assert '<a href="/apps/noserve/"' not in resp.text
     assert "<code>/apps/noserve/</code>" in resp.text
+
+
+def test_detail_page_identity_note_is_about_the_owner_not_the_reader(web_env):
+    """An Admin managing someone else's app must not read "YOUR grants": the
+    app reads data under its OWNER's grants regardless of who is looking at
+    the page (Devin Review on #2383). The note names the owner and reads the
+    same for the owner and for the admin."""
+    _create_app_row(slug="adminview", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    admin_resp = c.get("/apps/detail/adminview", headers=_auth(web_env["admin_pat"]))
+    owner_resp = c.get("/apps/detail/adminview", headers=_auth(web_env["owner_pat"]))
+    import html as _html
+
+    for resp in (admin_resp, owner_resp):
+        assert resp.status_code == 200
+        page = _html.unescape(resp.text)
+        assert "YOUR grants" not in page
+        assert "under your grants" not in page
+        assert "under the app owner's grants (owner@test.local)" in _identity_note(resp.text)
+        assert "runs under the app owner's grants" in page  # the selector label
+
+
+def test_detail_page_identity_script_rerenders_the_note_from_the_response(web_env):
+    """After a successful save the explanatory note must describe the mode the
+    server now holds, not the one the page was rendered with — the script
+    carries both texts and keys them off ``body.data_identity``; a failed
+    save returns before that line, so the old text survives there."""
+    _create_app_row(slug="notelive", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/notelive", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    html = resp.text
+    assert 'id="dda-identity-note"' in html
+    script = html[html.index('const noteEl = document.getElementById("dda-identity-note")') :]
+    assert "const NOTES = {" in script
+    assert "Sharing this app publishes what it fetches." in script
+    assert "Each viewer sees only what their own grants allow" in script
+    assert "NOTES[body.data_identity]" in script
+    # The re-render happens on the success path only: it sits after the
+    # `!r.ok` early return and before the `catch`.
+    assert script.index("if (!r.ok)") < script.index("NOTES[body.data_identity]") < script.index("} catch (e)")
