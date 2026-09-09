@@ -128,6 +128,20 @@ class CorpusChunksPgRepository:
             )
         return [dict(r) for r in rows]
 
+    def list_text_for_file(self, file_id: str) -> list[str]:
+        """Chunk texts for one file in ordinal order — nothing else.
+
+        The whole-file text a preview pages over needs only this column;
+        ``list_for_file`` also hauls every chunk's embedding out of the
+        database, which a preview never reads.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT text FROM corpus_chunks WHERE file_id = :file_id ORDER BY ordinal"),
+                {"file_id": file_id},
+            ).all()
+        return [r[0] for r in rows]
+
     def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
         """All chunks for an entire corpus, ordered by file_id then ordinal."""
         with self._engine.connect() as conn:

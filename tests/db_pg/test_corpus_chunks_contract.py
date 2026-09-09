@@ -168,6 +168,20 @@ def test_optional_fields_round_trip(repo):
     assert r["metadata"] == '{"source": "test"}'
 
 
+def test_list_text_for_file_is_the_texts_in_ordinal_order(repo):
+    """The preview's whole-file read needs the text column and nothing
+    else — no embeddings, no row dicts — in ordinal order, on both
+    backends."""
+    chunks = [
+        {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "Second"},
+        {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "First"},
+        {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 2, "text": "Third"},
+    ]
+    repo.add_many(chunks)
+    assert repo.list_text_for_file(FILE_ID) == ["First", "Second", "Third"]
+    assert repo.list_text_for_file("cf_nobody") == []
+
+
 def test_list_for_corpus_returns_all_file_chunks(repo):
     repo.add_many(
         [

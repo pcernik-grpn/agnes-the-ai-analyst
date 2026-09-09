@@ -227,15 +227,19 @@ class TestEndpointBehaviourItWraps:
     def test_extracted_text_is_assembled_whole(self, monkeypatch):
         """``_extracted_text`` used to stop joining chunks at the cap, so no
         offset could ever reach chunk 21 of a docx. It must build the whole
-        file; the endpoint pages over it."""
+        file; the endpoint pages over it. Only the text column is read —
+        a page has no use for the embeddings ``list_for_file`` carries."""
         from app.api import collections as mod
 
-        chunks = [{"ordinal": i, "text": f"chunk {i:03d} " + "z" * 990} for i in range(40)]
+        chunks = [f"chunk {i:03d} " + "z" * 990 for i in range(40)]
 
         class _Repo:
-            def list_for_file(self, file_id):
+            def list_text_for_file(self, file_id):
                 assert file_id == "cf_x"
                 return chunks
+
+            def list_for_file(self, file_id):  # pragma: no cover - must not be used
+                raise AssertionError("the preview must not load embeddings")
 
         monkeypatch.setattr(mod, "corpus_chunks_repo", lambda: _Repo())
 
@@ -243,6 +247,73 @@ class TestEndpointBehaviourItWraps:
         assert len(text) > 20_000
         assert text.endswith("chunk 039 " + "z" * 990)
         assert text.count("\n\n") == 39
+
+    def test_joined_chunks_do_not_repeat_the_overlap_window(self):
+        """The chunker keeps the tail of each window at the head of the
+        next, so a verbatim join repeated every boundary passage. Real
+        windowing, reassembled, must give the source text back."""
+        from app.api.collections import _join_chunks
+        from src.ingest.chunking import _OVERLAP_CHARS, _TARGET_CHARS, _window
+
+        full = " ".join(f"w{i:05d}" for i in range(2_000))  # 14k chars, unique tokens
+        pieces = _window(full, _TARGET_CHARS, _OVERLAP_CHARS)
+        assert len(pieces) >= 5, "the fixture must span several windows"
+        assert full.count(pieces[1][:_OVERLAP_CHARS]) == 1
+        assert "\n\n".join(pieces).count(pieces[1][:200]) == 2, "verbatim join really does repeat"
+
+        assert _join_chunks(pieces) == full
+
+    def test_chunks_without_a_shared_edge_keep_the_blank_line_join(self):
+        """Element-based chunks never overlap; a short coincidence at the
+        edge is not the window and must not be merged away."""
+        from app.api.collections import _join_chunks
+
+        assert _join_chunks(["Heading", "Body of the section"]) == "Heading\n\nBody of the section"
+        edge = "same twenty chars.."  # 20 < the 40-character threshold
+        joined = _join_chunks(["first element ends with " + edge, edge + " begins the second element"])
+        assert joined.count(edge) == 2
+        assert _join_chunks(["", "  ", "only"]) == "only"
+
+    def test_pages_of_a_windowed_document_do_not_repeat_boundaries(self, seeded_app, monkeypatch):
+        """End to end: a document chunked by the real windowing, read page
+        by page through the endpoint, must contain every token exactly
+        once when the pages are concatenated."""
+        from app.api import collections as mod
+        from src.ingest.chunking import _OVERLAP_CHARS, _TARGET_CHARS, _window
+
+        tok = seeded_app["admin_token"]
+        c = seeded_app["client"].post("/api/collections", json={"name": "Windowed"}, headers=_auth(tok))
+        cid = c.json()["id"]
+        up = seeded_app["client"].post(
+            f"/api/collections/{cid}/files",
+            files={"files": ("deck.pptx", b"PK\x03\x04 fake", "application/octet-stream")},
+            headers=_auth(tok),
+        )
+        assert up.status_code == 201, up.text
+        fid = up.json()[0]["file_id"]
+        full = " ".join(f"w{i:05d}" for i in range(6_000))  # ~42k chars, 3 pages, 15 windows
+        pieces = _window(full, _TARGET_CHARS, _OVERLAP_CHARS)
+
+        class _Repo:
+            def list_text_for_file(self, file_id):
+                return pieces if file_id == fid else []
+
+        monkeypatch.setattr(mod, "corpus_chunks_repo", lambda: _Repo())
+
+        pages: list[str] = []
+        offset: int | None = 0
+        while offset is not None:
+            body = (
+                seeded_app["client"]
+                .get(f"/api/collections/{cid}/files/{fid}/preview", params={"offset": offset}, headers=_auth(tok))
+                .json()
+            )
+            pages.append(body["text"])
+            offset = body["next_offset"]
+        assembled = "".join(pages)
+        assert assembled == full
+        assert len(pages) == 3
+        assert all(assembled.count(f"w{i:05d}") == 1 for i in range(6_000))
 
     def test_extracted_branch_pages_too(self, seeded_app, monkeypatch):
         """A pdf/docx has no readable bytes: its pages come from chunk text
@@ -603,6 +674,19 @@ class TestCliCatPagesThroughTheFile:
         assert "past the end" in r.output.lower()
         assert str(len(self.FULL)) in r.output, "must name the file's length so the caller can pick a valid offset"
         assert "no text preview" not in r.output.lower()
+
+    @pytest.mark.parametrize("argv", [["--limit", "0"], ["--limit", "-5"], ["--offset", "-1"]])
+    def test_out_of_range_flags_are_a_usage_error_not_a_clamp(self, argv):
+        """``--limit 0`` used to be clamped to one character and print it —
+        data handed back for a request that promised none. Reject at the
+        flag, before any request; the server keeps its own clamp for
+        direct API callers."""
+        fake, calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", *argv])
+        assert r.exit_code == 2, r.output
+        assert argv[0] in r.output
+        assert calls == [], "a rejected flag must not reach the server"
 
     def test_does_not_loop_on_a_server_that_does_not_advance(self):
         """Defensive: a ``next_offset`` that does not move forward must end

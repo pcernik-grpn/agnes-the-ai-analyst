@@ -375,8 +375,10 @@ PREVIEW_PAGE_CHARS = 20_000
 def cat_file(
     collection_id: str = typer.Argument(..., help="Collection id (col_...)"),
     file_id: str = typer.Argument(..., help="File id (cf_...) from `collections show`"),
-    offset: int = typer.Option(0, "--offset", help="Character offset to start reading from"),
-    limit: int | None = typer.Option(None, "--limit", help="Print at most N characters (default: the whole file)"),
+    offset: int = typer.Option(0, "--offset", min=0, help="Character offset to start reading from"),
+    limit: int | None = typer.Option(
+        None, "--limit", min=1, help="Print at most N characters (default: the whole file)"
+    ),
     as_json: bool = typer.Option(False, "--json", help="Emit one page of the raw preview payload"),
 ):
     """Print one file's extracted text — the whole file (requires access to the collection).
@@ -393,7 +395,7 @@ def cat_file(
     def _page(at: int, want: int | None) -> dict:
         params: dict = {"offset": at}
         if want is not None:
-            params["limit"] = max(1, min(want, PREVIEW_PAGE_CHARS))
+            params["limit"] = min(want, PREVIEW_PAGE_CHARS)
         try:
             return api_get_json(path, **params)
         except V2ClientError as exc:

@@ -2378,19 +2378,67 @@ def _no_text_reason(row: dict) -> str:
     }.get(status, "No preview is available for this format.")
 
 
+# The shortest shared edge `_join_chunks` treats as the chunker's overlap
+# window rather than a coincidence. Two element-based chunks (which never
+# overlap by construction) would have to end and begin with the same 40+
+# characters to be merged wrongly.
+_CHUNK_OVERLAP_MIN_MATCH = 40
+
+
+def _join_chunks(texts: list[str]) -> str:
+    """Assemble one file's chunk texts into a faithful document.
+
+    ``src.ingest.chunking`` windows a text into fixed-size pieces that each
+    keep the last ``_OVERLAP_CHARS`` characters of the previous one, so a
+    verbatim join repeats every boundary passage once — a whole-file read
+    of a long document was about an eighth duplicate text. When a chunk's
+    head is exactly the previous chunk's tail (at least
+    ``_CHUNK_OVERLAP_MIN_MATCH`` characters, probed up to twice the window
+    so an older overlap setting still matches), the shared part is dropped
+    and the two are joined seamlessly, which is what the source looked
+    like. Chunks that share no edge — element-based chunks, where each
+    element is windowed on its own — are joined with a blank line, as
+    before. A piece shorter than the threshold is never merged; a tiny
+    trailing window can therefore still repeat, which is the safe side.
+    """
+    from src.ingest.chunking import _OVERLAP_CHARS
+
+    out: list[str] = []
+    for raw in texts:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        if out:
+            prev = out[-1]
+            head = text[:_CHUNK_OVERLAP_MIN_MATCH]
+            shared = 0
+            if len(head) == _CHUNK_OVERLAP_MIN_MATCH:
+                probe = min(len(prev), len(text), 2 * _OVERLAP_CHARS)
+                pos = prev.find(head, len(prev) - probe)
+                while pos != -1:
+                    candidate = len(prev) - pos
+                    if candidate <= len(text) and prev.endswith(text[:candidate]):
+                        shared = candidate
+                        break
+                    pos = prev.find(head, pos + 1)
+            if shared:
+                out[-1] = prev + text[shared:]
+                continue
+        out.append(text)
+    return "\n\n".join(out)
+
+
 def _extracted_text(file_id: str) -> str:
     """Joined chunk text for a file — the only text a docx/xlsx/pdf-scan has.
 
     The WHOLE file: chunks come back ``ORDER BY ordinal`` and every one is
-    joined. This used to stop at ``_PREVIEW_MAX_CHARS``, which left chunk 21
-    onward unreachable through any surface — the cap belongs to the page the
-    endpoint returns, not to the text it pages over. The database work is
-    unchanged (``list_for_file`` already loaded every row); only the join
-    grew, and extracted text is small next to the chunk rows it came from.
+    joined (overlap-aware, see ``_join_chunks``). This used to stop at
+    ``_PREVIEW_MAX_CHARS``, which left chunk 21 onward unreachable through
+    any surface — the cap belongs to the page the endpoint returns, not to
+    the text it pages over. Only the text column is read: a page never
+    needs the embeddings ``list_for_file`` would haul along.
     """
-    chunks = corpus_chunks_repo().list_for_file(file_id)
-    parts = [text for c in chunks if (text := (c.get("text") or "").strip())]
-    return "\n\n".join(parts)
+    return _join_chunks(corpus_chunks_repo().list_text_for_file(file_id))
 
 
 @router.get("/{collection_id}/files/{file_id}/preview")
