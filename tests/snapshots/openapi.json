@@ -18640,6 +18640,25 @@
             }
           },
           {
+            "description": "Pagination continuation floor \u2014 required together with a complete cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to 'now', which drifts forward between calls \u2014 passing the pinned since_ts back keeps a multi-page read over the same window the first call saw, so a row near the window's edge cannot fall out between pages. Bounded to at most since_minutes before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond what since_minutes already allows. The server computes the floor from since_minutes on a fresh call and returns it in next_cursor.since_ts for the caller to carry forward on the next page.",
+            "in": "query",
+            "name": "since_ts",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Pagination continuation floor \u2014 required together with a complete cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to 'now', which drifts forward between calls \u2014 passing the pinned since_ts back keeps a multi-page read over the same window the first call saw, so a row near the window's edge cannot fall out between pages. Bounded to at most since_minutes before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond what since_minutes already allows. The server computes the floor from since_minutes on a fresh call and returns it in next_cursor.since_ts for the caller to carry forward on the next page.",
+              "title": "Since Ts"
+            }
+          },
+          {
             "in": "query",
             "name": "limit",
             "required": false,
