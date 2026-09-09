@@ -290,9 +290,33 @@ class TestDA005AgnesTokenEcho:
         assert report["findings"] == []
 
     def test_agnes_url_is_not_scanned(self):
-        """v1 scope: only the literal AGNES_TOKEN is checked — AGNES_URL/
-        AGNES_APP_ID are not secrets and must never be flagged."""
-        report = check_tree({"server/index.ts": "res.json({ url: AGNES_URL });\n"})
+        """Only the platform CREDENTIAL names are checked — AGNES_URL/
+        AGNES_APP_ID/AGNES_APP_SLUG/AGNES_DATA_IDENTITY are not secrets and
+        must never be flagged."""
+        report = check_tree({"server/index.ts": "res.json({ url: AGNES_URL, slug: AGNES_APP_SLUG, mode: AGNES_DATA_IDENTITY });\n"})
+        assert report["findings"] == []
+
+    def test_viewer_secret_echo_warns(self):
+        """The per-app assertion key is a credential too — echoing it lets
+        anyone who can open the app forge viewer identities to it."""
+        report = check_tree({"server/index.ts": "res.json({ k: process.env.AGNES_VIEWER_SECRET });\n"})
+        assert _rule_ids(report) == ["DA005"]
+        assert "AGNES_VIEWER_SECRET" in report["findings"][0]["message"]
+
+    def test_viewer_token_echo_warns_by_env_name_and_by_header_name(self):
+        """The per-request viewer data token arrives as a request header, so
+        both the constant name and the header name (any casing) are sinks."""
+        report = check_tree({"server/index.ts": "res.send(AGNES_VIEWER_TOKEN);\n"})
+        assert _rule_ids(report) == ["DA005"]
+        report = check_tree({"server/index.ts": 'res.json({ t: req.header("X-Agnes-Viewer-Token") });\n'})
+        assert _rule_ids(report) == ["DA005"]
+        report = check_tree({"server/index.ts": 'res.json({ t: req.headers["x-agnes-viewer-token"] });\n'})
+        assert _rule_ids(report) == ["DA005"]
+
+    def test_viewer_token_forwarded_outbound_is_not_a_sink(self):
+        """Reading the header to FORWARD it (the scaffold's `viewerTokenFrom`)
+        is the intended use and must stay clean."""
+        report = check_tree({"server/agnesViewer.ts": 'return req.header("x-agnes-viewer-token") ?? undefined;\n'})
         assert report["findings"] == []
 
     def test_secret_names_argument_is_accepted_but_unused_in_v1(self):

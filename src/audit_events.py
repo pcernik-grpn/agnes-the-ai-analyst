@@ -1226,6 +1226,21 @@ CATALOG: dict[str, AuditEvent] = {
         "subdomain proxy. One row per (user, app) per 15-minute window, "
         "not per request — see app/data_apps_subdomain.py.",
     ),
+    "data_app.viewer_query": AuditEvent(
+        "data_app.viewer_query",
+        "read",
+        "A hosted data app in viewer mode (data_identity='viewer') queried "
+        "Agnes AS ITS VIEWER with the per-request viewer token. Attributed to "
+        "the viewer, one row per (viewer, app) per 15-minute window — see "
+        "app/auth/data_app_viewer.py.",
+    ),
+    "data_app.data_identity_changed": AuditEvent(
+        "data_app.data_identity_changed",
+        "mutation",
+        "A hosted data app's data identity (owner|viewer — whose grants it "
+        "reads data with) was changed by its owner or an Admin; params carry "
+        "from/to and whether the container was redeployed.",
+    ),
     "notifications.ws_connect": AuditEvent(
         "notifications.ws_connect",
         "system",

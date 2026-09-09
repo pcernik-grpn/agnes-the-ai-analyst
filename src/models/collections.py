@@ -150,7 +150,7 @@ class CorpusChunk(Base):
     # ``CorpusChunksPgRepository.search_candidates``) reads a column instead
     # of re-parsing ``text`` per matched row. Nullable BY DESIGN: written by
     # ``add_many`` for every new row, backfilled for pre-existing rows either
-    # in place by migration ``0113_corpus_chunks_tsv`` (small table) or
+    # in place by migration ``0114_corpus_chunks_tsv`` (small table) or
     # out-of-band by ``scripts/backfill_corpus_chunks_tsv.py`` (large one) —
     # and every reader falls back per row with ``COALESCE(tsv,
     # to_tsvector('simple', text))``, so a NULL here is slower, never wrong.

@@ -1,5 +1,5 @@
 """``src.ingest.retrieval.search_with_meta`` on the Postgres backend, before
-and after the stored tsvector (migration ``0113_corpus_chunks_tsv``).
+and after the stored tsvector (migration ``0114_corpus_chunks_tsv``).
 
 The contract this pins: the stored column is a CACHE of the ranking input,
 never a different input. A small corpus returns byte-for-byte the same

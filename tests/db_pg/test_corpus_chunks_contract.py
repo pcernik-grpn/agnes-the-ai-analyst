@@ -401,7 +401,7 @@ def test_search_by_filename_requires_the_file_row_itself_to_be_in_scope(repo):
 
 def test_search_candidates_row_shape_is_the_column_pruned_set_on_both_backends(repo):
     """The candidate row shape is pinned across backends: the PG side's
-    stored ``tsv`` column (migration ``0113_corpus_chunks_tsv``) is a
+    stored ``tsv`` column (migration ``0114_corpus_chunks_tsv``) is a
     ranking input, never part of the returned dict."""
     repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "apple pie"}])
     (row,) = repo.search_candidates([CORPUS_ID], "apple", limit=10)
@@ -591,7 +591,7 @@ def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_ra
 
 
 # ---------------------------------------------------------------------------
-# Stored tsvector (migration 0113_corpus_chunks_tsv, PG-only — the DuckDB
+# Stored tsvector (migration 0114_corpus_chunks_tsv, PG-only — the DuckDB
 # sibling neither stores nor ranks, see its docstring)
 # ---------------------------------------------------------------------------
 

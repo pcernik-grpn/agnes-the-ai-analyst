@@ -578,8 +578,16 @@ def _resolve_identity(principal, *, table_id: str):
     the live group-membership read at all — ``policied_relation`` only
     calls it when the policy text needs it.
     """
-    from app.auth.session_principal import AgentPrincipal, SessionPrincipal
+    from app.auth.session_principal import AgentPrincipal, DataAppViewerPrincipal, SessionPrincipal
 
+    if isinstance(principal, DataAppViewerPrincipal):
+        # A hosted data app querying as its VIEWER (`data_identity='viewer'`):
+        # `$user_*` binds to whoever is looking at the app, never to the
+        # app's owner — the owner-identity reading is exactly what the
+        # default `owner` mode (the container's own `AGNES_TOKEN`) already
+        # gives, and the opt-in exists to get the other answer.
+        user_id, user_email = principal.viewer_user_id, principal.viewer_email
+        return user_id, user_email, lambda: _live_groups(user_id)
     if isinstance(principal, SessionPrincipal):
         raise PolicyIdentityUnresolvable(
             f"table {table_id!r} has a per-user access policy; this session has "

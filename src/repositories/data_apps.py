@@ -359,3 +359,14 @@ class DataAppsRepository:
             [text, slug],
         )
         return True
+
+    def set_data_identity(self, slug: str, value: str) -> bool:
+        """``data_identity`` is a Postgres-only column (A3 ratchet — Alembic
+        revision 0113, no DuckDB ladder step). Present on this side only so
+        the method-parity contract holds; it always refuses, typed, and the
+        app-wide handler turns that into a clean 501 rather than a 500.
+        Rows read from this backend lack the key and every reader defaults
+        it to ``'owner'`` (``src.data_apps.identity.data_identity_of``)."""
+        from src.repository_errors import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("data_app.data_identity")

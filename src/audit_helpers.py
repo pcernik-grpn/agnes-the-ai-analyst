@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from typing import Any
 
 from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
@@ -143,15 +144,56 @@ def identity_for_audit(user) -> tuple:
     A restricted principal (co-session / agent-session, V1d) is a frozen
     dataclass with no ``.get``: an ``AgentPrincipal`` reports its owner
     (the request legitimately runs on the owner's behalf, just
-    intersection-narrowed); a ``SessionPrincipal`` reports neither.
-    Supertype-agnostic ``isinstance(user, dict)`` check for the same
+    intersection-narrowed); a ``DataAppViewerPrincipal`` reports its VIEWER
+    (the request runs on the viewer's behalf — attributing it to the app
+    owner would misname who read what); a ``SessionPrincipal`` reports
+    neither. Supertype-agnostic ``isinstance(user, dict)`` check for the same
     future-proofing reason as ``client_kind_from_user`` above.
     """
     if user is None:
         return None, None
     if not isinstance(user, dict):
-        return getattr(user, "owner_user_id", None), getattr(user, "owner_email", None)
+        return (
+            getattr(user, "viewer_user_id", None) or getattr(user, "owner_user_id", None),
+            getattr(user, "viewer_email", None) or getattr(user, "owner_email", None),
+        )
     return user.get("id"), user.get("email")
+
+
+class WindowedAuditGate:
+    """One audit row per ``key`` per ``window_s`` — the debounce behind
+    ``data_app.access`` (``app/data_apps_subdomain.py``) and
+    ``data_app.viewer_query`` (``app/auth/data_app_viewer.py``).
+
+    Module-level state on purpose (one map per process, like the sampler
+    above), bounded so a churn of distinct keys cannot grow memory forever:
+    at ``max_entries`` the oldest entry is evicted before an insert, so the
+    map never exceeds the cap by more than the one key being added.
+    """
+
+    def __init__(self, window_s: float, max_entries: int = 10_000) -> None:
+        self.window_s = float(window_s)
+        self.max_entries = int(max_entries)
+        self._seen: dict = {}
+        self._lock = threading.Lock()
+
+    def should_log(self, key) -> bool:
+        """True the first time ``key`` is seen in the current window, False
+        for a repeat within it."""
+        now = time.monotonic()
+        with self._lock:
+            last = self._seen.get(key)
+            if last is not None and now - last < self.window_s:
+                return False
+            if key not in self._seen and len(self._seen) >= self.max_entries:
+                oldest = min(self._seen, key=self._seen.__getitem__)
+                self._seen.pop(oldest, None)
+            self._seen[key] = now
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._seen.clear()
 
 
 # ---------------------------------------------------------------------------

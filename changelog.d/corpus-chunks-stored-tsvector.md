@@ -3,7 +3,7 @@
   The bounded candidate query (`CorpusChunksPgRepository.search_candidates`)
   re-tokenized every matched chunk's text inside its `ORDER BY ts_rank_cd(...)`
   — measured at 2 s for a two-term query with ~4 500 matches on a 15M-row
-  table, all from cache. Migration `0113_corpus_chunks_tsv` adds a stored
+  table, all from cache. Migration `0114_corpus_chunks_tsv` adds a stored
   `corpus_chunks.tsv` tsvector, written on every insert; ranking reads it
   through a per-row `COALESCE(tsv, to_tsvector('simple', text))` fallback, so a
   row the backfill has not reached ranks exactly as before. The query now also

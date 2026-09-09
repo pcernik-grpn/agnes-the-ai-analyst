@@ -1,4 +1,4 @@
-"""Unit test for migration ``0113_corpus_chunks_tsv``'s row-count branch.
+"""Unit test for migration ``0114_corpus_chunks_tsv``'s row-count branch.
 
 The migration always adds the ``corpus_chunks.tsv`` column (a nullable
 column add is metadata-only, instant at any table size) and then either
@@ -24,7 +24,7 @@ from __future__ import annotations
 import importlib
 import logging
 
-MODULE_NAME = "migrations.versions.0113_corpus_chunks_tsv"
+MODULE_NAME = "migrations.versions.0114_corpus_chunks_tsv"
 
 
 class _FakeResult:

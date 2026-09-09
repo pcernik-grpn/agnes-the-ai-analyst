@@ -42,7 +42,7 @@ _RANK_CANDIDATE_FLOOR = 20_000
 # The tokenizer config shared by everything full-text on this table: the
 # ``0101`` GIN index expression, the WHERE predicate in ``search_candidates``,
 # the stored ``tsv`` column ``add_many`` writes (migration
-# ``0113_corpus_chunks_tsv``) and the per-row fallback that stands in for it.
+# ``0114_corpus_chunks_tsv``) and the per-row fallback that stands in for it.
 # A vector built with any other config would rank differently from the
 # expression it replaces, so this is one literal, used everywhere.
 _FTS_CONFIG = "simple"
@@ -74,7 +74,7 @@ class CorpusChunksPgRepository:
 
         Also writes ``tsv`` — the tokenized body,
         ``to_tsvector('simple', text)`` — from the insert itself (migration
-        ``0113_corpus_chunks_tsv``), so a new row is rankable from its
+        ``0114_corpus_chunks_tsv``), so a new row is rankable from its
         stored vector without any backfill; see ``search_candidates`` for
         why ranking reads that column and how a row without one (written
         before the column existed, not yet backfilled) still ranks. The
@@ -370,7 +370,7 @@ class CorpusChunksPgRepository:
         changes the top results.
 
         Ranking reads the STORED tokenized body (``tsv``, migration
-        ``0113_corpus_chunks_tsv``) rather than re-tokenizing ``text``
+        ``0114_corpus_chunks_tsv``) rather than re-tokenizing ``text``
         (perf follow-up, 2026-09). With the GIN index bounding the WHERE
         clause, the remaining cost of this query was
         ``to_tsvector('simple', c.text)`` evaluated once per matched row

@@ -7225,6 +7225,8 @@ async def data_app_detail_page(
     hiding it for a viewer avoids a page-load fetch that would 403).
     """
     from app.api.data_apps import _can_view, _serialize
+    from app.resource_types import ResourceType
+    from app.services.library_sharing import visibility_for
     from src.repositories import data_apps_repo, users_repo
 
     row = data_apps_repo().get_by_slug(slug)
@@ -7239,6 +7241,11 @@ async def data_app_detail_page(
     is_admin = is_user_admin(user["id"])
     is_owner = user["id"] == row["owner_user_id"]
     can_manage = is_owner or is_admin
+    # A linked app's owner_user_id is a synthetic `system` row that never
+    # matches a real visitor, so only Admin (never a "linked app owner")
+    # gets the sharing control there — the same predicate `can_manage`
+    # already encodes.
+    can_share = can_manage
 
     owner = users_repo().get_by_id(row["owner_user_id"])
     serialized = _serialize(row)
@@ -7254,6 +7261,8 @@ async def data_app_detail_page(
             "is_owner": is_owner,
             "is_admin": is_admin,
             "can_manage": can_manage,
+            "can_share": can_share,
+            "visibility": visibility_for(ResourceType.DATA_APP.value, slug),
         },
     )
 

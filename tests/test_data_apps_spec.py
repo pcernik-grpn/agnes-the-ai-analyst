@@ -32,6 +32,7 @@ def test_config_json_internal_repo_embeds_token():
         clone_url="http://app:8000/data-apps.git/sales",
         clone_token="PATPAT",
         service_token="SERVICE",
+        viewer_secret="VIEWER",
     )
     git = cfg["dataApp"]["git"]
     # The token is embedded into the repository URL: the runtime image only
@@ -56,7 +57,7 @@ def test_config_json_draft_uses_pinned_branch():
 
     row = {"repo_mode": "internal", "is_draft": True, "draft_branch": "init", "slug": "d--init"}
     cfg = build_config_json(
-        row, secrets={}, clone_url="http://app:8000/data-apps.git/d", clone_token="PAT", service_token="SERVICE"
+        row, secrets={}, clone_url="http://app:8000/data-apps.git/d", clone_token="PAT", service_token="SERVICE", viewer_secret="VIEWER"
     )
     assert cfg["dataApp"]["git"]["branch"] == "init"
     assert cfg["dataApp"]["git"]["repository"].endswith("/data-apps.git/d")
@@ -68,7 +69,7 @@ def test_config_json_prod_still_agnes_live():
 
     row = {"repo_mode": "internal", "slug": "d"}
     cfg = build_config_json(
-        row, secrets={}, clone_url="http://x/data-apps.git/d", clone_token="PAT", service_token="SERVICE"
+        row, secrets={}, clone_url="http://x/data-apps.git/d", clone_token="PAT", service_token="SERVICE", viewer_secret="VIEWER"
     )
     assert cfg["dataApp"]["git"]["branch"] == "agnes-live"
 
@@ -151,7 +152,7 @@ def test_config_json_external_repo():
         "cpu_limit": "",
         "env": "{}",
     }
-    cfg = build_config_json(app_external, secrets={}, clone_url="", clone_token="", service_token="SERVICE")
+    cfg = build_config_json(app_external, secrets={}, clone_url="", clone_token="", service_token="SERVICE", viewer_secret="VIEWER")
     git = cfg["dataApp"]["git"]
     assert git["repository"] == "https://github.com/user/repo.git"
     assert git["branch"] == "feature-x"
@@ -188,7 +189,7 @@ def test_config_json_embeds_percent_encoded_token():
 
     row = {"repo_mode": "internal", "slug": "s"}
     cfg = build_config_json(
-        row, secrets={}, clone_url="http://app:8000/data-apps.git/s", clone_token="a/b@c:d", service_token="SERVICE"
+        row, secrets={}, clone_url="http://app:8000/data-apps.git/s", clone_token="a/b@c:d", service_token="SERVICE", viewer_secret="VIEWER"
     )
     assert cfg["dataApp"]["git"]["repository"] == "http://agnes:a%2Fb%40c%3Ad@app:8000/data-apps.git/s"
     assert cfg["dataApp"]["git"]["#password"] == "a/b@c:d"  # raw token still in the field
@@ -204,6 +205,7 @@ def test_config_json_does_not_double_embed_credentials():
         clone_url="http://agnes:existing@app:8000/data-apps.git/s",
         clone_token="NEW",
         service_token="SERVICE",
+        viewer_secret="VIEWER",
     )
     assert cfg["dataApp"]["git"]["repository"] == "http://agnes:existing@app:8000/data-apps.git/s"
 
@@ -212,7 +214,7 @@ def test_config_json_external_repo_repository_untouched():
     from src.data_apps.spec import build_config_json
 
     row = {"repo_mode": "external", "repo_url": "https://github.com/org/repo", "repo_branch": "main", "slug": "s"}
-    cfg = build_config_json(row, secrets={}, clone_url="ignored", clone_token="PAT", service_token="SERVICE")
+    cfg = build_config_json(row, secrets={}, clone_url="ignored", clone_token="PAT", service_token="SERVICE", viewer_secret="VIEWER")
     # External repos keep their own URL + branch; no token embedding, no username field.
     assert cfg["dataApp"]["git"] == {"repository": "https://github.com/org/repo", "branch": "main"}
 
@@ -237,10 +239,42 @@ def test_the_runtime_credential_is_the_service_token_not_the_clone_token():
         clone_url="http://app:8000/data-apps.git/s",
         clone_token="GIT-SCOPED",
         service_token="SERVICE-SCOPED",
+        viewer_secret="VIEWER-SECRET",
     )
     secrets = cfg["dataApp"]["secrets"]
     assert secrets["AGNES_TOKEN"] == "SERVICE-SCOPED", "the app cannot read Agnes data with a clone token"
     assert cfg["dataApp"]["git"]["#password"] == "GIT-SCOPED", "the clone still needs the git-scoped one"
+    # The third credential — the per-app key the container verifies the
+    # proxy's `X-Agnes-Viewer` assertion with. Never the service token, never
+    # the clone token.
+    assert secrets["AGNES_VIEWER_SECRET"] == "VIEWER-SECRET"
+
+
+def test_viewer_secret_is_required_not_defaulted():
+    """A forgotten kwarg must fail loudly at the call site, not ship a
+    container that cannot verify any viewer assertion."""
+    import pytest
+
+    from src.data_apps.spec import build_config_json
+
+    with pytest.raises(TypeError):
+        build_config_json({"repo_mode": "internal", "slug": "s"}, secrets={}, clone_url="x", clone_token="c", service_token="s")  # type: ignore[call-arg]
+
+
+def test_container_spec_carries_slug_and_data_identity_env():
+    """`AGNES_APP_SLUG` (for the assertion's `aud` check) and
+    `AGNES_DATA_IDENTITY` are platform-owned and written AFTER the user's env
+    merge, so an app-authored value can never override them. A row without
+    the PG-only column reads `owner`."""
+    spec = build_container_spec(
+        {**APP, "env": '{"AGNES_APP_SLUG": "spoofed", "AGNES_DATA_IDENTITY": "viewer"}'},
+        defaults=DEFAULTS,
+        data_dir="/data",
+    )
+    assert spec["env"]["AGNES_APP_SLUG"] == "sales"
+    assert spec["env"]["AGNES_DATA_IDENTITY"] == "owner"
+    viewer_spec = build_container_spec({**APP, "data_identity": "viewer"}, defaults=DEFAULTS, data_dir="/data")
+    assert viewer_spec["env"]["AGNES_DATA_IDENTITY"] == "viewer"
 
 
 def test_the_deploy_path_passes_the_service_token():
@@ -248,6 +282,8 @@ def test_the_deploy_path_passes_the_service_token():
     import pathlib
 
     src = (pathlib.Path(__file__).resolve().parents[1] / "app" / "api" / "data_apps.py").read_text(encoding="utf-8")
-    call = src[src.index("config_json = build_config_json(") :][:600]
+    call = src[src.index("config_json = build_config_json(") :][:1400]
     assert "clone_token=git_token" in call
     assert "service_token=jwt_token" in call
+    # The viewer secret derives from the SAME new token id the row now carries.
+    assert "viewer_secret=derive_viewer_secret(slug, new_token_id)" in call

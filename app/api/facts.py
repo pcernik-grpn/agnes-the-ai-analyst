@@ -66,6 +66,7 @@ from src.audit_helpers import identity_for_audit, log_safe
 from src.repositories import audit_repo, facts_ingest_runs_repo, facts_repo
 from src.repositories.facts_pg import (
     FactNotFound,
+    FactsQueryTimeout,
     IngestBatchTooLarge,
     IngestDocumentExceedsClaimCap,
     IngestReservedStableId,
@@ -209,11 +210,21 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     Python post-filter, which would leak a shortfall signal). ``q`` is an
     OPTIONAL free-text name lookup matched against alias natural keys ONLY
     (never claim text) — see :meth:`FactsPgRepository.search` for the
-    normalization and ranking rules. Response: ``{"subjects": [{"id",
-    "type", "aliases", "attrs", "claim_count", "quote_count", "revealed"}],
-    "limit_applied"}`` — `limit_applied` is True only when the CALLER'S OWN
-    readable result set exceeds `limit`, never a signal that grants hid
-    additional matches.
+    normalization and ranking rules; a normalized `q` shorter than four
+    characters must start a name token of the alias (``llr`` matches
+    ``llr-corp`` and ``acme-llr``, not ``fullrange``), longer ones match as
+    a substring. Response: ``{"subjects": [{"id", "type", "aliases",
+    "attrs", "claim_count", "quote_count", "revealed"}], "limit_applied",
+    "candidates_capped"?}`` — `limit_applied` is True only when the CALLER'S
+    OWN readable result set exceeds `limit`, never a signal that grants hid
+    additional matches; the additive `candidates_capped: true` (present only
+    when true) says more readable names matched `q` than the server ranks
+    per call, so the page is the best-ranked matches and the caller should
+    narrow `q` or add `type` (`filters` are evaluated after that cap and
+    cannot reach a match it excluded). A search that outlives the server's
+    statement timeout
+    answers `504 {"reason": "facts_search_timeout", "hint": ...}` with the
+    next step, never the raw database error.
     """
     try:
         result = facts_repo().search(
@@ -226,6 +237,10 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except FactsQueryTimeout as exc:
+        # Typed + hinted (command-ux.md): the repository's message IS the
+        # next step. Never a bare 500 carrying the driver text.
+        raise HTTPException(status_code=504, detail={"reason": exc.reason, "hint": str(exc)})
     user_id, _email = identity_for_audit(user)
     log_safe(
         user_id=user_id,

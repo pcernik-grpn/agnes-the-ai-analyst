@@ -57,8 +57,8 @@ key with a commit per batch, so it never holds a long lock or a long
 transaction, and it is idempotent (only ``tsv IS NULL`` rows are touched) —
 safe to interrupt and re-run. Search keeps working throughout.
 
-Revision ID: 0113_corpus_chunks_tsv
-Revises: 0112_jobs_idem_pattern_index
+Revision ID: 0114_corpus_chunks_tsv
+Revises: 0113_data_apps_data_identity
 Create Date: 2026-09-08
 """
 
@@ -70,8 +70,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0113_corpus_chunks_tsv"
-down_revision: str | None = "0112_jobs_idem_pattern_index"
+revision: str = "0114_corpus_chunks_tsv"
+down_revision: str | None = "0113_data_apps_data_identity"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

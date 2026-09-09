@@ -103,7 +103,7 @@ def test_rank_cap_uses_the_documented_multiplier_and_floor():
 
 
 # ---------------------------------------------------------------------------
-# Stored tsvector (migration 0113_corpus_chunks_tsv): ranking reads the
+# Stored tsvector (migration 0114_corpus_chunks_tsv): ranking reads the
 # column, with a per-row fallback; the WHERE keeps the index expression.
 # ---------------------------------------------------------------------------
 

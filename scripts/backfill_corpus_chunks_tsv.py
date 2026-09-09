@@ -1,5 +1,5 @@
 """Backfill ``corpus_chunks.tsv`` — the stored tokenized body the retrieval
-ranking reads (migration ``0113_corpus_chunks_tsv``) — on an instance whose
+ranking reads (migration ``0114_corpus_chunks_tsv``) — on an instance whose
 table was too large for the migration to populate in place.
 
 Postgres only. Run it once, off-peak, from inside the app container (where

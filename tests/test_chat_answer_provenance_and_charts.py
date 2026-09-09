@@ -37,6 +37,7 @@ import json
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -979,3 +980,70 @@ Object.defineProperty(global, "fetch", {{
         "capture it synchronously alongside chatId, not off the live DOM inside "
         "fetchTranscriptMarkdown"
     )
+
+
+# --- The sandbox image's pip block vs. pyproject -----------------------------
+#
+# The Dockerfile's own comment says "keep in sync with the CLI-relevant entries
+# of [project.dependencies]". The half of that which breaks the CLI is the
+# UPPER bound: pyproject caps a package (`<`) exactly when a newer major is
+# known to break an import, so a sandbox copy of the pin that drops the cap
+# (or omits the package and lets a transitive floor-only requirement resolve
+# it) re-installs the breakage in every sandbox.
+
+
+def _split_requirement(req: str) -> tuple[str, str]:
+    """``"PyJWT >= 2.13.0"`` → ``("pyjwt", ">=2.13.0")``; markers dropped."""
+    m = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)$", req)
+    assert m, f"unparseable requirement {req!r}"
+    return m.group(1).lower().replace("_", "-"), m.group(2).split(";")[0].replace(" ", "")
+
+
+def _sandbox_pip_pins() -> dict[str, str]:
+    block = re.search(
+        r'RUN pip install --no-cache-dir \\\n((?:[ \t]+"[^"]+"(?: \\)?\n)+)',
+        _read(DOCKER_SANDBOX),
+    )
+    assert block, "the sandbox pip install block moved — re-point this guard"
+    return dict(_split_requirement(r) for r in re.findall(r'"([^"]+)"', block.group(1)))
+
+
+def _pyproject_pins() -> dict[str, str]:
+    project = tomllib.loads(_read(Path("pyproject.toml")))["project"]
+    reqs = list(project["dependencies"])
+    for extra in project.get("optional-dependencies", {}).values():
+        reqs.extend(extra)
+    return dict(_split_requirement(r) for r in reqs)
+
+
+def test_the_sandbox_image_pins_mcp_exactly_like_pyproject():
+    """`agnes mcp` (cli/mcp/server.py) imports `mcp.server.fastmcp`, which the
+    2.x SDK removed — that is why pyproject caps `mcp<2`. The sandbox image
+    installs `claude-agent-sdk`, whose own requirement on `mcp` is a floor
+    only, so an image with no `mcp` pin of its own resolves 2.x and the
+    runner's `agnes` stdio MCP server dies at import. Claude Code drops a
+    failed server silently: the agent keeps its built-in tools and loses
+    every Agnes foundation tool and every Universal-MCP passthrough tool,
+    with nothing in the sandbox log (live on a docker-provider instance,
+    2026-09-08)."""
+    pins = _sandbox_pip_pins()
+    assert "mcp" in pins, (
+        f"{DOCKER_SANDBOX} must pin mcp itself — claude-agent-sdk's floor-only requirement resolves to 2.x"
+    )
+    assert pins["mcp"] == _pyproject_pins()["mcp"], (
+        f"{DOCKER_SANDBOX} pins mcp{pins['mcp']} but pyproject says mcp{_pyproject_pins()['mcp']} — copy it verbatim"
+    )
+
+
+def test_the_sandbox_image_keeps_every_upper_bound_pyproject_sets():
+    """Every package the pip block shares with pyproject that pyproject caps
+    must carry the identical specifier in the image — a floor-only copy of a
+    capped pin is the mcp hole above, one package over."""
+    pyproject = _pyproject_pins()
+    for name, spec in _sandbox_pip_pins().items():
+        upstream = pyproject.get(name)
+        if upstream is None or "<" not in upstream:
+            continue
+        assert spec == upstream, (
+            f"{DOCKER_SANDBOX} pins {name}{spec} but pyproject caps it as {name}{upstream} — copy the specifier verbatim"
+        )

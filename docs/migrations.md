@@ -416,7 +416,7 @@ writes on insert instead. What is expensive is populating the rows that
 already exist, and that follows the index pattern: count first, backfill in
 place under a threshold, above it skip and log the operator follow-up.
 
-`migrations/versions/0113_corpus_chunks_tsv.py` (`corpus_chunks.tsv`, the
+`migrations/versions/0114_corpus_chunks_tsv.py` (`corpus_chunks.tsv`, the
 stored tokenized body the retrieval ranking reads instead of re-tokenizing
 `text` per matched row) is the worked example. Three things make it safe:
 

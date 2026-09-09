@@ -1,6 +1,6 @@
 """``scripts/backfill_corpus_chunks_tsv.py`` against a real Postgres.
 
-The out-of-band half of migration ``0113_corpus_chunks_tsv`` (the in-place
+The out-of-band half of migration ``0114_corpus_chunks_tsv`` (the in-place
 half is the migration's own ``UPDATE``, proven by
 ``test_corpus_chunks_tsv_migration.py``): on a table too large to rewrite
 at startup, this script populates ``tsv`` in keyset-paginated batches, one

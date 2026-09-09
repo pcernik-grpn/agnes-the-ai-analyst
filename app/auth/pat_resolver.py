@@ -162,6 +162,18 @@ DATA_APP_PREVIEW_SCOPE_PREFIX = "data-app-preview:"
 # load-bearing and pinned by a test.
 DATA_APP_SERVICE_SCOPE_PREFIX = "data-app:"
 
+# Scope prefix + `typ` of the per-request VIEWER data token minted by
+# `app.auth.data_app_viewer.mint_viewer_data_token` for a hosted app whose
+# `data_identity` is `'viewer'`. Resolves to a `DataAppViewerPrincipal`
+# (authority = owner ∩ viewer, live) via `resolve_viewer_principal` — never
+# to a plain user dict — and is admitted on exactly the service token's data
+# surface (`_data_app_path_allowed`). Same non-overlap property as the git
+# scope: `"data-app-viewer:x".startswith("data-app:")` is False (`-` vs `:`
+# at index 8), so a viewer token never falls into the service-token gate,
+# and vice versa. Pinned by a test.
+DATA_APP_VIEWER_SCOPE_PREFIX = "data-app-viewer:"
+DATA_APP_VIEWER_TYP = "data_app_viewer"
+
 # The API surface a hosted data app may reach.
 #
 # Split into exact paths and subtrees ON PURPOSE. One entry per router would
@@ -322,6 +334,22 @@ def resolve_token_to_user(
         path = request.url.path if request is not None else ""
         if not path.startswith(_AGENT_PAT_ALLOWED_PREFIXES):
             return None, "agent_pat_wrong_surface"
+
+    if payload.get("typ") == DATA_APP_VIEWER_TYP or scope.startswith(DATA_APP_VIEWER_SCOPE_PREFIX):
+        # A hosted data app querying AS ITS VIEWER. This branch ALWAYS
+        # returns: falling through to the generic user path below would hand
+        # back the viewer's FULL user dict — every grant they hold, admin bit
+        # included — to owner-authored code, which is precisely the
+        # escalation the restricted principal exists to prevent. Either
+        # signal alone (the `typ` or the scope prefix) is enough to land here;
+        # `resolve_viewer_principal` then requires both, fail-closed.
+        from app.auth.data_app_viewer import resolve_viewer_principal
+
+        viewer_principal, viewer_reason = resolve_viewer_principal(payload, request)
+        if viewer_principal is None:
+            return None, viewer_reason or "invalid_token"
+        _stash_payload(request, payload)
+        return viewer_principal, None
 
     typ = payload.get("typ")
     co_session_id = payload.get("chat_session_id")
