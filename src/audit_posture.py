@@ -1510,10 +1510,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /store/examples": "exempt:ui_support",
     "GET /store/new": "exempt:ui_support",
     # -- app.api.issues (issue reporting, step 1) -------------------------
-    "GET /api/admin/issues": "exempt:ui_support",
+    "GET /api/admin/issues": "issue.queue_read",
     "GET /api/issues/mine": "exempt:ui_support",
-    "GET /api/issues/{issue_id}": "exempt:ui_support",
-    "GET /api/issues/{issue_id}/screenshot": "exempt:ui_support",
+    "GET /api/issues/{issue_id}": "issue.read",
+    "GET /api/issues/{issue_id}/screenshot": "issue.read",
     "GET /{full_path:path}": "exempt:ui_support",
 }
 
@@ -1888,9 +1888,9 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     # tool self-calls (app/api/issues.py, catalog entries added by Task 2).
     "report_issue": "issue.report",
     "list_my_issues": "exempt:ui_support",
-    "get_issue": "exempt:ui_support",
+    "get_issue": "issue.read",
     "issue_comment": "issue.comment",
-    "issue_queue_list": "exempt:ui_support",
+    "issue_queue_list": "issue.queue_read",
     "issue_reply": "issue.comment",
     "issue_resolve": "issue.resolved",
 }

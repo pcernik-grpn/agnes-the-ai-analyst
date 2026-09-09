@@ -694,6 +694,15 @@ def pull(skip_materialize: bool = False) -> dict:
 _ISSUE_HEADERS = {"X-Agnes-Client": "mcp"}
 
 
+def _issue_ref(issue_id: str) -> str:
+    """Normalize `#42` / `42` / `iss_…` into a safe URL path segment — the
+    `#` these tools document starts a URI fragment and would truncate the
+    path (Devin review on #2402)."""
+    from urllib.parse import quote
+
+    return quote(str(issue_id).strip().lstrip("#"), safe="")
+
+
 @tool(read_only=False, idempotent=False)
 def report_issue(
     title: str,
@@ -739,7 +748,7 @@ def get_issue(issue_id: str) -> dict:
     Same tool as the server's `get_issue`.
     """
     try:
-        return api_get_json(f"/api/issues/{issue_id}", headers=_ISSUE_HEADERS)
+        return api_get_json(f"/api/issues/{_issue_ref(issue_id)}", headers=_ISSUE_HEADERS)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("get_issue", exc)) from exc
 
@@ -751,7 +760,7 @@ def issue_comment(issue_id: str, body: str) -> dict:
     Same tool as the server's `issue_comment`.
     """
     try:
-        return api_post_json(f"/api/issues/{issue_id}/comments", {"body": body}, headers=_ISSUE_HEADERS)
+        return api_post_json(f"/api/issues/{_issue_ref(issue_id)}/comments", {"body": body}, headers=_ISSUE_HEADERS)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("issue_comment", exc)) from exc
 

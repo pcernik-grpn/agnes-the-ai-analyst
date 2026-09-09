@@ -99,7 +99,10 @@ def test_report_prints_number_and_id(runner, fake_api):
     assert "Filed #42 (iss_abc)" in r.stdout
     assert fake_api.last_post_json["kind"] == "bug"
     assert fake_api.last_post_json["page_url"] == "/chat?session=x"
-    assert "kept in this instance" in r.stdout  # webhook not delivered → say so
+    # No claim about webhook delivery: the creation response always predates
+    # the background mirror, so any verdict printed here would be a guess.
+    assert "confirmed delivery" not in r.stdout
+    assert "agnes issue show 42" in r.stdout
 
 
 def test_report_json(runner, fake_api):

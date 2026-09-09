@@ -336,3 +336,53 @@ def test_report_without_a_screenshot_is_mirrored_immediately(state_backend, seed
     r = c.post("/api/issues", json={"title": "no screenshot", "kind": "bug"}, headers=tok)
     assert r.status_code == 201, r.text
     assert posted and "Screenshot:" not in posted[-1]["text"]
+
+
+def test_replacing_a_screenshot_is_atomic(state_backend, seeded_app_both, tmp_path, monkeypatch):
+    """A reader never sees a half-written PNG.
+
+    The upload used to write straight over the live path, so a GET served
+    while a replacement was in flight could return truncated bytes (Devin
+    review on #2402). Publishing through a temp file plus `os.replace` makes
+    every read see one whole image, and leaves no `.part` behind.
+    """
+    if state_backend != "pg":
+        pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    c, tok = seeded_app_both["client"], _auth(seeded_app_both["analyst_token"])
+    png_headers = {**tok, "Content-Type": "image/png"}
+
+    first = b"\x89PNG\r\n\x1a\n" + b"\x01" * 64
+    second = b"\x89PNG\r\n\x1a\n" + b"\x02" * 4096
+
+    row = c.post("/api/issues", json={"title": "screenshot replaced", "kind": "bug"}, headers=tok).json()
+    assert c.put(f"/api/issues/{row['id']}/screenshot", content=first, headers=png_headers).status_code == 204
+    assert c.get(f"/api/issues/{row['id']}/screenshot", headers=tok).content == first
+
+    assert c.put(f"/api/issues/{row['id']}/screenshot", content=second, headers=png_headers).status_code == 204
+    served = c.get(f"/api/issues/{row['id']}/screenshot", headers=tok).content
+    assert served == second, "a replacement must be published whole, never partially"
+
+    shot_dir = tmp_path / "issues" / row["id"]
+    leftovers = [p.name for p in shot_dir.iterdir() if p.name != "screenshot.png"]
+    assert leftovers == [], f"temp files left behind: {leftovers}"
+
+
+def test_a_rejected_screenshot_leaves_no_temp_file(state_backend, seeded_app_both, tmp_path, monkeypatch):
+    """A refused upload must not litter the directory either."""
+    if state_backend != "pg":
+        pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    c, tok = seeded_app_both["client"], _auth(seeded_app_both["analyst_token"])
+
+    row = c.post("/api/issues", json={"title": "bad upload", "kind": "bug"}, headers=tok).json()
+    bad = c.put(
+        f"/api/issues/{row['id']}/screenshot",
+        content=b"\xff\xd8\xff" + b"\x00" * 16,  # JPEG magic, declared as PNG
+        headers={**tok, "Content-Type": "image/png"},
+    )
+    assert bad.status_code == 400 and bad.json()["detail"]["error"] == "screenshot_not_png"
+
+    shot_dir = tmp_path / "issues" / row["id"]
+    if shot_dir.exists():
+        assert list(shot_dir.iterdir()) == [], "a refused upload wrote something"

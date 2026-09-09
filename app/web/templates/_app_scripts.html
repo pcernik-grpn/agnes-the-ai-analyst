@@ -5,8 +5,16 @@
          or fetch — a handler wired after the fact misses everything that
          already happened. Feeds the "Report a problem" dialog's auto-
          attached context (issue_report.js); nothing is sent anywhere until
-         that dialog submits. See app/web/static/js/client_diag.js. -->
-    <script src="{{ static_url('js/client_diag.js') }}"></script>
+         that dialog submits. See app/web/static/js/client_diag.js.
+
+         Gated on `can_report_issue` for the same reason the dialog is: on an
+         instance where reporting is unavailable (DuckDB app-state backend)
+         there is nothing that could ever read the buffer, so wrapping every
+         `fetch` on every page would be instrumentation with no consumer
+         (Devin review on #2402). The flag comes from `_chrome_ctx`; a page
+         rendered without it simply does not load the script, which is the
+         same outcome as the dialog not rendering. -->
+    {% if can_report_issue %}<script src="{{ static_url('js/client_diag.js') }}"></script>{% endif %}
     <!-- Cache-buster URLs for /static assets that a plain <script src> or
          hardcoded fetch() can't run through static_url() (external file, or
          a lazy runtime fetch/import) — so VersionedStaticFiles' immutable

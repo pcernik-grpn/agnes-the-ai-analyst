@@ -1542,6 +1542,15 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "issue.comment": AuditEvent("issue.comment", "mutation", "A reporter or admin commented on an issue"),
     "issue.resolved": AuditEvent("issue.resolved", "mutation", "An admin resolved an issue"),
+    # Reads that return somebody's words. A reporter paging their OWN list is
+    # ui_support noise, but an admin opening the queue or a single report is
+    # reading another person's report body, their identity and the page they
+    # were on — the cross-user read CONTRIBUTING.md wants on the record
+    # (Devin review on #2402).
+    "issue.queue_read": AuditEvent(
+        "issue.queue_read", "read", "An admin read the issue-report queue across every reporter"
+    ),
+    "issue.read": AuditEvent("issue.read", "read", "An issue report and its comments were read"),
     # -- 2026-09-08 LLM observability design §3.6 — the effective content-export
     # policy is written once at startup so the decision is in the trail.
     # Written by src/observability/content_policy.py with no actor: nobody

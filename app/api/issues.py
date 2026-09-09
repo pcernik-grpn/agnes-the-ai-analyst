@@ -32,6 +32,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -293,7 +294,7 @@ async def create_issue(
     )
     base_url = _public_base_url(request)
 
-    def _mirror() -> None:
+    async def _mirror() -> None:
         """Post the operator summary once, from the report's CURRENT state.
 
         Deliberately re-reads instead of mirroring the ``row`` captured above:
@@ -306,24 +307,37 @@ async def create_issue(
         a capture that fails or never uploads costs the operator a short delay
         and not the notification itself. Exactly one message is sent either
         way; the wait is what decides whether it can name the screenshot.
+
+        ``async def`` on purpose, and the single most important thing about
+        this function. Starlette runs a SYNCHRONOUS background callback in
+        the same bounded anyio worker pool that serves synchronous
+        dependencies — ``get_current_user`` among them — so a blocking
+        ``time.sleep`` here would park a request thread for the whole wait.
+        The web dialog ticks the screenshot box by default, so enough
+        simultaneous reports would exhaust the pool and stall authentication
+        for every other request, including the very screenshot upload each
+        wait is waiting for: a self-inflicted deadlock under load (Devin
+        review on #2402). Sleeping on the event loop costs no thread, and the
+        blocking repository and webhook calls are offloaded individually.
         """
-        import time
+        import anyio
 
         from app.services.issue_notifier import notify_issue_filed
 
-        deadline = time.monotonic() + _SCREENSHOT_WAIT_SEC if body.expect_screenshot else 0.0
+        loop_deadline = anyio.current_time() + _SCREENSHOT_WAIT_SEC if body.expect_screenshot else 0.0
         current = row
         while True:
-            fresh = repo.get(row["id"])
+            fresh = await anyio.to_thread.run_sync(lambda: repo.get(row["id"]))
             if fresh is None:  # deleted under us — nothing to mirror
                 return
             current = fresh
-            if current.get("screenshot_path") or time.monotonic() >= deadline:
+            if current.get("screenshot_path") or anyio.current_time() >= loop_deadline:
                 break
-            time.sleep(_SCREENSHOT_POLL_SEC)
+            await anyio.sleep(_SCREENSHOT_POLL_SEC)
 
-        if notify_issue_filed(current, public_base_url=base_url):
-            repo.mark_webhook_delivered(current["id"])
+        posted = await anyio.to_thread.run_sync(lambda: notify_issue_filed(current, public_base_url=base_url))
+        if posted:
+            await anyio.to_thread.run_sync(lambda: repo.mark_webhook_delivered(current["id"]))
 
     background.add_task(_mirror)
     return row
@@ -348,7 +362,20 @@ async def put_screenshot(
         raise _err(400, "screenshot_not_png", "screenshot must be a PNG")
     target = _screenshot_dir(row["id"])
     target.mkdir(parents=True, exist_ok=True)
-    (target / "screenshot.png").write_bytes(data)
+    # Publish atomically: write a uniquely-named neighbour, then rename over
+    # the live file. `os.replace` is atomic within a filesystem, so a reader
+    # holding `screenshot.png` open (the GET route below, or an operator
+    # following the webhook link) sees either the whole old image or the whole
+    # new one — never the half-written bytes a direct overwrite exposes when a
+    # replacement upload lands mid-read (Devin review on #2402).
+    final = target / "screenshot.png"
+    tmp = target / f".screenshot.{uuid4().hex}.part"
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, final)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # never leave a .part behind on failure
+        raise
     repo.set_screenshot(row["id"], f"issues/{row['id']}/screenshot.png")
 
     from src.audit_helpers import log_safe

@@ -3787,6 +3787,18 @@ def register_foundation_tools(
     # (never replacing them).
     _ISSUE_HEADERS = {"X-Agnes-Client": "mcp"}
 
+    def _issue_ref(issue_id: str) -> str:
+        """Normalize `#42` / `42` / `iss_…` into a safe URL path segment.
+
+        The `#` the tool docstrings invite a caller to type starts a URI
+        fragment, so interpolating it raw truncated the path and the server
+        saw no id at all (Devin review on #2402). Percent-encoding what is
+        left also keeps a stray `/` or `?` from re-shaping the request.
+        """
+        from urllib.parse import quote
+
+        return quote(str(issue_id).strip().lstrip("#"), safe="")
+
     @tool(read_only=False, idempotent=False)
     async def report_issue(
         title: str,
@@ -3869,7 +3881,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
-                f"{base_url}/api/issues/{issue_id}",
+                f"{base_url}/api/issues/{_issue_ref(issue_id)}",
                 headers={**headers_fn(), **_ISSUE_HEADERS},
                 timeout=30,
             )
@@ -3888,7 +3900,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(
-                f"{base_url}/api/issues/{issue_id}/comments",
+                f"{base_url}/api/issues/{_issue_ref(issue_id)}/comments",
                 json={"body": body},
                 headers={**headers_fn(), **_ISSUE_HEADERS},
                 timeout=30,
@@ -3935,7 +3947,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(
-                f"{base_url}/api/issues/{issue_id}/comments",
+                f"{base_url}/api/issues/{_issue_ref(issue_id)}/comments",
                 json={"body": body},
                 headers={**headers_fn(), **_ISSUE_HEADERS},
                 timeout=30,
@@ -3961,7 +3973,7 @@ def register_foundation_tools(
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(
-                f"{base_url}/api/admin/issues/{issue_id}/resolve",
+                f"{base_url}/api/admin/issues/{_issue_ref(issue_id)}/resolve",
                 json={"resolution_note": resolution_note},
                 headers={**headers_fn(), **_ISSUE_HEADERS},
                 timeout=30,

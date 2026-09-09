@@ -311,3 +311,41 @@ def test_stdio_translates_v2_client_error():
         pytest.raises(ValueError, match="report_issue"),
     ):
         stdio_server.report_issue(title="x")
+
+
+class TestAHashPrefixedNumberReachesTheServer:
+    """`#42` is documented in every issue tool's docstring.
+
+    Interpolated raw it starts a URI fragment, so the path was truncated to
+    `/api/issues/` and the server saw no id at all (Devin review on #2402).
+    Both transports normalize the reference before building the URL.
+    """
+
+    def test_http_tool_strips_the_hash(self):
+        from urllib.parse import quote
+
+        import app.api.mcp.foundation_tools as ft
+
+        src = ft.__file__
+        text = open(src, encoding="utf-8").read()
+        # Every issue URL goes through the normalizer, never the raw argument.
+        assert 'f"{base_url}/api/issues/{issue_id}"' not in text
+        assert "_issue_ref(issue_id)" in text
+        assert quote("#42".lstrip("#"), safe="") == "42"
+
+    def test_stdio_tool_strips_the_hash(self):
+        import cli.mcp.server as stdio
+
+        assert stdio._issue_ref("#42") == "42"
+        assert stdio._issue_ref(" 42 ") == "42"
+        assert stdio._issue_ref("iss_abc123") == "iss_abc123"
+        # a path separator can never re-shape the request
+        assert "/" not in stdio._issue_ref("42/../admin")
+
+    def test_http_normalizer_matches_the_stdio_one(self):
+        """The two transports must agree — a caller should not have to know
+        which one they are on."""
+        import cli.mcp.server as stdio
+
+        for raw, expected in (("#7", "7"), ("7", "7"), ("iss_x", "iss_x")):
+            assert stdio._issue_ref(raw) == expected

@@ -19,6 +19,8 @@ Postgres-backed test suite.
 
 from __future__ import annotations
 
+import re
+
 
 def _auth_client(seeded_app, token: str):
     client = seeded_app["client"]
@@ -62,6 +64,12 @@ class TestRailReportButton:
         # The vendored script tags stay off the gate too — no reason to load
         # css/drawer.css or issue_dialog.css for a dialog that never renders.
         assert "css/issue_dialog.css" not in html
+        # The diagnostics ring buffer follows the same gate: with no dialog
+        # nothing could ever read it, so instrumenting every fetch on every
+        # page would have no consumer (Devin review on #2402). Matched as a
+        # SCRIPT TAG, not a substring — `_app_scripts.html` names the file in
+        # an HTML comment that ships with every page either way.
+        assert not re.search(r"<script[^>]+client_diag\.js", html)
 
 
 class TestClientDiagAlwaysLoads:
