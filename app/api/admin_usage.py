@@ -678,6 +678,9 @@ def llm_calls(
     user_id: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     before: Optional[str] = Query(None, description="ISO timestamp cursor; fetch rows older than this."),
+    before_id: Optional[str] = Query(
+        None, description="Row-id tiebreaker for `before`; pass the previous page's `next_before_id`."
+    ),
     admin: dict = Depends(require_admin),
     repo: Any = Depends(_llm_calls_repo),
 ):
@@ -686,8 +689,11 @@ def llm_calls(
 
     Requires at least one of ``session_id``/``turn_id``/``job_id``/
     ``user_id`` so this never becomes an unbounded dump of every call the
-    instance ever made. ``before`` is the pagination cursor: pass the
-    previous page's ``next_before`` to fetch the next older page.
+    instance ever made. ``before``/``before_id`` are the pagination cursor:
+    pass the previous page's ``next_before``/``next_before_id`` together to
+    fetch the next older page via the composite keyset — rows sharing the
+    exact boundary timestamp are never skipped between pages. ``before``
+    alone still works (single-column cursor, kept for compatibility).
     """
     if not any([session_id, turn_id, job_id, user_id]):
         raise HTTPException(status_code=400, detail="one of session_id, turn_id, job_id, user_id is required")
@@ -699,9 +705,16 @@ def llm_calls(
             raise HTTPException(status_code=400, detail=f"invalid before: {before}")
 
     rows = repo.list_calls(
-        session_id=session_id, turn_id=turn_id, job_id=job_id, user_id=user_id, limit=limit, before=before_dt
+        session_id=session_id,
+        turn_id=turn_id,
+        job_id=job_id,
+        user_id=user_id,
+        limit=limit,
+        before=before_dt,
+        before_id=before_id,
     )
     next_before = rows[-1]["created_at"] if rows else None
+    next_before_id = rows[-1]["id"] if rows else None
 
     notes = []
     if not rows:
@@ -721,7 +734,7 @@ def llm_calls(
         client_kind="web",
     )
 
-    return {"rows": rows, "next_before": next_before, "notes": notes}
+    return {"rows": rows, "next_before": next_before, "next_before_id": next_before_id, "notes": notes}
 
 
 @router.get("/feedback")

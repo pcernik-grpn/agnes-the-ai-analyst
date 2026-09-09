@@ -168,12 +168,19 @@ class LlmCallsPgRepository:
         user_id: str | None = None,
         limit: int = 100,
         before: datetime | None = None,
+        before_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Detail rows for one turn/session/job/user, newest first.
 
         ``before`` is the pagination cursor: pass the previous page's last
         ``created_at`` (a ``datetime``, not the ISO string this method
-        returns) to fetch the next older page.
+        returns) to fetch the next older page. When the caller also passes
+        ``before_id`` (the same row's ``id``), the cursor becomes the
+        composite keyset ``(created_at, id) < (:before, :before_id)`` — a
+        plain ``created_at`` cursor alone can skip or repeat rows that share
+        the exact boundary timestamp, which multiple calls legitimately do
+        under load. ``before`` without ``before_id`` keeps the old,
+        single-column clause for backward compatibility.
         """
         clauses: list[str] = []
         params: dict[str, Any] = {"limit": limit}
@@ -189,14 +196,18 @@ class LlmCallsPgRepository:
         if user_id is not None:
             clauses.append("user_id = :user_id")
             params["user_id"] = user_id
-        if before is not None:
+        if before is not None and before_id is not None:
+            clauses.append("(created_at, id) < (:before, :before_id)")
+            params["before"] = before
+            params["before_id"] = before_id
+        elif before is not None:
             clauses.append("created_at < :before")
             params["before"] = before
         where = " AND ".join(clauses) if clauses else "TRUE"
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
-                    sa.text(f"SELECT * FROM llm_calls WHERE {where} ORDER BY created_at DESC LIMIT :limit"),
+                    sa.text(f"SELECT * FROM llm_calls WHERE {where} ORDER BY created_at DESC, id DESC LIMIT :limit"),
                     params,
                 )
                 .mappings()

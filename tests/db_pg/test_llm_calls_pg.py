@@ -78,6 +78,30 @@ def test_list_calls_filters_and_pages_newest_first(repo):
     assert repo.list_calls(turn_id="t1")[0]["priced_as"]["price_key"] == "claude-haiku-4-5"
 
 
+def test_list_calls_keyset_cursor_pages_rows_sharing_one_timestamp(repo):
+    """Three rows sharing the EXACT same ``created_at`` must each be
+    returned exactly once across limit=1 pages when the caller carries
+    ``before``/``before_id`` together — a plain ``created_at < :before``
+    cursor would skip or repeat rows at that boundary."""
+    same_ts = datetime.now(UTC)
+    rows = [_row(workload="chat", session_id="s-tied", turn_id=f"t{i}", created_at=same_ts) for i in range(3)]
+    repo.insert_batch(rows)
+
+    seen_ids: list[str] = []
+    before, before_id = None, None
+    for _ in range(4):  # 3 pages of real rows + one empty page to confirm termination
+        page = repo.list_calls(session_id="s-tied", limit=1, before=before, before_id=before_id)
+        if not page:
+            break
+        seen_ids.append(page[0]["id"])
+        before = datetime.fromisoformat(page[0]["created_at"])
+        before_id = page[0]["id"]
+
+    assert len(seen_ids) == 3
+    assert len(set(seen_ids)) == 3  # each row exactly once, none skipped or repeated
+    assert set(seen_ids) == {r["id"] for r in rows}
+
+
 def test_cost_summary_groups_and_sums(repo):
     repo.insert_batch(
         [

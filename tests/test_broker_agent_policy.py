@@ -7,6 +7,7 @@ functions directly, monkeypatching the repo/coordination seams.
 from __future__ import annotations
 
 import json
+import time
 
 from app.api import broker_agent_policy as pol
 
@@ -491,3 +492,41 @@ def test_accumulator_call_rows_do_not_disturb_the_usage_flush(monkeypatch):
     acc.flush()
     assert len(fake_repo.batches) == 1 and len(fake_repo.batches[0]) == 1
     assert ledger == [[{"id": "c1"}]]
+
+
+# ---------------------------------------------------------------------------
+# UsageAccumulator — lazily armed background flush timer
+# ---------------------------------------------------------------------------
+
+
+def test_accumulator_background_timer_flushes_a_lone_buffered_row(monkeypatch):
+    """A single buffered row on an otherwise-quiet accumulator must not stay
+    invisible until a second append (or shutdown) — a lazily armed
+    ``threading.Timer`` flushes it on its own after ``flush_interval_s``."""
+    fake_repo = _FakeLlmUsageRepo()
+    fake_coord = _FakeCoordination()
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: fake_repo)
+    monkeypatch.setattr(pol, "coordination", lambda: fake_coord)
+
+    acc = pol.UsageAccumulator(flush_size=20, flush_interval_s=0.05)
+    acc.add(_usage_row(1))
+    assert fake_repo.batches == []  # the append itself did not flush
+
+    time.sleep(0.3)
+    assert len(fake_repo.batches) == 1
+    assert len(fake_repo.batches[0]) == 1
+
+
+def test_accumulator_flush_after_size_trigger_leaves_no_pending_timer(monkeypatch):
+    fake_repo = _FakeLlmUsageRepo()
+    fake_coord = _FakeCoordination()
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: fake_repo)
+    monkeypatch.setattr(pol, "coordination", lambda: fake_coord)
+
+    acc = pol.UsageAccumulator(flush_size=2, flush_interval_s=3600)
+    acc.add(_usage_row(1))
+    assert acc._pending_timer is not None  # armed by the first, non-flushing append
+
+    acc.add(_usage_row(2))  # hits the size threshold; flush() must clear the timer
+    assert len(fake_repo.batches) == 1
+    assert acc._pending_timer is None

@@ -183,6 +183,34 @@ class TestLlmCalls:
         assert body["rows"] == []
         assert body["notes"]
 
+    def test_pages_with_the_composite_before_id_cursor(self, tmp_path, monkeypatch, pg_engine):
+        client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+        now = datetime.now(UTC)
+        _seed_calls(now)
+
+        r1 = client.get(
+            "/api/admin/telemetry/llm-calls",
+            params={"session_id": "s1", "limit": 2},
+            headers=_auth(admin_token),
+        )
+        assert r1.status_code == 200, r1.text
+        body1 = r1.json()
+        assert len(body1["rows"]) == 2
+        assert body1["next_before"] is not None
+        assert body1["next_before_id"] is not None
+        assert body1["next_before_id"] == body1["rows"][-1]["id"]
+        first_page_ids = {row["id"] for row in body1["rows"]}
+
+        r2 = client.get(
+            "/api/admin/telemetry/llm-calls",
+            params={"session_id": "s1", "before": body1["next_before"], "before_id": body1["next_before_id"]},
+            headers=_auth(admin_token),
+        )
+        assert r2.status_code == 200, r2.text
+        body2 = r2.json()
+        assert len(body2["rows"]) == 1
+        assert body2["rows"][0]["id"] not in first_page_ids
+
 
 class TestFeedback:
     def test_lists_and_filters_by_verdict(self, tmp_path, monkeypatch, pg_engine):
