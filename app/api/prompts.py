@@ -587,4 +587,10 @@ async def preview_prompt(
         rendered = template.render(**ctx)
     except TemplateError as e:
         raise HTTPException(status_code=400, detail=f"Template invalid: {e}")
+    if kind == "install":
+        # The shipped default still carries the single-brace {server_url}
+        # placeholder (substituted at bind time, not through Jinja) — an
+        # override that doesn't touch it must still resolve, so the preview
+        # matches what a real install prompt would send.
+        rendered = rendered.replace("{server_url}", server_url)
     return {"content": rendered}

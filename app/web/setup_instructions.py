@@ -266,25 +266,13 @@ def _tls_trust_block(ca_pem: str) -> list[str]:
 
 
 def _preamble_lines(*, custom_preamble: str = "", instance_brand: str = "Agnes") -> list[str]:
-    """Header that opens the prompt: what this is, which server, how sign-in
-    is handled, and the idempotence promise.
+    """Header that opens the prompt: what this is, which server, where the
+    login token already lives, and the idempotence promise.
 
-    No longer asserts a token is already sitting at `~/.agnes/token` before
-    step 2 runs. `agnes onboard` (`cli/commands/onboard.py::_resolve_onboard_
-    credential`) already tries, in order, a bootstrap token file, a saved
-    credential, and — with nothing found — falls back to the same
-    interactive browser sign-in `agnes auth login` uses. That fallback is
-    what the setup-code `/llms.txt` flow relies on entirely (see its own
-    comment: "the old un-numbered token precheck does not apply here"), and
-    it is the SAME code path this prompt's step 2 calls into — so a separate
-    prompt-level check for "is the file there yet" was answering a question
-    `agnes onboard` already answers better, one step later, with a real
-    browser sign-in instead of a dead end. What a prompt-level check still
-    cannot do is protect against a *stale, cross-deployment* saved
-    credential (`~/.config/agnes/token.json` never records which server it
-    belongs to) — but that surfaces as a clear auth failure inside `agnes
-    init`'s own verification, covered by the existing "paste the exact error
-    back and stop" guidance below, not by bash run ahead of time.
+    The token is written to `~/.agnes/token` out-of-band, before this prompt
+    is generated (`{server_url}/how-it-works#connect`'s CLI tab — the delivery
+    mechanism itself is out of this module's scope), so the steps only need
+    the path.
 
     That is stated as a plain fact: earlier wording told the agent to
     "never print the token, echo it, or paste it into this chat", which
@@ -341,10 +329,9 @@ def _preamble_lines(*, custom_preamble: str = "", instance_brand: str = "Agnes")
         "Requirements: `uv` (https://docs.astral.sh/uv/) and `curl`, plus network",
         "access to the server above.",
         "",
-        "If this machine already has a saved sign-in for {server_url} — a token at",
-        "~/.agnes/token from the install guide, or a previous `agnes auth login` —",
-        "step 2 reuses it; nothing needs to display its contents first. Otherwise",
-        "`agnes onboard` opens your browser to sign in when it gets there.",
+        "Your login token is already saved on this machine at ~/.agnes/token",
+        "(written by step 4 of the install guide at {server_url}). The steps below",
+        "use that file path, so there is no need to display its contents.",
         "",
         "Every step below is idempotent and safe to re-run: a machine that already",
         'ran this setup converges instead of reinstalling, so treat "already',
@@ -357,6 +344,66 @@ def _preamble_lines(*, custom_preamble: str = "", instance_brand: str = "Agnes")
     if custom_preamble:
         lines = [*custom_preamble.split("\n"), "", *lines]
     return lines
+
+
+def _token_precheck_lines() -> list[str]:
+    """Un-numbered pre-check: is `~/.agnes/token` where the steps expect it?
+
+    Deliberately NOT a numbered step — "0)" belongs to the TLS trust block,
+    which is gated on `ca_pem` and must be free to claim that number.
+
+    Two outcomes need different moves: on a FRESH install a missing file
+    means the token never landed (stop, send the user back to the guide); on
+    a RECONCILE it is expected, because the first run consumed and deleted
+    it after saving the credential to `~/.config/agnes/token.json`.
+
+    What tells them apart is NOT the existence of `token.json`. That file
+    holds `{"access_token", "email"}` and nothing else — it never records
+    which server the credential belongs to (`cli/config.py::save_token`) —
+    and there is exactly one of it per machine. So on a laptop already
+    signed in to a different Agnes deployment it exists and proves nothing
+    about this one. The earlier wording ("an earlier run already saved the
+    credential, so just continue") turned that into a false "already
+    configured" and sent the agent past a genuinely missing credential;
+    installs read it back as a check written to pass when it should stop.
+
+    The server *is* recorded, in `config.yaml`'s `server:` key
+    (`cli/config.py::get_server_url` reads it) — but on its own that is not
+    proof either, and keying on it alone was the same mistake in the other
+    direction. `/cli/install.sh` writes `server: $SERVER` into `config.yaml`
+    at install time (`app/api/cli_artifacts.py`), and prints "1. Sign in…"
+    immediately after, so a machine that merely ran the installer and never
+    signed in matches — and would be told to continue, only to fail three
+    steps later inside `agnes init --token-file`. So the check requires BOTH
+    signals: a saved credential (`token.json` exists) AND the recorded server
+    matching this one. Either alone is satisfiable without a sign-in to this
+    deployment. Deliberately a judgment the agent makes by comparing two strings
+    rather than a one-liner that exits non-zero: the CLI isn't installed yet
+    at this point in the prompt (step 1 installs it), so `agnes auth
+    whoami` — which would answer this directly — is not available here.
+
+    Restored after a false start: an earlier revision of this module dropped
+    this precheck, reasoning that `agnes onboard` resolves auth itself with
+    its own browser-sign-in fallback when nothing is found
+    (`cli/commands/onboard.py::_resolve_onboard_credential`). True — but only
+    on a branch that HAS that resolver. This module's own `cli/` tree does
+    not (that capability ships in a separate, not-yet-merged PR), so a fresh
+    install following this prompt with no saved token would sail past step 1
+    and dead-end at step 2 with no fallback at all. The precheck stays until
+    the resolver it was designed to lean on actually ships here.
+    """
+    return [
+        "Before you start, confirm the login token file is in place:",
+        '   test -s ~/.agnes/token && echo "token present" || echo "token missing"',
+        "",
+        "   Present: continue. Missing: an earlier run may have consumed it, but that",
+        "   needs BOTH a saved credential and a matching server — token.json records",
+        "   no server, and the installer writes server: before anyone has signed in:",
+        "      test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml",
+        "   Prints {server_url} → continue. Anything else, including no output →",
+        "   not signed in to {server_url}: stop, send the user to {server_url}/how-it-works#connect.",
+        "",
+    ]
 
 
 def _install_cli_commands(*, has_ca: bool, server_url_placeholder: str = "{server_url}") -> list[str]:
@@ -489,9 +536,8 @@ def _onboard_lines(server_url_placeholder: str = "{server_url}") -> list[str]:
     """Step 2 — `agnes onboard`, the whole of the old steps 2-6.
 
     `agnes onboard` is a deterministic state machine: directory check, init
-    (auth off `~/.agnes/token`, a saved credential, or — with neither — its
-    own browser-sign-in fallback; workspace files, Claude Code hooks, first
-    `agnes pull`), catalog smoke, git/claude
+    (auth off `~/.agnes/token` or the saved credential, workspace files,
+    Claude Code hooks, first `agnes pull`), catalog smoke, git/claude
     preflight, marketplace bootstrap, diagnose, summary. Each stage
     converges on a re-run and the command reports its own outcome, so the
     prompt neither enumerates the stages as instructions nor triages their
@@ -633,6 +679,7 @@ def resolve_lines(
     if has_ca:
         lines.extend(_tls_trust_block(ca_pem))  # type: ignore[arg-type]
     lines.extend(_preamble_lines(custom_preamble=custom_preamble, instance_brand=instance_brand))
+    lines.extend(_token_precheck_lines())
     lines.extend(_install_cli_lines(has_ca=has_ca))  # 1
     lines.append("")
     lines.extend(_onboard_lines())  # 2

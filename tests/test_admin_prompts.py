@@ -830,6 +830,25 @@ def test_facts_extraction_preview_is_the_content_itself():
     assert result == {"content": 'Rule 1: emit {"id": "x"}.'}
 
 
+def test_install_preview_resolves_the_bare_server_url_placeholder(admin_client):
+    """The shipped install-prompt default carries `{server_url}` substituted
+    at bind time via `str.replace`, not through Jinja — an admin override
+    that leaves it untouched (or the seed content itself) must still resolve
+    it in the preview response, matching what a real install prompt sends,
+    instead of leaving the literal placeholder in the "Copy rendered"
+    output."""
+    client, token = admin_client
+    r = client.post(
+        "/api/admin/prompts/install/preview",
+        headers=_hdr(token),
+        json={"content": "Server: {server_url}\n"},
+    )
+    assert r.status_code == 200, r.text
+    content = r.json()["content"]
+    assert "{server_url}" not in content
+    assert "Server: http" in content
+
+
 def test_an_unknown_prompt_kind_still_404s():
     from fastapi import HTTPException
 

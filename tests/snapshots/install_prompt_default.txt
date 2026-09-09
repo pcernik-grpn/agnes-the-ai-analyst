@@ -8,10 +8,9 @@ from {server_url}, and the command-line tool it installs is named `agnes`.
 Requirements: `uv` (https://docs.astral.sh/uv/) and `curl`, plus network
 access to the server above.
 
-If this machine already has a saved sign-in for {server_url} — a token at
-~/.agnes/token from the install guide, or a previous `agnes auth login` —
-step 2 reuses it; nothing needs to display its contents first. Otherwise
-`agnes onboard` opens your browser to sign in when it gets there.
+Your login token is already saved on this machine at ~/.agnes/token
+(written by step 4 of the install guide at {server_url}). The steps below
+use that file path, so there is no need to display its contents.
 
 Every step below is idempotent and safe to re-run: a machine that already
 ran this setup converges instead of reinstalling, so treat "already
@@ -19,6 +18,16 @@ configured" outcomes as success. If a step fails with an unfamiliar error,
 paste the exact error back and stop — and for a TLS error look for the cause
 (corporate proxy, internal CA, clock skew) rather than lowering certificate
 verification.
+
+Before you start, confirm the login token file is in place:
+   test -s ~/.agnes/token && echo "token present" || echo "token missing"
+
+   Present: continue. Missing: an earlier run may have consumed it, but that
+   needs BOTH a saved credential and a matching server — token.json records
+   no server, and the installer writes server: before anyone has signed in:
+      test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml
+   Prints {server_url} → continue. Anything else, including no output →
+   not signed in to {server_url}: stop, send the user to {server_url}/how-it-works#connect.
 
 1) Install the CLI:
    If someone else runs this, copy the commands below into the reply in full — not a reference to "step 1".

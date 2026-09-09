@@ -239,15 +239,16 @@
 
   // Mirrors install.html's copyToClipboard: Clipboard API when available in
   // a secure context, else the execCommand('copy') fallback (e.g. plain
-  // HTTP admin access over a LAN, which is not a secure context).
-  function copyToClipboard(text) {
-    if (navigator.clipboard && window.isSecureContext) {
-      return navigator.clipboard.writeText(text);
-    }
+  // HTTP admin access over a LAN, which is not a secure context). A secure
+  // context does not guarantee the write succeeds — e.g. a browser can still
+  // deny clipboard-write permission — so a rejection falls back too, instead
+  // of leaving the admin with a silently failed copy and no fallback path.
+  function copyViaTextarea(text) {
     const ta = document.createElement('textarea');
     ta.value = text;
     ta.style.position = 'fixed';
     ta.style.left = '-9999px';
+    ta.style.top = '-9999px';
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
@@ -258,6 +259,14 @@
         document.body.removeChild(ta);
       }
     });
+  }
+  function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).catch(function () {
+        return copyViaTextarea(text);
+      });
+    }
+    return copyViaTextarea(text);
   }
 
   // The IWT file list is repo-global (same repo backs both cards). Fetch it

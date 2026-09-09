@@ -197,7 +197,7 @@ def test_prompt_stays_short():
     which cannot move into a CLI that isn't installed yet)."""
     from app.web.setup_instructions import resolve_lines
 
-    assert len(resolve_lines("agnes.whl")) < 84
+    assert len(resolve_lines("agnes.whl")) < 90
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +205,7 @@ def test_prompt_stays_short():
 # ---------------------------------------------------------------------------
 
 
-def test_preamble_opens_with_brand_server_and_signin_note():
+def test_preamble_opens_with_brand_server_and_token_guard():
     from app.web.setup_instructions import resolve_lines
 
     lines = resolve_lines("agnes.whl")
@@ -225,15 +225,13 @@ def test_preamble_opens_with_brand_server_and_signin_note():
     assert "own deployment of Agnes" not in joined
     assert "Agnes is served from {server_url}" in joined
     assert "installs is named `agnes`" in joined
-    # Sign-in stated as an either/or, not a hard prerequisite: a saved
-    # credential (if present) is reused; otherwise agnes onboard's own
-    # browser-sign-in fallback handles it. No claim that a token is already
-    # sitting on disk, and no "step 4" cross-reference to a separate
-    # mandatory pre-step.
-    assert "step 2 reuses it" in joined
-    assert "opens your browser to sign in" in joined
-    assert "already saved on this machine" not in joined
+    # Token handling stated as a fact, not as an instruction to conceal:
+    # the steps use the file path, so nothing needs to display its contents.
+    assert "Your login token is already saved on this machine at ~/.agnes/token" in joined
+    assert "no need to display its contents" in joined
     assert "never print the token" not in joined
+    # Provenance fact: the token came from the install guide's previous step.
+    assert "step 4 of the install guide at {server_url}" in joined
     # Idempotence promise (one line, not a paragraph).
     assert "idempotent" in joined
 
@@ -276,27 +274,61 @@ def test_preamble_asserts_no_consent_on_the_assistants_behalf():
         assert phrase not in joined
 
 
-def test_token_precheck_is_gone():
-    """The bash "is the token file there yet" precheck was retired: `agnes
-    onboard` (step 2) already resolves auth itself — bootstrap file, saved
-    credential, then a browser-sign-in fallback — so a prompt-level check
-    for "is the file there yet" answered a question the CLI answers better,
-    one step later, with a real browser sign-in instead of a dead end. See
-    `_preamble_lines`'s docstring for the full reasoning."""
-    from app.web import setup_instructions as si
+def test_token_precheck_block():
+    """The pre-check keeps both branches of "the file isn't there": a fresh
+    install (stop, send the user back to the guide) and a reconcile (the
+    saved credential already exists — continue)."""
     from app.web.setup_instructions import resolve_lines
 
-    assert not hasattr(si, "_token_precheck_lines"), "_token_precheck_lines should have been deleted, not left unused"
+    joined = "\n".join(resolve_lines("agnes.whl"))
+    assert "test -s ~/.agnes/token" in joined
+    assert "{server_url}/how-it-works#connect" in joined
+    assert "~/.config/agnes/token.json" in joined
+    # The pre-check is prose, not a numbered step — step 0 belongs to the
+    # TLS trust block, which must be free to claim that number.
+    assert "0) Check" not in joined
+
+
+def test_token_precheck_requires_both_a_credential_and_a_matching_server():
+    """A missing token file must not be waved through by either signal alone.
+
+    Neither one discriminates by itself, in opposite directions:
+
+    `token.json` holds `{access_token, email}` and never the server, and there
+    is one per machine — so on a laptop signed in to a different Agnes
+    deployment it exists and proves nothing about this one. That was the
+    original false positive.
+
+    And `config.yaml`'s `server:` key is written by `/cli/install.sh` at
+    install time (`app/api/cli_artifacts.py`), which prints "1. Sign in…"
+    immediately after — so a machine that merely ran the installer matches the
+    server while nobody has ever signed in. Keying on the server *instead of*
+    token.json swapped one false positive for another, and this one is worse:
+    it fires on the ordinary fresh-install path, and the agent is told to
+    continue only to fail three steps later inside `agnes init --token-file`.
+
+    So the check requires BOTH, and anything else stops.
+    """
+    from app.web.setup_instructions import resolve_lines
 
     joined = "\n".join(resolve_lines("agnes.whl"))
-    assert "test -s ~/.agnes/token" not in joined
-    assert "token present" not in joined
-    assert "test -f ~/.config/agnes/token.json &&" not in joined
-    assert "stop, send the user to {server_url}/how-it-works#connect" not in joined
-    # The pre-check used to be prose ahead of step 1 — step 0 stays free for
-    # the TLS trust block, which is gated on `ca_pem`.
-    assert "0) Check" not in joined
-    assert "0) Before you start" not in joined
+
+    # Neither false-positive wording survives.
+    assert "so just continue" not in joined
+    assert "an earlier run already" not in joined
+    assert "an earlier run saved the credential and removed the" not in joined
+
+    # Both signals are tested, in one command so the agent cannot satisfy
+    # half of it.
+    assert "test -f ~/.config/agnes/token.json &&" in joined
+    assert "^server:" in joined
+    assert "~/.config/agnes/config.yaml" in joined
+
+    # Only the conjunction continues; everything else, including no output at
+    # all (the `test -f` short-circuit), stops.
+    assert "Prints {server_url} → continue" in joined
+    assert "including no output" in joined
+    assert "stop, send the user to {server_url}/how-it-works#connect" in joined
 
 
 def test_preamble_carries_no_pre_emptive_trust_assertion():
