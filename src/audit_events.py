@@ -1528,6 +1528,14 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a table's schema + sample values for the no-SQL policy builder.",
     ),
+    # -- issue reports (app/api/issues.py) ----------------------------------
+    # "Report a problem" from any surface; the record stays in the instance.
+    "issue.report": AuditEvent("issue.report", "mutation", "A user filed an issue report"),
+    "issue.screenshot": AuditEvent(
+        "issue.screenshot", "mutation", "The reporter attached a page screenshot to an issue"
+    ),
+    "issue.comment": AuditEvent("issue.comment", "mutation", "A reporter or admin commented on an issue"),
+    "issue.resolved": AuditEvent("issue.resolved", "mutation", "An admin resolved an issue"),
 }
 
 

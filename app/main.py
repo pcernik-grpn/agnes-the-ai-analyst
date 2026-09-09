@@ -591,6 +591,7 @@ from app.api.keboola_semantic_layer_refresh import router as keboola_semantic_la
 from app.api.semantic_sources_refresh import router as semantic_sources_refresh_router
 from app.api.semantic_layer_coverage import router as semantic_layer_coverage_router
 from app.api.semantic_feedback import router as semantic_feedback_router
+from app.api.issues import router as issues_router
 from app.api.activity import router as activity_router
 from app.api.observability import router as observability_router
 from app.api.admin_user_sessions import router as admin_user_sessions_router
@@ -3148,6 +3149,7 @@ def create_app() -> FastAPI:
     # Feedback (F4.5) — its own router because its RBAC shape differs: submit
     # is open to any signed-in caller, only the queue and resolve are admin.
     app.include_router(semantic_feedback_router)
+    app.include_router(issues_router)
     # Block 3 of #1707: the ONE scheduled refresh over registered
     # `semantic_sources` (git/upload/connection kinds). The Keboola and
     # Databricks refresh endpoints it replaced are gone; their sources are

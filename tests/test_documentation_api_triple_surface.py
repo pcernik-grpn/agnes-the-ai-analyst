@@ -303,6 +303,16 @@ _COHORT: dict[str, tuple[str, str]] = {
     # `share` command rather than a bespoke one.
     "/api/sharing/groups": ("app share", "data_app_share_get"),
     "/api/sharing/{resource_type}/{resource_id}": ("app share", "data_app_share"),
+    # Issue reporting (step 1, docs/superpowers/specs/2026-09-09-issue-
+    # reporting-step1-design.md) — "report a problem" from any surface.
+    # REST (app/api/issues.py) + CLI (`agnes issue ...` / `agnes admin issue
+    # ...`) + MCP (app/api/mcp/foundation_tools.py) landed together.
+    "/api/issues": ("issue report", "report_issue"),
+    "/api/issues/mine": ("issue list", "list_my_issues"),
+    "/api/issues/{issue_id}": ("issue show", "get_issue"),
+    "/api/issues/{issue_id}/comments": ("issue comment", "issue_comment"),
+    "/api/admin/issues": ("admin issue list", "issue_queue_list"),
+    "/api/admin/issues/{issue_id}/resolve": ("admin issue resolve", "issue_resolve"),
 }
 
 
@@ -467,6 +477,12 @@ _LIBRARY_RAW_REASON = (
     "fails this test rather than passing silently. `…/preview` is capped "
     "(_PREVIEW_MAX_CHARS) and says so via `truncated`; an uncapped paginated "
     "whole-file reader would still be its own feature."
+)
+_ISSUE_SCREENSHOT_REASON = (
+    "the issue screenshot is a raw PNG body: PUT uploads bytes the browser captured, GET streams "
+    "them back for the browser to draw — neither has a JSON analogue for MCP, and the CLI attaches "
+    "a file through `agnes issue report --screenshot` against the same PUT (binary-body precedent: "
+    "_COLLECTIONS_FILES_REASON / _LIBRARY_RAW_REASON)"
 )
 
 
@@ -2062,6 +2078,7 @@ _EXEMPT: dict[str, str] = {
         "plan) — system-to-system, X-Runner-Token authenticated; no user-facing "
         "CLI subcommand or MCP analogue"
     ),
+    "/api/issues/{issue_id}/screenshot": _ISSUE_SCREENSHOT_REASON,
 }
 
 

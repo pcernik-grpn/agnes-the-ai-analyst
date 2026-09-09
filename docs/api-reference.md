@@ -2980,6 +2980,76 @@ chat agent offers to call when it cannot support its own answer),
 `semantic_feedback_list`, `semantic_feedback_resolve`. UI:
 `/admin/semantic-layer?tab=feedback`.
 
+### `/api/issues` — "Report a problem" (issue reporting, step 1)
+
+- /api/issues
+- /api/issues/{issue_id}
+- /api/issues/{issue_id}/screenshot
+- /api/issues/{issue_id}/comments
+- /api/issues/mine
+- /api/admin/issues
+- /api/admin/issues/{issue_id}/resolve
+
+A single gesture on every surface (web rail, `agnes issue …`, MCP) that files
+a report with page/session/version context attached automatically, keeps the
+record in the instance, and mirrors a text summary to the operator's chat
+webhook.
+
+`POST /api/issues` (**any signed-in caller**, deliberately not admin) files
+one: `{title, body?, kind?, page_url?, context?}`. Only `title` is required.
+`kind` is one of `bug | wrong_answer | request | question | other`, default
+`bug`. `context` is free-form JSON the client captured (browser, chat
+session id, recent client-side errors) — every string leaf is capped at 300
+chars and the whole payload at 32 KB server-side; the server merges in its
+own `app_version` / `app_commit` / `request_id`. `source_surface` (`web` /
+`cli` / `mcp`) is derived server-side from the `X-Agnes-Client` header, never
+client-supplied. A 201 triggers a `BackgroundTasks` post of a `{"text": …}`
+summary to `issues.webhook_url` (env `AGNES_ISSUES_WEBHOOK_URL`) when one is
+configured; `webhook_delivered_at` on the row records whether it landed.
+
+`GET /api/issues/mine[?status=open|resolved&limit=]` lists the caller's own
+reports, newest activity first: `{"data": [...], "count": n, "truncated":
+{"limit", "total"} | null}`. `GET /api/issues/{issue_id}` returns one report
+plus its comment thread (`{...row, "comments": [...]}`); `issue_id` accepts
+the `iss_…` id or the bare/`#`-prefixed number. Someone else's report answers
+`404 issue_not_found`, never `403` — ids must not be probeable.
+`POST /api/issues/{issue_id}/comments` (`{body}`) adds a follow-up; the
+reporter's own comment is stamped `author_kind: "reporter"`, an admin's
+`"admin"`.
+
+`PUT /api/issues/{issue_id}/screenshot` (raw `image/png` body, owner only)
+attaches one PNG (magic-byte checked, 3 MiB cap) under
+`{DATA_DIR}/issues/{id}/screenshot.png`; `GET .../screenshot` streams it back
+(reporter or admin) with a `frame-ancestors 'self'` CSP header.
+
+`GET /api/admin/issues[?status=&limit=]` (admin) is the full queue across
+every reporter, same envelope as `/mine`. `POST
+/api/admin/issues/{issue_id}/resolve` (admin, `{resolution_note?}`) closes
+one: `404` when it does not exist, `409 already_resolved` when somebody
+already closed it — the transition is guarded, so a second admin never
+overwrites who actually fixed it.
+
+Error bodies follow the standard `{"detail": {"error": "<code>", "message":
+"...", "hint"?: "..."}}` shape, with codes `missing_title`,
+`context_too_large`, `screenshot_too_large`, `screenshot_not_png`,
+`already_resolved`, `issue_not_found`.
+
+**Postgres-only.** All seven routes read `issue_reports` / `issue_comments`,
+which exist on Postgres only (see `docs/migrations.md` → "Adding a PG-only
+feature"); on an instance still running the frozen DuckDB app-state backend
+they answer `501` with `error: "requires_postgres_backend"`.
+
+CLI: `agnes issue report "<title>" [-m …] [--kind …] [--url …]
+[--screenshot <path>]`, `agnes issue list [--status open] [--json]`, `agnes
+issue show <id>`, `agnes issue comment <id> "<text>"` (any signed-in caller
+— placement follows authority, same split as `semantic-model feedback
+submit` vs `admin semantic feedback`); `agnes admin issue list|show|reply
+<id> "<text>"|resolve <id> [--note …]` (admin). MCP: `report_issue`,
+`list_my_issues`, `get_issue`, `issue_comment` (any signed-in caller, also
+registered on the sandboxed stdio server), `issue_queue_list`,
+`issue_reply`, `issue_resolve` (admin, HTTP transport only). UI: rail-foot
+button + user-menu item, every page.
+
 ### `/api/admin/semantic-models` and `/api/semantic-models` — Open semantic-layer contract
 
 Admin CRUD over canonical Apache Ossie semantic-model documents, plus a

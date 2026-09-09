@@ -136,6 +136,11 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "memory_detection_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/memory_detection_runs_pg.py"
     ),
+    # Issue reporting (step 1) — both parameter-free and reach
+    # issue_reports_repo() before any other validation: DuckDB -> typed 501,
+    # Postgres -> 200 (empty envelope, nothing filed).
+    "GET /api/issues/mine": ("a reporter's own issues read `issue_reports`, a PG-only table (issue reporting step 1)"),
+    "GET /api/admin/issues": ("the issue queue reads `issue_reports`, a PG-only table (issue reporting step 1)"),
 }
 
 
