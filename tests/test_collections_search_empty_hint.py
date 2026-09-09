@@ -214,9 +214,7 @@ class TestTheCombinedHintCountsEverySearchedLeg:
     def test_a_caller_who_can_reach_something_gets_the_wording_branch(self, seeded_app):
         tok = seeded_app["admin_token"]
         _make_collection_with_file(seeded_app, tok, "Reachable", "alpha bravo")
-        r = seeded_app["client"].get(
-            "/api/knowledge/search", params={"q": "nosuchwordanywhere"}, headers=_auth(tok)
-        )
+        r = seeded_app["client"].get("/api/knowledge/search", params={"q": "nosuchwordanywhere"}, headers=_auth(tok))
         assert r.status_code == 200, r.text
         hint = r.json().get("hint", "")
         assert "NOT evidence that access is missing" in hint
@@ -425,9 +423,7 @@ class TestACappedScanThatMatchedNothingIsRefused:
         _make_collection_with_file(seeded_app, tok, "Compounds", "Riveronium is a compound")
         monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
 
-        r = seeded_app["client"].get(
-            "/api/collections/search", params={"q": "riveron"}, headers=_auth(tok)
-        )
+        r = seeded_app["client"].get("/api/collections/search", params={"q": "riveron"}, headers=_auth(tok))
 
         assert r.status_code == 422, r.text
         detail = r.json()["detail"]
@@ -444,9 +440,7 @@ class TestACappedScanThatMatchedNothingIsRefused:
         _make_collection_with_file(seeded_app, tok, "Stopwords", "the alpha is here and there")
         monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
 
-        r = seeded_app["client"].get(
-            "/api/collections/search", params={"q": "the and is"}, headers=_auth(tok)
-        )
+        r = seeded_app["client"].get("/api/collections/search", params={"q": "the and is"}, headers=_auth(tok))
 
         assert r.status_code == 422, r.text
         assert r.json()["detail"]["reason"] == "no_usable_term"
@@ -474,3 +468,35 @@ class TestTheTruncationNoteSaysWhichPathFilledTheCap:
         note = body["truncated_note"]
         assert "FILE NAMES" in note
         assert "not a sign that your query is too broad" in note
+
+
+class TestTheResponseCarriesTheTruncationSourceAsAField:
+    def test_truncated_source_is_on_the_wire_not_only_in_the_prose(self, seeded_app, monkeypatch):
+        """The workspace prompt's document rails tell an agent to branch on
+        `truncated_source` — so the field has to exist for it to read.
+
+        It was computed and used only to format `truncated_note`, which made
+        that guidance point at nothing. (Devin Review on #2420.)
+        """
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        _make_collection_with_file(seeded_app, tok, "Sourced", "kubernetes cluster guide")
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+
+        body = _search(seeded_app, tok, "kubernetes")
+
+        assert body.get("truncated") is True
+        assert body.get("truncated_source") == "body"
+
+    def test_no_truncation_source_field_when_nothing_was_capped(self, seeded_app, monkeypatch):
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        _make_collection_with_file(seeded_app, tok, "Uncapped", "kubernetes cluster guide")
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 100)
+
+        body = _search(seeded_app, tok, "kubernetes")
+
+        assert body.get("truncated") is None
+        assert "truncated_source" not in body

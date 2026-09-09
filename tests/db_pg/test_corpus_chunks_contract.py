@@ -981,3 +981,39 @@ def test_search_candidates_path_prefix_cannot_cross_a_corpus_boundary(repo_and_f
     # The control: the same query IS answered when the scope matches.
     rows = repo.search_candidates([CORPUS_ID], "statement of work", limit=10, path_prefix="00_Granted/")
     assert [r["file_id"] for r in rows] == ["cf_granted"]
+
+
+def test_search_candidates_fills_its_window_when_only_one_term_matches(repo, monkeypatch):
+    """A sparse multi-term query must not under-fill and call itself complete.
+
+    The per-term windows are `rank_cap / len(terms)` rows each, so a query
+    whose matches all sit under ONE term could only ever return that term's
+    share — measured at 1 row of a requested 6 with 30 chunks matching. The
+    retrieval layer infers "was the scan capped" from `len(rows) >= limit`,
+    so that short result was reported as COMPLETE: the cap ate matching
+    documents and said nothing. Exactly the fail-quiet failure this change
+    set exists to remove, reintroduced one layer down.
+
+    (Devin Review on #2420. The DuckDB sibling had its top-up from the
+    start, so this is a contract both backends must satisfy.)
+    """
+    import src.repositories.corpus_chunks as duck_mod
+    import src.repositories.corpus_chunks_pg as pg_mod
+
+    # Small caps so the branch is reachable without inserting 20k rows.
+    monkeypatch.setattr(pg_mod, "_RANK_CANDIDATE_FLOOR", 8)
+    monkeypatch.setattr(pg_mod, "_RANK_CANDIDATE_MULTIPLIER", 1)
+    assert duck_mod._MAX_ILIKE_TERMS >= 8  # the DuckDB side shares the window by term count
+
+    repo.add_many(
+        [{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"alpha row {i}"} for i in range(30)]
+    )
+
+    # Eight terms; only `alpha` matches anything at all.
+    rows = repo.search_candidates([CORPUS_ID], "alpha zulu yankee xray whiskey victor uniform tango", limit=6)
+
+    assert len(rows) == 6, (
+        f"under-filled: {len(rows)} of 6 while 30 chunks match — the caller would "
+        "then report truncated=False and silently omit the rest"
+    )
+    assert all("alpha" in r["text"] for r in rows)

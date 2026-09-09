@@ -1078,7 +1078,12 @@ def register_foundation_tools(
         subset of the corpus rather than every accessible chunk. That case
         carries its own ``truncated_cap`` (the chunk limit applied) alongside
         ``truncated_note`` — narrow with ``collection_id`` or a more specific
-        query to reach what was excluded. A query too generic to narrow the
+        query to reach what was excluded.
+
+        The response also carries ``truncated_source`` — ``body`` (passages
+        matched more than one request can rank: your query really is broad),
+        ``filename`` (only file NAMES overflowed, which says nothing about
+        the query) or ``both``. Branch on that field, not on the prose. A query too generic to narrow the
         corpus by (e.g. only common words) is refused outright rather than
         silently ranking an arbitrary slice; the tool call raises with the
         server's ``search_query_too_broad`` detail in that case.

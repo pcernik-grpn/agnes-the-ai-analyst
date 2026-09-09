@@ -244,6 +244,11 @@ def collections_search(query: str, k: int = 10, collection_id: str = "", path_pr
     silently ranking an arbitrary slice; the tool call raises with the
     server's ``search_query_too_broad`` detail in that case.
 
+    The response also carries ``truncated_source`` — ``body`` (passages
+    matched more than one request can rank: your query really is broad),
+    ``filename`` (only file NAMES overflowed, which says nothing about
+    the query) or ``both``. Branch on that field, not on the prose.
+
     **Narrowing to a folder.** ``path_prefix`` restricts the search to files
     whose path starts with it — the right move for follow-on work, where a
     crawled bucket is ONE collection holding every client's documents and

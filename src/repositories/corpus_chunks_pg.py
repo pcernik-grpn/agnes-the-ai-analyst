@@ -632,6 +632,21 @@ class CorpusChunksPgRepository:
         every duplicate of an id carries the identical value and ``MAX`` is
         just the dedupe. ``DISTINCT ON (id)`` would force ``ORDER BY id``
         first and cost another nesting level to get back to rank order.
+
+        A FINAL any-term leg joins the per-term ones, and it is not
+        redundant: the per-term windows are ``rank_cap / len(terms)`` rows
+        each, so a query whose matches all sit under ONE term could only
+        ever return that term's share — measured at 1 row of a requested 6
+        with 30 chunks matching. The caller infers "was the scan capped"
+        from ``len(rows) >= limit``, so that short result was then reported
+        as complete: the cap silently ate matching documents and said
+        nothing, which is the exact failure this whole change set exists to
+        remove. The extra leg carries the OR'd query under the caller's own
+        ``limit``, so the window always fills from whichever term actually
+        has the matches while the per-term legs keep the rare term
+        represented. Bounded by ``rank_cap + limit`` rows, one query.
+        (Devin Review on #2420; the DuckDB sibling had this top-up from the
+        start, so this also closes a parity gap between the two.)
         """
         if limit <= 0 or not terms:
             return []
@@ -654,6 +669,16 @@ class CorpusChunksPgRepository:
                 " LIMIT :per_term)"
             )
         or_query = " || ".join(f"plainto_tsquery('{_FTS_CONFIG}', :t{i})" for i in range(len(terms)))
+        # The fill leg — see the docstring. Under the caller's `limit`, not
+        # `per_term`, because its whole job is to make the window fillable
+        # when the per-term shares cannot fill it.
+        legs.append(
+            "(SELECT id, tsv, text FROM corpus_chunks "
+            " WHERE corpus_id = ANY(:corpus_ids) "
+            f"  AND to_tsvector('{_FTS_CONFIG}', text) @@ ({or_query}) "
+            f"  {scope_sql} "
+            " LIMIT :limit)"
+        )
         exclude_sql = ""
         if exclude_ids:
             exclude_sql = "WHERE u.id <> ALL(:exclude_ids) "

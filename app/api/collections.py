@@ -585,7 +585,14 @@ async def search_collections(
         # this note in practice.
         payload["truncated"] = True
         payload["truncated_cap"] = meta["cap"]
-        payload["truncated_note"] = _truncated_note(meta["cap"], meta.get("truncated_source"))
+        # The machine-readable half of the note. Emitting only the prose was a
+        # real gap, not a nicety: the workspace prompt's own document-search
+        # rails tell an agent to branch on `truncated_source` ("file NAMES
+        # overflowed, which says nothing about how broad your query is"), and
+        # the field was never on the wire for it to read. (Devin Review on
+        # #2420.)
+        payload["truncated_source"] = meta.get("truncated_source")
+        payload["truncated_note"] = _truncated_note(meta["cap"], payload["truncated_source"])
         payload["candidates_capped"] = True
     if not results:
         payload["searched_collections"] = len(allowed)

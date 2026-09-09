@@ -207,7 +207,18 @@ def search_collections(
         return
     results = body.get("results", [])
     if not results:
-        typer.echo("No matches.")
+        # Name the narrowing that was in effect. The command-UX standard's
+        # "silent partial scope is forbidden" rule applies here even though
+        # the user asked for the narrowing: a bare "No matches." cannot be
+        # told apart from "your prefix matched no folder", which sends
+        # someone rewording a query when the path was the problem.
+        if prefix_clean:
+            typer.echo(f"No matches under '{prefix_clean}'.")
+            typer.echo("  (searched only files whose path starts with that prefix — it is matched")
+            typer.echo("   literally and is case-sensitive. Drop --path-prefix to search everything,")
+            typer.echo("   or `agnes collections show <id> --q <term>` to see the real paths.)")
+        else:
+            typer.echo("No matches.")
         return
     for r in results:
         loc = r.get("filename") or r.get("file_id")
