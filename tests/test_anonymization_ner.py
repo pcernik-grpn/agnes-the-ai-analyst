@@ -403,6 +403,33 @@ def test_temperature_is_dropped_when_the_model_rejects_it():
     assert "temperature" not in client.calls[2]
 
 
+def test_a_detection_is_recorded_as_anonymization_work(monkeypatch):
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    detector, _client = _detector([_Response("[]")])
+
+    detector("Petr Novák byl tady.")
+
+    assert len(records) == 1
+    assert (records[0].workload, records[0].purpose) == ("anonymization", "ner_detect")
+    assert records[0].provider == "anthropic"
+
+
+def test_the_no_temperature_retry_is_one_call_record_not_two(monkeypatch):
+    """The retry re-sends the SAME logical detection with one keyword
+    dropped. Recording it twice would double-count a chunk's cost."""
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    rejection = _ApiError(400, "temperature: unsupported parameter for this model")
+    detector, client = _detector([rejection, _Response("[]")])
+
+    detector("Petr Novák byl tady.")
+
+    assert len(client.calls) == 2, "the retry must still happen"
+    assert len(records) == 1
+    assert records[0].status == "ok", "the pair succeeded — the first attempt is not a failed call"
+
+
 # ---------------------------------------------------------------------------
 # Usage accounting
 # ---------------------------------------------------------------------------

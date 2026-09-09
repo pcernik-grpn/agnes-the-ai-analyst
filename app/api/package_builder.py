@@ -369,27 +369,31 @@ def _stub_turn_body(message: str, draft: Dict[str, Any], tables: List[Dict[str, 
     }
 
 
-def _llm_turn(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+def _llm_turn(
+    prompt: str, schema: Dict[str, Any], *, user_id: str | None = None, subject_id: str | None = None
+) -> Dict[str, Any]:
     """One structured call. Raises ``ValueError`` when nothing is configured."""
     from app.instance_config import load_instance_config
     from connectors.llm import create_extractor_from_env_or_config
+    from src.observability.llm_context import llm_context
 
     try:
         instance_config = load_instance_config()
     except (ValueError, FileNotFoundError):
         instance_config = {}
     extractor = create_extractor_from_env_or_config((instance_config or {}).get("ai"))
-    return extractor.extract_json(
-        prompt=prompt,
-        max_tokens=2000,
-        json_schema=schema,
-        schema_name="package_builder_turn",
-        system=SYSTEM,
-    )
+    with llm_context(workload="builder", purpose="package_builder_turn", user_id=user_id, subject_id=subject_id):
+        return extractor.extract_json(
+            prompt=prompt,
+            max_tokens=2000,
+            json_schema=schema,
+            schema_name="package_builder_turn",
+            system=SYSTEM,
+        )
 
 
 @router.post("/builder/turn")
-async def package_builder_turn(payload: PackageTurnRequest):
+async def package_builder_turn(payload: PackageTurnRequest, user: dict = Depends(require_admin)):
     """Run one turn of the data-package builder. Proposes; never writes.
 
     Returns ``{reply, patch, suggestions}``. Nothing here creates a package
@@ -415,6 +419,7 @@ async def package_builder_turn(payload: PackageTurnRequest):
                 _llm_turn,
                 _prompt(message=message, history=payload.history, draft=draft, tables=tables, groups=groups),
                 _schema(tables, groups),
+                user_id=user["id"],
             )
         except ValueError as e:
             logger.warning("package builder: no LLM configured: %s", e)

@@ -3156,3 +3156,60 @@ def test_plan_documents_with_no_partition_sees_every_file(monkeypatch):
         )
     )
     assert sorted(w.file_id for w in works) == sorted(r["id"] for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# call labelling — every extraction generation says what it was for
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def llm_records(monkeypatch):
+    """Collect the ``LlmCallRecord`` every traced generation emits.
+
+    ``trace_generation`` binds ``record_call`` at import time, so the seam is
+    the name inside ``llm_tracing`` — patching the ledger module would leave
+    the already-bound reference in place.
+    """
+    records: list[Any] = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    return records
+
+
+def test_a_document_extraction_is_recorded_as_extraction_work(llm_records):
+    client = FakeClient(_Response("NODES\nEDGES\n"))
+    _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", client=client).call("first")
+
+    assert len(llm_records) == 1
+    record = llm_records[0]
+    assert (record.workload, record.purpose) == ("extraction", "facts_extraction")
+    assert record.provider == "anthropic"
+    assert record.model_requested == "claude-haiku-4-5"
+    assert record.status == "ok"
+
+
+def test_a_vertex_pass_is_recorded_against_vertex(llm_records):
+    """Same model, different bill — the record has to tell them apart."""
+    client = FakeClient(_Response("NODES\nEDGES\n"))
+    _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, provider="vertex").call("first")
+
+    assert llm_records[0].provider == "gcp.vertex_ai"
+
+
+def test_a_failed_extraction_is_recorded_as_an_error_and_still_raises(llm_records):
+    """Instrumentation observes the failure; it never swallows it."""
+
+    class Boom(RuntimeError):
+        pass
+
+    client = FakeClient(Boom("upstream exploded"))
+    extractor = _Extractor(
+        system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, max_attempts=1, sleep=lambda _s: None
+    )
+    with pytest.raises(Exception):
+        extractor.call("first")
+
+    assert llm_records, "a failed call must still be recorded"
+    assert llm_records[0].status == "error"
+    assert llm_records[0].error_type == "Boom"
+    assert llm_records[0].purpose == "facts_extraction"

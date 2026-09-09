@@ -2458,18 +2458,28 @@ class _Extractor:
             return self._client, (self._call_model or self.model)
 
     def _create(self, user_message: str) -> Any:
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
         client, model = self._ensure_client()
-        return client.messages.create(
-            model=model,
-            max_tokens=self.max_output_tokens,
-            # The rules + ontology ride the system channel behind a cache
-            # breakpoint: byte-identical for every document of the run, so
-            # a corpus pass pays for the prefix once instead of per
-            # document. That is the single largest cost lever this stage
-            # has — see the per-document cost note in instance.yaml.example.
-            system=[{"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user_message}],
-        )
+        with (
+            llm_context(workload="extraction"),
+            trace_generation(provider=provider_label(self.provider), model=model, purpose="facts_extraction") as cap,
+        ):
+            cap.set_input(user_message)
+            response = client.messages.create(
+                model=model,
+                max_tokens=self.max_output_tokens,
+                # The rules + ontology ride the system channel behind a cache
+                # breakpoint: byte-identical for every document of the run, so
+                # a corpus pass pays for the prefix once instead of per
+                # document. That is the single largest cost lever this stage
+                # has — see the per-document cost note in instance.yaml.example.
+                system=[{"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_message}],
+            )
+            cap.set_output_from_anthropic(response)
+        return response
 
     def _record(self, response: Any) -> None:
         from src.anonymization_ner import _usage_value
@@ -4864,13 +4874,21 @@ def _run_batch_pass(
 
     def _sync_retry(message: str) -> str:
         from src.anonymization_ner import _reply_text
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
 
-        response = client.messages.create(
-            model=resolved_model,
-            max_tokens=max_output_tokens,
-            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": message}],
-        )
+        with (
+            llm_context(workload="extraction"),
+            trace_generation(provider=provider_label(provider), model=resolved_model, purpose="facts_retry") as cap,
+        ):
+            cap.set_input(message)
+            response = client.messages.create(
+                model=resolved_model,
+                max_tokens=max_output_tokens,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": message}],
+            )
+            cap.set_output_from_anthropic(response)
         _record_usage("sync", getattr(response, "usage", None))
         return _reply_text(response)
 
@@ -4998,8 +5016,21 @@ def _run_batch_pass(
                     report.docs_truncated += 1
                 message = getattr(result, "message", None)
                 from src.anonymization_ner import _reply_text
+                from src.observability import llm_context, record_generation
+                from src.observability.llm_tracing import provider_label
 
                 reply_text = _reply_text(message)
+                with llm_context(workload="extraction"):
+                    record_generation(
+                        provider=provider_label(provider),
+                        model=resolved_model,
+                        purpose="facts_batch",
+                        usage=getattr(message, "usage", None),
+                        subject_id=file_id,
+                        batch=True,
+                        model_response=getattr(message, "model", None),
+                        stop_reason=getattr(message, "stop_reason", None),
+                    )
                 _record_usage("batch", getattr(message, "usage", None))
                 if phase == "retry":
                     _finalize_retry(work, entry, reply_text)

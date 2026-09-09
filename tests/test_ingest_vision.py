@@ -151,3 +151,45 @@ def test_extract_image_text_vertex_path(monkeypatch, tmp_path):
     assert out == "hello table"
     assert captured["ctor"]["project_id"] == "proj-1"
     assert "@" in captured["model"]  # vertex id form
+
+
+def test_a_transcription_is_recorded_as_vision_work(monkeypatch, tmp_path):
+    """The fallback is the expensive path — a cost report has to be able to
+    separate it from the OCR and extraction passes around it."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+
+    class _Block:
+        type = "text"
+        text = "transcribed"
+
+    class _Usage:
+        input_tokens = 42
+        output_tokens = 7
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+
+    class _Resp:
+        content = [_Block()]
+        usage = _Usage()
+        model = "claude-haiku-4-5-20251001"
+        stop_reason = "end_turn"
+
+    class _Client:
+        def __init__(self, api_key=None):
+            self.messages = type("M", (), {"create": lambda _self, **_kw: _Resp()})()
+
+    import anthropic
+
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key=None: _Client())
+    img = tmp_path / "p.png"
+    img.write_bytes(b"\x89PNG fake")
+
+    from src.ingest.vision import extract_image_text
+
+    assert extract_image_text(str(img), ext="png") == "transcribed"
+    assert len(records) == 1
+    assert (records[0].workload, records[0].purpose) == ("vision", "image_caption")
+    assert records[0].provider == "anthropic"
+    assert records[0].input_tokens == 42
