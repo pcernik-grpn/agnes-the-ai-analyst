@@ -208,8 +208,10 @@ def _shorten(value: str, cap: int) -> str:
     return value[:cap].rstrip() + SEARCH_TRUNCATED_MARK
 
 
-def _apply_cap(hits: list[Any], cap: int) -> list[Any]:
-    """Every prose field longer than ``cap`` becomes a marked prefix.
+def _apply_cap(hits: list[Any], cap: int, *, text_fields: tuple[str, ...] = SEARCH_TEXT_FIELDS) -> list[Any]:
+    """Every prose field (:data:`SEARCH_TEXT_FIELDS` by default, or a
+    caller-supplied ``text_fields`` for a non-search listing —
+    :func:`compact_listing`) longer than ``cap`` becomes a marked prefix.
 
     Always derived from the ORIGINAL hits (never from a previous pass), so a
     shorter cap re-cuts the full text and the mark is appended exactly once.
@@ -219,7 +221,7 @@ def _apply_cap(hits: list[Any], cap: int) -> list[Any]:
         if not isinstance(hit, dict):
             out.append(hit)
             continue
-        fields = [f for f in SEARCH_TEXT_FIELDS if isinstance(hit.get(f), str) and len(hit[f]) > cap]
+        fields = [f for f in text_fields if isinstance(hit.get(f), str) and len(hit[f]) > cap]
         if not fields:
             out.append(hit)
             continue
@@ -230,35 +232,64 @@ def _apply_cap(hits: list[Any], cap: int) -> list[Any]:
     return out
 
 
-def _cap_envelope(payload: dict, cap: int) -> dict:
-    """The payload with its own prose fields (:data:`SEARCH_ENVELOPE_FIELDS`)
-    cut to ``cap`` and listed in a top-level ``truncated_fields``."""
-    fields = [f for f in SEARCH_ENVELOPE_FIELDS if isinstance(payload.get(f), str) and len(payload[f]) > cap]
+def _cap_envelope(payload: dict, cap: int, *, envelope_fields: tuple[str, ...] = SEARCH_ENVELOPE_FIELDS) -> dict:
+    """The payload with its own prose fields (:data:`SEARCH_ENVELOPE_FIELDS`
+    by default, or a caller-supplied ``envelope_fields``) cut to ``cap`` and
+    listed in a top-level ``truncated_fields``."""
+    fields = [f for f in envelope_fields if isinstance(payload.get(f), str) and len(payload[f]) > cap]
     if not fields:
         return payload
     return {**payload, **{f: _shorten(payload[f], cap) for f in fields}, "truncated_fields": fields}
 
 
-def _with_results(payload: dict, tool_name: str, hits: list[Any], *, total: int, budget: int) -> dict:
+#: Default trailing sentence in :func:`_with_results` — read the document a
+#: shortened SEARCH hit came from. ``compact_listing`` callers supply their
+#: own ``next_step`` instead (command-ux.md: the hint must fit the tool).
+_SEARCH_HIT_NEXT_STEP = (
+    "To read the document a shortened hit came from, call "
+    "collection_file_read(collection_id=<hit.corpus_id>, file_id=<hit.file_id>) "
+    "and follow its next_offset past the first page; "
+    "otherwise narrow the query or lower `k`."
+)
+
+#: Default English for the two disclosure lines below — the search-tool
+#: contract's original wording, kept as the default so
+#: :func:`compact_search_results` (which never overrides these) is
+#: byte-for-byte unaffected by this generalization. A ``compact_listing``
+#: caller with a differently-named list field typically overrides both:
+#: ``{kept}`` (the count that DID fit) is always available even though the
+#: default template does not use it — the hook a caller wanting to name "the
+#: limit that would fit" (command-ux.md) reaches for.
+_DEFAULT_SHORTENED_NOTE = (
+    "{shortened} of {total} results carry shortened text (a PREFIX — see each hit's `truncated_fields`)"
+)
+_DEFAULT_DROPPED_NOTE = "{dropped} lower-ranked result(s) of {total} were dropped"
+
+
+def _with_results(
+    payload: dict,
+    tool_name: str,
+    hits: list[Any],
+    *,
+    total: int,
+    budget: int,
+    list_field: str = "results",
+    shortened_note: str = _DEFAULT_SHORTENED_NOTE,
+    dropped_note: str = _DEFAULT_DROPPED_NOTE,
+    next_step: str = _SEARCH_HIT_NEXT_STEP,
+) -> dict:
     shortened = sum(1 for h in hits if isinstance(h, dict) and h.get("truncated_fields"))
     dropped = total - len(hits)
+    kept = len(hits)
     what: list[str] = []
     if shortened:
-        what.append(
-            f"{shortened} of {total} results carry shortened text (a PREFIX — see each hit's `truncated_fields`)"
-        )
+        what.append(shortened_note.format(shortened=shortened, total=total, dropped=dropped, kept=kept))
     if dropped:
-        what.append(f"{dropped} lower-ranked result(s) of {total} were dropped")
+        what.append(dropped_note.format(shortened=shortened, total=total, dropped=dropped, kept=kept))
     if payload.get("truncated_fields"):
         what.append(f"the response's own {', '.join(payload['truncated_fields'])} field(s) were shortened")
-    note = (
-        f"{tool_name}: {'; '.join(what)} to fit the {budget:,}-character tool output budget. "
-        "To read the document a shortened hit came from, call "
-        "collection_file_read(collection_id=<hit.corpus_id>, file_id=<hit.file_id>) "
-        "and follow its next_offset past the first page; "
-        "otherwise narrow the query or lower `k`."
-    )
-    return {**payload, "results": hits, "truncated": True, "truncated_note": note}
+    note = f"{tool_name}: {'; '.join(what)} to fit the {budget:,}-character tool output budget. {next_step}"
+    return {**payload, list_field: hits, "truncated": True, "truncated_note": note}
 
 
 def compact_search_results(payload: Any, tool_name: str, *, budget: int | None = None) -> Any:
@@ -365,6 +396,304 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
             f"({SEARCH_MAX_CHARS_ENV}) is smaller than the response envelope itself; raise it."
         ),
     }
+
+
+def compact_listing(
+    payload: Any,
+    tool_name: str,
+    *,
+    list_field: str,
+    text_fields: tuple[str, ...] = (),
+    envelope_fields: tuple[str, ...] = (),
+    budget: int | None = None,
+    shortened_note: str = _DEFAULT_SHORTENED_NOTE,
+    dropped_note: str = _DEFAULT_DROPPED_NOTE,
+    next_step: str,
+    item_noun: str = "item",
+) -> Any:
+    """:func:`compact_search_results`'s shorten-then-drop algorithm,
+    generalized to any list-shaped tool response whose growable field is not
+    named ``"results"`` and whose per-item prose fields are not the fixed
+    :data:`SEARCH_TEXT_FIELDS` set — ``skills[].body``,
+    ``models[].description``, ``files[].processing_detail``,
+    ``claims[].quote``, ...
+
+    Same disclosure contract, never raises: a response over ``budget`` is
+    shortened (prose fields at ``text_fields``/``envelope_fields`` become
+    marked prefixes) and, if that alone does not fit, trimmed from the TAIL
+    of ``payload[list_field]`` — never returned silently short. ``next_step``
+    has no generic default on purpose (command-ux.md: the note must hint the
+    ACTUAL next step for THIS tool — "call `semantic_model_get`", "lower
+    `limit`", ...) — every caller must say what to do next. ``shortened_note``/
+    ``dropped_note`` are ``.format()`` templates over ``shortened``, ``total``,
+    ``dropped`` and ``kept`` (the count that DID fit — the hook for naming
+    "the limit that would fit"); the defaults are the search-tool wording,
+    reused verbatim when a caller has no reason to say it differently. A
+    ``budget`` of ``0`` disables compaction. ``text_fields=()`` (the default)
+    skips straight to count-based dropping for a list with no shortenable
+    prose field.
+    """
+    effective = search_max_chars() if budget is None else budget
+    if effective <= 0 or not isinstance(payload, dict):
+        return payload
+    items = payload.get(list_field)
+    if not isinstance(items, list) or wire_size(payload) <= effective:
+        return payload
+
+    hits = list(items)
+    total = len(hits)
+
+    def _candidate(kept: list[Any], cap: int) -> dict:
+        capped_envelope = _cap_envelope(payload, cap, envelope_fields=envelope_fields) if envelope_fields else payload
+        capped_hits = _apply_cap(kept, cap, text_fields=text_fields) if text_fields else kept
+        return _with_results(
+            capped_envelope,
+            tool_name,
+            capped_hits,
+            total=total,
+            budget=effective,
+            list_field=list_field,
+            shortened_note=shortened_note,
+            dropped_note=dropped_note,
+            next_step=next_step,
+        )
+
+    def _fits(candidate: dict) -> bool:
+        return wire_size(candidate) <= effective
+
+    # Same interval-walking binary search as compact_search_results — see its
+    # docstring for why a plain single binary search over [floor, longest]
+    # can land short (Copilot review on #2046).
+    lengths = sorted(
+        {len(h[f]) for h in hits if isinstance(h, dict) for f in text_fields if isinstance(h.get(f), str)}
+        | {len(payload[f]) for f in envelope_fields if isinstance(payload.get(f), str)}
+    )
+    bounds = [SEARCH_TEXT_FLOOR] + [n for n in lengths if n > SEARCH_TEXT_FLOOR]
+    for j in range(len(bounds) - 2, -1, -1):
+        lo, hi = bounds[j], bounds[j + 1] - 1
+        if not _fits(_candidate(hits, lo)):
+            continue
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _fits(_candidate(hits, mid)):
+                lo = mid
+            else:
+                hi = mid - 1
+        return _candidate(hits, lo)
+
+    # Even the floor does not fit (or there is no text field to shorten):
+    # drop from the tail until it does.
+    kept = hits
+    candidate = _candidate(kept, SEARCH_TEXT_FLOOR)
+    while kept:
+        kept = kept[:-1]
+        candidate = _candidate(kept, SEARCH_TEXT_FLOOR)
+        if _fits(candidate):
+            return candidate
+    # Even an empty list with every prose field at the floor does not fit:
+    # the budget is smaller than the response envelope itself.
+    return {
+        list_field: [],
+        "truncated": True,
+        "truncated_note": (
+            f"{tool_name}: {total} {item_noun}(s) withheld — the {effective:,}-character tool output budget "
+            f"({SEARCH_MAX_CHARS_ENV}) is smaller than the response envelope itself; raise it."
+        ),
+    }
+
+
+def paginate_text(text: str, offset: int = 0, *, budget: int | None = None) -> dict:
+    """Page ``text`` into a budget-sized chunk starting at ``offset`` — the
+    shared idiom for a tool whose growable field is ONE long string rather
+    than a list. Mirrors the established ``app/api/collections.py::
+    _text_page`` pattern (what ``collection_file_read`` already exposes),
+    generalized for a tool with no REST-side pager of its own
+    (``documentation_api``, ``semantic_model_get``).
+
+    Returns ``{"text", "offset", "next_offset", "total_chars", "truncated"}``.
+    ``next_offset`` is ``None`` once the tail of ``text`` is reached — a
+    caller chains ``offset=next_offset`` to keep reading. ``offset`` is
+    clamped to ``>= 0`` rather than rejected, same reasoning as the file-list
+    clamps elsewhere: a paging client builds these itself. A ``budget`` of
+    ``0`` (or the ``AGNES_MCP_SEARCH_MAX_CHARS`` override) disables paging
+    and returns the rest of ``text`` from ``offset`` in one page.
+    """
+    effective = search_max_chars() if budget is None else budget
+    offset = max(0, offset)
+    total = len(text)
+    page = text[offset:] if effective <= 0 else text[offset : offset + effective]
+    end = offset + len(page)
+    next_offset = end if end < total else None
+    return {
+        "text": page,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total_chars": total,
+        "truncated": next_offset is not None,
+    }
+
+
+#: Bounded retries for :func:`paginate_text_response` — the overshoot it
+#: corrects for (JSON-escaping plus a small wrapper) is always tiny relative
+#: to the page, so this converges in one or two iterations in practice; the
+#: cap only guards against a pathological ``assemble`` callback.
+_PAGINATE_RESPONSE_MAX_RETRIES = 8
+
+
+def paginate_text_response(
+    text: str,
+    offset: int,
+    assemble: Callable[[dict], Any],
+    *,
+    budget: int | None = None,
+) -> Any:
+    """:func:`paginate_text` plus the check its raw-length slicing cannot do
+    on its own: verify the CALLER's fully assembled response — not just the
+    page — actually fits ``budget`` on the wire.
+
+    ``wire_size`` (what an MCP client measures) pretty-prints with
+    ``pydantic_core.to_json``, where a JSON-escaped character — a markdown
+    newline, a quote — can cost more than one character on the wire, and the
+    caller's own wrapper (a slug, a content hash, an optional
+    ``truncated_note``) adds a few more. A raw-length slice sized to exactly
+    fill ``budget`` can therefore overshoot once assembled. This shrinks and
+    re-assembles instead of letting that through — bounded retries, since the
+    overshoot is always small relative to the page.
+
+    ``assemble`` receives the page dict :func:`paginate_text` returns
+    (``text``, ``offset``, ``next_offset``, ``total_chars``, ``truncated``)
+    and returns the tool's own response shape built around it. A ``budget``
+    of ``0`` disables the check (same as :func:`paginate_text`).
+    """
+    effective = search_max_chars() if budget is None else budget
+    page = paginate_text(text, offset, budget=effective)
+    result = assemble(page)
+    if effective <= 0:
+        return result
+    for _ in range(_PAGINATE_RESPONSE_MAX_RETRIES):
+        overshoot = wire_size(result) - effective
+        if overshoot <= 0:
+            return result
+        # Shave off at least the overshoot, plus a little extra so the
+        # (slightly shorter) re-assembled wrapper's own field widths
+        # (fewer digits in `next_offset`, etc.) don't reopen the gap.
+        shrink_to = len(page["text"]) - overshoot - 8
+        if shrink_to >= len(page["text"]) or shrink_to < 0:
+            break
+        page = paginate_text(text, offset, budget=shrink_to)
+        result = assemble(page)
+    return result
+
+
+def compact_graph_result(payload: Any, tool_name: str, *, budget: int | None = None, next_step: str) -> Any:
+    """Fit a ``{"nodes": [...], "edges": [...], "truncated": {...}}``
+    fact-graph response (``fact_edges``, ``fact_neighbors``) into the tool
+    output budget.
+
+    The two lists are correlated — every edge names a ``src``/``dst`` node
+    id — so they cannot be shortened independently the way
+    :func:`compact_listing` trims one flat list: dropping ``nodes`` on its
+    own could leave an edge pointing at a node the response no longer
+    carries. Instead: shorten every edge's inline ``claims[].quote`` (the one
+    genuinely unbounded prose field) first: if that alone fits, every edge
+    and node survives. Otherwise drop edges from the TAIL (discovery/listing
+    order, same "cut the low-priority end, not the middle" rule as
+    :func:`compact_search_results`) and re-derive ``nodes`` down to the ids a
+    SURVIVING edge still references, so a caller never sees a dangling
+    reference.
+
+    Disclosure rides the EXISTING ``truncated`` dict ``fact_edges``/
+    ``fact_neighbors`` already return (``depth``/``fanout``/``result``/
+    ``claims`` keys) — this only ever ADDS an ``"output"`` key to it, never
+    replaces the dict with a bare boolean, so an existing reader of those
+    flags is unaffected — plus a new top-level ``truncated_note``. Never
+    raises; a ``budget`` of ``0`` disables compaction.
+    """
+    effective = search_max_chars() if budget is None else budget
+    if effective <= 0 or not isinstance(payload, dict):
+        return payload
+    edges = payload.get("edges")
+    nodes = payload.get("nodes")
+    if not isinstance(edges, list) or not isinstance(nodes, list) or wire_size(payload) <= effective:
+        return payload
+
+    total_edges = len(edges)
+
+    def _shorten_claim_quotes(kept_edges: list[Any]) -> tuple[list[Any], int]:
+        shortened_count = 0
+        out: list[Any] = []
+        for e in kept_edges:
+            claims = e.get("claims") if isinstance(e, dict) else None
+            if not isinstance(claims, list) or not claims:
+                out.append(e)
+                continue
+            new_claims = []
+            edge_shortened = False
+            for cl in claims:
+                quote = cl.get("quote") if isinstance(cl, dict) else None
+                if isinstance(quote, str) and len(quote) > SEARCH_TEXT_FLOOR:
+                    new_claims.append({**cl, "quote": _shorten(quote, SEARCH_TEXT_FLOOR)})
+                    edge_shortened = True
+                else:
+                    new_claims.append(cl)
+            if edge_shortened:
+                shortened_count += 1
+                out.append({**e, "claims": new_claims})
+            else:
+                out.append(e)
+        return out, shortened_count
+
+    def _candidate(kept_edges: list[Any]) -> dict:
+        shortened_edges, shortened_count = _shorten_claim_quotes(kept_edges)
+        referenced = {
+            e[k] for e in shortened_edges if isinstance(e, dict) for k in ("src", "dst") if e.get(k) is not None
+        }
+        kept_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id") in referenced]
+        dropped_edges = total_edges - len(kept_edges)
+        dropped_nodes = len(nodes) - len(kept_nodes)
+        what: list[str] = []
+        if shortened_count:
+            what.append(f"{shortened_count} edge(s) had an inline claim quote shortened to a PREFIX")
+        if dropped_edges:
+            what.append(f"{dropped_edges} of {total_edges} edges were dropped (last-discovered first)")
+        if dropped_nodes:
+            what.append(f"{dropped_nodes} node(s) no longer referenced by a surviving edge were dropped")
+        note = f"{tool_name}: {'; '.join(what)} to fit the {effective:,}-character tool output budget. {next_step}"
+        existing = payload.get("truncated")
+        merged_truncated = {**existing, "output": True} if isinstance(existing, dict) else True
+        return {
+            **payload,
+            "nodes": kept_nodes,
+            "edges": shortened_edges,
+            "truncated": merged_truncated,
+            "truncated_note": note,
+        }
+
+    def _fits(candidate: dict) -> bool:
+        return wire_size(candidate) <= effective
+
+    full = _candidate(edges)
+    if _fits(full):
+        return full
+
+    # Binary search the largest edge-count PREFIX that fits: size is
+    # monotone non-decreasing in the count (more edges -> a non-shrinking
+    # referenced-node set -> at least as many bytes), and n=total_edges is
+    # already known not to fit (checked above).
+    lo, hi = 0, total_edges - 1
+    best = _candidate(edges[:0])
+    if not _fits(best):
+        # Even the smallest possible graph does not fit. Returning it anyway
+        # is still the most honest thing this helper can do — the note says
+        # so, and the caller is never left computing over a silent drop.
+        return best
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits(_candidate(edges[:mid])):
+            lo = mid
+        else:
+            hi = mid - 1
+    return _candidate(edges[:lo])
 
 
 def summarize_docstring(doc: str | None) -> tuple[str, bool]:

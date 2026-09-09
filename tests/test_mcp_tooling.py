@@ -15,10 +15,14 @@ from src.mcp_tooling import (
     SEARCH_MAX_CHARS_ENV,
     SEARCH_TEXT_FLOOR,
     MCPOutputTooLarge,
+    compact_graph_result,
+    compact_listing,
     compact_search_results,
     ensure_output_size,
     ensure_query_output_size,
     max_output_chars,
+    paginate_text,
+    paginate_text_response,
     progressive_tool,
     search_max_chars,
     summarize_docstring,
@@ -500,3 +504,304 @@ class TestCompactSearchResults:
             budget=DEFAULT_SEARCH_MAX_CHARS,
         )
         assert wire_size(one_more) > DEFAULT_SEARCH_MAX_CHARS
+
+
+# ── generic listing compaction (MCP output-budget sweep, 2026-09) ─────────────
+#
+# compact_search_results (above) is the search-tool contract, locked to a
+# `results` list and the fixed SEARCH_TEXT_FIELDS set. compact_listing is its
+# generalization for a tool whose growable field has a different name and
+# different prose fields (`skills[].body`, `models[].description`,
+# `files[].processing_detail`, `claims[].quote`, ...). Same algorithm, same
+# disclosure contract, no default `next_step` — every caller must say what
+# to do next.
+
+
+def _widget(i: int, note_len: int = 3_000) -> dict:
+    return {"id": f"w{i:03d}", "name": f"widget-{i}", "note": ("lorem ipsum dolor sit amet. " * 200)[:note_len]}
+
+
+class TestCompactListing:
+    def test_fitting_payload_returned_untouched(self):
+        payload = {"widgets": [_widget(0, 50)], "total": 1}
+        out = compact_listing(
+            payload, "widget_list", list_field="widgets", text_fields=("note",), budget=20_000, next_step="narrow it."
+        )
+        assert out is payload
+
+    def test_a_non_default_list_field_is_shortened_then_kept(self):
+        payload = {"widgets": [_widget(i) for i in range(10)], "total": 10}
+        out = compact_listing(
+            payload,
+            "widget_list",
+            list_field="widgets",
+            text_fields=("note",),
+            budget=6_000,
+            shortened_note="{shortened} of {total} widgets carry shortened text",
+            next_step="lower `limit` or narrow the filter.",
+        )
+        assert wire_size(out) <= 6_000
+        assert out["truncated"] is True
+        assert len(out["widgets"]) == 10  # shortened, not dropped, at this budget
+        assert "10 of 10 widgets carry shortened text" in out["truncated_note"]
+        assert "lower `limit`" in out["truncated_note"]
+        assert out["total"] == 10  # fields outside list_field/envelope_fields pass through
+
+    def test_default_note_wording_says_results_unless_overridden(self):
+        """The default templates are the search-tool wording, verbatim —
+        reused as-is by a caller with no reason to say it differently. A
+        caller with a differently-named list still gets an honest, if
+        generic, disclosure without having to write its own templates."""
+        payload = {"widgets": [_widget(i) for i in range(10)]}
+        out = compact_listing(
+            payload, "widget_list", list_field="widgets", text_fields=("note",), budget=6_000, next_step="n/a"
+        )
+        assert "10 of 10 results carry shortened text" in out["truncated_note"]
+        assert out["widgets"] is not payload["widgets"]  # still the widgets list, just under the generic key
+
+    def test_drops_from_the_tail_and_reports_the_limit_that_would_fit(self):
+        payload = {"widgets": [_widget(i) for i in range(10)]}
+        out = compact_listing(
+            payload,
+            "widget_list",
+            list_field="widgets",
+            text_fields=("note",),
+            budget=1_200,
+            dropped_note="{dropped} of {total} widgets were dropped — pass limit={kept} next time to avoid this cap",
+            next_step="lower `limit` or narrow the filter.",
+        )
+        kept = out["widgets"]
+        assert 0 < len(kept) < 10
+        assert [w["id"] for w in kept] == [w["id"] for w in payload["widgets"][: len(kept)]]
+        assert f"pass limit={len(kept)} next time" in out["truncated_note"]
+        assert wire_size(out) <= 1_200
+
+    def test_no_text_fields_still_drops_from_the_tail(self):
+        """A list whose items carry no shortenable prose (e.g. small fixed
+        fields only) skips straight to count-based dropping."""
+        payload = {"rows": [{"id": i, "blob": "x" * 400} for i in range(50)]}
+        out = compact_listing(payload, "row_list", list_field="rows", budget=2_000, next_step="lower `limit`.")
+        assert wire_size(out) <= 2_000
+        assert 0 < len(out["rows"]) < 50
+        assert out["truncated"] is True
+
+    def test_zero_budget_disables(self):
+        payload = {"widgets": [_widget(i) for i in range(10)]}
+        assert compact_listing(payload, "x", list_field="widgets", budget=0, next_step="n/a") is payload
+
+    def test_non_matching_shape_passes_through(self):
+        assert compact_listing("plain", "x", list_field="widgets", budget=10, next_step="n/a") == "plain"
+        payload = {"other": "x" * 5_000}
+        assert compact_listing(payload, "x", list_field="widgets", budget=100, next_step="n/a") is payload
+
+    def test_next_step_is_a_required_keyword(self):
+        with pytest.raises(TypeError):
+            compact_listing({"widgets": []}, "x", list_field="widgets")  # type: ignore[call-arg]
+
+    def test_envelope_fields_are_capped_alongside_the_list(self):
+        payload = {"widgets": [_widget(0, 50)], "query": "q" * 8_000}
+        out = compact_listing(
+            payload,
+            "widget_list",
+            list_field="widgets",
+            envelope_fields=("query",),
+            budget=2_000,
+            next_step="narrow `query`.",
+        )
+        assert wire_size(out) <= 2_000
+        assert out["query"].endswith("…") and len(out["query"]) < 8_000
+
+    def test_below_the_envelope_returns_a_small_actionable_note(self):
+        """Below the minimal envelope nothing can fit — a misconfiguration.
+        The answer is a tiny, FIXED note naming the knob (its own length is
+        not itself bounded by the tiny budget that triggered it — same as
+        compact_search_results's equivalent fallback), never an oversized
+        payload the client would refuse."""
+        payload = {"widgets": [_widget(i, 50) for i in range(4)]}
+        out = compact_listing(
+            payload, "widget_list", list_field="widgets", item_noun="widget", budget=40, next_step="n/a"
+        )
+        assert out == {
+            "widgets": [],
+            "truncated": True,
+            "truncated_note": out["truncated_note"],
+        }
+        assert "4 widget(s) withheld" in out["truncated_note"]
+        assert SEARCH_MAX_CHARS_ENV in out["truncated_note"]
+
+
+# ── text pagination (documentation_api, semantic_model_get) ──────────────────
+
+
+class TestPaginateText:
+    def test_short_text_returned_whole_with_no_next_offset(self):
+        page = paginate_text("hello world", budget=1_000)
+        assert page == {
+            "text": "hello world",
+            "offset": 0,
+            "next_offset": None,
+            "total_chars": 11,
+            "truncated": False,
+        }
+
+    def test_pages_through_with_offset_chaining(self):
+        text = "abcdefghij" * 10  # 100 chars
+        page1 = paginate_text(text, budget=30)
+        assert page1["truncated"] is True
+        assert page1["next_offset"] == 30
+        assert page1["text"] == text[:30]
+
+        page2 = paginate_text(text, offset=page1["next_offset"], budget=30)
+        assert page2["text"] == text[30:60]
+        assert page2["next_offset"] == 60
+
+        pages = [page1, page2]
+        offset = page2["next_offset"]
+        while offset is not None:
+            p = paginate_text(text, offset=offset, budget=30)
+            pages.append(p)
+            offset = p["next_offset"]
+        assert "".join(p["text"] for p in pages) == text
+        assert pages[-1]["truncated"] is False
+
+    def test_negative_offset_is_clamped(self):
+        assert paginate_text("hello", offset=-5, budget=1_000)["offset"] == 0
+
+    def test_budget_zero_returns_everything_from_offset(self):
+        text = "x" * 500_000
+        page = paginate_text(text, budget=0)
+        assert page["text"] == text
+        assert page["truncated"] is False
+
+    def test_env_budget_is_read_at_call_time(self, monkeypatch):
+        monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "10")
+        page = paginate_text("0123456789ABCDEF")
+        assert page["text"] == "0123456789"
+        assert page["next_offset"] == 10
+
+
+class TestPaginateTextResponse:
+    """`paginate_text` slices by raw character count; a caller that wraps the
+    page in its own dict (`documentation_api`, `semantic_model_get`) can
+    still overshoot the wire budget once JSON-escaping is counted (a
+    markdown newline costs two characters once serialized) plus the
+    wrapper's own keys — `paginate_text_response` is the fix: it verifies
+    the ASSEMBLED response, not just the raw page."""
+
+    def _assemble(self, page: dict) -> dict:
+        out = {
+            "content": page["text"],
+            "offset": page["offset"],
+            "next_offset": page["next_offset"],
+            "total_chars": page["total_chars"],
+            "truncated": page["truncated"],
+        }
+        if page["truncated"]:
+            out["truncated_note"] = f"call again with offset={page['next_offset']}"
+        return out
+
+    def test_small_text_passes_through(self):
+        out = paginate_text_response("hello world", 0, self._assemble, budget=1_000)
+        assert out["content"] == "hello world"
+        assert out["truncated"] is False
+
+    def test_newline_heavy_text_still_fits_the_wire_budget(self):
+        """The reproduction: raw-length slicing alone (no escaping
+        awareness) put a real ~20k-char documentation_api page over a
+        20,000-char budget once wrapped and JSON-escaped."""
+        text = '# Heading\n\nSome body text with `code` and "quotes".\n' * 2_000
+        out = paginate_text_response(text, 0, self._assemble, budget=DEFAULT_SEARCH_MAX_CHARS)
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+
+    def test_pages_chain_to_the_exact_original_text(self):
+        text = 'line one\nline two with "quotes" and \\backslash\\.\n' * 500
+        pages = []
+        offset = 0
+        while True:
+            out = paginate_text_response(text, offset, self._assemble, budget=2_000)
+            pages.append(out)
+            assert wire_size(out) <= 2_000
+            if not out["truncated"]:
+                break
+            offset = out["next_offset"]
+        assert "".join(p["content"] for p in pages) == text
+
+    def test_zero_budget_disables_the_check(self):
+        text = "x" * 500_000
+        out = paginate_text_response(text, 0, self._assemble, budget=0)
+        assert out["content"] == text
+
+
+# ── fact-graph compaction (fact_edges, fact_neighbors) ────────────────────────
+
+
+def _edge(i: int, quote_len: int = 0) -> dict:
+    edge: dict = {"id": f"e{i:03d}", "src": f"n{i:03d}a", "dst": f"n{i:03d}b", "type": "knows", "attrs": {}}
+    if quote_len:
+        edge["claims"] = [{"quote": ("evidence text. " * 300)[:quote_len], "id": f"cl{i}"}]
+    return edge
+
+
+def _node(node_id: str) -> dict:
+    return {"id": node_id, "type": "person", "aliases": [], "attrs": {}, "claim_count": 1, "quote_count": 1}
+
+
+def _graph_payload(n: int, *, quote_len: int = 0) -> dict:
+    edges = [_edge(i, quote_len) for i in range(n)]
+    node_ids = {edges[i]["src"] for i in range(n)} | {edges[i]["dst"] for i in range(n)}
+    nodes = [_node(nid) for nid in sorted(node_ids)]
+    return {"nodes": nodes, "edges": edges, "truncated": {"depth": False, "fanout": False, "result": False}}
+
+
+class TestCompactGraphResult:
+    def test_small_graph_returned_untouched(self):
+        payload = _graph_payload(1)
+        out = compact_graph_result(payload, "fact_edges", budget=20_000, next_step="n/a")
+        assert out is payload
+
+    def test_shortens_claim_quotes_before_dropping_edges(self):
+        payload = _graph_payload(20, quote_len=1_500)
+        assert wire_size(payload) > 20_000
+        out = compact_graph_result(payload, "fact_edges", budget=20_000, next_step="lower `limit`.")
+        assert wire_size(out) <= 20_000
+        assert len(out["edges"]) == 20  # kept every edge, only shortened the quotes
+        assert any(e["claims"][0]["quote"].endswith("…") for e in out["edges"])
+        assert out["truncated"]["output"] is True
+        # The pre-existing structured flags survive untouched.
+        assert out["truncated"]["depth"] is False
+
+    def test_drops_edges_from_the_tail_and_prunes_unreferenced_nodes(self):
+        payload = _graph_payload(200)
+        out = compact_graph_result(payload, "fact_edges", budget=3_000, next_step="lower `limit`.")
+        kept_edges = out["edges"]
+        assert 0 < len(kept_edges) < 200
+        # Ranked/discovery order preserved, cut from the tail.
+        assert [e["id"] for e in kept_edges] == [e["id"] for e in payload["edges"][: len(kept_edges)]]
+        referenced = {e["src"] for e in kept_edges} | {e["dst"] for e in kept_edges}
+        assert {n["id"] for n in out["nodes"]} == referenced
+        assert wire_size(out) <= 3_000
+        assert out["truncated"]["output"] is True
+        assert "edges were dropped" in out["truncated_note"]
+
+    def test_never_replaces_the_existing_truncated_dict_with_a_bare_bool(self):
+        payload = _graph_payload(200)
+        out = compact_graph_result(payload, "fact_neighbors", budget=3_000, next_step="n/a")
+        assert isinstance(out["truncated"], dict)
+        assert out["truncated"]["result"] is False
+        assert out["truncated"]["output"] is True
+
+    def test_zero_budget_disables(self):
+        payload = _graph_payload(50)
+        assert compact_graph_result(payload, "fact_edges", budget=0, next_step="n/a") is payload
+
+    def test_never_raises_even_when_nothing_fits(self):
+        payload = _graph_payload(50)
+        out = compact_graph_result(payload, "fact_edges", budget=10, next_step="n/a")
+        assert isinstance(out, dict)
+        assert out["truncated"]["output"] is True
+
+    def test_input_payload_is_never_mutated(self):
+        payload = _graph_payload(20, quote_len=1_500)
+        snapshot = json.dumps(payload, sort_keys=True)
+        compact_graph_result(payload, "fact_edges", budget=3_000, next_step="n/a")
+        assert json.dumps(payload, sort_keys=True) == snapshot
