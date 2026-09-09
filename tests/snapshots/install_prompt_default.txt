@@ -5,6 +5,9 @@ Server: {server_url}
 BRAND is this organization's own deployment of Agnes, served
 from {server_url}, and the command-line tool it installs is named `agnes`.
 
+Requirements: `uv` (https://docs.astral.sh/uv/) and `curl`, plus network
+access to the server above.
+
 Your login token is already saved on this machine at ~/.agnes/token
 (written by step 4 of the install guide at {server_url}). The steps below
 use that file path, so there is no need to display its contents.
@@ -24,9 +27,10 @@ Before you start, confirm the login token file is in place:
    no server, and the installer writes server: before anyone has signed in:
       test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml
    Prints {server_url} → continue. Anything else, including no output →
-   not signed in to {server_url}: stop, send the user to {server_url}/home step 4.
+   not signed in to {server_url}: stop, send the user to {server_url}/how-it-works#connect.
 
 1) Install the CLI:
+   If someone else runs this, copy the commands below into the reply in full — not a reference to "step 1".
    TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)
    (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {server_url}/cli/download)
    WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)
@@ -48,6 +52,9 @@ Before you start, confirm the login token file is in place:
        || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
 
 2) Set up the BRAND workspace in the current directory:
+
+   If someone else runs this, copy the exact command (with the agreed folder) into
+   the reply in full — not a reference to "step 2".
 
    agnes onboard --server-url "{server_url}" --workspace .
 
@@ -72,3 +79,7 @@ Before you start, confirm the login token file is in place:
    - the diagnose status it finished on
    - which connectors are available to set up later — nothing to do now,
      just ask when you want one (e.g. "set up Jira")
+
+   A good first question from here: "What data can I access through
+   BRAND? Give me a brief overview and suggest three useful
+   questions you can answer."
