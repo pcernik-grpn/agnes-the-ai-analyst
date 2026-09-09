@@ -322,20 +322,32 @@ const WS_CLOSE_REJECTED = new Set([4404]);
 // transient case retrying exists for.
 const WS_MINT_FATAL_STATUS = new Set([401, 403, 404]);
 
-/** A 401/403 anywhere in the chat path means the BROWSER'S SESSION is gone,
- *  not that chat is broken — and the two need opposite reactions from the
- *  reader. Rendering the raw status left them with "Could not start chat:
- *  401" and nothing to do; the actual fix was to reload, which nobody has a
- *  reason to guess (reported 2026-09-09, resolved by the reporter noticing
- *  a reload had silently logged them out).
+/** A 401 anywhere in the chat path means the BROWSER'S SESSION is gone, not
+ *  that chat is broken — and the two need opposite reactions from the reader.
+ *  Rendering the raw status left them with "Could not start chat: 401" and
+ *  nothing to do; the actual fix was to sign in again, which nobody has a
+ *  reason to guess from a number.
  *
  *  Says what happened, then goes to the login they need, carrying the page
  *  they were on in `?next=` so signing in returns them here instead of the
- *  dashboard. Returns true when it handled the error, so a caller can skip
- *  its generic branch — and false for every other failure, which is still a
- *  real chat error and must keep its own message. */
+ *  dashboard.
+ *
+ *  403 is the OTHER half and must NOT be answered the same way. That caller
+ *  IS signed in — `require_chat_access` refuses them because their group's
+ *  grant on chat was revoked or never made. Sending them to a login they will
+ *  pass and bounce straight off again is a loop that hides the real cause, so
+ *  403 gets its own sentence, naming who can undo it, and stays on the page.
+ *
+ *  Returns true when it handled the error, so a caller can skip its generic
+ *  branch — and false for every other failure, which is still a real chat
+ *  error and must keep its own message. */
 function handleExpiredSession(err) {
-  if (!err || (err.status !== 401 && err.status !== 403)) return false;
+  const status = err && err.status;
+  if (status === 403) {
+    setStatus("You do not have access to chat — ask an administrator to grant it.", "error");
+    return true;
+  }
+  if (status !== 401) return false;
   setStatus("Your session expired — taking you to sign in\u2026", "error");
   const next = encodeURIComponent(location.pathname + location.search);
   // A beat before navigating: the sentence above is the only explanation the
@@ -2858,7 +2870,7 @@ function _renderAgentSelectMenu(filter) {
       // value, and the slugless default entry must post the plain create.
       newChat(a.slug || undefined).catch((err) => {
         console.error("chat: could not start a session as agent", err);
-        if (window.appToast) {
+        if (!handleExpiredSession(err) && window.appToast) {
           window.appToast({ kind: requestErrorTone(err.status, err.code || err.message), msg: _agentStartMessage(err) });
         }
       });
@@ -3091,7 +3103,11 @@ async function loadAndRenderHistory(chatId) {
     if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
   } catch (err) {
     if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
-    setStatus(`Could not load history: ${err.message}`, "warn");
+    // Same split as every other entry path: a signed-out reader gets the
+    // login, not a warning about history they cannot reach either way.
+    if (!handleExpiredSession(err)) {
+      setStatus(`Could not load history: ${err.message}`, "warn");
+    }
     // #1973: the outcome is the caller's to act on — a RESTORE that cannot
     // read its own history must show an error, not the empty-state hero.
     return { ok: false, error: err.message, count: 0 };
@@ -3394,6 +3410,10 @@ async function openSession(chatId, wsUrlOverride, { restoring = false, reconnect
       // review). Keep the transcript, the id and the URL, and say it is
       // retryable: sending a message re-mints a ticket via ensureWsReady,
       // and so does a reload of this same URL.
+      // An expired login cannot be retried by sending another message, which
+      // is what the resume copy tells the reader to do — so it is handled
+      // first and the retryable-failure panel is skipped.
+      if (handleExpiredSession(err)) return;
       _renderResumeFailure(err.message);
       return;
     }
@@ -7391,7 +7411,9 @@ async function startNewChatFromGesture() {
     _endToolGroup();
     showCapabilities();
     setThreadTitle(null);
-    setStatus(chatErrorCopy(err.message, err.code || "session_create_failed"), "error");
+    if (!handleExpiredSession(err)) {
+      setStatus(chatErrorCopy(err.message, err.code || "session_create_failed"), "error");
+    }
   }
 }
 
@@ -9660,7 +9682,7 @@ const ChatAttachments = (() => {
     hideCapabilities();
     newChat(_agentSlug).catch((err) => {
       console.error("chat: could not start a session as agent", err);
-      if (window.appToast) {
+      if (!handleExpiredSession(err) && window.appToast) {
         window.appToast({ kind: requestErrorTone(err.status, err.code || err.message), msg: _agentStartMessage(err) });
       }
       // Put the page back. The dashboard was hidden one line up in anticipation

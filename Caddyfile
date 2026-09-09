@@ -17,16 +17,19 @@
 		protocols tls1.2 tls1.3
 	}
 
-	# Access log. Off until 2026-09-09, and its absence cost us a diagnosis:
-	# an expired browser session returned 401 on POST /api/chat/sessions and
-	# left NO trace anywhere — the app logs no HTTP access lines and Caddy
-	# logged only warnings — so "how often does this hit people?" was
-	# unanswerable and we learned of it from a user's screenshot.
+	# Access log. The app itself logs no HTTP access lines, so without this
+	# the deployment keeps no record that a request was made at all: a status
+	# a user reports ("it said 401") cannot be confirmed, dated, or counted,
+	# and "how often does this happen?" has no answer to read.
 	#
 	# JSON to stdout, so the container log carries it wherever the host
 	# already ships logs; Caddy redacts the Authorization header itself.
 	# One line per request, not per byte, so a multi-GB parquet pull costs
 	# one entry like anything else.
+	#
+	# Every externally served site block needs its own `log` — it is
+	# site-scoped, not global. Keep this in step with
+	# deploy/caddy/Caddyfile.mtier and Caddyfile.apps-subdomain.
 	log {
 		output stdout
 		format json
@@ -222,6 +225,14 @@
 #     management ambiguous" — and Caddy then refuses to start at all, which
 #     on a DOMAIN-less lab deployment means no server rather than no alias.
 {$DOMAIN_ALIAS:127.0.0.1:8081} {
+	# Access log, as in the primary block — `log` is site-scoped, and traffic
+	# still arriving on a retired hostname is precisely what an operator needs
+	# counted to know when the old DNS record can go.
+	log {
+		output stdout
+		format json
+	}
+
 	# NO `tls` directive here, deliberately — do not "fix" this by mirroring
 	# the primary site's {$CADDY_TLS}. An explicit `tls <email>` pins an ACME
 	# issuer for the site, which overrides Caddy's per-name issuer choice: the
