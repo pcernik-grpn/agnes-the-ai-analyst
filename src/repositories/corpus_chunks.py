@@ -139,7 +139,10 @@ class CorpusChunksRepository:
         is the column body search scopes candidates on
         (``search_candidates``), so a chunk left behind after a move keeps
         answering under the collection the file just left. Called on the
-        single-file move path right after the file row moves — the
+        single-file move path BEFORE the file row itself moves, so that a
+        failure there cannot strand the body in the collection the file is
+        leaving (``app/api/collections.py::move_file`` explains the ordering,
+        and compensates this write if the file-row move then fails). The
         collection-consolidation path re-homes chunks the same way, in bulk.
         Unknown file → 0.
 

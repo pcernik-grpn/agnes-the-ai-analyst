@@ -1110,6 +1110,73 @@ def test_move_file_chunk_failure_leaves_nothing_behind_in_the_source(seeded_app,
     assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
 
 
+def test_move_file_file_row_failure_puts_the_content_back(seeded_app, monkeypatch):
+    """The mirror of the test above: when the FILE-ROW write is the one that
+    fails, the already-committed content move is compensated back.
+
+    Re-homing the content first is what keeps a failure from stranding the
+    body in the collection the file is leaving, but on its own it left the
+    opposite split: content under the target, file still in the source. That
+    is the benign direction — the caller has proven access to the target and
+    the request replays — but it is still a split nobody asked for, so the
+    endpoint undoes it before surfacing the error.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Undo Src"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Undo Dst"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="rolled-back.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "rolled back body"}])
+
+    real_files_repo = corpus_files_repo
+    faulty = {"on": True}
+
+    def _maybe_exploding_files_repo():
+        repo = real_files_repo()
+        if not faulty["on"]:
+            return repo
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+                    raise RuntimeError("simulated file-row move failure")
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _maybe_exploding_files_repo)
+    with pytest.raises(RuntimeError, match="simulated file-row move failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": dst_id},
+            headers=admin,
+        )
+
+    # Compensated: the content is back with the file it belongs to, and the
+    # target never keeps the body of a file that did not arrive.
+    assert corpus_files_repo().get(fid)["corpus_id"] == src_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [src_id]
+    assert corpus_chunks_repo().list_for_corpus(dst_id) == []
+
+    faulty["on"] = False
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
     """A name with no alphanumerics must not yield an empty slug."""
     c = seeded_app["client"]

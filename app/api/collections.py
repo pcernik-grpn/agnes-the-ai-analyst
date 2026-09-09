@@ -1956,6 +1956,29 @@ class MoveFileBody(BaseModel):
     target_collection_id: str = Field(min_length=1)
 
 
+def _undo_content_move(file_id: str, source_corpus_id: str) -> None:
+    """Put a file's chunks (and claims) back under ``source_corpus_id``.
+
+    Compensation for a move whose final file-row write failed after the
+    denormalized rows had already been repointed — see ``move_file``. Every
+    failure here is logged and swallowed: the caller is already receiving the
+    original error, and replacing it with a failure from the cleanup would
+    hide what actually broke.
+    """
+    try:
+        corpus_chunks_repo().reassign_file_corpus(file_id, source_corpus_id)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error("move_file: could not restore chunks for %s to %s: %s", file_id, source_corpus_id, e)
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        facts_repo().reassign_file_corpus(file_id, source_corpus_id)
+    except RequiresPostgresBackend:
+        pass
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("move_file: could not restore claims for %s to %s: %s", file_id, source_corpus_id, e)
+
+
 @router.post("/{collection_id}/files/{file_id}/move")
 async def move_file(
     collection_id: str,
@@ -2048,7 +2071,20 @@ async def move_file(
     except Exception as e:
         logger.warning("move_file: could not repoint claims for %s: %s", file_id, e)
 
-    if not cf_repo.move_to_corpus(file_id, target_id):
+    # The content is already under the target; the file row is the last write.
+    # If it fails, put the content back rather than leaving the request's
+    # visible effect half-applied: this direction is the benign one (the
+    # caller has proven access to the target, and the retry works because the
+    # source still owns the file), but it is still a split nobody asked for.
+    # A compensation that itself fails is logged and never masks the original
+    # error — the caller must see what actually broke.
+    try:
+        moved = cf_repo.move_to_corpus(file_id, target_id)
+    except Exception:
+        _undo_content_move(file_id, collection_id)
+        raise
+    if not moved:
+        _undo_content_move(file_id, collection_id)
         raise HTTPException(status_code=404, detail="file_not_found")
 
     source_emptied = False
