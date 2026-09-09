@@ -1039,6 +1039,77 @@ def test_move_file_rehomes_its_chunks_for_search(seeded_app):
     assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
 
 
+def test_move_file_chunk_failure_leaves_nothing_behind_in_the_source(seeded_app, monkeypatch):
+    """A failure re-homing the chunks must never leave the file moved with its
+    body still answering under the source.
+
+    The two writes commit separately (different repositories, and on the
+    frozen DuckDB backend different connections), so one can land without the
+    other. The chunks move FIRST for that reason: a failure then stops the
+    move before the file row is touched, so the content is never stranded in
+    the collection the caller is taking it OUT of — the exact leak this
+    endpoint is being fixed for. The half-done state is also replayable: the
+    file row still sits in the source, so the same request retries cleanly.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Fail Src"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Fail Dst"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="halfway.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "half moved body"}])
+
+    real_chunks_repo = corpus_chunks_repo
+    faulty = {"on": True}
+
+    def _maybe_exploding_chunks_repo():
+        repo = real_chunks_repo()
+        if not faulty["on"]:
+            return repo
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "reassign_file_corpus":
+                    raise RuntimeError("simulated chunk re-home failure")
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_chunks_repo", _maybe_exploding_chunks_repo)
+    with pytest.raises(RuntimeError, match="simulated chunk re-home failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": dst_id},
+            headers=admin,
+        )
+
+    # The file did not move, so its body is not stranded under a collection
+    # the file has left — file and chunks are both still in the source.
+    assert corpus_files_repo().get(fid)["corpus_id"] == src_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [src_id]
+
+    # And the same request replays to completion once the fault clears.
+    # (Clearing the fault by flag, not `monkeypatch.undo()` — that would also
+    # revert the fixture's own patches and log the caller out.)
+    faulty["on"] = False
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert corpus_files_repo().get(fid)["corpus_id"] == dst_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
     """A name with no alphanumerics must not yield an empty slug."""
     c = seeded_app["client"]

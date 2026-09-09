@@ -312,3 +312,40 @@ def test_ingest_file_routes_zip_to_bundle(e2e_env, tmp_path, monkeypatch):
     monkeypatch.setattr(bundle_mod, "ingest_bundle", fake_bundle)
     assert ingest_file(file_id) == "indexed"
     assert calls["args"] == (corpus_id, file_id, str(zip_path))
+
+
+def test_chunks_land_in_the_collection_the_file_is_in_when_they_are_written(e2e_env, tmp_path, monkeypatch):
+    """A move that happens WHILE a file is being ingested must not be undone
+    by the ingest finishing.
+
+    ``ingest_file`` reads the file's collection once at the top and then does
+    the slow part (extraction, OCR, embedding). A move landing in that window
+    re-homes the chunks that exist at the time and cannot touch rows the
+    ingest has yet to write — so the ingest used to write its chunks under
+    the collection the file has already left, restoring the very leak the
+    move exists to close. The collection is re-read at write time instead.
+    """
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    src_id = _new_corpus("ing-move-src")
+    dst_id = _new_corpus("ing-move-dst")
+    doc = tmp_path / "moving.txt"
+    doc.write_text("the body of a file that moves mid-ingest", encoding="utf-8")
+    file_id = _add_file(src_id, "moving.txt", "txt", str(doc))
+
+    real_extract = __import__("src.ingest.runner", fromlist=["extract_text"]).extract_text
+
+    def _extract_then_move(path, file_type):
+        # The move lands after the collection was read, before chunks exist.
+        corpus_files_repo().move_to_corpus(file_id, dst_id)
+        corpus_chunks_repo().reassign_file_corpus(file_id, dst_id)
+        return real_extract(path, file_type)
+
+    monkeypatch.setattr("src.ingest.runner.extract_text", _extract_then_move)
+    assert ingest_file(file_id) == "indexed"
+
+    assert corpus_files_repo().get(file_id)["corpus_id"] == dst_id
+    written = {ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(file_id)}
+    assert written == {dst_id}
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []

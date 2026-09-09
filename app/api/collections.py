@@ -2000,16 +2000,27 @@ async def move_file(
     if managing is not None:
         _refuse_source_managed(managing)
 
-    if not cf_repo.move_to_corpus(file_id, target_id):
-        raise HTTPException(status_code=404, detail="file_not_found")
-
-    # The file row has moved; its CHUNKS have not. `corpus_chunks.corpus_id`
-    # is denormalized from `corpus_files` and is the column body search scopes
-    # candidates on (`search_with_meta` → `search_candidates`), so a chunk
-    # left behind keeps answering under the collection the file just left —
-    # readable to that collection's audience, invisible to the new one's.
-    # Not best-effort: chunks exist on both app-state backends, so a failure
-    # here is a real error, never a missing optional feature.
+    # Two columns are denormalized from `corpus_files.corpus_id` and do not
+    # follow the file on their own: `corpus_chunks.corpus_id` (what body
+    # search scopes candidates on — `search_with_meta` → `search_candidates`)
+    # and `claims.corpus_id` (what fact visibility is filtered on). A row left
+    # behind does not merely file the content under the old collection in the
+    # facets — it leaves it READABLE to the collection the file just left.
+    #
+    # Both are repointed BEFORE the file row moves, and the order is the
+    # safety property, not a detail: these writes commit separately (distinct
+    # repositories, and distinct connections on the frozen DuckDB backend), so
+    # one can land without the other. Failing before the file row moves leaves
+    # the file and its content together in the source — nothing stranded in a
+    # collection the file has left, and the same request replays cleanly,
+    # because the caller's source collection still owns the file. Doing it the
+    # other way round would fail into exactly the leak this fixes, and into a
+    # state where the retry 404s (the file no longer belongs to the source the
+    # caller addressed).
+    #
+    # The chunk write is NOT best-effort: chunks exist on both app-state
+    # backends, so a failure there is a real error, never a missing optional
+    # feature.
     moved_chunks = corpus_chunks_repo().reassign_file_corpus(file_id, target_id)
     if moved_chunks:
         logger.info(
@@ -2019,11 +2030,7 @@ async def move_file(
             target_id,
         )
 
-    # Its CLAIMS have not moved either. `claims.corpus_id` is denormalized the
-    # same way and is the column fact visibility is filtered on, so leaving it
-    # behind does not merely file the facts under the old collection in the
-    # graph facets — it leaves them readable to the collection the file just
-    # left. Best-effort by design: the fact graph is Postgres-only and
+    # Claims stay best-effort by design: the fact graph is Postgres-only and
     # optional, so an instance without it must still be able to move a file.
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
@@ -2040,6 +2047,9 @@ async def move_file(
         pass  # no fact graph on this backend — nothing to repoint
     except Exception as e:
         logger.warning("move_file: could not repoint claims for %s: %s", file_id, e)
+
+    if not cf_repo.move_to_corpus(file_id, target_id):
+        raise HTTPException(status_code=404, detail="file_not_found")
 
     source_emptied = False
     try:
