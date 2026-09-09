@@ -43,7 +43,14 @@ CAVEATS = (
 )
 
 #: Wording that must NOT survive anywhere in either server's tool docs.
-STALE = (("filenames are not indexed", r"filename[s]?\s+are\s+not\s+indexed"),)
+STALE = (
+    ("filenames are not indexed", r"filename[s]?\s+are\s+not\s+indexed"),
+    # `collection_file_read` pages at ~20k characters, so one call is the
+    # FIRST page, not the document. A search docstring that still promises a
+    # full read from that call sends the agent straight back into the bug the
+    # paging fixed — for any document over one page.
+    ("a full read from one collection_file_read call", r"in\s+full\s+with\s+``collection_file_read"),
+)
 
 SEARCH_TOOLS = ("collections_search", "knowledge_search")
 
@@ -155,6 +162,7 @@ def test_neither_server_still_ships_the_stale_caveat(label, pattern):
 COMPACTION_CONTRACT = (
     ("the truncated_fields marker", r"truncated_fields"),
     ("the whole-document follow-up", r"collection_file_read"),
+    ("the follow-up is paged (next_offset)", r"next_offset"),
     ("prefix, not the whole passage", r"prefix"),
 )
 

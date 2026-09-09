@@ -6,6 +6,7 @@ Commands:
   list    [--json]
   show    <id>       [--limit N] [--offset N] [--q TERM] [--json]
   upload    <id> <path...>   (multipart POST per file)
+  cat       <id> <file_id>   [--offset N] [--limit N] [--json]  (whole file by default)
   reingest  <id> <file_id>   (re-run ingestion for one file)
   rm        <id>       [--yes]
   rm-file   <id> <file_id>   [--yes]
@@ -377,48 +378,101 @@ def upload_files(
 # ---------------------------------------------------------------------------
 
 
+# One page of a file's text as the server hands it out — the per-call cap
+# `GET …/preview` enforces so a single read cannot flood a context window.
+# `cat` follows `next_offset` across pages, so this is a page size, not a
+# limit on what the command prints.
+PREVIEW_PAGE_CHARS = 20_000
+
+
 @collections_app.command("cat")
 def cat_file(
     collection_id: str = typer.Argument(..., help="Collection id (col_...)"),
     file_id: str = typer.Argument(..., help="File id (cf_...) from `collections show`"),
-    as_json: bool = typer.Option(False, "--json", help="Emit the raw preview payload"),
+    offset: int = typer.Option(0, "--offset", min=0, help="Character offset to start reading from"),
+    limit: int | None = typer.Option(
+        None, "--limit", min=1, help="Print at most N characters (default: the whole file)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit one page of the raw preview payload"),
 ):
-    """Print one file's extracted text (requires access to the collection).
+    """Print one file's extracted text — the whole file (requires access to the collection).
 
     The companion to `collections search`: search finds a file when you know
-    a word inside it, this reads one you can already name. The server caps
-    the text at ~20k characters — a truncated read says so on stderr rather
-    than handing back a silent prefix.
+    a word inside it, this reads one you can already name. The server hands
+    the text out in pages of ~20k characters; `cat` follows them to the end
+    and prints everything. `--offset N` starts N characters in, `--limit N`
+    stops after N characters (and says so on stderr rather than handing back
+    a silent prefix), `--json` emits a single page as the server sent it.
     """
-    try:
-        out = api_get_json(f"/api/collections/{collection_id}/files/{file_id}/preview")
-    except V2ClientError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1)
+    path = f"/api/collections/{collection_id}/files/{file_id}/preview"
+
+    def _page(at: int, want: int | None) -> dict:
+        params: dict = {"offset": at}
+        if want is not None:
+            params["limit"] = min(want, PREVIEW_PAGE_CHARS)
+        try:
+            return api_get_json(path, **params)
+        except V2ClientError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1)
 
     if as_json:
-        typer.echo(json_lib.dumps(out, indent=2, default=str))
+        typer.echo(json_lib.dumps(_page(offset, limit), indent=2, default=str))
         return
 
+    out = _page(offset, limit)
     # Key on the TEXT, not on `kind`. `kind` is the browser modal's switch
     # (draw an image, embed a PDF, print text) — a PDF comes back
     # `kind="pdf"` and still carries the ingested text a reader here wants.
     # Gating on `kind == "text"` refused exactly the format this command
     # exists for.
     text = out.get("text")
-    if not text:
+    if text is None or out.get("reason"):
         # `reason` is the server's own sentence for "indexed yet?", "rejected",
         # "no extractable text" — relaying it beats inventing a summary.
         typer.echo(out.get("reason") or "No text preview is available for this file.", err=True)
         raise typer.Exit(1)
-
-    typer.echo(text)
-    if out.get("truncated"):
+    total = out.get("total_chars") or 0
+    if not text and total and offset >= total:
+        # An empty PAGE of a file that has text is the caller's offset past
+        # the end — not "no text", which is what the sentence above claims.
         typer.echo(
-            f"\n[truncated] Showing the first {len(text)} characters. "
-            f"Use `agnes collections search <term> --collection {collection_id}` to reach the rest.",
+            f"Offset {offset} is past the end of this file's text "
+            f"({total} characters; valid offsets are 0..{total - 1}).",
             err=True,
         )
+        raise typer.Exit(1)
+
+    at = offset
+    remaining = limit
+    printed = 0
+    while True:
+        text = out.get("text") or ""
+        typer.echo(text, nl=False)
+        printed += len(text)
+        if remaining is not None:
+            remaining -= len(text)
+        nxt = out.get("next_offset")
+        # Stop at the end, at the caller's limit, or on a server that does
+        # not advance — a page that points at itself must not spin us.
+        if nxt is None or nxt <= at or (remaining is not None and remaining <= 0):
+            break
+        at = nxt
+        out = _page(at, remaining)
+    typer.echo()
+
+    if out.get("truncated"):
+        nxt = out.get("next_offset")
+        if nxt is not None:
+            hint = f"Re-run with `--offset {nxt}` to continue, or without `--limit` for the whole file."
+        else:
+            # The server's own byte window on a very large plain-text file:
+            # the text goes on, but not through this endpoint.
+            hint = (
+                "The server reads only the beginning of a very large text file; use "
+                f"`agnes collections search <term> --collection {collection_id}` to reach the rest."
+            )
+        typer.echo(f"\n[truncated] Printed {printed} characters from offset {offset}. {hint}", err=True)
 
 
 @collections_app.command("reingest")

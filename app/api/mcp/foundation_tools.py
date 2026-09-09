@@ -21,13 +21,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
-
-from pydantic import Field
+from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from src.mcp_tooling import (
     compact_search_results,
@@ -105,6 +105,369 @@ SERVER_INSTRUCTIONS = (
     "and call `validate_semantic_query` before running SQL that touches modeled data. "
     "Run `server_info` to check connectivity at the start of a session."
 )
+
+
+#: How many packages `admin_access_picture` CARRIES. The route's default page
+#: is 200 and used to be its ceiling too, so a composed reader lost every
+#: package past the 200th and misclassified their tables as unpackaged; the
+#: route now takes `?limit=` up to 5000. The tool asks for ONE ROW MORE than
+#: this: a page that comes back with the extra row proves more exist (and is
+#: cut back to the limit), while an inventory of exactly this many packages is
+#: complete -- `len >= limit` could not tell the two apart.
+_ACCESS_PICTURE_PACKAGE_LIMIT = 4999
+
+#: Longest list the picture carries for unpackaged tables. `include_tables=False`
+#: is the first narrowing step, but an instance with thousands of orphans would
+#: trip the output cap again with nothing narrower to ask for — so the list is
+#: capped and the true total rides beside it.
+_ACCESS_PICTURE_LIST_CAP = 200
+
+#: The parts of the picture a caller can ask for on their own. `include_tables=
+#: False` only drops table arrays; packages are still repeated in `packages`
+#: and in every `by_group` entry, so on a large instance the real narrowing
+#: step is one section at a time. The completeness metadata rides with every
+#: section.
+_ACCESS_PICTURE_SECTIONS = ("all", "packages", "by_group", "unreachable")
+
+
+def _stack_auto_membership() -> bool:
+    """The instance's stack membership mode — a config flag, read in-process.
+
+    Not a data read, so no RBAC question arises from resolving it here rather
+    than over HTTP; the composed picture forks on it the way
+    ``StackResolver.stack`` does.
+    """
+    from app.instance_config import get_stack_auto_membership
+
+    return bool(get_stack_auto_membership())
+
+
+def _compose_access_picture(
+    overview: dict,
+    packages: list[dict],
+    registry: dict,
+    *,
+    include_tables: bool,
+    auto_membership: bool,
+    packages_truncated: bool,
+    section: str = "all",
+) -> dict:
+    """Fold the three admin reads behind ``admin_access_picture`` into one picture.
+
+    Pure -- no I/O -- so the fold rules are testable without an HTTP round
+    trip. Every rule is imported from the surface that already owns it rather
+    than restated: which unpackaged tables count as unreachable is the
+    ``/admin`` gap card's (``app.services.admin_dashboard``), which package
+    statuses an analyst can see and pull is the stack resolver's
+    (``HIDDEN_STATUSES`` / ``UNDELIVERABLE_STATUSES``), and whether an
+    ``available`` grant is in a member's stack is the membership-mode fork
+    ``StackResolver.stack`` applies. The tool and those pages cannot disagree.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.admin_dashboard import _DISTRIBUTABLE_QUERY_MODES
+    from app.services.stack_resolver import HIDDEN_STATUSES, UNDELIVERABLE_STATUSES
+    from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+    from src.grant_scopes import EVERYONE_TARGET_ID
+
+    if section not in _ACCESS_PICTURE_SECTIONS:
+        raise ValueError(f"section must be one of {', '.join(_ACCESS_PICTURE_SECTIONS)}, got {section!r}")
+
+    account_total = int(overview.get("account_total") or 0)
+    groups = [
+        {
+            "id": g["id"],
+            "name": g.get("name") or g["id"],
+            "is_system": bool(g.get("is_system", False)),
+            "is_everyone": bool(g.get("is_everyone", False)),
+            "member_count": int(g.get("member_count") or 0),
+        }
+        for g in (overview.get("groups") or [])
+    ]
+    groups_by_id = {g["id"]: g for g in groups}
+
+    def _is_everyone_grant(gr: dict) -> bool:
+        # `audience` is what the overview resolved (scope column on Postgres,
+        # carrier-group membership on the frozen DuckDB ladder); the holder
+        # check is the belt to that suspender for a payload that lacks it.
+        if gr.get("audience") == EVERYONE_TARGET_ID or gr.get("scope") == EVERYONE_TARGET_ID:
+            return True
+        holder = groups_by_id.get(gr.get("group_id") or "")
+        return bool(holder and holder["is_everyone"])
+
+    grants_by_pkg: dict[str, list[dict]] = {}
+    for gr in overview.get("grants") or []:
+        if gr.get("resource_type") != "data_package":
+            continue
+        holder = groups_by_id.get(gr.get("group_id") or "")
+        everyone = _is_everyone_grant(gr)
+        grants_by_pkg.setdefault(str(gr.get("resource_id")), []).append(
+            {
+                "group_id": gr.get("group_id"),
+                "group_name": SYSTEM_EVERYONE_GROUP if everyone else (holder["name"] if holder else gr.get("group_id")),
+                "requirement": gr.get("requirement") or "available",
+                "audience": EVERYONE_TARGET_ID if everyone else "group",
+                "member_count": account_total if everyone else (holder["member_count"] if holder else None),
+            }
+        )
+
+    tables_by_id = {t["id"]: t for t in (registry.get("tables") or [])}
+    # `/api/admin/registry` stamps `packaged` on every row from ONE bulk
+    # membership read over every package -- the authority, and immune to the
+    # package page below being truncated. The union over the page is only the
+    # fallback for a payload that lacks the flag.
+    # ...unless the registry says its own read failed: it then stamps `false`
+    # on every row (`packaged_read_ok: false`), which read naively would call
+    # every distributable table orphaned. Fall back to the page union and say so.
+    packaged_read_ok = registry.get("packaged_read_ok", True) is not False
+    registry_knows_packaging = packaged_read_ok and any("packaged" in t for t in tables_by_id.values())
+    packaged_union: set[str] = set()
+    pkgs_out: list[dict] = []
+    for p in packages:
+        table_ids = [str(t) for t in (p.get("table_ids") or [])]
+        packaged_union.update(table_ids)
+        status = p.get("status") or "prod"
+        entry: dict[str, Any] = {
+            "id": p["id"],
+            "slug": p.get("slug"),
+            "name": p.get("name") or p["id"],
+            "status": status,
+            # The stack resolver's two lifecycle axes, verbatim: a draft never
+            # reaches a non-admin surface; a coming-soon package is browsable
+            # but never in a stack or a pull manifest.
+            "visible_to_analysts": status not in HIDDEN_STATUSES,
+            "deliverable": status not in UNDELIVERABLE_STATUSES,
+            "table_count": len(table_ids),
+            "granted_to": grants_by_pkg.get(p["id"], []),
+        }
+        if include_tables:
+            entry["tables"] = [
+                {"id": tid, "name": (tables_by_id.get(tid) or {}).get("name") or tid} for tid in table_ids
+            ]
+        pkgs_out.append(entry)
+
+    def _is_packaged(t: dict) -> bool:
+        if registry_knows_packaging:
+            return bool(t.get("packaged"))
+        return t["id"] in packaged_union
+
+    unpackaged_all = sorted(
+        (
+            {"id": t["id"], "name": t.get("name") or t["id"], "query_mode": t.get("query_mode") or "local"}
+            for t in tables_by_id.values()
+            if (t.get("query_mode") or "") in _DISTRIBUTABLE_QUERY_MODES and not _is_packaged(t)
+        ),
+        key=lambda t: t["name"],
+    )
+    unpackaged = unpackaged_all[:_ACCESS_PICTURE_LIST_CAP]
+    # A draft granted to nobody is the normal authoring state, not a gap: it
+    # is hidden from analysts whether or not it is granted.
+    ungranted = [
+        {"id": p["id"], "name": p["name"], "status": p["status"]}
+        for p in pkgs_out
+        if not p["granted_to"] and p["visible_to_analysts"]
+    ]
+
+    def _reachable(p: dict) -> bool:
+        return bool(p["visible_to_analysts"] and p["deliverable"])
+
+    def _in_stack(requirement: str | None, via: str) -> str:
+        # Auto-membership (the default): every granted package is in the
+        # stack the moment it is granted. Classic: only `required` lands
+        # automatically; `available` needs the member's own subscription.
+        if via == "admin" or auto_membership or requirement == "required":
+            return "always"
+        return "if_subscribed"
+
+    def _merge(entries: list[dict]) -> list[dict]:
+        """One entry per package, keeping the STRONGEST grant.
+
+        A package can reach a member twice -- a direct grant on their group
+        and an everyone-scoped one -- and ``StackResolver.stack`` puts it in
+        ``required_ids`` if EITHER is required. Deduplicating by id used to let
+        the weaker grant win when it happened to come first, so classic mode
+        reported ``if_subscribed`` for a package every member already has.
+        ``via`` lists every source, sorted, so nothing is attributed to one.
+        """
+        by_id: dict[str, dict] = {}
+        for e in entries:
+            cur = by_id.get(e["id"])
+            if cur is None:
+                cur = by_id[e["id"]] = {**e, "via": [e["via"]], "_member_req": None}
+            elif e["via"] not in cur["via"]:
+                cur["via"].append(e["via"])
+            if e["requirement"] == "required":
+                cur["requirement"] = "required"
+            if e["in_stack"] == "always":
+                cur["in_stack"] = "always"
+            if e["via"] in ("group", "admin") and (e["requirement"] == "required" or cur["_member_req"] is None):
+                # The strongest tier among the sources that reach EVERY member.
+                cur["_member_req"] = e["requirement"]
+        out = []
+        for e in by_id.values():
+            e["via"] = sorted(e["via"])
+            member_req = e.pop("_member_req")
+            # An everyone-scoped grant reaches PEOPLE only (the grant reader
+            # applies it to human users), while a group may hold service
+            # accounts too. Only a direct (or admin) grant covers every member.
+            e["applies_to"] = "all_members" if member_req is not None else "people_only"
+            if member_req is not None and member_req != e["requirement"]:
+                # A stronger everyone-scoped grant lifted the row's tier, but
+                # it reaches people only: a service account in the group holds
+                # just the member-wide tier, so say so beside the row rather
+                # than let the people-effective state stand for it.
+                e["service_accounts"] = {"requirement": member_req, "in_stack": _in_stack(member_req, "group")}
+            out.append(e)
+        return out
+
+    everyone_pkgs = _merge(
+        [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "requirement": g["requirement"],
+                "via": EVERYONE_TARGET_ID,
+                "in_stack": _in_stack(g["requirement"], EVERYONE_TARGET_ID),
+            }
+            for p in pkgs_out
+            if _reachable(p)
+            for g in p["granted_to"]
+            if g["audience"] == EVERYONE_TARGET_ID
+        ]
+    )
+    by_group: list[dict] = [
+        {
+            "group_id": EVERYONE_TARGET_ID,
+            "group_name": SYSTEM_EVERYONE_GROUP,
+            "member_count": account_total,
+            "bypasses_grants": False,
+            "packages": everyone_pkgs,
+        }
+    ]
+    for g in groups:
+        if g["is_everyone"]:
+            continue  # the carrier is the `everyone` baseline above, not a roster
+        is_admin = g["is_system"] and g["name"] == SYSTEM_ADMIN_GROUP
+        if is_admin:
+            reach = [
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "requirement": None,
+                    "via": ["admin"],
+                    "in_stack": "always",
+                    "applies_to": "all_members",
+                }
+                for p in pkgs_out
+            ]
+        else:
+            direct = [
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "requirement": gr["requirement"],
+                    "via": "group",
+                    "in_stack": _in_stack(gr["requirement"], "group"),
+                }
+                for p in pkgs_out
+                if _reachable(p)
+                for gr in p["granted_to"]
+                if gr["audience"] == "group" and gr["group_id"] == g["id"]
+            ]
+            # Everyone entries are already merged; flatten their `via` back to
+            # single sources so the merge below can union them with the direct
+            # grants per package.
+            everyone_flat = [{**e, "via": v} for e in everyone_pkgs for v in e["via"]]
+            reach = _merge(direct + everyone_flat)
+        by_group.append(
+            {
+                "group_id": g["id"],
+                "group_name": g["name"],
+                "member_count": g["member_count"],
+                "bypasses_grants": is_admin,
+                "packages": reach,
+            }
+        )
+
+    notes = [
+        f"Members of the '{SYSTEM_ADMIN_GROUP}' group bypass grants and reach every package and table.",
+        (
+            "member_count counts group rows (service accounts included); an everyone-scoped grant reaches "
+            "every person, so its member_count is account_total."
+        ),
+        (
+            "Everyone-scoped grants reach people only: a service account in a group reaches just the "
+            "group's direct grants -- by_group entries say so with applies_to=all_members | people_only, "
+            "and carry service_accounts={requirement, in_stack} when a stronger Everyone grant lifted the "
+            "row above what the group's own grant gives its service accounts."
+        ),
+        (
+            "tables_in_no_package lists distributable tables only (query_mode blank/local/materialized): "
+            "remote tables answer server-side without a package and internal rows have no parquet to pull."
+        ),
+        (
+            "Lifecycle: a draft package is hidden from analysts and a coming-soon package is browsable but "
+            "never delivered; by_group applies the same rule the stack resolver applies, and a draft granted "
+            "to nobody is not listed as a gap."
+        ),
+        (
+            "membership_mode=auto: every granted package is in a member's stack the moment it is granted, "
+            "required and available alike; subscribing only controls whether a local copy is kept."
+            if auto_membership
+            else "membership_mode=classic: only 'required' grants land in a member's stack automatically; an "
+            "'available' grant reaches a member only after they subscribe, so in_stack='if_subscribed' "
+            "entries are potential per-user access, not effective access."
+        ),
+        (
+            "captured_at: composed from three sequential reads, not one transaction -- a grant or package "
+            "edit racing the call can leave one read ahead of another; re-run if an edit just happened."
+        ),
+    ]
+    if packages_truncated:
+        notes.append(
+            f"packages_truncated=true: more than {_ACCESS_PICTURE_PACKAGE_LIMIT} packages exist and only the first "
+            f"{_ACCESS_PICTURE_PACKAGE_LIMIT} (by name) are carried, so packages and by_group are incomplete; "
+            "tables_in_no_package stays complete because the registry stamps packaging from a bulk read over "
+            "every package."
+            if registry_knows_packaging
+            else f"packages_truncated=true: more than {_ACCESS_PICTURE_PACKAGE_LIMIT} packages exist and only the "
+            f"first {_ACCESS_PICTURE_PACKAGE_LIMIT} (by name) are carried, so packages, by_group AND "
+            "tables_in_no_package are incomplete."
+        )
+    if not packaged_read_ok:
+        notes.append(
+            "packaged_read_ok=false: the registry could not read package membership, so tables_in_no_package "
+            "is derived from the package page instead"
+            + (" -- and is incomplete because that page was truncated." if packages_truncated else ".")
+        )
+    if section != "all":
+        notes.append(
+            f"section={section}: only that part of the picture is included; call with section='all' for the rest."
+        )
+
+    out: dict[str, Any] = {
+        "source": "server",
+        "section": section,
+        "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "membership_mode": "auto" if auto_membership else "classic",
+        "account_total": account_total,
+        "packages_truncated": packages_truncated,
+    }
+    if section in ("all", "packages", "by_group"):
+        out["groups"] = groups
+    if section in ("all", "packages"):
+        out["packages"] = pkgs_out
+    if section in ("all", "by_group"):
+        out["by_group"] = by_group
+    if section in ("all", "unreachable"):
+        out["unreachable"] = {
+            "tables_in_no_package": unpackaged,
+            "tables_in_no_package_total": len(unpackaged_all),
+            "tables_in_no_package_truncated": len(unpackaged_all) > len(unpackaged),
+            "packages_granted_to_no_group": ungranted,
+        }
+    out["notes"] = notes
+    return out
 
 
 FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
@@ -204,6 +567,14 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "delete_contributed_skill",
     "admin_config_surface",
     "admin_source_connections_list",
+    # The access picture behind the chat landing page's admin starters ("who
+    # has access to which data", "what is shared with no one", "what does a
+    # non-admin see"): packages -> granted groups -> member counts, plus what
+    # nobody can reach. Composes GET /api/admin/access-overview +
+    # GET /api/admin/data-packages + GET /api/admin/registry -- no new REST
+    # surface, so no new CLI verb is owed; the CLI leg is the existing
+    # `agnes admin group list` / `grant list` / `data-package list`.
+    "admin_access_picture",
     # Register a table from an upstream source (admin only). Triple-surface with
     # POST /api/admin/register-table + `agnes admin register-table`.
     "admin_register_table",
@@ -696,8 +1067,10 @@ def register_foundation_tools(
         failing the call. When the response carries ``truncated: true``, each hit
         whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
         ``…``) — never summarise a prefix as the whole passage. Read the document
-        in full with ``collection_file_read(collection_id=<corpus_id>,
-        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+        document's FIRST page; follow its ``next_offset`` with ``offset=``
+        until it is null, as its own docstring says — or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
         A large collection set (#2151) can ALSO set ``truncated: true`` for a
@@ -782,8 +1155,10 @@ def register_foundation_tools(
         failing the call. When the response carries ``truncated: true``, each hit
         whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
         ``…``) — never summarise a prefix as the whole passage. Read the document
-        in full with ``collection_file_read(collection_id=<corpus_id>,
-        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+        document's FIRST page; follow its ``next_offset`` with ``offset=``
+        until it is null, as its own docstring says — or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
         Args:
@@ -1101,7 +1476,7 @@ def register_foundation_tools(
             return r.json()
 
     @tool(read_only=True)
-    async def collection_file_read(collection_id: str, file_id: str) -> dict:
+    async def collection_file_read(collection_id: str, file_id: str, offset: int = 0) -> dict:
         """Read one file's text straight, without guessing search terms.
 
         Use this when you know WHICH file you want — "what is in this
@@ -1109,28 +1484,39 @@ def register_foundation_tools(
         when you do not: it needs words that appear in the body, and it
         cannot enumerate a collection (see its own note).
 
-        Returns ``kind`` plus, for readable files, ``text`` and
-        ``truncated``. The server caps the text (~20k characters), so
-        ``truncated: true`` means you are holding a PREFIX — do not
-        summarise it as the whole document; fall back to
-        ``collections_search`` with a distinctive term to reach the rest.
-        Read ``text`` regardless of ``kind``: ``kind`` describes how a
-        BROWSER would show the file (``text`` / ``pdf`` / ``image``), and a
-        PDF comes back ``kind="pdf"`` while still carrying its ingested
+        Returns ``kind`` plus, for readable files, ``text``, ``truncated``,
+        ``offset``, ``next_offset`` and ``total_chars``. One call returns
+        at most ~20k characters — a page, so a single read can never flood
+        the context window. ``truncated: true`` means you are holding a
+        PREFIX: do not summarise it as the whole document. To continue,
+        call again with ``offset=next_offset`` and keep going until
+        ``next_offset`` is null; ``total_chars`` says up front how many
+        pages that is, so decide whether the whole file is worth reading
+        before you page (a 200k-character file is ten calls). ``truncated:
+        true`` with ``next_offset: null`` means a very large plain-text
+        file continues past what the server reads of it — the rest is
+        reachable only through ``collections_search`` with a distinctive
+        term. Read ``text`` regardless of ``kind``: ``kind`` describes how
+        a BROWSER would show the file (``text`` / ``pdf`` / ``image``), and
+        a PDF comes back ``kind="pdf"`` while still carrying its ingested
         text. When ``text`` is empty, ``reason`` says why (still ingesting,
         rejected, or nothing extractable) — relay that rather than
         reporting an access error.
 
         Do not loop this over a whole collection: reading many files to
-        answer one question is what retrieval is for.
+        answer one question is what retrieval is for. Paging through the
+        ONE file you were asked about is what ``offset`` exists for.
 
         Args:
             collection_id: Collection id from ``collections_list`` (``col_...``).
             file_id: File id from ``collection_get`` (``cf_...``).
+            offset: Character offset to read from — ``0`` (the default) for
+                the start, the previous response's ``next_offset`` to continue.
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{base_url}/api/collections/{collection_id}/files/{file_id}/preview",
+                params={"offset": offset},
                 headers=headers_fn(),
                 timeout=30,
             )
@@ -2539,6 +2925,124 @@ def register_foundation_tools(
             _raise_for_status_with_detail(r)
             return {"connections": r.json()}
 
+    @tool(read_only=True)
+    async def admin_access_picture(
+        include_tables: bool = True,
+        section: Literal["all", "packages", "by_group", "unreachable"] = "all",
+    ) -> dict:
+        """Admin-only access picture: every data package, which groups are granted it and how many accounts each holds, what nobody can reach (distributable tables in no package, packages granted to no group), and what each group can see. Answers "who has access to which data", "what is shared with no one" and "what does a non-admin see" from the real grants -- call it instead of guessing from the catalog.
+
+        Composes three admin-wide reads -- ``GET /api/admin/access-overview``
+        (groups, grants, people total), ``GET /api/admin/data-packages
+        ?include_table_ids=true&limit=5000`` (one row more than the 4,999
+        the picture carries, so a full page proves more exist while an
+        inventory of exactly 4,999 is complete) and ``GET /api/admin/registry``
+        (every registered table, each stamped ``packaged``) -- with the fold
+        rules the ``/admin`` gap cards and the stack resolver use, so the
+        answer is theirs, not a second opinion. Requires an admin identity: a
+        non-admin caller gets those routes' own 403, never a partial picture.
+        The registry, not the catalog, is the table inventory on purpose: an
+        agent credential is stack-surface, and for that surface the catalog
+        narrows even an admin to their own stack -- the one set of tables
+        that is never orphaned.
+
+        Args:
+            include_tables: Include each package's table list (default). Pass
+                ``False`` on a large instance when the response trips the
+                output cap -- ``table_count`` and the unreachable tray stay.
+            section: ``all`` (default) or ONE of ``packages`` / ``by_group`` /
+                ``unreachable``. The real narrowing step on a large instance:
+                packages are repeated in ``packages`` and in every ``by_group``
+                entry, so asking for one section at a time bounds the response
+                where ``include_tables=False`` alone cannot. The completeness
+                metadata (``packages_truncated``, ``notes``) rides with every
+                section.
+
+        Returns ``{"source": "server", "section", "captured_at",
+        "membership_mode", "account_total", "packages_truncated", "notes"}``
+        plus the requested sections -- ``groups`` + ``packages``, ``groups`` +
+        ``by_group``, ``unreachable``, or all of them:
+
+        - ``membership_mode``: ``auto`` (the default -- every granted package
+          is in a member's stack at once) or ``classic`` (only ``required``
+          grants land automatically; ``available`` needs the member's own
+          subscription). Read ``by_group[].packages[].in_stack`` with it:
+          ``always`` or ``if_subscribed`` -- the latter is potential per-user
+          access, not effective access.
+        - ``groups``: ``[{id, name, is_system, is_everyone, member_count}]``.
+          ``member_count`` counts group rows (service accounts included); the
+          Everyone carrier's roster is every account by construction.
+        - ``packages``: ``[{id, slug, name, status, visible_to_analysts,
+          deliverable, table_count, tables?, granted_to: [{group_id,
+          group_name, requirement, audience, member_count}]}]``.
+          ``visible_to_analysts`` is false for a draft, ``deliverable`` is
+          false for a coming-soon package (the stack resolver's two lifecycle
+          axes). ``audience`` is ``"everyone"`` for an everyone-scoped grant
+          (``member_count`` is then the people total) and ``"group"``
+          otherwise. ``packages_truncated`` is true when more than 4,999
+          packages exist -- the package half is then the first 4,999 by name.
+        - ``by_group``: what a member of each group can reach -- an
+          ``everyone`` baseline entry first, then every group with its direct
+          grants merged with that baseline, one entry per package keeping the
+          strongest grant (``via`` lists every source: ``group`` /
+          ``everyone`` / ``admin``; ``requirement`` is ``required`` if any
+          source is; ``applies_to`` is ``people_only`` when the ONLY source
+          is an everyone-scoped grant, which reaches human users and not a
+          service account the group may also hold, else ``all_members``;
+          when a stronger everyone-scoped grant lifted the row's tier above
+          the group's own grant, ``service_accounts: {requirement,
+          in_stack}`` carries the member-wide state that a service account
+          in the group actually holds).
+          Drafts and coming-soon packages are excluded exactly as
+          ``StackResolver.stack`` excludes them; ``bypasses_grants`` is true
+          for the Admin group, which reaches everything regardless. This is
+          the "what would a non-admin see" answer: pick the group, read its
+          ``packages``.
+        - ``unreachable.tables_in_no_package``: registered tables no analyst
+          can ever pull -- distributable ``query_mode`` (blank / ``local`` /
+          ``materialized``) and in no package. ``remote`` tables answer
+          server-side without a package and ``internal`` rows have no
+          parquet, so neither is listed. Capped at 200 entries;
+          ``tables_in_no_package_total`` / ``_truncated`` say whether more
+          exist. Derived from the registry's own ``packaged`` stamp; when the
+          registry reports ``packaged_read_ok: false`` the fold falls back to
+          the package page and a note says so. Fix: add the table to a package.
+        - ``unreachable.packages_granted_to_no_group``: analyst-visible
+          packages no analyst can see (drafts are not gaps). Fix: grant the
+          package to a group on ``/admin/access``.
+        - ``captured_at``: three sequential reads, not one transaction -- an
+          edit racing the call can leave one read ahead of another.
+        """
+        limit = _ACCESS_PICTURE_PACKAGE_LIMIT
+        async with httpx.AsyncClient() as c:
+            ov = await c.get(f"{base_url}/api/admin/access-overview", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(ov)
+            pk = await c.get(
+                f"{base_url}/api/admin/data-packages",
+                headers=headers_fn(),
+                # One row more than the picture carries: see _ACCESS_PICTURE_PACKAGE_LIMIT.
+                params={"include_table_ids": "true", "limit": str(limit + 1)},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(pk)
+            rg = await c.get(f"{base_url}/api/admin/registry", headers=headers_fn(), timeout=60)
+            _raise_for_status_with_detail(rg)
+        rows = pk.json() or []
+        return ensure_output_size(
+            _compose_access_picture(
+                ov.json(),
+                rows[:limit],
+                rg.json(),
+                include_tables=include_tables,
+                auto_membership=_stack_auto_membership(),
+                packages_truncated=len(rows) > limit,
+                section=section,
+            ),
+            "admin_access_picture",
+            hint="call again with include_tables=False, or one section at a time: "
+            "section='unreachable' | 'packages' | 'by_group'",
+        )
+
     @tool(read_only=False)
     async def admin_register_table(
         name: str,
@@ -3619,6 +4123,9 @@ def register_foundation_tools(
         source: str = "",
         trail: str = "",
         q: str = "",
+        cursor_ts: str = "",
+        cursor_id: str = "",
+        since_ts: str = "",
     ) -> dict:
         """Tail the unified Activity Center timeline (admin only).
 
@@ -3641,12 +4148,57 @@ def register_foundation_tools(
                             "llm" | "agent_scope". Empty (default) returns the
                             unified timeline across all four.
             q:             Free-text search over the row's params JSON.
+            cursor_ts:      Pagination cursor, timestamp half — pass the prior
+                             page's ``next_cursor["ts"]`` verbatim. Both
+                             ``cursor_ts`` and ``cursor_id`` must be set
+                             together — setting only one raises ValueError
+                             naming the missing half, rather than silently
+                             restarting the read from page one.
+            cursor_id:      Pagination cursor, id half — pass the prior page's
+                             ``next_cursor["id"]`` verbatim.
+            since_ts:       Pagination floor — pass the prior page's
+                             ``next_cursor["since_ts"]`` verbatim alongside
+                             cursor_ts/cursor_id. Continuation-only: setting
+                             it without both cursor halves raises ValueError,
+                             and the server independently rejects it as more
+                             than since_minutes before cursor_ts, so it can
+                             never widen a single read's scan past what
+                             since_minutes already allows. ``since_minutes``
+                             computes a floor relative to "now", which drifts
+                             forward between calls; forwarding the pinned
+                             since_ts keeps a multi-page read over the same
+                             window the first call saw, so a row near the
+                             window's edge cannot silently fall out between
+                             pages. Omit only on the first (uncursored) call.
+
+        When a returned page's ``next_cursor`` is non-null, continue by
+        calling again with ``cursor_ts=next_cursor["ts"]``,
+        ``cursor_id=next_cursor["id"]``, and ``since_ts=next_cursor["since_ts"]``
+        — every other filter must stay identical across pages, since the
+        cursor only makes sense relative to the same query. Dropping
+        since_ts on a continuation call still works, but re-derives the
+        floor from since_minutes at call time instead of the one the first
+        call pinned — always forward it.
 
         Returns ``{"rows": [{"timestamp", "trail", "source", "action",
         "resource", "user_id", "user_email", "result", "params", ...}, ...],
-        "next_cursor"}``. Mirrors ``GET /api/admin/activity`` and
-        ``agnes admin activity``. Requires an admin PAT.
+        "next_cursor": {"ts", "id", "since_ts"} | null}``. Mirrors
+        ``GET /api/admin/activity`` and ``agnes admin activity``. Requires
+        an admin PAT.
         """
+        if bool(cursor_ts) != bool(cursor_id):
+            missing = "cursor_id" if cursor_ts else "cursor_ts"
+            raise ValueError(
+                f"activity: cursor_ts and cursor_id must be passed together — {missing} is "
+                "missing. Pass both halves from a prior page's next_cursor (or neither, for "
+                "a fresh read)."
+            )
+        if since_ts and not (cursor_ts and cursor_id):
+            raise ValueError(
+                "activity: since_ts is continuation-only — pass it together with a complete "
+                "cursor_ts and cursor_id from a prior page's next_cursor, never on a fresh "
+                "(uncursored) read."
+            )
         params: dict[str, Any] = {"since_minutes": since_minutes, "limit": limit}
         if action_prefix:
             params["action_prefix"] = action_prefix
@@ -3662,6 +4214,11 @@ def register_foundation_tools(
             params["trail"] = trail
         if q:
             params["q"] = q
+        if cursor_ts and cursor_id:
+            params["cursor_ts"] = cursor_ts
+            params["cursor_id"] = cursor_id
+        if since_ts:
+            params["since_ts"] = since_ts
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
             _raise_for_status_with_detail(r)

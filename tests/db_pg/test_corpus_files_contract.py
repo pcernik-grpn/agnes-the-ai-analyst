@@ -412,6 +412,35 @@ def test_move_to_corpus_returns_false_when_missing(repo):
     assert repo.move_to_corpus("cf_nonexistent", "col_dst") is False
 
 
+def test_move_to_corpus_expected_corpus_id_refuses_a_file_that_moved_on(repo):
+    """``expected_corpus_id`` makes the reparent a compare-and-set, so two
+    concurrent moves of one file cannot both believe they won.
+
+    Both requests validate the source before writing, so both can reach the
+    file-row write; without the guard the later write silently overwrites the
+    earlier one while the loser's content sits at ITS target, leaving the file
+    in one collection and its body in another. With it, the second write
+    reports False and the endpoint can put the content where the file
+    actually ended up.
+    """
+    a = repo.add(
+        corpus_id="col_src",
+        filename="raced.md",
+        sha256="s-race",
+        file_type="md",
+        size_bytes=10,
+        storage_path="blobs/s-race",
+    )
+    # The winner moves it out of the source.
+    assert repo.move_to_corpus(a, "col_winner", expected_corpus_id="col_src") is True
+    # The loser still believes the file is in the source: refused, not applied.
+    assert repo.move_to_corpus(a, "col_loser", expected_corpus_id="col_src") is False
+    assert repo.get(a)["corpus_id"] == "col_winner"
+    # Without the guard the same call is still the old last-writer-wins.
+    assert repo.move_to_corpus(a, "col_loser") is True
+    assert repo.get(a)["corpus_id"] == "col_loser"
+
+
 def test_update_in_place_preserves_id_and_refreshes_fields(repo):
     """Upsert-in-place (fact-graph-over-Collections §6 prerequisite): a
     matched re-upload refreshes content fields on the SAME row instead of

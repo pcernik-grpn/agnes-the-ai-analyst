@@ -253,8 +253,9 @@ def _with_results(payload: dict, tool_name: str, hits: list[Any], *, total: int,
         what.append(f"the response's own {', '.join(payload['truncated_fields'])} field(s) were shortened")
     note = (
         f"{tool_name}: {'; '.join(what)} to fit the {budget:,}-character tool output budget. "
-        "To read a shortened document chunk in full, call "
-        "collection_file_read(collection_id=<hit.corpus_id>, file_id=<hit.file_id>); "
+        "To read the document a shortened hit came from, call "
+        "collection_file_read(collection_id=<hit.corpus_id>, file_id=<hit.file_id>) "
+        "and follow its next_offset past the first page; "
         "otherwise narrow the query or lower `k`."
     )
     return {**payload, "results": hits, "truncated": True, "truncated_note": note}
@@ -399,6 +400,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "pull": "Sync Data To This Machine",
     "stack_artefacts_candidates": "List Artifact Candidates",
     "admin_config_surface": "Get Config Surface",
+    "admin_access_picture": "Get Access Picture",
     "admin_register_table": "Register Source Table",
     "store_compose_plugin": "Publish A Plugin Bundling Existing Items",
     "store_edit_markdown": "Update A Published Skill Or Agent From Markdown",

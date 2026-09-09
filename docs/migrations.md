@@ -311,6 +311,11 @@ repo module.
    "<table_name>"`. Read the generated file; verify `downgrade()` is the
    true inverse of `upgrade()`. Nothing lands in `src/db.py` —
    `SCHEMA_VERSION` does not move.
+   Then append the new revision id on its own line to
+   `migrations/shipped_revision_ids.txt` — the append-only manifest of every
+   id that ever shipped (issue #2086, see "A database stranded by a
+   renumbered revision" below); `tests/test_alembic_revision_ratchet.py`
+   fails until it is there.
 3. **Run round-trip + drift + pairwise tests**:
    ```bash
    pytest tests/db_pg/test_alembic_skeleton.py tests/db_pg/test_alembic_roundtrip.py
@@ -399,6 +404,38 @@ degrades, it does not break. Unit-test both branches by faking `alembic.op`
 (`op.get_bind()` returning a stub whose `.scalar()` reports a controlled row
 count) rather than actually seeding millions of rows — see
 `tests/db_pg/test_corpus_chunks_fts_index_migration.py`.
+
+## Adding a column that needs a backfill on an already-huge table
+
+Sibling of the index pattern above. A nullable column with no default is a
+metadata-only `ALTER TABLE` — instant, no rewrite, safe at any size — so the
+column itself always lands. A `GENERATED … STORED` column is NOT: adding one
+rewrites the whole table and every index on it under an `ACCESS EXCLUSIVE`
+lock, with no `CONCURRENTLY` form, so reach for a plain column the repository
+writes on insert instead. What is expensive is populating the rows that
+already exist, and that follows the index pattern: count first, backfill in
+place under a threshold, above it skip and log the operator follow-up.
+
+`migrations/versions/0114_corpus_chunks_tsv.py` (`corpus_chunks.tsv`, the
+stored tokenized body the retrieval ranking reads instead of re-tokenizing
+`text` per matched row) is the worked example. Three things make it safe:
+
+1. **New rows are covered from the moment the migration lands** —
+   `CorpusChunksPgRepository.add_many` writes the column on every insert.
+2. **Every reader falls back per row** — `COALESCE(tsv, to_tsvector('simple',
+   text))` in `search_candidates`, so a row the backfill has not reached
+   ranks exactly as it did before the column existed (slower, never wrong),
+   and a partially backfilled table is a normal state, not a broken one.
+   The `WHERE` clause and the `0101` GIN index stay on the *expression* for
+   the same reason — an index on the new column would not see NULL rows.
+3. **The backfill is batched, keyset-paginated by primary key, one short
+   transaction per batch, idempotent** (`scripts/backfill_corpus_chunks_tsv.py`,
+   run from inside the app container) — never a long lock, never a long
+   transaction pinning vacuum, safe to interrupt and re-run. Its in-place
+   threshold sits well under the index pattern's 1,000,000 because an
+   `UPDATE` that rewrites every row is heavier than an index build over
+   them: each row gets a new heap version and, being non-HOT, a new entry
+   in every index on the table.
 
 ## Adding a new table that needs a data backfill on an already-huge sibling
 

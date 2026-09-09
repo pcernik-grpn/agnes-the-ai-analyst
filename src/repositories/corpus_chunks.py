@@ -131,6 +131,41 @@ class CorpusChunksRepository:
         """Remove all chunks for the given file (idempotent)."""
         self.conn.execute("DELETE FROM corpus_chunks WHERE file_id = ?", [file_id])
 
+    def reassign_file_corpus(
+        self, file_id: str, target_corpus_id: str, *, expected_corpus_id: str | None = None
+    ) -> int:
+        """Repoint one file's chunks at the collection it now lives in; return
+        the count.
+
+        ``corpus_chunks.corpus_id`` is denormalized from ``corpus_files`` and
+        is the column body search scopes candidates on
+        (``search_candidates``), so a chunk left behind after a move keeps
+        answering under the collection the file just left. Called on the
+        single-file move path BEFORE the file row itself moves, so that a
+        failure there cannot strand the body in the collection the file is
+        leaving (``app/api/collections.py::move_file`` explains the ordering,
+        and compensates this write if the file-row move then fails). The
+        collection-consolidation path re-homes chunks the same way, in bulk.
+        Unknown file → 0.
+
+        ``expected_corpus_id`` turns the write into a compare-and-set: only
+        rows currently in that collection move. The move endpoint's
+        compensation path needs it — putting content back unconditionally
+        would drag back rows a CONCURRENT, successful move of the same file
+        has since claimed, recreating the leak in a request that did nothing
+        wrong.
+
+        Counted via ``RETURNING`` rather than ``rowcount``: DuckDB's DBAPI
+        ``rowcount`` is ``-1`` for DML.
+        """
+        sql = "UPDATE corpus_chunks SET corpus_id = ? WHERE file_id = ?"
+        params: list[Any] = [target_corpus_id, file_id]
+        if expected_corpus_id is not None:
+            sql += " AND corpus_id = ?"
+            params.append(expected_corpus_id)
+        moved = self.conn.execute(sql + " RETURNING id", params).fetchall()
+        return len(moved)
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
@@ -142,6 +177,19 @@ class CorpusChunksRepository:
             [file_id],
         ).fetchall()
         return [dict(zip(_COLS, r)) for r in rows]
+
+    def list_text_for_file(self, file_id: str) -> list[str]:
+        """Chunk texts for one file in ordinal order — nothing else.
+
+        The whole-file text a preview pages over needs only this column;
+        ``list_for_file`` also hauls every chunk's embedding out of the
+        database, which a preview never reads.
+        """
+        rows = self.conn.execute(
+            "SELECT text FROM corpus_chunks WHERE file_id = ? ORDER BY ordinal",
+            [file_id],
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def list_for_corpus(self, corpus_id: str) -> list[dict[str, Any]]:
         """All chunks for an entire corpus, ordered by file_id then ordinal."""
@@ -389,20 +437,30 @@ class CorpusChunksRepository:
         Column-pruned (``embedding`` always ``None``) like every candidate
         fetch here. Empty ``corpus_ids``/``terms`` → ``[]``.
 
+        Scoped on both sides of the join — the file row's current
+        ``corpus_id`` as well as the chunk's — mirroring the PG sibling
+        (see its docstring for the index path this enables there and for
+        the fail-closed reading: a file moved to a collection outside the
+        caller's scope no longer answers by name under the one it left,
+        even while stale chunk rows still carry the old ``corpus_id``).
+
         ``path_prefix`` narrows to files under one folder, exactly as on the
         body pass — a scoped search that let a name from OUTSIDE the scope
-        answer would not be scoped at all.
+        answer would not be scoped at all. It reads the FILE row's
+        ``corpus_id`` too, so it enforces the same fail-closed property
+        independently whenever a prefix is given.
         """
         if not corpus_ids or not terms:
             return []
         placeholders = ", ".join("?" for _ in corpus_ids)
         term_clause = " OR ".join("cf.filename ILIKE ?" for _ in terms)
         scope_sql, scope_params = self._path_prefix_clause(path_prefix, corpus_ids, alias="cc")
-        params: list[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + scope_params + [limit]
+        params: list[Any] = list(corpus_ids) + list(corpus_ids) + [f"%{t}%" for t in terms] + scope_params + [limit]
         rows = self.conn.execute(
             f"SELECT {_SELECT_CC_NO_EMBED} FROM corpus_chunks cc "
             f"JOIN corpus_files cf ON cf.id = cc.file_id "
-            f"WHERE cc.corpus_id IN ({placeholders}) AND ({term_clause}) {scope_sql} "
+            f"WHERE cc.corpus_id IN ({placeholders}) AND cf.corpus_id IN ({placeholders}) "
+            f"AND ({term_clause}) {scope_sql} "
             f"ORDER BY cc.file_id, cc.ordinal LIMIT ?",
             params,
         ).fetchall()

@@ -168,6 +168,20 @@ def test_optional_fields_round_trip(repo):
     assert r["metadata"] == '{"source": "test"}'
 
 
+def test_list_text_for_file_is_the_texts_in_ordinal_order(repo):
+    """The preview's whole-file read needs the text column and nothing
+    else — no embeddings, no row dicts — in ordinal order, on both
+    backends."""
+    chunks = [
+        {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "Second"},
+        {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "First"},
+        {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 2, "text": "Third"},
+    ]
+    repo.add_many(chunks)
+    assert repo.list_text_for_file(FILE_ID) == ["First", "Second", "Third"]
+    assert repo.list_text_for_file("cf_nobody") == []
+
+
 def test_list_for_corpus_returns_all_file_chunks(repo):
     repo.add_many(
         [
@@ -372,6 +386,54 @@ def test_search_by_filename_ignores_non_matching_names(repo):
     assert repo.search_by_filename([CORPUS_ID], ["quarterly", "report"], limit=10) == []
 
 
+def test_search_by_filename_requires_the_file_row_itself_to_be_in_scope(repo):
+    """A name hit needs the file's CURRENT collection in scope, not only the
+    chunk rows': ``move_to_corpus`` re-homes the file row while stale chunk
+    rows may still carry the old ``corpus_id``, and the moved file must stop
+    answering by name under the collection it left (fail-closed, both
+    backends — see ``search_by_filename``'s docstring)."""
+    files_repo = _files_repo_for(repo)
+    fid = files_repo.add(
+        corpus_id=CORPUS_ID,
+        filename="quarterly-report.md",
+        sha256="s",
+        file_type="md",
+        size_bytes=1,
+        storage_path="/x",
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": fid, "ordinal": 0, "text": "alpha"}])
+    assert repo.search_by_filename([CORPUS_ID], ["quarterly"], limit=10)
+
+    assert files_repo.move_to_corpus(fid, "col_elsewhere")
+
+    assert repo.search_by_filename([CORPUS_ID], ["quarterly"], limit=10) == []
+    assert repo.search_by_filename(["col_elsewhere"], ["quarterly"], limit=10) == []
+    # Back in scope once BOTH the file's collection and the chunks' are granted.
+    hits = repo.search_by_filename([CORPUS_ID, "col_elsewhere"], ["quarterly"], limit=10)
+    assert [h["file_id"] for h in hits] == [fid]
+
+
+def test_search_candidates_row_shape_is_the_column_pruned_set_on_both_backends(repo):
+    """The candidate row shape is pinned across backends: the PG side's
+    stored ``tsv`` column (migration ``0114_corpus_chunks_tsv``) is a
+    ranking input, never part of the returned dict."""
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "apple pie"}])
+    (row,) = repo.search_candidates([CORPUS_ID], "apple", limit=10)
+    assert set(row) == {
+        "id",
+        "corpus_id",
+        "file_id",
+        "ordinal",
+        "text",
+        "section_path",
+        "page",
+        "bbox",
+        "metadata",
+        "created_at",
+        "embedding",
+    }
+
+
 def test_search_by_filename_empty_terms_or_corpus_ids(repo):
     files_repo = _files_repo_for(repo)
     fid = files_repo.add(
@@ -543,6 +605,136 @@ def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_ra
 
 
 # ---------------------------------------------------------------------------
+# reassign_file_corpus — the single-file move path's chunk re-homing
+# ---------------------------------------------------------------------------
+
+
+def test_reassign_file_corpus_rehomes_only_that_files_chunks(repo):
+    """Moving a file between collections must carry its chunks along:
+    ``corpus_chunks.corpus_id`` is the column body search scopes on, so a
+    chunk left behind keeps answering under the collection the file just
+    left. Only the moved file's rows move; a sibling file's stay put."""
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "relocated body zebra"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "relocated body zebra two"},
+        ]
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": "cf_stays", "ordinal": 0, "text": "staying body zebra"}])
+
+    moved = repo.reassign_file_corpus(FILE_ID, "col_target")
+
+    assert moved == 2
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == ["col_target", "col_target"]
+    assert [r["file_id"] for r in repo.list_for_corpus(CORPUS_ID)] == ["cf_stays"]
+    # Body search follows the move: nothing of the file under the source,
+    # all of it under the target.
+    assert {r["file_id"] for r in repo.search_candidates([CORPUS_ID], "relocated", limit=10)} == set()
+    assert {r["file_id"] for r in repo.search_candidates(["col_target"], "relocated", limit=10)} == {FILE_ID}
+
+
+def test_reassign_file_corpus_unknown_file_is_zero(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "untouched"}])
+    assert repo.reassign_file_corpus("cf_nope", "col_target") == 0
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]
+
+
+def test_reassign_file_corpus_expected_corpus_id_only_moves_rows_still_there(repo):
+    """``expected_corpus_id`` makes the write a compare-and-set.
+
+    The move endpoint compensates a failed move by putting the content back,
+    and an unconditional put-back is a race: a concurrent move of the same
+    file that SUCCEEDED would have its content dragged back to the original
+    source, recreating the leak in a request that did nothing wrong. Passing
+    the collection the caller expects the rows to be in makes the
+    compensation touch only the rows still belonging to its own attempt.
+    """
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "contested body"}])
+    repo.reassign_file_corpus(FILE_ID, "col_other_winner")
+
+    # Someone else already moved the rows on: a put-back that expects them
+    # under our own target must be a no-op.
+    assert repo.reassign_file_corpus(FILE_ID, CORPUS_ID, expected_corpus_id="col_our_target") == 0
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == ["col_other_winner"]
+
+    # Matching the actual current collection moves them.
+    assert repo.reassign_file_corpus(FILE_ID, CORPUS_ID, expected_corpus_id="col_other_winner") == 1
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]
+
+
+# ---------------------------------------------------------------------------
+# Stored tsvector (migration 0114_corpus_chunks_tsv, PG-only — the DuckDB
+# sibling neither stores nor ranks, see its docstring)
+# ---------------------------------------------------------------------------
+
+
+def _null_out_tsv(pg_repo, where: str = "TRUE") -> None:
+    with pg_repo._engine.begin() as conn:
+        conn.execute(sa.text(f"UPDATE corpus_chunks SET tsv = NULL WHERE {where}"))
+
+
+def test_add_many_stores_the_tokenized_body_alongside_the_text(pg_repo):
+    """Every new row carries ``tsv`` = ``to_tsvector('simple', text)`` from
+    the insert itself — nothing written after the column landed ever needs
+    the backfill. A NULL text stays NULL on both columns."""
+    pg_repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "Contract renewal terms"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": None},
+        ]
+    )
+    with pg_repo._engine.connect() as conn:
+        rows = conn.execute(
+            sa.text(
+                "SELECT tsv::text AS stored, to_tsvector('simple', text)::text AS fresh "
+                "FROM corpus_chunks ORDER BY ordinal"
+            )
+        ).all()
+    assert rows[0].stored == rows[0].fresh
+    assert "'contract':1" in rows[0].stored
+    assert rows[1].stored is None and rows[1].fresh is None
+
+
+def test_search_candidates_ranking_is_identical_with_and_without_the_stored_tsvector(pg_repo):
+    """The stored column is a cache of the ranking input, never a different
+    input: the ranked result is identical whether every row, no row, or only
+    some rows carry ``tsv`` (the per-row ``COALESCE`` fallback — what a
+    table looks like part-way through ``scripts/backfill_corpus_chunks_tsv.py``,
+    and what every pre-migration row looks like until then)."""
+    texts = [
+        "contract",
+        "contract contract contract",
+        "a contract mentioned once",
+        "renewal of the contract and its terms",
+        "nothing relevant here",
+    ]
+    pg_repo.add_many(
+        [{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": t} for i, t in enumerate(texts)]
+    )
+
+    stored = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+    assert len(stored) == 4
+    assert stored[0]["text"] == "contract contract contract"
+    assert "tsv" not in stored[0]
+
+    _null_out_tsv(pg_repo, where="ordinal % 2 = 0")  # partially backfilled
+    partial = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+    _null_out_tsv(pg_repo)  # nothing backfilled
+    fallback = pg_repo.search_candidates([CORPUS_ID], "contract", limit=10)
+
+    assert stored == partial == fallback
+
+
+def test_search_candidates_still_matches_rows_without_a_stored_tsvector(pg_repo):
+    """The WHERE clause stays on the ``to_tsvector('simple', text)``
+    expression — a row the backfill has not reached is still a candidate
+    (``tsv @@ query`` would have silently dropped it)."""
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "shared keyword apple"}])
+    _null_out_tsv(pg_repo)
+    rows = pg_repo.search_candidates([CORPUS_ID], "apple", limit=10)
+    assert len(rows) == 1 and rows[0]["text"] == "shared keyword apple"
+
+
 # Multi-word candidate selection + path-prefix scoping (2026-09)
 #
 # The failure these cover, observed live: four of six document searches in
@@ -782,12 +974,7 @@ def test_search_candidates_path_prefix_cannot_cross_a_corpus_boundary(repo_and_f
     repo.add_many([{"corpus_id": CORPUS_ID, "file_id": "cf_granted", "ordinal": 0, "text": "statement of work"}])
 
     # A prefix naming a folder outside the granted corpus finds nothing...
-    assert (
-        repo.search_candidates(
-            [CORPUS_ID], "statement of work", limit=10, path_prefix="99_SomeOtherCorpus/"
-        )
-        == []
-    )
+    assert repo.search_candidates([CORPUS_ID], "statement of work", limit=10, path_prefix="99_SomeOtherCorpus/") == []
     # ...and an EMPTY corpus list stays fail-closed with a prefix set, the
     # same as without one.
     assert repo.search_candidates([], "statement of work", limit=10, path_prefix="00_Granted/") == []

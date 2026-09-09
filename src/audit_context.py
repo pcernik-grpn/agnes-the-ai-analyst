@@ -90,6 +90,32 @@ def auto_duration_ms() -> int | None:
     return int((time.monotonic() - t0) * 1000)
 
 
+def run_without_request_timing(fn, /, *args, **kwargs):
+    """Call ``fn`` in a COPY of the current context whose request-start mark
+    is cleared, so an audit write inside it stores ``duration_ms`` as NULL
+    instead of autofilling the running request's age.
+
+    Both audit repositories read ``duration_ms=None`` as "autofill from
+    :func:`auto_duration_ms`". That is right for a handler writing about
+    its own request and wrong for a write that merely *inherits* a request
+    context: an ``asyncio`` task copies the context it was created in, so a
+    chat pump spawned from inside an HTTP handler carries that request's
+    start mark for its whole life, and an unmeasured event it records hours
+    later would be stamped with an unrelated request's age. The copy keeps
+    the caller's own context untouched — the handler that continues after
+    the write still sees its start mark.
+    """
+    import contextvars
+
+    ctx = contextvars.copy_context()
+
+    def _cleared():
+        _request_started.set(None)
+        return fn(*args, **kwargs)
+
+    return ctx.run(_cleared)
+
+
 def set_request_meta(*, client_ip: str | None, correlation_id: str | None) -> None:
     """Stamp the current request's client IP + correlation id. Called once,
     per request, by ``AuditTimingMiddleware``."""

@@ -3462,7 +3462,27 @@ separate bounded path and is unaffected). The backing GIN index
 a table over 1,000,000 rows to avoid a long lock during startup; see that
 migration's docstring for the `CREATE INDEX CONCURRENTLY` statement an
 operator must then run out-of-band. Full-text search works without the
-index either way, just via a slower sequential scan.
+index either way, just via a slower sequential scan. Ranking reads a stored
+tokenized copy of each chunk (`corpus_chunks.tsv`, migration
+`0114_corpus_chunks_tsv`, written on every insert) rather than re-tokenizing
+the text per matched row; on a table over 200,000 rows that migration adds
+the column but leaves populating existing rows to
+`scripts/backfill_corpus_chunks_tsv.py` (batched, idempotent, run off-peak —
+see `docs/migrations.md`), and until then those rows rank through a per-row
+fallback — slower, identical results.
+
+`…/files/{file_id}/preview` returns one file's text a page at a time.
+Optional `offset` (characters, default `0`) and `limit` (default and maximum
+20 000; both clamped, never a `422`) select the page; the response echoes the
+`offset` it used and adds `next_offset` (`null` when the page reaches the end
+of the text) and `total_chars`, while `truncated` means "this response is not
+the end of the text". Chain `offset=next_offset` until it is `null` to read
+the whole file — that is what `agnes collections cat` and the
+`collection_file_read` MCP tool do. The per-call cap is the guarantee that one
+read cannot flood a context window; paging is how the rest is reached. A
+plain-text upload is read from disk up to 512 KiB: `total_chars` counts that
+window, and when the file continues past it the last page still says
+`truncated: true` with no `next_offset`.
 
 - /api/collections
 - /api/collections/search

@@ -89,6 +89,7 @@
   {% if connect_error %}
     <div class="connx-banner connx-banner--error">Connect failed: {{ connect_error }}.
       {% if retry_source %}<a href="/api/mcp/sources/{{ retry_source }}/oauth/authorize">Try again</a>{% endif %}
+      {% if connect_error_admin_fix_source %}<a href="/admin/mcp-sources/{{ connect_error_admin_fix_source }}">Register the OAuth client</a>{% endif %}
     </div>
   {% endif %}
   {% if not connect_sources %}

@@ -298,6 +298,10 @@ class TestCompactSearchResults:
         assert len(out["results"]) == 10  # shortened, not dropped
         assert "10 of 10 results carry shortened text" in out["truncated_note"]
         assert "collection_file_read" in out["truncated_note"]
+        # The read tool pages: the note must not promise the document from
+        # one call, or a hit past page one sends the model to the wrong text.
+        assert "next_offset" in out["truncated_note"]
+        assert "in full" not in out["truncated_note"]
         assert "knowledge_search" in out["truncated_note"]
         assert "dropped" not in out["truncated_note"]
 

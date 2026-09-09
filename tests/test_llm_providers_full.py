@@ -34,6 +34,33 @@ def _anthropic_response(text: str, stop_reason: str = "end_turn"):
     return resp
 
 
+def _anthropic_thinking_response(text: str, stop_reason: str = "end_turn"):
+    """A response whose FIRST block is a thinking block, second the answer.
+
+    What a thinking-capable model (Claude 5 family, adaptive thinking on by
+    default — no ``thinking`` request parameter needed) returns on the turns it
+    decides to think. Deliberately NOT a MagicMock: a thinking block carries
+    ``.thinking``/``.signature`` and no ``.text`` at all, and a MagicMock would
+    invent the very attribute this test is about.
+    """
+
+    class _Thinking:
+        type = "thinking"
+        thinking = "Let me consider the schema..."
+        signature = "sig"
+
+    class _Text:
+        type = "text"
+
+        def __init__(self, t: str) -> None:
+            self.text = t
+
+    resp = MagicMock()
+    resp.content = [_Thinking(), _Text(text)]
+    resp.stop_reason = stop_reason
+    return resp
+
+
 def _openai_response(content: str | None, finish_reason: str = "stop"):
     message = MagicMock()
     message.content = content
@@ -152,6 +179,43 @@ class TestAnthropicExtractor:
             ext.extract_json("prompt", 1000, _SCHEMA, "test_schema")
 
         assert mock_client.messages.create.call_count == MAX_RETRIES
+
+    @patch("connectors.llm.anthropic_provider.anthropic.Anthropic")
+    def test_thinking_block_before_answer_is_parsed(self, mock_cls):
+        """A leading thinking block does not hide the answer.
+
+        Reading ``content[0].text`` raised AttributeError on exactly the turns
+        a thinking-capable model chose to think — wrapped as "Failed to parse
+        ... as JSON (AttributeError)" and re-raised without retry, so every
+        structured-output caller (builders, guardrails, ontology, corporate
+        memory) failed intermittently and blamed the model for bad JSON.
+        """
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.return_value = _anthropic_thinking_response('{"value": "hello"}')
+
+        ext = AnthropicExtractor(api_key="sk-ant-test", model="claude-haiku-4-5-20251001")
+
+        assert ext.extract_json("prompt", 1000, _SCHEMA, "test_schema") == {"value": "hello"}
+
+    @patch("connectors.llm.anthropic_provider.anthropic.Anthropic")
+    def test_thinking_only_response_raises_format_error(self, mock_cls):
+        """Thinking with no text block is a format error, not an AttributeError."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        class _Thinking:
+            type = "thinking"
+            thinking = "..."
+
+        resp = MagicMock()
+        resp.content = [_Thinking()]
+        resp.stop_reason = "end_turn"
+        mock_client.messages.create.return_value = resp
+
+        ext = AnthropicExtractor(api_key="sk-ant-test", model="claude-haiku-4-5-20251001")
+        with pytest.raises(LLMFormatError, match="no text block"):
+            ext.extract_json("prompt", 1000, _SCHEMA, "test_schema")
 
     @patch("connectors.llm.anthropic_provider.anthropic.Anthropic")
     def test_truncated_response_raises_format_error(self, mock_cls):
