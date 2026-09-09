@@ -45,6 +45,14 @@ def _node_run(script: str) -> str:
     return out.stdout
 
 
+def _const_source(name: str) -> str:
+    """The shipped `const <name> = …;` line, verbatim."""
+    js = TOUR_JS.read_text(encoding="utf-8")
+    m = re.search(rf"^const {name} = .*?;$", js, re.MULTILINE)
+    assert m, f"{name} is no longer a module-level const"
+    return m.group(0)
+
+
 def _fn_source(name: str) -> str:
     """The shipped source of one top-level function — never a copy."""
     js = TOUR_JS.read_text(encoding="utf-8")
@@ -222,7 +230,12 @@ def _run_hop(active_extra: str, assertions: str) -> dict:
             _fn_source("_gotoStep"),
             _fn_source("_markPopoverPending"),
             _fn_source("_unmarkPopoverPending"),
-            "const NAV_STUCK_MS = 30000;",
+            # Lift both constants from the shipped source rather than
+            # restating them: NAV_STUCK_MS is now derived from
+            # RESUME_FRESH_MS, and a hardcoded copy here would keep passing
+            # after that link was cut.
+            _const_source("RESUME_FRESH_MS"),
+            _const_source("NAV_STUCK_MS"),
             assertions,
             # A pending 30s timer keeps node alive until it fires; exit as soon
             # as the assertions have printed.

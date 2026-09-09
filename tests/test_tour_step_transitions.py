@@ -314,20 +314,20 @@ def test_recovery_is_armed_for_every_hop_not_only_ones_with_a_card():
     assert "setTimeout(" not in _fn("_markPopoverPending")
 
 
-def test_the_stuck_threshold_cannot_fire_during_a_real_page_load():
-    """Too low and it re-enables the card mid-navigation, where a second press
-    restarts the request and delays the arrival it was waiting for. The load
-    this fires against measures ~1.8s throttled; the worst report is 5-10s."""
+def test_the_stuck_threshold_is_tied_to_the_resume_window():
+    """Two failure modes, one constant between them. Too low and it re-enables
+    the card mid-navigation, where a second press restarts a request that was
+    about to land — the load this fires against is exactly the 5-10s one the
+    change exists for. Too high and it holds the card dead past the point where
+    `resumePendingTour` will still accept the stashed record, so the hop cannot
+    deliver the next step however long it waits. Deriving it from
+    RESUME_FRESH_MS is what keeps the two from drifting apart."""
     js = _js()
-    m = re.search(r"const NAV_STUCK_MS = (\d+);", js)
-    assert m, "the recovery threshold must be a named constant"
-    assert int(m.group(1)) >= 20000, "too close to a legitimately slow load"
-
-
-def test_the_stuck_timer_is_cleared_when_the_tour_ends():
-    """Otherwise it fires against a torn-down `_active` (or the next run's)."""
-    assert "clearTimeout(_active.navStuckTimer)" in _fn("_endTour")
-    assert "navStuckTimer: null," in _js()
+    assert "const NAV_STUCK_MS = RESUME_FRESH_MS;" in js, (
+        "a literal here silently decouples recovery from the resume window"
+    )
+    # And that window has to be declared before it, or the constant is TDZ-dead.
+    assert js.index("const RESUME_FRESH_MS") < js.index("const NAV_STUCK_MS")
 
 
 def test_coming_back_from_the_bfcache_reuses_the_same_undo():

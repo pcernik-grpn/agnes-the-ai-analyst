@@ -1121,18 +1121,24 @@ function _gotoStep(nextIndex) {
 }
 
 // How long a committed cross-page hop may leave the card pending before we
-// conclude the navigation is not happening.
+// conclude it is not landing.
 //
-// There is no browser signal for "the navigation was cancelled" — `pagehide`
-// only fires once the document is actually being replaced, which is the case
-// we do NOT need to recover from — so a timer is the only mechanism available.
-// That makes the threshold the whole design: too low and it re-enables the
-// card DURING a legitimately slow load, where a second press would restart
-// the request and delay the arrival it was waiting for. The destination this
-// fires against loads in ~1.8s under 4x CPU + 900kbps throttling and the
-// worst report we have is 5-10s, so 30s is far outside the range of a real
-// load while still turning a permanently dead card into a recoverable one.
-const NAV_STUCK_MS = 30000;
+// Tied to RESUME_FRESH_MS rather than picked, because that constant already
+// decides the question: `resumePendingTour` refuses a stashed record older
+// than it, so once the window has passed the hop CANNOT produce a resumed tour
+// however long it keeps loading. Holding the card hostage past that point buys
+// nothing, and it is what makes recovery safe — by the time this fires the
+// navigation can no longer deliver the next step, so re-enabling the actions
+// is not competing with a live hop, it is letting the reader retry one that is
+// already lost. (A fixed 8s was wrong in the other direction: the symptom this
+// whole change addresses was a reader waiting 5-10s, so it could fire mid-load
+// while the hop was still perfectly capable of landing.)
+//
+// There is no browser signal to lean on instead: `pagehide` fires only once
+// the document is actually being replaced, which is the case needing no
+// recovery at all. A timer is the only mechanism, so the threshold is the
+// whole design.
+const NAV_STUCK_MS = RESUME_FRESH_MS;
 
 // Put the card into its "working on it" state: actions dead, progress bar
 // running. Used for the one transition the engine cannot make instant — a
