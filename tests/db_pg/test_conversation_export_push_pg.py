@@ -114,6 +114,17 @@ def _watermark_name_for(config: dict | None = None) -> str:
     return watermark_name(cfg["endpoint"], surfaces)
 
 
+def _feedback_watermark_name_for(config: dict | None = None) -> str:
+    """The aux "late feedback" sweep's `export_watermarks.name` row for a
+    given delivery config -- the second-watermark sibling of
+    `_watermark_name_for`."""
+    from app.worker.kinds_conversation_export import feedback_watermark_name
+
+    cfg = config or _default_config()
+    surfaces = tuple(cfg["surfaces"]) if cfg["surfaces"] else ()
+    return feedback_watermark_name(cfg["endpoint"], surfaces)
+
+
 def _latest_export_audit_params(pg_engine) -> dict:
     return _latest_export_audit_row(pg_engine)[1]
 
@@ -144,7 +155,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
 
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
         watermark = export_watermarks_repo().get(_watermark_name_for())
         assert watermark is not None
@@ -165,7 +176,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
         assert len(attempts) == MAX_ATTEMPTS
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1, "refreshed": 0}
         assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     def test_second_run_after_success_sends_zero_records(self, pg_client, pg_engine):
@@ -181,10 +192,10 @@ class TestWatermarkAdvancesOnlyOn2xx:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
 
     def test_forked_session_with_diverged_last_message_at_is_not_resent(self, pg_client, pg_engine):
@@ -215,7 +226,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
         assert len(requests) == 1
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
 
     def test_a_failure_on_batch_2_advances_the_key_only_through_batch_1(self, pg_client, pg_engine, monkeypatch):
@@ -241,7 +252,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
 
         result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 1, "batches": 1, "batches_failed": 1}
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 1, "refreshed": 0}
         watermark = export_watermarks_repo().get(_watermark_name_for())
         assert watermark is not None
         _watermark_ts, cursor_id = watermark
@@ -285,13 +296,13 @@ class TestSurfacesFilterPushedIntoQuery:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
         (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
         assert delivered["thread_id"] == web_id
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1  # the slack session never triggers a delivery
 
 
@@ -313,7 +324,7 @@ class TestRetrySemantics:
         assert MAX_ATTEMPTS == 4
         assert len(attempts) == 4
         assert sleeps == [1.0, 2.0, 4.0]
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1, "refreshed": 0}
         assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     @pytest.mark.parametrize("status", [400, 404, 429])
@@ -332,7 +343,7 @@ class TestRetrySemantics:
 
         assert len(attempts) == 1
         assert sleeps == []
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1, "refreshed": 0}
 
 
 class TestFailureHandling:
@@ -583,7 +594,7 @@ class TestWatermarkTracksDeliveryConfig:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
 
         new_endpoint = "https://new-collector.example.com/ingest"
@@ -591,7 +602,7 @@ class TestWatermarkTracksDeliveryConfig:
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert second == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 2
         assert str(requests[1].url) == new_endpoint
 
@@ -624,7 +635,7 @@ class TestWatermarkTracksDeliveryConfig:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
         assert delivered["thread_id"] == web_id
 
@@ -637,7 +648,7 @@ class TestWatermarkTracksDeliveryConfig:
         # everything that now matches the filter (both sessions), not only
         # the newly-included one. That IS the fix: the slack conversation,
         # previously unreachable under any cursor, is finally delivered.
-        assert second == {"sent": 2, "batches": 1, "batches_failed": 0}
+        assert second == {"sent": 2, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 2
         delivered2 = {json.loads(line)["thread_id"] for line in requests[1].content.decode("utf-8").splitlines()}
         assert delivered2 == {web_id, slack_session.id}
@@ -662,7 +673,7 @@ class TestSettleWindow:
 
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 0
         assert export_watermarks_repo().get(_watermark_name_for()) is None
 
@@ -679,7 +690,7 @@ class TestSettleWindow:
 
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
 
     def test_a_message_inside_the_window_is_exported_once_the_window_passes(self, pg_client, pg_engine, monkeypatch):
@@ -706,13 +717,13 @@ class TestSettleWindow:
         monkeypatch.setattr(mod, "datetime", _FrozenDatetime)
 
         first = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert first == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 0
 
         _FrozenDatetime._fixed = base_now + timedelta(minutes=6)
         second = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert second == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
         assert len(requests) == 1
 
 
@@ -754,3 +765,131 @@ class TestEndpointHostAllowlist:
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda _s: None)
         assert "skipped" not in result, result
         assert len(calls) == 1
+
+
+class TestLateFeedbackAuxSweep:
+    """Review finding (Devin, bug): "late feedback never reaches exports".
+    The main keyset walk advances past a `chat_sessions` row once, on
+    `last_message_at` -- a thumbs-up/down (or a comment edit) filed AFTER a
+    conversation was already delivered never moves it, so the delivered
+    record's `feedback_json` stayed empty for good. A second, coarser
+    watermark now sweeps `chat_message_feedback` by its own change
+    timestamp (`session_ids_updated_between`) and re-delivers just those
+    records through the same builder/batching/retry path."""
+
+    def test_late_feedback_is_redelivered_with_the_feedback_in_the_payload(self, pg_client, pg_engine):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import chat_message_feedback_repo
+
+        session_id = _seed_session(pg_engine, index=0)
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
+        assert len(requests) == 1
+
+        chat_message_feedback_repo().upsert(
+            session_id=session_id, turn_id="t0", user_id="analyst-1", verdict="up", comment="great answer"
+        )
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 1}
+        assert len(requests) == 2
+        (delivered,) = [json.loads(line) for line in requests[1].content.decode("utf-8").splitlines()]
+        assert delivered["thread_id"] == session_id
+        (feedback_entry,) = delivered["feedback_json"]
+        assert feedback_entry["verdict"] == "up"
+        assert feedback_entry["comment"] == "great answer"
+
+    def test_with_no_new_feedback_the_next_run_sends_zero_records(self, pg_client, pg_engine):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        _seed_session(pg_engine, index=0)
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
+        assert len(requests) == 1
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "refreshed": 0}
+        assert len(requests) == 1
+
+    def test_a_5xx_on_the_aux_batch_leaves_the_feedback_watermark_in_place(self, pg_client, pg_engine):
+        import app.worker.kinds_conversation_export as mod
+        from src.repositories import chat_message_feedback_repo, export_watermarks_repo
+
+        session_id = _seed_session(pg_engine, index=0)
+        feedback_name = _feedback_watermark_name_for()
+
+        def ok_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        first = mod.run_conversation_export_once(client=_mock_client(ok_handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
+        baseline = export_watermarks_repo().get(feedback_name)
+        assert baseline is not None  # the first run's empty aux sweep still advances the baseline
+
+        chat_message_feedback_repo().upsert(session_id=session_id, turn_id="t0", user_id="analyst-1", verdict="up")
+
+        attempts: list[httpx.Request] = []
+
+        def failing_handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(request)
+            return httpx.Response(500)
+
+        second = mod.run_conversation_export_once(client=_mock_client(failing_handler), sleep=lambda *_: None)
+
+        assert second["refreshed"] == 0
+        assert len(attempts) == mod.MAX_ATTEMPTS  # the aux batch retries exactly like a main one
+        assert export_watermarks_repo().get(feedback_name) == baseline
+
+        retry_requests: list[httpx.Request] = []
+
+        def retry_handler(request: httpx.Request) -> httpx.Response:
+            retry_requests.append(request)
+            return httpx.Response(200)
+
+        third = mod.run_conversation_export_once(client=_mock_client(retry_handler), sleep=lambda *_: None)
+
+        assert third["refreshed"] == 1
+        assert len(retry_requests) == 1
+        (delivered,) = [json.loads(line) for line in retry_requests[0].content.decode("utf-8").splitlines()]
+        assert delivered["thread_id"] == session_id
+
+    def test_a_conversation_delivered_by_the_main_walk_this_run_is_not_swept_twice(self, pg_client, pg_engine):
+        """A session whose feedback already exists when it is FIRST
+        delivered (main walk and aux sweep both cover it in the same run)
+        must be sent once, not twice -- the main walk's record already
+        carries the feedback via the same `feedback.list_for_sessions` bulk
+        read every record build uses, with no time filter of its own."""
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import chat_message_feedback_repo
+
+        session_id = _seed_session(pg_engine, index=0)
+        chat_message_feedback_repo().upsert(session_id=session_id, turn_id="t0", user_id="analyst-1", verdict="up")
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 0, "refreshed": 0}
+        assert len(requests) == 1
+        (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
+        assert delivered["thread_id"] == session_id
+        (feedback_entry,) = delivered["feedback_json"]
+        assert feedback_entry["verdict"] == "up"
