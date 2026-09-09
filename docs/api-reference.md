@@ -3479,10 +3479,22 @@ does not exist or has no readable claim. `search` also accepts an OPTIONAL
 `q` — a free-text name lookup matched against `fact_aliases.natural_key`
 ONLY (never a claim's quote or attrs, so it cannot reopen the §5 attribute
 oracle): the query is normalized (casefolded, spaces -> hyphens) and matched
-as a substring, filtering candidates before `limit` applies, then ranked —
-an exact match on the alias's slug first, a prefix match second, any other
-substring match last (no `pg_trgm`/extension similarity ranking; this
-schema does not enable one). All three request models are `extra="forbid"`
+as a substring — except that a normalized `q` under four characters must
+start a name token of the alias slug (`llr` matches `llr-corp` and
+`acme-llr`, not `fullrange`), because a 2–3 character fragment is a
+substring of a large share of any real alias set — filtering candidates
+before `limit` applies, then ranked — an exact match on the alias's slug
+first, a prefix match second, any other match last (no `pg_trgm`/extension
+similarity ranking; this schema does not enable one). The candidate set a
+`q` search ranks is bounded (500 readable name matches per call, selected
+in rank order so the page is always the best-ranked visible matches); when
+more readable names match than that, the response carries the additive
+`candidates_capped: true` — narrow `q` rather than reading the page as
+complete. `limit_applied` keeps its own meaning (the caller's OWN visible
+set exceeds `limit`). A search that outlives the server's statement
+timeout answers `504 {"reason": "facts_search_timeout", "hint": ...}` with
+the next step (narrow `q`, add `type`, lower `limit`), never the raw
+database error. All three request models are `extra="forbid"`
 — an unrecognized field `422`s rather than being silently ignored. Triple-
 surface: `agnes facts search|neighbors|claims` (CLI; `search` takes an
 optional second positional `[query]` for `q`) and `fact_search`/

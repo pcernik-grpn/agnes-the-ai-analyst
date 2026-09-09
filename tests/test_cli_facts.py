@@ -230,6 +230,39 @@ def test_search_without_query_omits_q_from_payload():
     assert "q" not in captured["json"]
 
 
+def test_search_notes_when_the_name_match_was_capped():
+    """`candidates_capped: true` (the server ranked only the best N name
+    matches, not every one) must be disclosed with the next step — narrow
+    the QUERY — never rendered as if the table were the complete answer."""
+    subjects = [
+        {
+            "id": "f_1",
+            "type": "organization",
+            "aliases": ["organization:widget"],
+            "attrs": {},
+            "claim_count": 1,
+            "quote_count": 1,
+            "revealed": False,
+        }
+    ]
+    data = {"subjects": subjects, "limit_applied": False, "candidates_capped": True}
+    with patch("cli.commands.facts.api_post", return_value=_resp(200, data)):
+        result = runner.invoke(app, ["facts", "search", "organization", "widget"])
+    assert result.exit_code == 0, result.output
+    assert "narrow" in result.output.lower(), result.output
+
+
+def test_search_timeout_renders_the_servers_hint():
+    """The typed `504 facts_search_timeout` body carries the server's own
+    hint; the CLI must show that hint, not a bare status line."""
+    body = {"detail": {"reason": "facts_search_timeout", "hint": "Narrow `q` to a longer, more specific name."}}
+    with patch("cli.commands.facts.api_post", return_value=_resp(504, body)):
+        result = runner.invoke(app, ["facts", "search", "organization", "llr"])
+    assert result.exit_code == 1
+    assert "facts_search_timeout" in result.output
+    assert "Narrow `q`" in result.output
+
+
 # ---------------------------------------------------------------------------
 # neighbors
 # ---------------------------------------------------------------------------

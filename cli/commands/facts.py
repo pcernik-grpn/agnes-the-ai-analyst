@@ -78,7 +78,12 @@ def _format_attrs(attrs: Optional[dict]) -> str:
 def search_facts(
     fact_type: str = typer.Argument(..., metavar="TYPE", help="Subject type to search (e.g. 'person', 'engagement')"),
     q: Optional[str] = typer.Argument(
-        None, metavar="[QUERY]", help="Optional free-text name lookup (e.g. a person or organization name)"
+        None,
+        metavar="[QUERY]",
+        help=(
+            "Optional free-text name lookup (e.g. a person or organization name). Under four characters it "
+            "must start a name token ('llr' finds 'llr-corp' and 'acme-llr', not 'fullrange')."
+        ),
     ),
     filter: List[str] = typer.Option([], "--filter", help="Attribute filter key=value (repeatable)"),
     limit: int = typer.Option(20, "--limit", min=1, max=100, help="Max results (server caps at 100)"),
@@ -87,7 +92,10 @@ def search_facts(
     """Search typed subjects (facts) by type, an optional name, and attribute filters.
 
     QUERY matches subject ALIASES only (never claim text) — an exact or
-    prefix match on the name ranks first. Attributes are projected from YOUR
+    prefix match on the name ranks first. The server ranks a bounded set of
+    name matches per call; when more names match than that, the table is
+    the best-ranked matches and a note asks you to narrow QUERY. Attributes
+    are projected from YOUR
     readable evidence only, per key, latest-`document_date`-wins — a genuine
     tie between two documents shows as `⚠ conflicted (n values)` rather than
     silently picking one. Use `agnes facts claims <id>` on a result to see
@@ -127,6 +135,12 @@ def search_facts(
         typer.echo(
             f"{s['id']:20s}  {s['type']:14s}  {s.get('claim_count', 0):<6d}  "
             f"{s.get('quote_count', 0):<6d}  {_format_attrs(s.get('attrs'))}{marker}"
+        )
+    if data.get("candidates_capped"):
+        typer.echo(
+            "(more names match QUERY than the server ranks per call — this is the best-ranked subset, "
+            "not every match; narrow QUERY to a longer or more specific name, or add --filter)",
+            err=True,
         )
     if data.get("limit_applied"):
         typer.echo(

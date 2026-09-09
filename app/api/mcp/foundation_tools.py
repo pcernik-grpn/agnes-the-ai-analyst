@@ -1169,7 +1169,12 @@ def register_foundation_tools(
                 conflicted key never matches.
             q: Optional free-text name lookup (e.g. a person or org name),
                 matched against alias names only, never claim text. An
-                exact or prefix match ranks first.
+                exact or prefix match ranks first. Prefer a full name or
+                a distinctive word: a `q` shorter than four characters
+                must start a name token (`llr` finds `llr-corp` and
+                `acme-llr`, not `fullrange`), and a short or common
+                fragment matches so many names that the result is capped
+                (see `candidates_capped`) or the search times out.
             limit: Max results (server caps at 100).
             include_claims: 0 (default) or 1-3 — attach that many of each
                 subject's NEWEST readable quotes inline as `claims`, so you
@@ -1179,25 +1184,39 @@ def register_foundation_tools(
 
         Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
         "claim_count", "quote_count", "revealed", "claims"?}],
-        "limit_applied", "claims_truncated"?}`` — `limit_applied` is true
-        only when YOUR OWN readable results exceed `limit`, never a signal
-        that grants hid additional matches; `claims_truncated` (only with
-        `include_claims`) means the inline budget ran out part-way.
+        "limit_applied", "candidates_capped"?, "claims_truncated"?}`` —
+        `limit_applied` is true only when YOUR OWN readable results exceed
+        `limit`, never a signal that grants hid additional matches;
+        `candidates_capped: true` (present only when true) means more
+        readable names matched `q` than the server ranks per call — the
+        page holds the best-ranked matches, not all of them, so narrow `q`
+        (a longer or more specific name) or add `type`/`filters` before
+        concluding something is absent; `claims_truncated` (only with
+        `include_claims`) means the inline budget ran out part-way. A search
+        that outlives the server's statement timeout errors with the same
+        next step (narrow `q`, add `type`, lower `limit`) instead of a raw
+        database message.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
+        from src.repositories.facts_pg import FactsQueryTimeout
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(
-            facts_repo().search,
-            caller,
-            type=type,
-            filters=filters or {},
-            q=q,
-            limit=limit,
-            include_claims=include_claims,
-        )
+        try:
+            return await asyncio.to_thread(
+                facts_repo().search,
+                caller,
+                type=type,
+                filters=filters or {},
+                q=q,
+                limit=limit,
+                include_claims=include_claims,
+            )
+        except FactsQueryTimeout as exc:
+            # The repository's message IS the hint (command-ux.md) — surface
+            # it as the tool error instead of the driver's QueryCanceled text.
+            raise ValueError(str(exc)) from None
 
     @tool(read_only=True)
     async def fact_type_map() -> dict:
