@@ -259,3 +259,101 @@ class LlmCallsPgRepository:
     def count(self) -> int:
         with self._engine.connect() as conn:
             return int(conn.execute(sa.text("SELECT COUNT(*) FROM llm_calls")).scalar() or 0)
+
+    # ------------------------------------------------ conversation export
+
+    def totals_for_sessions(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Per-session ledger totals for the conversation-corpus export
+        (design 2026-09-08 §3.12) -- one round trip for a whole page of
+        sessions. A session absent from the returned dict has NO ``llm_calls``
+        row at all; that absence is what tells the export builder to fall back
+        to ``chat_messages`` token columns (``cost_status='transcript'``)
+        rather than report a silent zero.
+
+        ``primary_model``/``provider`` are the (model, provider) pair with the
+        most calls for the session -- a second grouped query rather than
+        folding a mode into the first, because Postgres has no built-in mode()
+        aggregate and a window-function tiebreak reads far clearer as its own
+        statement.
+        """
+        if not session_ids:
+            return {}
+        ids = list(session_ids)
+        totals_sql = """
+            SELECT session_id,
+                   COUNT(*) AS llm_run_count,
+                   COALESCE(SUM(input_tokens), 0) AS total_prompt_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS total_completion_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) AS llm_cache_read_tokens,
+                   COALESCE(SUM(cache_creation_tokens), 0) AS llm_cache_creation_tokens,
+                   COALESCE(SUM(cost_usd), 0) AS total_cost
+            FROM llm_calls
+            WHERE session_id = ANY(:session_ids)
+            GROUP BY session_id
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(totals_sql), {"session_ids": ids}).mappings().all()
+
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            out[r["session_id"]] = {
+                "llm_run_count": int(r["llm_run_count"]),
+                "total_prompt_tokens": int(r["total_prompt_tokens"]),
+                "total_completion_tokens": int(r["total_completion_tokens"]),
+                "llm_cache_read_tokens": int(r["llm_cache_read_tokens"]),
+                "llm_cache_creation_tokens": int(r["llm_cache_creation_tokens"]),
+                "total_cost": float(r["total_cost"]),
+                "primary_model": None,
+                "provider": None,
+            }
+        if not out:
+            return out
+
+        primary_sql = """
+            SELECT session_id, model, provider FROM (
+                SELECT session_id,
+                       COALESCE(model_response, model_requested) AS model,
+                       provider,
+                       COUNT(*) AS n,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id ORDER BY COUNT(*) DESC
+                       ) AS rn
+                FROM llm_calls
+                WHERE session_id = ANY(:session_ids)
+                GROUP BY session_id, COALESCE(model_response, model_requested), provider
+            ) ranked WHERE rn = 1
+        """
+        with self._engine.connect() as conn:
+            primary_rows = conn.execute(sa.text(primary_sql), {"session_ids": ids}).mappings().all()
+        for r in primary_rows:
+            if r["session_id"] in out:
+                out[r["session_id"]]["primary_model"] = r["model"]
+                out[r["session_id"]]["provider"] = r["provider"]
+        return out
+
+    def statuses_for_sessions(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Per-session run status for the conversation-corpus export: the
+        most recent call's ``status`` and the distinct ``error_type``s seen,
+        for sessions that have at least one ``llm_calls`` row.
+        """
+        if not session_ids:
+            return {}
+        sql = """
+            SELECT session_id,
+                   (array_agg(status ORDER BY created_at DESC))[1] AS last_run_status,
+                   bool_or(status = 'error') AS has_error,
+                   array_remove(array_agg(DISTINCT error_type), NULL) AS error_types
+            FROM llm_calls
+            WHERE session_id = ANY(:session_ids)
+            GROUP BY session_id
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), {"session_ids": list(session_ids)}).mappings().all()
+        return {
+            r["session_id"]: {
+                "last_run_status": r["last_run_status"],
+                "has_error": bool(r["has_error"]),
+                "error_types": sorted(r["error_types"] or []),
+            }
+            for r in rows
+        }

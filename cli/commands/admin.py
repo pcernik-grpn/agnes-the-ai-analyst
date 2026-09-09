@@ -11,6 +11,7 @@ from cli.commands.admin_ask import app as admin_ask_app
 from cli.commands.admin_autodoc import autodoc_tables
 from cli.commands.admin_config import admin_config_app
 from cli.commands.admin_connection import admin_connection_app
+from cli.commands.admin_conversations import app as admin_conversations_app
 from cli.commands.admin_data_package import admin_data_package_app
 from cli.commands.admin_digest import admin_digest_app
 from cli.commands.admin_doctor import doctor_app as admin_doctor_app
@@ -101,6 +102,11 @@ admin_app.add_typer(admin_skills_app, name="skill", help="Contributed skills man
 admin_app.add_typer(admin_jobs_app, name="jobs", help="Job queue admin (wave-2B worker runtime)")
 admin_app.add_typer(admin_analytics_app, name="analytics", help="DuckLake analytics-backend migration (wave-2G)")
 admin_app.add_typer(admin_facts_app, name="facts", help="Fact-graph maintenance (TCRD-296 synthesis E.21)")
+admin_app.add_typer(
+    admin_conversations_app,
+    name="conversations",
+    help="Conversation corpus export for evaluation (design 2026-09-08 §3.12)",
+)
 # Single direct command (mirrors `register-table` / `discover-and-register`):
 # LLM-generate descriptions for undescribed tables (#399).
 admin_app.command("autodoc-tables")(autodoc_tables)

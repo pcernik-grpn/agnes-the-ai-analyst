@@ -136,6 +136,15 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "memory_detection_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/memory_detection_runs_pg.py"
     ),
+    # Conversation corpus export (design 2026-09-08 §3.12) -- genuinely
+    # parameter-free (every query param has a default; a bare call is
+    # missing `since` too, but the PG-only repo dependency resolves BEFORE
+    # that check runs) -- DuckDB -> typed 501, Postgres -> 400
+    # `since_required` (nothing seeded, and `since` is required regardless).
+    "GET /api/admin/conversations/export": (
+        "llm_calls_repo() / chat_message_feedback_repo() are PG-only (A3 ratchet) "
+        "-- DuckDB has no implementation to resolve; see src/repositories/llm_calls_pg.py"
+    ),
 }
 
 

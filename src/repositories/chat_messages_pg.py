@@ -318,3 +318,51 @@ class ChatMessagePgRepository:
                 .all()
             )
         return [dict(r) for r in rows]
+
+    def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[ChatMessage]]:
+        """Every message for ``session_ids``, grouped by session and ordered
+        oldest-first within each -- the conversation-corpus export's bulk
+        read (design 2026-09-08 §3.12): one query for a whole page of
+        sessions rather than one ``list_messages`` call per session.
+
+        A session with no messages is not a key in the returned dict --
+        callers that need every requested id present regardless use
+        ``dict.get(session_id, [])``.
+        """
+        if not session_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
+                        "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                        "model, sender_email, turn_id, created_at FROM chat_messages "
+                        "WHERE session_id = ANY(:session_ids) ORDER BY session_id ASC, created_at ASC"
+                    ),
+                    {"session_ids": list(session_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: dict[str, list[ChatMessage]] = {}
+        for r in rows:
+            out.setdefault(r["session_id"], []).append(
+                ChatMessage(
+                    id=r["id"],
+                    session_id=r["session_id"],
+                    role=r["role"],
+                    content=r["content"],
+                    tool_calls=_decode_json_column(r["tool_calls"]),
+                    parts=_decode_json_column(r["parts"]),
+                    tokens_in=r["tokens_in"],
+                    tokens_out=r["tokens_out"],
+                    cache_read_tokens=r["cache_read_tokens"],
+                    cache_creation_tokens=r["cache_creation_tokens"],
+                    model=r["model"],
+                    sender_email=r["sender_email"],
+                    turn_id=r["turn_id"],
+                    created_at=r["created_at"],
+                )
+            )
+        return out

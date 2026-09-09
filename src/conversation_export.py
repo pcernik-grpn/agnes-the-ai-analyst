@@ -1,0 +1,495 @@
+"""The conversation-corpus export — one record per chat session, built for
+evaluation rather than for the LLM-call telemetry (design 2026-09-08 §3.12).
+
+Telemetry (spans, ``llm_calls`` rows) is one row per LLM call, content
+capped, aimed at "what did this cost and where does it burn". This export
+is the opposite shape: one COMPLETE record per conversation, assembled
+on-instance from what the instance already keeps (``chat_sessions``,
+``chat_messages``, ``llm_calls``, ``chat_message_feedback``,
+``agent_memories``), for "why are the answers bad, at scale".
+
+Three functions, kept pure of any repository/HTTP concern so they are
+testable without a database:
+
+- :func:`build_conversation_record` — one session's data in, the spec 3.12
+  record shape out. Never receives an email: the caller resolves
+  ``user_id`` before this is called, so there is nothing here to leak.
+- :func:`iter_conversations` — one page of sessions (keyset on
+  ``(last_message_at, id)``), the bulk-by-session-id repo reads, and the
+  per-session record assembly. Takes a :class:`ConversationExportRepoBundle`
+  so the caller (the API route) supplies real repos and the tests supply
+  fakes.
+- :func:`serialize_jsonl` — records to newline-delimited JSON bytes, for
+  ``StreamingResponse``.
+
+**Content policy.** ``content_mode`` is ``"full"`` or ``"pseudonymized"`` —
+never ``"off"``; the caller (the route) refuses the whole request under
+``off`` before any of this runs (spec 3.12, "under the content policy").
+Under ``pseudonymized`` every text leaf in ``messages_json``,
+``tool_calls_json`` and ``first_user_message`` goes through ``anonymizer``
+exactly once (never per span, never twice for the same leaf shared between
+the two JSON blobs) — see :func:`_pseudonymize_parts`. Ids and timestamps
+are never touched.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import os
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, is_dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from src.llm_pricing import cost_usd
+
+#: What ``content_mode`` may be on a built record — "off" never reaches this
+#: module (the route refuses the request before calling in).
+CONTENT_MODES = ("full", "pseudonymized")
+
+
+# ---------------------------------------------------------------------------
+# Cursor codec — same shape as ``corpus_file_events_pg.py``'s
+# encode_cursor/decode_cursor: an opaque, URL-safe token for one
+# (last_message_at, session_id) keyset position.
+# ---------------------------------------------------------------------------
+
+
+def encode_cursor(last_message_at: datetime, session_id: str) -> str:
+    """Opaque, URL-safe pagination token for one keyset position."""
+    raw = f"{last_message_at.isoformat()}|{session_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def decode_cursor(cursor: str) -> tuple[datetime, str]:
+    """Inverse of :func:`encode_cursor`. Raises ``ValueError`` on a malformed
+    token — the caller (the API route) turns that into a typed 400, never a
+    500 from a bad comparison downstream."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        ts_str, session_id = raw.split("|", 1)
+        return datetime.fromisoformat(ts_str), session_id
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError(f"malformed cursor: {cursor!r}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Repo bundle — everything iter_conversations needs to build one page.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConversationExportRepoBundle:
+    """The repos (and the resolved policy) one export page needs.
+
+    ``sessions``/``messages``/``calls``/``feedback``/``memories`` are the
+    PG repositories this feature reads (``chat_session_repo()``,
+    ``chat_message_repo()``, ``llm_calls_repo()``,
+    ``chat_message_feedback_repo()``, ``agent_memories_repo()``); ``users``
+    resolves an owner's ``user_id`` from their ``user_email`` (only
+    ``get_by_email`` is called). Kept as a plain bundle rather than five
+    separate keyword arguments so a test can hand in five small fakes and
+    the route can hand in five real repos, with the same call shape either
+    way.
+    """
+
+    sessions: Any
+    messages: Any
+    calls: Any
+    feedback: Any
+    memories: Any
+    users: Any
+    content_mode: str
+    anonymizer: Callable[[str], str] | None = None
+    #: Cache of email -> resolved user_id, filled in as sessions are
+    #: processed (a page rarely spans more than a handful of distinct
+    #: owners, so this reduces the resolution from O(sessions) calls to
+    #: O(distinct owners)). Exposed for tests; callers never set it.
+    _user_id_cache: dict[str, str | None] = field(default_factory=dict)
+
+
+def _resolve_user_id(bundle: ConversationExportRepoBundle, email: str | None) -> str | None:
+    if not email:
+        return None
+    if email in bundle._user_id_cache:
+        return bundle._user_id_cache[email]
+    resolved: str | None = None
+    try:
+        user = bundle.users.get_by_email(email)
+        resolved = (user or {}).get("id")
+    except Exception:  # noqa: BLE001 — a lookup failure never breaks the export
+        resolved = None
+    bundle._user_id_cache[email] = resolved
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Content transforms — applied once per leaf, shared by messages_json and
+# tool_calls_json (they read the SAME transformed parts).
+# ---------------------------------------------------------------------------
+
+
+def _walk_strings(value: Any, fn: Callable[[str], str]) -> Any:
+    """Apply ``fn`` to every string leaf in ``value``, preserving shape.
+    Non-string scalars (ints, bools, None) and container structure pass
+    through untouched — only text is ever pseudonymized."""
+    if isinstance(value, str):
+        return fn(value) if value else value
+    if isinstance(value, dict):
+        return {k: _walk_strings(v, fn) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_walk_strings(v, fn) for v in value]
+    return value
+
+
+def _pseudonymize_parts(parts: list[dict] | None, fn: Callable[[str], str]) -> list[dict] | None:
+    """A message's ``parts`` array with every text/args/result leaf run
+    through ``fn`` — never ``tool_use_id``, ``type``, ``state``, ``is_error``
+    or ``approval``, which are structure, not content."""
+    if not parts:
+        return parts
+    out: list[dict] = []
+    for part in parts:
+        p = dict(part)
+        if p.get("type") == "text" and isinstance(p.get("text"), str):
+            p["text"] = fn(p["text"]) if p["text"] else p["text"]
+        elif p.get("type") == "tool":
+            if "args" in p:
+                p["args"] = _walk_strings(p["args"], fn)
+            if "result" in p:
+                p["result"] = _walk_strings(p["result"], fn)
+        out.append(p)
+    return out
+
+
+def _tool_calls_from_parts(turn_id: Any, parts: list[dict] | None, started_at: str | None) -> list[dict]:
+    calls: list[dict] = []
+    for part in parts or []:
+        if part.get("type") != "tool":
+            continue
+        calls.append(
+            {
+                "turn_id": turn_id,
+                "tool_name": part.get("tool"),
+                "input": part.get("args"),
+                "output": part.get("result"),
+                "is_error": bool(part.get("is_error", False)),
+                "started_at": started_at,
+            }
+        )
+    return calls
+
+
+def _iso(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _deployment_environment() -> str:
+    """Mirror of ``src.observability.otel._deployment_env`` /
+    ``app.logging_config._deployment_env`` — kept in step so the export's
+    ``deployment_environment`` field agrees with the label the logs and
+    spans carry for this same instance."""
+    for var in ("AGNES_DEPLOYMENT_ENV", "RELEASE_CHANNEL"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
+def _totals(calls: Mapping[str, Any] | None, messages: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], str]:
+    """``(totals, cost_status)`` — ``ledger`` when ``calls`` (an
+    ``llm_calls``-backed summary) is given, else ``transcript`` when at
+    least one message carries token columns, else ``unavailable`` with
+    every figure zeroed. Never a silent zero: the caller always has
+    ``cost_status`` to tell "measured" from "nothing to measure" apart.
+    """
+    if calls is not None:
+        return (
+            {
+                "llm_run_count": int(calls.get("llm_run_count") or 0),
+                "total_prompt_tokens": int(calls.get("total_prompt_tokens") or 0),
+                "total_completion_tokens": int(calls.get("total_completion_tokens") or 0),
+                "llm_cache_read_tokens": int(calls.get("llm_cache_read_tokens") or 0),
+                "llm_cache_creation_tokens": int(calls.get("llm_cache_creation_tokens") or 0),
+                "total_cost": float(calls.get("total_cost") or 0.0),
+                "primary_model": calls.get("primary_model"),
+                "provider": calls.get("provider"),
+                "last_run_status": calls.get("last_run_status"),
+                "has_error": bool(calls.get("has_error")),
+                "error_types": list(calls.get("error_types") or []),
+            },
+            "ledger",
+        )
+
+    token_bearing = [m for m in messages if m.get("tokens_in") is not None or m.get("tokens_out") is not None]
+    empty = {
+        "llm_run_count": 0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "llm_cache_read_tokens": 0,
+        "llm_cache_creation_tokens": 0,
+        "total_cost": 0.0,
+        "primary_model": None,
+        "provider": None,
+        "last_run_status": None,
+        "has_error": False,
+        "error_types": [],
+    }
+    if not token_bearing:
+        return dict(empty), "unavailable"
+
+    total_cost = round(
+        sum(
+            cost_usd(
+                model=m.get("model"),
+                input_tokens=int(m.get("tokens_in") or 0),
+                output_tokens=int(m.get("tokens_out") or 0),
+                cache_read_tokens=int(m.get("cache_read_tokens") or 0),
+                cache_creation_tokens=int(m.get("cache_creation_tokens") or 0),
+            )
+            for m in token_bearing
+        ),
+        6,
+    )
+    models = [m["model"] for m in token_bearing if m.get("model")]
+    primary_model = Counter(models).most_common(1)[0][0] if models else None
+    return (
+        {
+            **empty,
+            "llm_run_count": len(token_bearing),
+            "total_prompt_tokens": sum(int(m.get("tokens_in") or 0) for m in token_bearing),
+            "total_completion_tokens": sum(int(m.get("tokens_out") or 0) for m in token_bearing),
+            "llm_cache_read_tokens": sum(int(m.get("cache_read_tokens") or 0) for m in token_bearing),
+            "llm_cache_creation_tokens": sum(int(m.get("cache_creation_tokens") or 0) for m in token_bearing),
+            "total_cost": total_cost,
+            "primary_model": primary_model,
+            # provider is unknown from chat_messages alone (no column for
+            # it) — reporting a guess here would be the exact silent-zero
+            # class this function exists to avoid, just for a string
+            # instead of a number.
+            "provider": None,
+        },
+        "transcript",
+    )
+
+
+def _feedback_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "turn_id": row.get("turn_id"),
+        "user_id": row.get("user_id"),
+        "verdict": row.get("verdict"),
+        "comment": row.get("comment"),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+def _memory_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+    content = row.get("content") or ""
+    return {
+        "memory_id": row.get("id"),
+        "turn_id": row.get("source_turn_id"),
+        "status": row.get("status"),
+        "content_length": len(content),
+    }
+
+
+def build_conversation_record(
+    session: Mapping[str, Any],
+    messages: Sequence[Mapping[str, Any]],
+    calls: Mapping[str, Any] | None,
+    feedback: Sequence[Mapping[str, Any]],
+    memories: Sequence[Mapping[str, Any]],
+    *,
+    content_mode: str,
+    anonymizer: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    """One conversation-corpus record (spec 3.12's field table).
+
+    ``session`` carries ``id``, ``surface``, ``agent_id`` and ``user_id`` —
+    already resolved by the caller, never an email; this function has no
+    way to leak one because it never receives one. ``messages`` is oldest
+    first (``chat_messages`` shape: ``role``, ``content``, ``parts``,
+    ``turn_id``, ``created_at``, plus the four token columns and ``model``
+    for the ``cost_status='transcript'`` fallback). ``calls`` is the
+    session's merged ``llm_calls`` totals+statuses, or ``None`` when no
+    ledger row exists for it. ``feedback``/``memories`` are the raw
+    ``chat_message_feedback``/``agent_memories`` rows for this session.
+    """
+    if content_mode not in CONTENT_MODES:
+        raise ValueError(f"content_mode must be one of {CONTENT_MODES}, got {content_mode!r}")
+    if content_mode == "pseudonymized" and anonymizer is None:
+        raise ValueError("anonymizer is required when content_mode='pseudonymized'")
+
+    def _text(value: Any) -> Any:
+        if content_mode == "pseudonymized" and isinstance(value, str) and value:
+            return anonymizer(value)  # type: ignore[misc]
+        return value
+
+    ordered = list(messages)
+    messages_json: list[dict[str, Any]] = []
+    tool_calls_json: list[dict[str, Any]] = []
+    for m in ordered:
+        created_at_iso = _iso(m.get("created_at"))
+        transformed_parts = (
+            _pseudonymize_parts(m.get("parts"), _text) if content_mode == "pseudonymized" else m.get("parts")
+        )
+        messages_json.append(
+            {
+                "role": m.get("role"),
+                "content": _text(m.get("content")),
+                "turn_id": m.get("turn_id"),
+                "created_at": created_at_iso,
+                "parts": transformed_parts,
+            }
+        )
+        tool_calls_json.extend(_tool_calls_from_parts(m.get("turn_id"), transformed_parts, created_at_iso))
+
+    turn_ids = {m.get("turn_id") for m in ordered if m.get("turn_id")}
+    first_user = next((m for m in ordered if m.get("role") == "user"), None)
+    first_user_message = _text(first_user.get("content")) if first_user is not None else None
+    last_message = ordered[-1] if ordered else None
+
+    conversation_start = _iso(ordered[0].get("created_at")) if ordered else None
+    conversation_end = _iso(ordered[-1].get("created_at")) if ordered else None
+    duration_seconds = None
+    start_dt, end_dt = (ordered[0].get("created_at"), ordered[-1].get("created_at")) if ordered else (None, None)
+    if isinstance(start_dt, datetime) and isinstance(end_dt, datetime):
+        duration_seconds = (end_dt - start_dt).total_seconds()
+
+    totals, cost_status = _totals(calls, ordered)
+
+    return {
+        "thread_id": session.get("id"),
+        "source": "agnes",
+        "surface": session.get("surface"),
+        "agent_id": session.get("agent_id"),
+        "user_id": session.get("user_id"),
+        "deployment_environment": _deployment_environment(),
+        "conversation_start": conversation_start,
+        "conversation_end": conversation_end,
+        "duration_seconds": duration_seconds,
+        "turn_count": len(turn_ids),
+        "message_count": len(ordered),
+        "tool_call_count": len(tool_calls_json),
+        "tool_calls_sequence": [c["tool_name"] for c in tool_calls_json],
+        "llm_run_count": totals["llm_run_count"],
+        "total_prompt_tokens": totals["total_prompt_tokens"],
+        "total_completion_tokens": totals["total_completion_tokens"],
+        "llm_cache_read_tokens": totals["llm_cache_read_tokens"],
+        "llm_cache_creation_tokens": totals["llm_cache_creation_tokens"],
+        "total_cost": totals["total_cost"],
+        "primary_model": totals["primary_model"],
+        "provider": totals["provider"],
+        "cost_status": cost_status,
+        "messages_json": messages_json,
+        "tool_calls_json": tool_calls_json,
+        "first_user_message": first_user_message,
+        "last_message_role": last_message.get("role") if last_message is not None else None,
+        "final_assistant_message_complete": bool(last_message is not None and last_message.get("role") == "assistant"),
+        "last_run_status": totals["last_run_status"],
+        "has_error": totals["has_error"],
+        "error_types": totals["error_types"],
+        "feedback_json": [_feedback_entry(f) for f in feedback],
+        "memory_writes_json": [_memory_entry(m) for m in memories],
+        "content_mode": content_mode,
+        "exported_at": _iso(datetime.now(UTC)),
+    }
+
+
+def _messages_to_dicts(rows: Iterable[Any]) -> list[dict[str, Any]]:
+    """``ChatMessage`` dataclasses (the repo's return shape) or plain
+    dicts (a test's fakes) -> plain dicts, uniformly."""
+    out = []
+    for r in rows:
+        if is_dataclass(r) and not isinstance(r, type):
+            d = dict(r.__dict__)
+        else:
+            d = dict(r)
+        out.append(d)
+    return out
+
+
+def iter_conversations(
+    repo_bundle: ConversationExportRepoBundle,
+    *,
+    since: datetime,
+    until: datetime,
+    surface: str | None = None,
+    agent_id: str | None = None,
+    limit: int = 200,
+    cursor: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """One page of conversation-corpus records, newest-cursor-forward.
+
+    Fetches ``limit + 1`` rows from ``repo_bundle.sessions.
+    list_completed_between`` to detect "more pages exist" without a second
+    COUNT query, then bulk-reads messages/calls/feedback/memories for
+    exactly the sessions on this page (no per-session queries) before
+    building each record. Raises ``ValueError`` for a malformed ``cursor``
+    (the route turns that into a typed 400).
+    """
+    after = decode_cursor(cursor) if cursor else None
+    rows = repo_bundle.sessions.list_completed_between(
+        since, until, surface=surface, agent_id=agent_id, limit=limit + 1, after=after
+    )
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    if not rows:
+        return [], None
+
+    next_cursor = encode_cursor(rows[-1]["last_message_at"], rows[-1]["id"]) if has_more else None
+
+    session_ids = [r["id"] for r in rows]
+    messages_by_session = repo_bundle.messages.list_for_sessions(session_ids)
+    totals_by_session = repo_bundle.calls.totals_for_sessions(session_ids)
+    statuses_by_session = repo_bundle.calls.statuses_for_sessions(session_ids)
+    feedback_by_session = repo_bundle.feedback.list_for_sessions(session_ids)
+    memories_by_session = repo_bundle.memories.list_for_sessions(session_ids)
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        sid = row["id"]
+        session_view = {
+            "id": sid,
+            "surface": row.get("surface"),
+            "agent_id": row.get("agent_id"),
+            "user_id": _resolve_user_id(repo_bundle, row.get("user_email")),
+        }
+        messages = _messages_to_dicts(messages_by_session.get(sid, []))
+        calls = None
+        if sid in totals_by_session:
+            calls = {**totals_by_session[sid], **statuses_by_session.get(sid, {})}
+        record = build_conversation_record(
+            session_view,
+            messages,
+            calls,
+            feedback_by_session.get(sid, []),
+            memories_by_session.get(sid, []),
+            content_mode=repo_bundle.content_mode,
+            anonymizer=repo_bundle.anonymizer,
+        )
+        records.append(record)
+    return records, next_cursor
+
+
+def serialize_jsonl(records: Iterable[Mapping[str, Any]]) -> Iterator[bytes]:
+    """Records -> newline-delimited JSON bytes, one line per record — the
+    shape ``StreamingResponse`` streams for the default ``format=jsonl``."""
+    for record in records:
+        yield (json.dumps(record, default=str) + "\n").encode("utf-8")
+
+
+__all__ = [
+    "CONTENT_MODES",
+    "ConversationExportRepoBundle",
+    "build_conversation_record",
+    "decode_cursor",
+    "encode_cursor",
+    "iter_conversations",
+    "serialize_jsonl",
+]
