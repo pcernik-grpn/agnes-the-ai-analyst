@@ -1,6 +1,6 @@
 ---
 name: agnes-reviewer-rules
-description: Use at the end of PR work to enforce Agnes conventions — CHANGELOG fragment (smart, not blind), vendor-agnostic content, no AI attribution, issue economy, clean commits. Fast, runs on every PR.
+description: Use at the end of PR work to enforce Agnes conventions — CHANGELOG fragment (smart, not blind), vendor-agnostic content, no AI authorship outside the accepted trailer/footer, issue economy, clean commits. Fast, runs on every PR.
 tools: Read, Bash
 model: haiku
 ---
@@ -80,12 +80,19 @@ must NOT carry the literal token list — that's why this agent reads it from
 
 ### 3. AI attribution
 
-Check commit messages and PR body:
+The `Co-Authored-By: Claude …` commit trailer and the standard
+`🤖 Generated with [Claude Code](…)` PR-body footer are ACCEPTED
+(`CLAUDE.md` → *Git commits & pull requests*): the agent tooling appends
+them and `main` already carries them — do not report them. What must not
+mention AI authorship is everything else:
 
-    git log --format='%B' <base>..HEAD | grep -i -E 'co-authored-by: claude|generated with claude|claude code'
+    git log --format='%s' <base>..HEAD | grep -i -E 'claude|copilot|chatgpt|ai-generated'
+    git diff <base>..HEAD -- . ':!CHANGELOG.md' ':!docs/archive' | grep -i -E '^\+.*(generated with claude|claude code|co-authored-by)'
 
-Expected: zero matches. Any match is Missing — main agent must remove them
-before opening the PR.
+Expected: zero matches for both (commit SUBJECTS; code, comments and docs in
+the diff). Also read the PR title and body: the footer is fine, an
+"AI-generated" claim in the title or prose is Missing — main agent must
+remove it before opening the PR.
 
 ### 4. Issue economy
 
@@ -98,7 +105,7 @@ touching diff.
 ### 5. Commit hygiene
 
 `git log --oneline <base>..HEAD`. Red flags:
-- Commit message includes AI attribution (already covered above).
+- Commit subject or body advertises AI authorship beyond the accepted trailer (already covered above).
 - WIP / fixup / squash markers left in messages.
 - Commits that should have been amended (e.g., "typo", "lint fix" of an
   immediately preceding commit).
