@@ -437,6 +437,26 @@ auth:
 #                           #   semantic_layer
 #                           # An unknown workload name is dropped and warned
 #                           # about at startup rather than silently kept.
+#   conversation_export:    # optional push sink for the conversation-corpus
+#                           # export (design 2026-09-08 §3.12) — a
+#                           # `conversation-export` worker job POSTs
+#                           # newline-delimited JSON batches of completed
+#                           # conversations to `endpoint` on a schedule.
+#                           # Unset (the default) = the scheduler never
+#                           # enqueues the job. Same content-export policy
+#                           # gate as the pull endpoint above (`GET
+#                           # /api/admin/conversations/export`): refuses
+#                           # with no outbound request at all, and never
+#                           # moves the watermark, when `content_export`
+#                           # above is off or excludes workload `chat`.
+#     endpoint: ""          # https URL the batches are POSTed to; blank = off
+#     headers_secret_env: "" # name of an env var holding
+#                           # OTEL_EXPORTER_OTLP_HEADERS-shaped
+#                           # "k1=v1,k2=v2" auth headers — never the header
+#                           # value itself in this file
+#     interval_minutes: 60  # how often the scheduler enqueues the job
+#     surfaces: []          # optional allowlist (web, slack_dm, api, ...);
+#                           # empty = every surface
 
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY

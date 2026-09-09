@@ -215,6 +215,8 @@ __all__ = [
     # LLM observability ledger + chat feedback (design 2026-09-08) — Postgres-only
     "llm_calls_repo",
     "chat_message_feedback_repo",
+    # Export-sink watermarks (design 2026-09-08 §3.12, Task 11) — Postgres-only
+    "export_watermarks_repo",
 ]
 
 
@@ -774,6 +776,14 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "sharepoint_connection_merge": {
         PG: ("src.repositories.sharepoint_connection_merge_pg", "SharePointConnectionMergePgRepository"),
     },
+    # Export-sink watermarks (design 2026-09-08 §3.12, Task 11) —
+    # POSTGRES-ONLY, A3 ratchet: no DuckDB backend. The ``conversation-export``
+    # worker job resolves ``llm_calls_repo()`` (itself PG-only) FIRST and
+    # swallows RequiresPostgresBackend before ever reaching this repo, so a
+    # DuckDB-backed instance never resolves this key at all.
+    "export_watermarks": {
+        PG: ("src.repositories.export_watermarks_pg", "ExportWatermarksPgRepository"),
+    },
 }
 
 
@@ -1297,3 +1307,12 @@ def llm_calls_repo() -> Any:
 # posture as llm_calls_repo above.
 def chat_message_feedback_repo() -> Any:
     return _build("chat_message_feedback")
+
+
+# Export-sink watermarks (design 2026-09-08 §3.12, Task 11) — POSTGRES-ONLY,
+# same posture as llm_calls_repo above. The ``conversation-export`` worker
+# job never reaches this factory on a DuckDB-backed instance: it resolves
+# ``llm_calls_repo()`` first and swallows the resulting
+# RequiresPostgresBackend before ever asking for a watermark.
+def export_watermarks_repo() -> Any:
+    return _build("export_watermarks")

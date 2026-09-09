@@ -279,6 +279,26 @@ and `agent_scope_snapshots` is pruned while the `agents` rows are not.
 | `llm_calls` retention (days, `0` = keep forever) | `retention.llm_calls_days` | `0` | `get_llm_calls_retention_days()` |
 | `usage_events` retention (days, `0` = keep forever) — `USAGE_EVENTS_RETENTION_DAYS` env var wins when set; pruned by its own `POST /api/admin/usage/prune` job, not the sweep | `retention.usage_events_days` | `0` | `get_usage_events_retention_days()` |
 
+### Conversation corpus export (push sink)
+
+See [`observability.md`](observability.md) for the full shape (spec 3.12)
+and the pull endpoint (`GET /api/admin/conversations/export`) this shares
+its content-export policy gate with.
+
+| Knob | `instance.yaml` path | Default | Resolver |
+|------|----------------------|---------|----------|
+| Push-sink config block (`None` = off) | `observability.conversation_export` | unset | `get_conversation_export_config()` |
+
+Unset by default: the scheduler never enqueues the `conversation-export`
+worker job. Setting `endpoint` turns it on; `headers_secret_env` names an
+environment variable holding `OTEL_EXPORTER_OTLP_HEADERS`-shaped auth
+headers (never the header value itself in `instance.yaml`);
+`interval_minutes` (default `60`) sets the scheduler's cadence; `surfaces`
+optionally narrows which chat surfaces are included (empty = every
+surface). Same `observability.content_export` policy gate as the pull
+endpoint — refuses with no outbound request at all, and never advances the
+watermark, when that policy is off or excludes workload `chat`.
+
 ---
 
 ## Annotated `instance.yaml` examples
