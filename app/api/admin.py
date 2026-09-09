@@ -5495,8 +5495,11 @@ def _discover_bigquery(dataset: Optional[str]) -> Dict[str, Any]:
         )
 
 
-# Keep blocking repository reads in FastAPI's thread pool: the sync dashboard
-# polls this route during extraction, and a slow read must not stall HTTP.
+# At most one registry read per process may occupy a shared HTTP worker.
+# Contending polls must fail fast, never wait for this lock in the pool.
+_registry_read_lock = threading.Lock()
+
+
 @router.get("/registry")
 def list_registry(
     user: dict = Depends(require_admin),
@@ -5541,6 +5544,15 @@ def list_registry(
         never disagrees with (or is more expensive than) what a real query
         through the policy would do. Absent entirely on an unpolicied row.
     """
+    if not _registry_read_lock.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Registry read already in progress", headers={"Retry-After": "3"})
+    try:
+        return _read_registry()
+    finally:
+        _registry_read_lock.release()
+
+
+def _read_registry():
     repo = table_registry_repo()
     tables = repo.list_all()
 

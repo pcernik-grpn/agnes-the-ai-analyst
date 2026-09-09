@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import threading
 
+import anyio
 import httpx
 
 
@@ -36,6 +37,9 @@ def test_version_responds_while_registry_read_is_blocked(seeded_app, monkeypatch
     controller.start()
 
     async def exercise():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        original_tokens = limiter.total_tokens
+        limiter.total_tokens = 4
         transport = httpx.ASGITransport(app=seeded_app["client"].app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             registry = asyncio.create_task(
@@ -48,13 +52,34 @@ def test_version_responds_while_registry_read_is_blocked(seeded_app, monkeypatch
                 assert await asyncio.to_thread(entered.wait, 5), "registry never reached the read"
                 response = await client.get("/api/version")
                 assert response.status_code == 200
+                # More overlapping polls than pool slots must fail fast, leaving
+                # room for real authentication dependencies and sync handlers.
+                polls = await asyncio.gather(
+                    *(
+                        client.get(
+                            "/api/admin/registry", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}
+                        )
+                        for _ in range(12)
+                    )
+                )
+                assert all(p.status_code == 503 and p.headers["Retry-After"] == "3" for p in polls)
+                authenticated = await client.get(
+                    "/api/sync/status", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}
+                )
+                assert authenticated.status_code == 200
                 assert not watchdog_fired.is_set(), "registry read blocked the HTTP event loop"
                 assert not registry.done(), "version must respond before the registry read is released"
             finally:
                 release.set()
                 result = await registry
+                limiter.total_tokens = original_tokens
             assert result.status_code == 200
             assert result.json()["packaged_read_ok"] is True
+            # The admission lock must be released after the read finishes.
+            again = await client.get(
+                "/api/admin/registry", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}
+            )
+            assert again.status_code == 200
 
     try:
         asyncio.run(exercise())
@@ -123,3 +148,18 @@ def test_http_responds_during_queued_sync(seeded_app, monkeypatch):
         asyncio.run(exercise())
     finally:
         release.set()
+
+
+def test_registry_admission_recovers_after_read_failure(monkeypatch):
+    from app.api import admin
+
+    def fail():
+        raise RuntimeError("read failed")
+
+    monkeypatch.setattr(admin, "_read_registry", fail)
+    import pytest
+
+    with pytest.raises(RuntimeError, match="read failed"):
+        admin.list_registry(user={}, conn=None)
+    monkeypatch.setattr(admin, "_read_registry", lambda: {"tables": []})
+    assert admin.list_registry(user={}, conn=None) == {"tables": []}

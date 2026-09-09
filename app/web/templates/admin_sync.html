@@ -185,7 +185,10 @@
 <script>
 let allRows = [];
 let filterText = "";
-let pollInterval = null;
+let pollTimer = null;
+let statusPending = false;
+let wasSyncing = false;
+let registryLoaded = false;
 
 /* Escapes both quote forms, not only `&`, `<`, `>`. The `textContent` ->
    `innerHTML` round-trip this replaced covers what a TEXT node needs, and
@@ -323,14 +326,20 @@ function renderZeroExplain(total, synced) {
 async function loadRegistry() {
   try {
     const r = await fetch("/api/admin/registry", { credentials: "include" });
+    if (r.status === 503) {
+      registryLoaded = false; // Another dashboard is reading; retry on the next poll.
+      return;
+    }
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
     allRows = Array.isArray(data) ? data : (data.tables || data.items || []);
     renderTable();
     updateSummary();
+    registryLoaded = true;
     const now = new Date();
     document.getElementById("last-refresh").textContent = "Updated " + now.toLocaleTimeString();
   } catch (e) {
+    registryLoaded = false;
     toast("Failed to load tables: " + e.message, "error");
   }
 }
@@ -359,33 +368,27 @@ async function reportJobOutcome() {
 }
 
 async function checkStatus() {
+  if (statusPending) return;
+  statusPending = true;
+  clearTimeout(pollTimer);
   try {
     const r = await fetch("/api/sync/status", { credentials: "include" });
     if (!r.ok) return;
     const data = await r.json();
     const badge = document.getElementById("status-badge");
     const label = document.getElementById("status-label");
-    if (data.locked) {
-      badge.className = "sync-status-badge running";
-      label.textContent = "Syncing…";
-      // Reload table data while sync runs
-      await loadRegistry();
-      if (!pollInterval) {
-        pollInterval = setInterval(async () => {
-          await checkStatus();
-        }, 3000);
-      }
-    } else {
-      badge.className = "sync-status-badge idle";
-      label.textContent = "Idle";
-      if (pollInterval) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-        await loadRegistry();
-        await reportJobOutcome();
-      }
-    }
-  } catch (_) {}
+    const finished = wasSyncing && !data.locked;
+    wasSyncing = !!data.locked;
+    badge.className = "sync-status-badge " + (wasSyncing ? "running" : "idle");
+    label.textContent = wasSyncing ? "Syncing…" : "Idle";
+    if (wasSyncing || finished || !registryLoaded) await loadRegistry();
+    if (finished) await reportJobOutcome();
+  } catch (_) {
+  } finally {
+    statusPending = false;
+    // Schedule only after all work settles, including a slow registry read.
+    pollTimer = setTimeout(checkStatus, wasSyncing ? 3000 : 5000);
+  }
 }
 
 document.getElementById("trigger-btn").addEventListener("click", async () => {
@@ -423,10 +426,7 @@ document.getElementById("table-search").addEventListener("input", e => {
   renderTable();
 });
 
-// Init
-loadRegistry();
+// One polling chain owns initial loading and subsequent refreshes.
 checkStatus();
-// Lightweight status poll every 5s
-setInterval(checkStatus, 5000);
 </script>
 {% endblock %}
