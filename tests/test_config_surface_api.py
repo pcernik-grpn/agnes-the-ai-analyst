@@ -282,6 +282,22 @@ class TestEmptyEnvProvenance:
     """
 
     def _resolves_empty_as_override(self, resolver_name, env_var):
+        """Does a PRESENT-but-empty env var beat the yaml tier for this knob?
+
+        The yaml tier has to be pinned to something the empty value cannot
+        coincide with, or the probe is blind exactly where it matters. An
+        earlier version compared the resolver's stock unset result against its
+        empty result, which cannot see a default-OFF switch: both are `False`,
+        so `news`, `studio`, `knowledge_digests`, `contribute_skill` and
+        `store_moderation` all looked unaffected while
+        `features.news_enabled: true` + `AGNES_NEWS_ENABLED=` really does
+        resolve False from the environment and get reported as `default`
+        (Devin Review on #2419).
+
+        So pin yaml to `True` and compare env-unset against env-empty: they
+        differ only when the empty environment value overrode yaml. A knob that
+        ignores an empty value returns the pinned yaml value both times.
+        """
         import app.instance_config as ic
 
         fn = getattr(ic, resolver_name, None)
@@ -290,11 +306,12 @@ class TestEmptyEnvProvenance:
         had = os.environ.get(env_var)
         try:
             os.environ.pop(env_var, None)
-            ic.reset_cache()
-            unset = fn()
-            os.environ[env_var] = ""
-            ic.reset_cache()
-            empty = fn()
+            with patch.object(ic, "get_value", lambda *k, **kw: True):
+                ic.reset_cache()
+                yaml_only = fn()
+                os.environ[env_var] = ""
+                ic.reset_cache()
+                with_empty_env = fn()
         except Exception:  # noqa: BLE001 — a resolver that raises is not comparable, so skip it
             return False
         finally:
@@ -302,7 +319,7 @@ class TestEmptyEnvProvenance:
             if had is not None:
                 os.environ[env_var] = had
             ic.reset_cache()
-        return empty != unset
+        return with_empty_env != yaml_only
 
     def test_every_row_honouring_an_empty_override_declares_it(self):
         from app.api.config_surface import _KNOB_CATALOGUE
@@ -336,3 +353,25 @@ class TestEmptyEnvProvenance:
             "these knobs ignore a present-but-empty env var, so declaring "
             f"env_empty_overrides would mislabel their source as `env`: {wrong}"
         )
+
+    def test_a_default_off_row_reports_env_not_default(self):
+        """The finding's own example, pinned at the tier level: `news` defaults
+        OFF, so an empty `AGNES_NEWS_ENABLED` resolves to the same `False` the
+        default carries. Before the flag, `_source_for` therefore said
+        `default` — while `features.news_enabled: true` in yaml was being
+        overridden by the environment. Equal values, different tiers: the
+        source has to come from the override's presence, not from comparing
+        the value to the default."""
+        from app.api.config_surface import _KNOB_CATALOGUE, _source_for
+
+        row = next(e for e in _KNOB_CATALOGUE if e["key"] == "news_enabled")
+        assert row.get("env_empty_overrides") is True
+        with patch.dict("os.environ", {row["env_var"]: ""}):
+            source = _source_for(
+                row["env_var"],
+                row["resolver"],
+                False,  # what the resolver returns for an empty override
+                row["default"],  # …which is also the default: indistinguishable by value
+                env_empty_overrides=True,
+            )
+        assert source == "env"

@@ -34,10 +34,14 @@
   the `=` therefore turned such a feature off while the inventory reported
   `source: "yaml"`, sending an operator to look for a config line that does not
   exist. Rows now opt in with `env_empty_overrides`, set on the four knobs that
-  need it — `onboarding_enabled`, `agent_profiles_enabled`,
-  `home_automode_visibility` and `home_status_frame_visibility` — and a sweep in
-  `tests/test_config_surface_api.py` fails if a future row honours an empty
-  override without declaring it, or declares it without honouring one.
+  need it — every switch-backed boolean in the catalogue, nine rows — and a
+  sweep in `tests/test_config_surface_api.py` fails if a future row honours an
+  empty override without declaring it, or declares it without honouring one.
+  The sweep pins the yaml tier while probing, because comparing a resolver's
+  stock unset result against its empty result is blind to a default-OFF switch:
+  both are `False`, yet `features.news_enabled: true` plus `AGNES_NEWS_ENABLED=`
+  really is the environment overriding yaml, and it used to be reported as
+  `default`.
 
 ### Internal
 - The design-system reference's accent vocabulary named `--ds-kai-*`, a token

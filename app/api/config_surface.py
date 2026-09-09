@@ -150,6 +150,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_STUDIO_ENABLED",
         "yaml_path": "studio.enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "news_enabled",
@@ -157,6 +162,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_NEWS_ENABLED",
         "yaml_path": "features.news_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "knowledge_digests_ui_enabled",
@@ -164,6 +174,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_KNOWLEDGE_DIGESTS_ENABLED",
         "yaml_path": "features.knowledge_digests_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "contribute_skill_enabled",
@@ -171,6 +186,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_CONTRIBUTE_SKILL_ENABLED",
         "yaml_path": "features.contribute_skill_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "store_moderation_enabled",
@@ -178,6 +198,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_STORE_MODERATION_ENABLED",
         "yaml_path": "features.store_moderation_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         # `default` is True and must stay in step with the switch's own
