@@ -211,3 +211,27 @@ def test_duckdb_answers_a_typed_501_and_changes_nothing(tmp_path, monkeypatch, p
     r = client.patch("/api/data-apps/ident-app", json={}, headers=_auth(owner_token))
     assert r.status_code == 400 and r.json()["detail"] == "nothing_to_update"
     assert client.get("/api/data-apps/ident-app", headers=_auth(owner_token)).json()["effective_description"] == "fine"
+
+
+def test_contested_op_lease_refuses_before_writing_anything(tmp_path, monkeypatch, pg_engine):
+    """A deploy/stop/wake in flight holds the per-slug op lease. The flip
+    must then answer 409 with the column UNCHANGED and no
+    `data_app.data_identity_changed` row — the lease is taken before the
+    write, not after it (review finding on this PR)."""
+    from app.api.data_apps import require_op_lease
+
+    client, _admin, fake = _client("pg", tmp_path, monkeypatch, pg_engine)
+    owner_token, _ = _owner()
+    _create_app(state="running")
+
+    holder = require_op_lease("ident-app")  # somebody else's deploy
+    try:
+        r = client.patch("/api/data-apps/ident-app", json={"data_identity": "viewer"}, headers=_auth(owner_token))
+    finally:
+        from app.api.data_apps import release_op_lease
+
+        release_op_lease("ident-app", holder)
+    assert r.status_code == 409, r.text
+    assert client.get("/api/data-apps/ident-app", headers=_auth(owner_token)).json()["data_identity"] == "owner"
+    assert fake.up_calls == []
+    assert _audit_actions() == []

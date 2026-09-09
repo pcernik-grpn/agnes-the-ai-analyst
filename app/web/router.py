@@ -7251,10 +7251,6 @@ async def data_app_detail_page(
     serialized = _serialize(row)
     serialized["owner_email"] = (owner or {}).get("email") or row["owner_user_id"]
     serialized["badge_class"] = _state_badge_class(row["state"])
-    # `data_identity` is a lead-builder addition to `_serialize()` landing in
-    # a sibling change; default it here so this page renders correctly both
-    # before and after that lands (see PATCH /api/data-apps/{slug} contract).
-    serialized["data_identity"] = serialized.get("data_identity") or "owner"
 
     return templates.TemplateResponse(
         request,

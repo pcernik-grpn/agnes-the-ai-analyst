@@ -1360,19 +1360,20 @@ async def list_data_apps(
     return out
 
 
-async def _redeploy_for_data_identity(slug: str) -> dict:
-    """Re-bake the container after a ``data_identity`` flip.
+async def _redeploy_for_data_identity_locked(row: dict) -> dict:
+    """Re-bake the container after a ``data_identity`` flip. The CALLER holds
+    the per-slug op lease (``require_op_lease``) around both the column write
+    and this call — see ``patch_data_app`` — so a concurrent deploy/stop/wake
+    is refused with 409 BEFORE anything is written, never after.
 
     ``AGNES_DATA_IDENTITY`` and the viewer secret are baked into the
     container at ``build_container_spec``/``build_config_json`` time, so a
     running (or sleeping — a paused container resumes as-is) app would keep
     serving the OLD mode after the row changed: owner→viewer stale means
     viewers see owner data under a "viewer" label; viewer→owner stale means
-    the app keeps demanding a token the proxy no longer sends. So a
-    reachable app is redeployed synchronously, under the same op lease
-    ``deploy_data_app`` takes (409 ``op_in_progress`` propagates if a deploy
-    is in flight), minus the git fast-forward — ``redeploy_current`` serves
-    whatever ``agnes-live`` already points at.
+    the app keeps demanding a token the proxy no longer sends. So a reachable
+    app is redeployed synchronously, minus the git fast-forward —
+    ``redeploy_current`` serves whatever ``agnes-live`` already points at.
 
     Returns the ``redeploy`` sub-object the caller puts on the response:
     ``{"triggered": False}`` for an app with no container to re-bake (its
@@ -1383,26 +1384,21 @@ async def _redeploy_for_data_identity(slug: str) -> dict:
     409 instead of serving a container whose mode contradicts the registry.
     """
     repo = data_apps_repo()
-    row = repo.get_by_slug(slug)
-    if not row or row.get("state") not in REACHABLE_STATES:
+    if row.get("state") not in REACHABLE_STATES:
         return {"triggered": False}
-    holder = require_op_lease(slug)
     try:
-        try:
-            await run_in_threadpool(redeploy_current, row)
-        except (RunnerUnavailable, RunnerError) as exc:
-            # `redeploy_current` already recorded state=error via
-            # `_handle_runner_failure`.
-            return {"triggered": True, "ok": False, "detail": f"runner_error: {exc}"}
-        except (OwnerNotFoundError, DraftParentMissingError, ValueError) as exc:
-            # These leave the row's state untouched — but a container still
-            # running the old mode IS the failure here, so record it.
-            repo.set_state(row["id"], "error", f"data_identity redeploy failed: {exc}")
-            return {"triggered": True, "ok": False, "detail": str(exc)}
-        repo.set_state(row["id"], "running")
-        return {"triggered": True, "ok": True}
-    finally:
-        release_op_lease(slug, holder)
+        await run_in_threadpool(redeploy_current, row)
+    except (RunnerUnavailable, RunnerError) as exc:
+        # `redeploy_current` already recorded state=error via
+        # `_handle_runner_failure`.
+        return {"triggered": True, "ok": False, "detail": f"runner_error: {exc}"}
+    except (OwnerNotFoundError, DraftParentMissingError, ValueError) as exc:
+        # These leave the row's state untouched — but a container still
+        # running the old mode IS the failure here, so record it.
+        repo.set_state(row["id"], "error", f"data_identity redeploy failed: {exc}")
+        return {"triggered": True, "ok": False, "detail": str(exc)}
+    repo.set_state(row["id"], "running")
+    return {"triggered": True, "ok": True}
 
 
 @router.patch("/{slug}")
@@ -1431,7 +1427,7 @@ async def patch_data_app(
     themselves. Postgres-backed instances only: the column is PG-only (A3),
     so on DuckDB the repo raises ``RequiresPostgresBackend`` → 501 before
     anything else is touched. A reachable app is redeployed synchronously
-    (see ``_redeploy_for_data_identity``); the response carries the outcome
+    (see ``_redeploy_for_data_identity_locked``); the response carries the outcome
     under ``redeploy``. Drafts stay ``owner`` (400 ``draft_has_no_data_
     identity``); linked apps have no container (400, after authz so the
     distinct code never leaks an app's kind to a caller who'd get 403).
@@ -1452,15 +1448,23 @@ async def patch_data_app(
             raise HTTPException(status_code=400, detail="draft_has_no_data_identity")
         previous = data_identity_of(row)
         if payload.data_identity != previous:
-            repo.set_data_identity(slug, payload.data_identity)  # RequiresPostgresBackend -> 501 on DuckDB
-            redeploy = await _redeploy_for_data_identity(slug)
-            _audit(
-                conn,
-                user["id"],
-                "data_app.data_identity_changed",
-                f"data_app:{slug}",
-                {"from": previous, "to": payload.data_identity, "redeploy": redeploy},
-            )
+            # The op lease is taken BEFORE the column write, so a concurrent
+            # deploy/stop/wake answers 409 `operation_in_progress` with
+            # nothing changed — never a flipped row whose container was not
+            # re-baked and whose audit row was lost to the exception path.
+            holder = require_op_lease(slug)
+            try:
+                repo.set_data_identity(slug, payload.data_identity)  # RequiresPostgresBackend -> 501 on DuckDB
+                redeploy = await _redeploy_for_data_identity_locked(repo.get_by_slug(slug) or row)
+                _audit(
+                    conn,
+                    user["id"],
+                    "data_app.data_identity_changed",
+                    f"data_app:{slug}",
+                    {"from": previous, "to": payload.data_identity, "redeploy": redeploy},
+                )
+            finally:
+                release_op_lease(slug, holder)
         else:
             redeploy = {"triggered": False}
 

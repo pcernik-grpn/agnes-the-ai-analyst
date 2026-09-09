@@ -404,6 +404,10 @@ POSTURE: dict[str, str] = {
     # -- app.api.data_apps -----------------------------------------------------
     "DELETE /api/data-apps/{slug}": "data_app.delete",
     "DELETE /api/data-apps/{slug}/drafts/{draft_slug}": "data_app.draft_delete",
+    # Primary/success action. The same route also writes
+    # `data_app.data_identity_changed` when the body flips `data_identity`
+    # (owner|viewer — app/api/data_apps.py::patch_data_app); the handler
+    # always writes its own row(s), so the fallback here is never used.
     "PATCH /api/data-apps/{slug}": "data_app.set_description",
     "POST /api/data-apps": "data_app.create",
     "POST /api/data-apps/reap-idle": "data_app.reap_idle",
