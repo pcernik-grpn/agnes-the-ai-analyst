@@ -25,7 +25,9 @@
   after the next turn started, and a memory written outside any turn, record
   no turn rather than the wrong one. An interrupted answer and a forwarded
   (role-split) turn carry the same `turn_id` and message id as the user
-  message that started them.
+  message that started them, and so does a question redelivered after a
+  restart. A conversation written before messages carried structured parts
+  still reports its tool calls, read from the legacy column.
 - **A real trace per chat turn.** ChatManager mints a `turn_id` per user message,
   opens an `agnes.chat.turn` span with one `agnes.chat.tool <tool>` child per tool
   call, and the broker parents its completion spans under it via a coordination
