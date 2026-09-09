@@ -843,7 +843,7 @@ retention: the export reads what `chat_messages` already keeps.
 
 ### Pulling it
 
-`GET /api/admin/conversations/export?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+`GET /api/admin/conversations/corpus?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
 — admin-only, Postgres-only (a DuckDB-backed instance answers a typed
 `501`), newline-delimited JSON by default, `limit` at most 500, a keyset
 cursor on `(last_message_at, id)` returned as both the `X-Next-Cursor`
@@ -853,7 +853,7 @@ every conversation the instance has ever held.
 
 ```bash
 curl -s -H "Authorization: Bearer $PAT" \
-  "$SERVER/api/admin/conversations/export?since=2026-01-01&limit=200" \
+  "$SERVER/api/admin/conversations/corpus?since=2026-01-01&limit=200" \
   | tee conversations.jsonl
 ```
 

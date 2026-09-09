@@ -1,4 +1,4 @@
-"""``GET /api/admin/conversations/export`` on Postgres (design 2026-09-08
+"""``GET /api/admin/conversations/corpus`` on Postgres (design 2026-09-08
 §3.12).
 
 PG-side by necessity, not by preference: the export reads ``llm_calls`` and
@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import sqlalchemy as sa
 
-_EXPORT = "/api/admin/conversations/export"
+_EXPORT = "/api/admin/conversations/corpus"
 _BASE = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
 
 

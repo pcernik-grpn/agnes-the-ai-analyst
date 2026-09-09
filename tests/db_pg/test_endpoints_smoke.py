@@ -3952,7 +3952,7 @@ KNOWN_UNTESTED = {
     # test_conversation_export_api.py (admin gate + DuckDB typed 501), and
     # tests/db_pg/test_conversation_export_pg.py (admin gate, policy gate,
     # cursor pagination across pages, format=json, audit row).
-    "GET /api/admin/conversations/export",
+    "GET /api/admin/conversations/corpus",
 }
 
 

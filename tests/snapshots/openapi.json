@@ -20235,10 +20235,10 @@
         ]
       }
     },
-    "/api/admin/conversations/export": {
+    "/api/admin/conversations/corpus": {
       "get": {
         "description": "The evaluation-corpus pull (spec 3.12). Admin-only, Postgres-only,\ncontent-export-policy-gated. ``since`` is required \u2014 a caller that omits\nit gets a typed 400, not an unbounded scan of every conversation ever\nheld.",
-        "operationId": "export_conversations_api_admin_conversations_export_get",
+        "operationId": "export_conversations_api_admin_conversations_corpus_get",
         "parameters": [
           {
             "description": "ISO date/datetime, inclusive lower bound. Required.",

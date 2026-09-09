@@ -1,5 +1,5 @@
 """`agnes admin conversations export` — the evaluation-corpus pull (design
-2026-09-08 §3.12), mirroring `GET /api/admin/conversations/export`.
+2026-09-08 §3.12), mirroring `GET /api/admin/conversations/corpus`.
 
 Admin-only, Postgres-only (a DuckDB-backed instance answers a typed 501),
 gated by the instance's content-export policy. Follows the server's
@@ -94,7 +94,7 @@ def export_conversations(
             if cursor:
                 page_params["cursor"] = cursor
             try:
-                resp = api_get("/api/admin/conversations/export", params=page_params)
+                resp = api_get("/api/admin/conversations/corpus", params=page_params)
             except Exception as exc:
                 typer.echo(f"[err] cannot reach server: {exc}", err=True)
                 raise typer.Exit(1) from exc

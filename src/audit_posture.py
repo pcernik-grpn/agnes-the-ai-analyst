@@ -1071,7 +1071,7 @@ READ_POSTURE: dict[str, str] = {
     # The evaluation-corpus pull. Real content (messages, tool calls), so a
     # cataloged action rather than exempt -- same reasoning as
     # `catalog.sample` / `collection.file_preview` above.
-    "GET /api/admin/conversations/export": "conversations.export",
+    "GET /api/admin/conversations/corpus": "conversations.export",
     # -- app.api.cowork_bundle --
     "GET /api/user/setup-tokens": "exempt:self",
     # -- app.api.data --

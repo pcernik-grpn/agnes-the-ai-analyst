@@ -2101,7 +2101,7 @@ _EXEMPT: dict[str, str] = {
     # instance via a deliberate admin action under the content-export
     # policy, not a tool a live chat/agent-api turn could reach for on its
     # own — a different risk than an admin's own scoped queries.
-    "/api/admin/conversations/export": (
+    "/api/admin/conversations/corpus": (
         "the evaluation-corpus pull (design 2026-09-08 §3.12) — CLI-covered "
         "(`agnes admin conversations export`); no MCP tool by design — handing "
         "a live agent a tool that reads back the whole corpus (other users' "

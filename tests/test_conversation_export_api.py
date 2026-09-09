@@ -1,4 +1,4 @@
-"""``GET /api/admin/conversations/export`` on the DEFAULT (DuckDB-backed) app
+"""``GET /api/admin/conversations/corpus`` on the DEFAULT (DuckDB-backed) app
 fixture (design 2026-09-08 §3.12).
 
 ``llm_calls`` and ``chat_message_feedback`` are Postgres-only tables (A3
@@ -12,7 +12,7 @@ exists to serve it.
 
 from __future__ import annotations
 
-_EXPORT = "/api/admin/conversations/export"
+_EXPORT = "/api/admin/conversations/corpus"
 
 
 def _auth(token: str) -> dict:

@@ -1,7 +1,7 @@
 """``conversation-export`` worker job kind — the push sink for the
 conversation-corpus export (design 2026-09-08 §3.12, Task 11).
 
-Task 10 built the PULL side (``GET /api/admin/conversations/export`` —
+Task 10 built the PULL side (``GET /api/admin/conversations/corpus`` —
 ``app/api/conversations_export.py``): an admin (or a data platform with a
 PAT) asks for a window and gets it back. This is the PUSH side: a
 scheduled ``conversation-export`` job reads a Postgres-persisted watermark

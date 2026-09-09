@@ -25,7 +25,7 @@
   Agent memories now record the turn and message that wrote them
   (`agent_memories.source_turn_id`/`source_message_id`).
 - **A queryable corpus of whole conversations, for evaluation.**
-  `GET /api/admin/conversations/export` (`agnes admin conversations export`)
+  `GET /api/admin/conversations/corpus` (`agnes admin conversations export`)
   pulls one complete record per chat session — every surface, transcript, tool
   calls, feedback and memory writes joined in, never truncated — under the same
   content-export policy as the OTel export. Postgres-only; a pull is refused

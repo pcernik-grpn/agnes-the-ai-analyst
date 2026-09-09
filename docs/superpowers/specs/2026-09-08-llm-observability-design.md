@@ -579,7 +579,7 @@ consumes, so an evaluation job can point at this export without remapping:
 | `exported_at` | |
 
 **Delivery, pull (first).**
-`GET /api/admin/conversations/export?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+`GET /api/admin/conversations/corpus?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
 — admin-only, newline-delimited JSON by default, keyset cursor on
 `(conversation_end, thread_id)`, `limit` at most 500, Postgres-only (typed
 `501` on the frozen DuckDB backend). CLI

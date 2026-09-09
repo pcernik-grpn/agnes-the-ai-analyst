@@ -1,4 +1,4 @@
-"""Conversation corpus export — ``GET /api/admin/conversations/export``
+"""Conversation corpus export — ``GET /api/admin/conversations/corpus``
 (design 2026-09-08 §3.12).
 
 An evaluation-corpus pull, not telemetry: one COMPLETE record per chat
@@ -106,7 +106,7 @@ def _export_denial_reason(workload: str) -> str:
     return "mode_off"
 
 
-@router.get("/api/admin/conversations/export")
+@router.get("/api/admin/conversations/corpus")
 def export_conversations(
     since: str | None = Query(None, description="ISO date/datetime, inclusive lower bound. Required."),
     until: str | None = Query(None, description="ISO date/datetime, exclusive upper bound. Default: now."),

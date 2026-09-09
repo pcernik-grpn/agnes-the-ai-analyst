@@ -282,7 +282,7 @@ and `agent_scope_snapshots` is pruned while the `agents` rows are not.
 ### Conversation corpus export (push sink)
 
 See [`observability.md`](observability.md) for the full shape (spec 3.12)
-and the pull endpoint (`GET /api/admin/conversations/export`) this shares
+and the pull endpoint (`GET /api/admin/conversations/corpus`) this shares
 its content-export policy gate with.
 
 | Knob | `instance.yaml` path | Default | Resolver |
