@@ -5495,8 +5495,10 @@ def _discover_bigquery(dataset: Optional[str]) -> Dict[str, Any]:
         )
 
 
+# Keep blocking repository reads in FastAPI's thread pool: the sync dashboard
+# polls this route during extraction, and a slow read must not stall HTTP.
 @router.get("/registry")
-async def list_registry(
+def list_registry(
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
