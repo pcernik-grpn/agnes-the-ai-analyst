@@ -29,36 +29,46 @@ class ExportWatermarksPgRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
-    def get(self, name: str) -> datetime | None:
-        """The current watermark for ``name``, or ``None`` when no row
-        exists yet (a sink that has never delivered a batch) — the caller
-        treats ``None`` as "export everything since the beginning"."""
+    def get(self, name: str) -> tuple[datetime, str] | None:
+        """The current ``(watermark, cursor_id)`` for ``name``, or ``None``
+        when no row exists yet, or the row's ``watermark`` is still
+        ``NULL`` (a sink that has never delivered a batch) — the caller
+        treats ``None`` as "export everything since the beginning". Always
+        returns BOTH fields together: a caller resuming a keyset walk
+        needs the id alongside the timestamp (design 2026-09-08 §3.12,
+        push-sink defect fix) — a bare timestamp is not a safe resume
+        point on its own.
+        """
         with self._engine.connect() as conn:
             row = conn.execute(
-                sa.text("SELECT watermark FROM export_watermarks WHERE name = :name"), {"name": name}
+                sa.text("SELECT watermark, cursor_id FROM export_watermarks WHERE name = :name"), {"name": name}
             ).first()
-        return row[0] if row is not None else None
+        if row is None or row[0] is None:
+            return None
+        return (row[0], row[1])
 
-    def advance(self, name: str, watermark: datetime) -> dict[str, Any]:
-        """Upsert ``name``'s watermark to ``watermark``.
+    def set(self, name: str, watermark: datetime, cursor_id: str) -> dict[str, Any]:
+        """Upsert ``name``'s ``(watermark, cursor_id)``.
 
         The caller (the ``conversation-export`` worker job) only ever calls
-        this with a value strictly later than what :meth:`get` last
-        returned — after a batch's destination endpoint answered 2xx, to
-        the latest ``conversation_end`` in that batch — so this method
-        trusts the caller rather than re-validating monotonicity itself.
+        this with a keyset position strictly later than what :meth:`get`
+        last returned — after a batch's destination endpoint answered 2xx,
+        to the last DELIVERED row's own ``(last_message_at, id)`` — so this
+        method trusts the caller rather than re-validating monotonicity
+        itself.
         """
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text(
                     """
-                    INSERT INTO export_watermarks (name, watermark, updated_at)
-                    VALUES (:name, :watermark, current_timestamp)
+                    INSERT INTO export_watermarks (name, watermark, cursor_id, updated_at)
+                    VALUES (:name, :watermark, :cursor_id, current_timestamp)
                     ON CONFLICT (name) DO UPDATE
                       SET watermark = EXCLUDED.watermark,
+                          cursor_id = EXCLUDED.cursor_id,
                           updated_at = current_timestamp
                     """
                 ),
-                {"name": name, "watermark": watermark},
+                {"name": name, "watermark": watermark, "cursor_id": cursor_id},
             )
-        return {"name": name, "watermark": watermark}
+        return {"name": name, "watermark": watermark, "cursor_id": cursor_id}

@@ -10,6 +10,7 @@ call.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -37,6 +38,17 @@ class _FakePolicy:
         self.placement = placement
 
 
+def _default_config(**overrides) -> dict:
+    config = {
+        "endpoint": "https://collector.example.com/ingest",
+        "headers_secret_env": _HEADERS_ENV,
+        "interval_minutes": 60,
+        "surfaces": (),
+    }
+    config.update(overrides)
+    return config
+
+
 @pytest.fixture(autouse=True)
 def _config(monkeypatch):
     """Default every test in this file to an ON, `full` content-export
@@ -48,16 +60,7 @@ def _config(monkeypatch):
 
     monkeypatch.setattr(mod, "content_export_mode", lambda workload=None: "full")
     monkeypatch.setattr(mod, "load_content_export_policy", lambda: _FakePolicy())
-    monkeypatch.setattr(
-        ic,
-        "get_conversation_export_config",
-        lambda: {
-            "endpoint": "https://collector.example.com/ingest",
-            "headers_secret_env": _HEADERS_ENV,
-            "interval_minutes": 60,
-            "surfaces": (),
-        },
-    )
+    monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config())
     monkeypatch.setenv(_HEADERS_ENV, _HEADERS_VALUE)
 
 
@@ -94,14 +97,19 @@ def _mock_client(handler) -> httpx.Client:
 
 
 def _latest_export_audit_params(pg_engine) -> dict:
+    return _latest_export_audit_row(pg_engine)[1]
+
+
+def _latest_export_audit_row(pg_engine) -> tuple[str, dict]:
     with pg_engine.connect() as conn:
         row = conn.execute(
             sa.text(
-                "SELECT params FROM audit_log WHERE action = 'conversations.export' ORDER BY timestamp DESC LIMIT 1"
+                "SELECT result, params FROM audit_log WHERE action = 'conversations.export' "
+                "ORDER BY timestamp DESC LIMIT 1"
             )
         ).first()
     assert row is not None, "expected one conversations.export audit row"
-    return row[0]
+    return row[0], row[1]
 
 
 class TestWatermarkAdvancesOnlyOn2xx:
@@ -122,7 +130,8 @@ class TestWatermarkAdvancesOnlyOn2xx:
         assert len(requests) == 1
         watermark = export_watermarks_repo().get(WATERMARK_NAME)
         assert watermark is not None
-        assert watermark >= _BASE
+        watermark_ts, _cursor_id = watermark
+        assert watermark_ts >= _BASE
 
     def test_a_500_leaves_the_watermark_and_retries(self, pg_client, pg_engine):
         from app.worker.kinds_conversation_export import MAX_ATTEMPTS, WATERMARK_NAME, run_conversation_export_once
@@ -140,6 +149,274 @@ class TestWatermarkAdvancesOnlyOn2xx:
         assert len(attempts) == MAX_ATTEMPTS
         assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
         assert export_watermarks_repo().get(WATERMARK_NAME) is None
+
+    def test_second_run_after_success_sends_zero_records(self, pg_client, pg_engine):
+        """The trailing conversation of a run must not be re-sent on the
+        next tick -- the defect the keyset watermark fix closes."""
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        _seed_session(pg_engine, index=0)
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert len(requests) == 1
+
+    def test_forked_session_with_diverged_last_message_at_is_not_resent(self, pg_client, pg_engine):
+        """A fork bumps ``chat_sessions.last_message_at`` to "now" while the
+        message's own ``created_at`` (and thus a record's own
+        ``conversation_end``) stays put -- exactly what
+        ``chat_session_participants_pg.py``'s fork path does. The watermark
+        must track the SESSION's own position, never anything derived from
+        the record body, or this session is re-sent every tick forever."""
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        session_id = _seed_session(pg_engine, index=0)
+        diverged_ts = _BASE + timedelta(hours=1)
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": diverged_ts, "id": session_id},
+            )
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first["sent"] == 1
+        assert len(requests) == 1
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert len(requests) == 1
+
+    def test_a_failure_on_batch_2_advances_the_key_only_through_batch_1(self, pg_client, pg_engine, monkeypatch):
+        import app.worker.kinds_conversation_export as mod
+        from src.repositories import export_watermarks_repo
+
+        monkeypatch.setattr(mod, "MAX_BATCH_RECORDS", 1)
+        id1 = _seed_session(pg_engine, index=0)
+        _id2 = _seed_session(pg_engine, index=1)
+
+        responses = iter(
+            [
+                httpx.Response(200),  # batch 1 (id1) -- succeeds
+                httpx.Response(500),  # batch 2 (id2) -- exhausts every retry
+                httpx.Response(500),
+                httpx.Response(500),
+                httpx.Response(500),
+            ]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return next(responses)
+
+        result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 1}
+        watermark = export_watermarks_repo().get(mod.WATERMARK_NAME)
+        assert watermark is not None
+        _watermark_ts, cursor_id = watermark
+        assert cursor_id == id1
+
+
+class TestSurfacesFilterPushedIntoQuery:
+    def test_a_filtered_out_surface_never_resurfaces_and_the_next_run_sends_zero(
+        self, pg_client, pg_engine, monkeypatch
+    ):
+        """``surfaces=("web",)`` must narrow the QUERY itself, not just what
+        gets POSTed -- the defect the query-level push-down fix closes. A
+        newer, excluded-surface conversation must neither be delivered nor
+        keep getting re-fetched and re-discarded on every subsequent tick."""
+        import app.instance_config as ic
+        from app.chat.types import Surface
+        from src.repositories import chat_message_repo, chat_session_repo
+
+        monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config(surfaces=("web",)))
+
+        web_id = _seed_session(pg_engine, index=0, surface="web")
+        slack_session = chat_session_repo().create_session(user_email="analyst@test.com", surface=Surface.SLACK_DM)
+        chat_message_repo().append_message(session_id=slack_session.id, role="user", content="hi slack", turn_id="s1")
+        slack_ts = _BASE + timedelta(minutes=1)  # newer than the web session
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": slack_ts, "id": slack_session.id},
+            )
+            conn.execute(
+                sa.text("UPDATE chat_messages SET created_at = :ts WHERE session_id = :id"),
+                {"ts": slack_ts, "id": slack_session.id},
+            )
+
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert len(requests) == 1
+        (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
+        assert delivered["thread_id"] == web_id
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert len(requests) == 1  # the slack session never triggers a delivery
+
+
+class TestRetrySemantics:
+    def test_connection_error_retries_with_exponential_backoff_and_leaves_the_watermark(self, pg_client, pg_engine):
+        from app.worker.kinds_conversation_export import MAX_ATTEMPTS, WATERMARK_NAME, run_conversation_export_once
+        from src.repositories import export_watermarks_repo
+
+        _seed_session(pg_engine, index=0)
+        attempts: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(request)
+            raise httpx.ConnectError("boom", request=request)
+
+        sleeps: list[float] = []
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=sleeps.append)
+
+        assert MAX_ATTEMPTS == 4
+        assert len(attempts) == 4
+        assert sleeps == [1.0, 2.0, 4.0]
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert export_watermarks_repo().get(WATERMARK_NAME) is None
+
+    @pytest.mark.parametrize("status", [400, 404, 429])
+    def test_a_4xx_response_is_never_retried_within_a_run(self, pg_client, pg_engine, status):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        _seed_session(pg_engine, index=0)
+        attempts: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(request)
+            return httpx.Response(status)
+
+        sleeps: list[float] = []
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=sleeps.append)
+
+        assert len(attempts) == 1
+        assert sleeps == []
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+
+
+class TestFailureHandling:
+    def test_a_mid_walk_exception_does_not_raise_and_audits_a_failed_result(self, pg_client, pg_engine, monkeypatch):
+        import app.worker.kinds_conversation_export as mod
+
+        _seed_session(pg_engine, index=0)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("unexpected failure")
+
+        monkeypatch.setattr(mod, "iter_conversations", _boom)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result == {"failed": "RuntimeError"}
+        audit_result, params = _latest_export_audit_row(pg_engine)
+        assert audit_result == "failed"
+        assert params["error"] == "RuntimeError"
+        assert params["delivery"] == "push"
+        serialized = json.dumps(params)
+        assert "unexpected failure" not in serialized  # class name only, never the message
+
+
+class TestAdvisoryLease:
+    def test_lock_held_skips_without_running_the_export(self, pg_client, pg_engine, monkeypatch):
+        import app.worker.kinds_conversation_export as mod
+
+        @contextlib.contextmanager
+        def fake_lease():
+            yield False
+
+        monkeypatch.setattr("src.db_pg.conversation_export_lease", fake_lease)
+        _seed_session(pg_engine, index=0)
+
+        result = mod.run_conversation_export({})
+
+        assert result == {"skipped": "lock_held"}
+
+
+class TestContentMode:
+    def test_pseudonymized_mode_transforms_text_and_marks_content_mode(self, pg_client, pg_engine, monkeypatch):
+        import app.worker.kinds_conversation_export as mod
+
+        monkeypatch.setattr(mod, "content_export_mode", lambda workload=None: "pseudonymized")
+        monkeypatch.setattr(mod, "export_text", lambda text: text.replace("hello", "REDACTED") if text else text)
+        _seed_session(pg_engine, index=0, content="hello world")
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result["sent"] == 1
+        (record,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
+        assert record["content_mode"] == "pseudonymized"
+        assert "REDACTED" in record["first_user_message"]
+        assert "hello" not in json.dumps(record)
+
+    def test_real_content_export_mode_denies_the_chat_workload_via_policy_workloads(
+        self, pg_client, pg_engine, monkeypatch
+    ):
+        """Uses the REAL ``content_export_mode`` (not monkeypatched to a
+        fixed string) with a policy that excludes ``chat`` from its
+        ``workloads`` allowlist -- proving the call site really passes
+        ``workload="chat"`` rather than an argument-less call that would
+        pass an allowlist-scoped policy through unfiltered."""
+        import app.worker.kinds_conversation_export as mod
+        from src.observability import content_policy as cp
+
+        monkeypatch.setattr(mod, "content_export_mode", cp.content_export_mode)
+        monkeypatch.setattr(
+            cp,
+            "load_content_export_policy",
+            lambda config=None: cp.ContentExportPolicy(
+                mode="full",
+                placement="operator",
+                basis="b",
+                approved_by="a",
+                approved_at="",
+                requested_mode="full",
+                warnings=(),
+                workloads=("builder",),
+            ),
+        )
+        _seed_session(pg_engine, index=0)
+        calls = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["count"] += 1
+            return httpx.Response(200)
+
+        result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result == {"skipped": "content_export_disabled"}
+        assert calls["count"] == 0
 
 
 class TestBatching:
@@ -262,16 +539,7 @@ class TestDuckDbSwallowsCleanly:
         import app.worker.kinds_conversation_export as mod
 
         monkeypatch.setattr(mod, "content_export_mode", lambda workload=None: "full")
-        monkeypatch.setattr(
-            ic,
-            "get_conversation_export_config",
-            lambda: {
-                "endpoint": "https://collector.example.com/ingest",
-                "headers_secret_env": None,
-                "interval_minutes": 60,
-                "surfaces": (),
-            },
-        )
+        monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config(headers_secret_env=None))
 
         result = mod.run_conversation_export_once(sleep=lambda *_: None)
 
