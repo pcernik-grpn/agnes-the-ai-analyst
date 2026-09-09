@@ -846,6 +846,7 @@ CATALOG: dict[str, AuditEvent] = {
     "chat.session.title_update": AuditEvent(
         "chat.session.title_update", "mutation", "A chat session's title was changed."
     ),
+    "chat.feedback": AuditEvent("chat.feedback", "mutation", "A user rated one chat turn (thumbs up/down)."),
     "chat.copresence.fork": AuditEvent(
         "chat.copresence.fork", "mutation", "A shared chat session was forked into the caller's own copy."
     ),

@@ -3235,6 +3235,7 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/sessions
 - /api/chat/sessions/{chat_id}
 - /api/chat/sessions/{chat_id}/archived
+- /api/chat/sessions/{chat_id}/feedback
 - /api/chat/sessions/{chat_id}/files
 - /api/chat/sessions/{chat_id}/files/download
 - /api/chat/sessions/{chat_id}/files/preview
@@ -4141,6 +4142,17 @@ session. Both delivery paths carry it: native providers mount the session
 directory, and the kai-agent provider packs the same bytes into its workspace
 tarball, so the preview cannot work on one provider and silently do nothing on
 the other.
+
+`POST /api/chat/sessions/{chat_id}/feedback` records a thumbs up/down on one
+completed chat turn (`{turn_id, verdict: "up"|"down", comment?}`) — the LLM
+observability design's quality signal (§3.5). Gated like the session's other
+routes: the owner or a live participant, 404 for a stranger (never 403). One
+row per `(turn_id, user_id)` — resubmitting for the same turn UPDATEs it
+rather than adding a second opinion. Postgres-only (A3 ratchet): the feedback
+repository is resolved as a dependency, so a DuckDB-backed instance answers
+the typed `501 requires_postgres_backend` before the body is even validated.
+The comment never enters the audit trail or the structured log line — only
+`session_id`, `turn_id` and `verdict` do.
 
 `POST /api/store/entities/builder/preview-agent` backs that builder's Preview
 tab for agent TEMPLATES. A template is a system prompt, so trying one means
