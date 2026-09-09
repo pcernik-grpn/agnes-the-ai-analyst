@@ -26,6 +26,15 @@ We deliberately exclude ``audit_log.created_at`` / ``data_packages.created_at``
 from comparison — wall-clock columns flicker between two adjacent writes. We
 DO compare row counts, schema, and content columns. Audit rows are matched
 by ``(action, target)`` pairs since exact wall-clock differs.
+
+PG-only routes are out of scope for this suite. ``parity_env`` snapshots
+deltas via ``src.db.get_system_db()`` against ``seeded_app``'s DuckDB
+app-state backend, so a route backed by a Postgres-only repository (A3
+PG-first ratchet) answers a typed ``501`` here rather than writing anything
+to compare — there is nothing for a DuckDB-side snapshot to see. This is why
+neither ``/api/semantic-feedback`` nor the issue-reporting routes
+(``/api/issues*``, ``/api/admin/issues*`` — issue reporting step 1) have a
+parity class in this file: both are PG-only by design, not by omission.
 """
 
 from __future__ import annotations

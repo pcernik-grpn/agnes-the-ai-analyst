@@ -517,6 +517,16 @@ class TestToolRegistration:
             "flag_semantic_issue",
             "semantic_feedback_list",
             "semantic_feedback_resolve",
+            # Issue reporting (step 1) — "report a problem" from any surface.
+            # Triple-surface with /api/issues* + /api/admin/issues* + `agnes
+            # issue …` / `agnes admin issue …`.
+            "report_issue",
+            "list_my_issues",
+            "get_issue",
+            "issue_comment",
+            "issue_queue_list",
+            "issue_reply",
+            "issue_resolve",
             # Job management for scheduler — list, get, enqueue tasks.
             # Triple-surface with GET /api/jobs + GET /api/jobs/{job_id} +
             # POST /api/jobs + `agnes admin jobs`.
