@@ -65,12 +65,19 @@ def _config(monkeypatch):
 
 
 def _seed_session(
-    pg_engine, *, index: int, user_email: str = "analyst@test.com", surface: str = "web", content: str | None = None
+    pg_engine,
+    *,
+    index: int,
+    user_email: str = "analyst@test.com",
+    surface: str = "web",
+    content: str | None = None,
+    ts: datetime | None = None,
 ):
     """One chat session with one user message, `last_message_at` pinned to
     a deterministic, strictly-increasing timestamp -- mirrors
     `tests/db_pg/test_conversation_export_pg.py`'s helper of the same
-    shape."""
+    shape. `ts` overrides the default `_BASE`-relative timestamp for tests
+    that need a NOW-relative one (the settle-window tests below)."""
     from app.chat.types import Surface
     from src.repositories import chat_message_repo, chat_session_repo
 
@@ -79,7 +86,7 @@ def _seed_session(
         session_id=session.id, role="user", content=content or f"hello {index}", turn_id=f"t{index}"
     )
 
-    ts = _BASE + timedelta(minutes=index)
+    ts = ts if ts is not None else _BASE + timedelta(minutes=index)
     with pg_engine.begin() as conn:
         conn.execute(
             sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
@@ -94,6 +101,17 @@ def _seed_session(
 
 def _mock_client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _watermark_name_for(config: dict | None = None) -> str:
+    """The `export_watermarks.name` row a given delivery config resolves
+    to -- defaults to `_default_config()` so most tests can call this with
+    no arguments."""
+    from app.worker.kinds_conversation_export import watermark_name
+
+    cfg = config or _default_config()
+    surfaces = tuple(cfg["surfaces"]) if cfg["surfaces"] else ()
+    return watermark_name(cfg["endpoint"], surfaces)
 
 
 def _latest_export_audit_params(pg_engine) -> dict:
@@ -114,7 +132,7 @@ def _latest_export_audit_row(pg_engine) -> tuple[str, dict]:
 
 class TestWatermarkAdvancesOnlyOn2xx:
     def test_a_successful_batch_advances_the_watermark(self, pg_client, pg_engine):
-        from app.worker.kinds_conversation_export import WATERMARK_NAME, run_conversation_export_once
+        from app.worker.kinds_conversation_export import run_conversation_export_once
         from src.repositories import export_watermarks_repo
 
         _seed_session(pg_engine, index=0)
@@ -128,13 +146,13 @@ class TestWatermarkAdvancesOnlyOn2xx:
 
         assert result == {"sent": 1, "batches": 1, "batches_failed": 0}
         assert len(requests) == 1
-        watermark = export_watermarks_repo().get(WATERMARK_NAME)
+        watermark = export_watermarks_repo().get(_watermark_name_for())
         assert watermark is not None
         watermark_ts, _cursor_id = watermark
         assert watermark_ts >= _BASE
 
     def test_a_500_leaves_the_watermark_and_retries(self, pg_client, pg_engine):
-        from app.worker.kinds_conversation_export import MAX_ATTEMPTS, WATERMARK_NAME, run_conversation_export_once
+        from app.worker.kinds_conversation_export import MAX_ATTEMPTS, run_conversation_export_once
         from src.repositories import export_watermarks_repo
 
         _seed_session(pg_engine, index=0)
@@ -148,7 +166,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
 
         assert len(attempts) == MAX_ATTEMPTS
         assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
-        assert export_watermarks_repo().get(WATERMARK_NAME) is None
+        assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     def test_second_run_after_success_sends_zero_records(self, pg_client, pg_engine):
         """The trailing conversation of a run must not be re-sent on the
@@ -224,7 +242,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
         result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
         assert result == {"sent": 1, "batches": 1, "batches_failed": 1}
-        watermark = export_watermarks_repo().get(mod.WATERMARK_NAME)
+        watermark = export_watermarks_repo().get(_watermark_name_for())
         assert watermark is not None
         _watermark_ts, cursor_id = watermark
         assert cursor_id == id1
@@ -279,7 +297,7 @@ class TestSurfacesFilterPushedIntoQuery:
 
 class TestRetrySemantics:
     def test_connection_error_retries_with_exponential_backoff_and_leaves_the_watermark(self, pg_client, pg_engine):
-        from app.worker.kinds_conversation_export import MAX_ATTEMPTS, WATERMARK_NAME, run_conversation_export_once
+        from app.worker.kinds_conversation_export import MAX_ATTEMPTS, run_conversation_export_once
         from src.repositories import export_watermarks_repo
 
         _seed_session(pg_engine, index=0)
@@ -296,7 +314,7 @@ class TestRetrySemantics:
         assert len(attempts) == 4
         assert sleeps == [1.0, 2.0, 4.0]
         assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
-        assert export_watermarks_repo().get(WATERMARK_NAME) is None
+        assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     @pytest.mark.parametrize("status", [400, 404, 429])
     def test_a_4xx_response_is_never_retried_within_a_run(self, pg_client, pg_engine, status):
@@ -506,7 +524,7 @@ class TestContentPolicyGate:
 
         assert result == {"skipped": "content_export_disabled"}
         assert calls["count"] == 0
-        assert export_watermarks_repo().get(mod.WATERMARK_NAME) is None
+        assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     def test_not_configured_makes_no_request(self, pg_client, pg_engine, monkeypatch):
         import app.instance_config as ic
@@ -544,3 +562,155 @@ class TestDuckDbSwallowsCleanly:
         result = mod.run_conversation_export_once(sleep=lambda *_: None)
 
         assert result == {"skipped": "requires_postgres_backend"}
+
+
+class TestWatermarkTracksDeliveryConfig:
+    """The watermark identity is a function of ``endpoint``/``surfaces`` --
+    the defect fix for an operator who repoints the endpoint or widens the
+    surfaces allowlist and would otherwise silently resume the OLD
+    configuration's cursor, never re-delivering anything completed before
+    the change to the new destination / newly-included surface."""
+
+    def test_changing_the_endpoint_redelivers_everything_to_the_new_endpoint(self, pg_client, pg_engine, monkeypatch):
+        import app.instance_config as ic
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        _seed_session(pg_engine, index=0)
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert len(requests) == 1
+
+        new_endpoint = "https://new-collector.example.com/ingest"
+        monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config(endpoint=new_endpoint))
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert len(requests) == 2
+        assert str(requests[1].url) == new_endpoint
+
+    def test_widening_surfaces_delivers_the_previously_excluded_conversation(self, pg_client, pg_engine, monkeypatch):
+        import app.instance_config as ic
+        from app.chat.types import Surface
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import chat_message_repo, chat_session_repo
+
+        monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config(surfaces=("web",)))
+
+        web_id = _seed_session(pg_engine, index=0, surface="web")
+        slack_session = chat_session_repo().create_session(user_email="analyst@test.com", surface=Surface.SLACK_DM)
+        chat_message_repo().append_message(session_id=slack_session.id, role="user", content="hi slack", turn_id="s1")
+        slack_ts = _BASE + timedelta(minutes=1)
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": slack_ts, "id": slack_session.id},
+            )
+            conn.execute(
+                sa.text("UPDATE chat_messages SET created_at = :ts WHERE session_id = :id"),
+                {"ts": slack_ts, "id": slack_session.id},
+            )
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
+        assert delivered["thread_id"] == web_id
+
+        monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config(surfaces=("web", "slack_dm")))
+
+        second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        # The widened surfaces list is a NEW delivery configuration -- its
+        # watermark starts fresh at the epoch, so the run re-delivers
+        # everything that now matches the filter (both sessions), not only
+        # the newly-included one. That IS the fix: the slack conversation,
+        # previously unreachable under any cursor, is finally delivered.
+        assert second == {"sent": 2, "batches": 1, "batches_failed": 0}
+        assert len(requests) == 2
+        delivered2 = {json.loads(line)["thread_id"] for line in requests[1].content.decode("utf-8").splitlines()}
+        assert delivered2 == {web_id, slack_session.id}
+
+
+class TestSettleWindow:
+    """A conversation is walked only once its `last_message_at` is at
+    least `SETTLE_WINDOW` old -- the defect fix for a push tick that lands
+    between a user message and its still-pending assistant answer."""
+
+    def test_a_message_one_minute_old_is_not_exported_and_the_watermark_does_not_move(self, pg_client, pg_engine):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import export_watermarks_repo
+
+        now = datetime.now(UTC)
+        _seed_session(pg_engine, index=0, ts=now - timedelta(minutes=1))
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert len(requests) == 0
+        assert export_watermarks_repo().get(_watermark_name_for()) is None
+
+    def test_a_message_ten_minutes_old_is_exported(self, pg_client, pg_engine):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        now = datetime.now(UTC)
+        _seed_session(pg_engine, index=0, ts=now - timedelta(minutes=10))
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert len(requests) == 1
+
+    def test_a_message_inside_the_window_is_exported_once_the_window_passes(self, pg_client, pg_engine, monkeypatch):
+        """An interrupted turn (a user message that never gets answered)
+        is left for a later tick, not skipped forever -- once the settle
+        window has passed the SAME session is exported by the next run."""
+        import app.worker.kinds_conversation_export as mod
+
+        base_now = datetime.now(UTC)
+        _seed_session(pg_engine, index=0, ts=base_now - timedelta(minutes=1))
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        class _FrozenDatetime(datetime):
+            _fixed = base_now
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+        monkeypatch.setattr(mod, "datetime", _FrozenDatetime)
+
+        first = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert first == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert len(requests) == 0
+
+        _FrozenDatetime._fixed = base_now + timedelta(minutes=6)
+        second = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert len(requests) == 1
