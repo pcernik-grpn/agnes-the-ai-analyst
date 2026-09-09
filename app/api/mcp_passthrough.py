@@ -16,10 +16,14 @@ with per-tool RBAC enforced via ``tool_grants`` + ``user_group_members``
   ``/call`` directly to forward a single invocation.
 
 The ``/call`` endpoint forwards to the upstream MCP source via
-``connectors/mcp/client.call_tool_async``; auth_method + auth_secret_env
-on ``mcp_sources`` decide what the upstream sees. RFC #461 §4 vault +
-per-user credential passthrough is the next step — see
-``dev_docs/POC-mcp-universal.md`` "Known limitations".
+``connectors/mcp/client.call_tool_async``. What the upstream sees depends on
+the source's ``scope``: a ``'shared'`` source forwards the shared vault
+secret (``auth_method`` + ``auth_secret_env`` on ``mcp_sources``); a
+``'per_user'`` source forwards the caller's OWN credential — their
+``mcp_user_secrets`` row, or their ``mcp_user_oauth_tokens`` row for
+``auth_method='oauth'`` — and ``enforce_per_user_credential`` fails closed
+when that row is absent, never borrowing the shared secret (RFC #461 §4,
+implemented; see ``app/api/mcp_policy.py`` and ``app/api/mcp_user_secrets.py``).
 """
 
 from __future__ import annotations
