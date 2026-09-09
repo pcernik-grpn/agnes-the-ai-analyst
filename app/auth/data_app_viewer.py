@@ -217,6 +217,46 @@ def mint_viewer_data_token(row: Mapping[str, Any], user: Mapping[str, Any]) -> s
     )
 
 
+def verify_viewer_assertion(row: Mapping[str, Any], token: str) -> Optional[dict[str, Any]]:
+    """Server-side check of an ``X-Agnes-Viewer`` assertion an app hands BACK
+    (e.g. as ``viewer_assertion`` in a write body, to stamp who submitted a
+    row). Returns the claims, or ``None`` for anything that does not verify
+    under THIS app's current derived secret with ``aud="data-app:<slug>"``.
+
+    Trust level, stated plainly: the per-app secret is held by the container,
+    so a verified assertion proves "minted by the proxy for this app, OR by
+    this app's own (owner-controlled) code" — attribution the owner could
+    forge for their own app, never authorization. Use it to stamp
+    ``submitted_by``; never to widen what the write itself may do. For a
+    server-verifiable viewer identity use viewer mode: the container forwards
+    ``X-Agnes-Viewer-Token`` as its bearer and ``pat_resolver`` resolves a
+    ``DataAppViewerPrincipal`` (``viewer_user_id`` is then unforgeable).
+
+    An assertion minted under the PREVIOUS ``service_token_id`` (a redeploy
+    landed in the last five minutes) fails here by design — same as the
+    container's own check.
+    """
+    import jwt
+
+    from app.auth.jwt import ALGORITHM
+
+    token_id = row.get("service_token_id") or ""
+    if not token or not token_id or not row.get("slug"):
+        return None
+    try:
+        claims = jwt.decode(
+            token,
+            derive_viewer_secret(row["slug"], token_id),
+            algorithms=[ALGORITHM],
+            audience=f"data-app:{row['slug']}",
+        )
+    except jwt.InvalidTokenError:
+        return None
+    if claims.get("typ") != VIEWER_ASSERTION_TYP or not claims.get("sub"):
+        return None
+    return claims
+
+
 def build_viewer_headers(row: Mapping[str, Any], user: Mapping[str, Any], via: str) -> dict[str, str]:
     """The headers the proxy adds to one upstream request/handshake: the
     assertion always (when mintable), the data token only in viewer mode."""

@@ -241,3 +241,21 @@ def test_windowed_audit_gate_debounces_and_bounds():
     assert len(gate._seen) == 2
     gate.reset()
     assert gate.should_log(("u1", "s")) is True
+
+
+def test_verify_viewer_assertion_round_trips_and_pins_slug_and_secret(conn):
+    from app.auth import data_app_viewer as dav
+
+    row = {"slug": "sales", "id": "app_1", "service_token_id": "tok-1"}
+    user = {"id": "viewer", "email": "viewer@example.com", "name": "Viewer"}
+    token = dav.mint_viewer_assertion(row, user, "session")
+    claims = dav.verify_viewer_assertion(row, token)
+    assert claims and claims["sub"] == "viewer" and claims["email"] == "viewer@example.com"
+    # another app cannot accept it (aud + secret both differ) ...
+    assert dav.verify_viewer_assertion({**row, "slug": "other"}, token) is None
+    # ... nor the same app after its service token rotated ...
+    assert dav.verify_viewer_assertion({**row, "service_token_id": "tok-2"}, token) is None
+    # ... and garbage / a server-signed viewer DATA token is not an assertion.
+    assert dav.verify_viewer_assertion(row, "not.a.jwt") is None
+    assert dav.verify_viewer_assertion(row, dav.mint_viewer_data_token(row, user)) is None
+    assert dav.verify_viewer_assertion({**row, "service_token_id": ""}, token) is None
