@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -123,6 +123,7 @@ class LlmCallRecord:
     completion_chars: int | None
     stop_reason: str | None
     stream_complete: bool | None
+    response_truncated: bool | None = None
 
     def to_row(self) -> dict[str, Any]:
         """The ledger row — column names are the field names, one to one."""
@@ -161,6 +162,7 @@ def build_record(
     completion_chars: int | None = None,
     stop_reason: str | None = None,
     stream_complete: bool | None = None,
+    response_truncated: bool | None = None,
     trace_id: str | None = None,
     span_id: str | None = None,
     batch: bool = False,
@@ -172,14 +174,17 @@ def build_record(
     call that never produced one — a failure is a real, zero-cost row, not a
     gap in the ledger. The price follows the model the RESPONSE reported when
     there is one (an alias can resolve upstream to a different family) and
-    the requested model otherwise.
+    the requested model otherwise. ``response_truncated`` marks a completion
+    whose usage was recovered from the broker's bounded head/tail edges after
+    its full-body mirror overflowed — the tokens and price are real, only the
+    content summary was cut short.
     """
     tokens = {k: _int((usage or {}).get(k)) for k in TOKEN_KINDS}
     priced_model = model_response or model_requested
     cost = round(cost_usd(model=priced_model, batch=batch, **tokens), 6)
     return LlmCallRecord(
         id=str(uuid4()),
-        created_at=created_at or datetime.now(timezone.utc),
+        created_at=created_at or datetime.now(UTC),
         kind=kind,
         workload=context.workload,
         purpose=context.purpose,
@@ -205,6 +210,7 @@ def build_record(
         completion_chars=completion_chars,
         stop_reason=stop_reason,
         stream_complete=stream_complete,
+        response_truncated=response_truncated,
         **tokens,
     )
 

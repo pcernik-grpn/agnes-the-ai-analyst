@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
@@ -57,6 +58,7 @@ from app.api.broker_agent_policy import (
     check_model,
     check_model_value,
     parse_usage,
+    parse_usage_from_edges,
     usage_accumulator,
 )
 from app.api.broker_vertex import (
@@ -91,9 +93,17 @@ from src.repositories import (
 logger = logging.getLogger(__name__)
 
 #: Cap on the SSE bytes mirrored for streaming usage recording — a
-#: completion body far past this is pathological; usage recording is then
-#: skipped (logged) rather than holding unbounded memory per request.
+#: completion body far past this is pathological; the full mirror stops
+#: growing past this point (logged), but usage still survives via the
+#: bounded head/tail edges below.
 _SSE_USAGE_COLLECT_MAX_BYTES = 8 * 1024 * 1024
+#: Size of the head and tail edge buffers kept for EVERY streamed completion,
+#: on top of the full mirror above. Anthropic puts usage in ``message_start``
+#: (the stream's first bytes) and ``message_delta`` (its last), so 64 KiB at
+#: each end is enough to recover tokens, cost, model and stop reason from a
+#: stream whose full body blew past the mirror cap — only the content
+#: summary is then lost.
+_SSE_EDGE_BYTES = 64 * 1024
 
 router = APIRouter(prefix="/api/broker", tags=["broker"])
 
@@ -945,6 +955,7 @@ def _record_completion(
     latency_ms: Optional[int],
     summary: "_otel.CompletionSummary",
     error: Optional[BaseException] = None,
+    response_truncated: bool = False,
 ) -> Optional[LlmCallRecord]:
     """Build, price and buffer the ``llm_calls`` row for one completion.
 
@@ -954,6 +965,9 @@ def _record_completion(
     exported span describe the same call. Returns the record so the caller
     can finish the span with the price it just computed; returns ``None``
     if anything went wrong, because a measurement never costs a forward.
+    ``response_truncated`` marks a streamed completion whose usage was
+    recovered from the head/tail edges after the full-body mirror
+    overflowed — the tokens and price are still real (spec 3.1).
     """
     try:
         trace_id, span_id = _otel.span_ids(span) if span is not None else (None, None)
@@ -974,6 +988,7 @@ def _record_completion(
             completion_chars=summary.completion_chars,
             stop_reason=summary.stop_reason,
             stream_complete=summary.stream_complete,
+            response_truncated=response_truncated,
             trace_id=trace_id,
             span_id=span_id,
         )
@@ -1676,50 +1691,74 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
         state = {"overflow": False}
+        # The bounded edges kept for EVERY streamed completion regardless of
+        # the full mirror's own overflow state: a 64 KiB append-only head and
+        # a 64 KiB rolling tail (whole chunks, so the cap is approximate, not
+        # exact). Anthropic's usage lives in `message_start` (first bytes)
+        # and `message_delta` (last bytes), so these two windows are what a
+        # completion whose body blew past `_SSE_USAGE_COLLECT_MAX_BYTES`
+        # falls back to (`parse_usage_from_edges` below) — tokens, cost,
+        # model and stop reason survive; only the content summary is lost.
+        head = bytearray()
+        tail: collections.deque[bytes] = collections.deque()
+        tail_bytes = 0
         # Mirror the passthrough bytes when SOMETHING downstream reads them:
         # the budget ledger, the span, or the call record (which is built for
         # every completion, export on or off).
         mirror_body = collect_usage or otel_span is not None or completion_context is not None
 
         async def _passthrough():
+            nonlocal tail_bytes
             try:
                 async for chunk in resp.aiter_bytes():
-                    if mirror_body and not state["overflow"]:
-                        if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
-                            collected.extend(chunk)
-                        else:
-                            state["overflow"] = True
+                    if mirror_body:
+                        if len(head) < _SSE_EDGE_BYTES:
+                            head.extend(chunk[: _SSE_EDGE_BYTES - len(head)])
+                        tail.append(chunk)
+                        tail_bytes += len(chunk)
+                        while len(tail) > 1 and tail_bytes - len(tail[0]) >= _SSE_EDGE_BYTES:
+                            tail_bytes -= len(tail.popleft())
+                        if not state["overflow"]:
+                            if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
+                                collected.extend(chunk)
+                            else:
+                                state["overflow"] = True
                     yield chunk
             finally:
                 await resp.aclose()
                 await client.aclose()
                 body = bytes(collected)
                 # Parsed ONCE for all three consumers below (budget ledger,
-                # call record, span) — the same figures, by construction.
-                usage = None if state["overflow"] else parse_usage(body, ctype)
+                # call record, span) — the same figures, by construction. An
+                # overflowed stream recovers usage from the edges instead of
+                # losing it outright (spec 3.1).
+                if state["overflow"]:
+                    usage = parse_usage_from_edges(bytes(head), b"".join(tail), ctype)
+                else:
+                    usage = parse_usage(body, ctype)
                 if collect_usage:
                     try:
                         if state["overflow"]:
                             logger.warning(
-                                "SSE usage recording skipped for session %s: stream exceeded %d bytes",
+                                "usage recovered from stream edges; content summary truncated "
+                                "(session %s, stream exceeded %d bytes)",
                                 row.get("session_id"),
                                 _SSE_USAGE_COLLECT_MAX_BYTES,
                             )
-                        else:
-                            if usage and agent_row is not None:
-                                usage_accumulator.add(
-                                    {
-                                        **usage,
-                                        "id": str(uuid.uuid4()),
-                                        "agent_id": agent_row["id"],
-                                        "user_id": agent_row.get("owner_user_id"),
-                                        "caller_user_id": caller_user_id,
-                                        "session_id": row.get("session_id"),
-                                    },
-                                    budget_ttl_s=budget_ttl_s,
-                                )
-                            if usage and turn_session_id:
-                                add_turn_usage(turn_session_id, usage)
+                        if usage and agent_row is not None:
+                            usage_accumulator.add(
+                                {
+                                    **usage,
+                                    "id": str(uuid.uuid4()),
+                                    "agent_id": agent_row["id"],
+                                    "user_id": agent_row.get("owner_user_id"),
+                                    "caller_user_id": caller_user_id,
+                                    "session_id": row.get("session_id"),
+                                },
+                                budget_ttl_s=budget_ttl_s,
+                            )
+                        if usage and turn_session_id:
+                            add_turn_usage(turn_session_id, usage)
                     except Exception:
                         logger.exception(
                             "llm usage recording failed for agent %s (stream already forwarded)",
@@ -1730,10 +1769,16 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                 if completion_context is not None:
                     summary = _otel.describe_completion(
                         request_body=raw_body,
-                        response_body=body,
+                        response_body=bytes(head) if state["overflow"] else body,
                         content_type=ctype,
                         response_truncated=state["overflow"],
                     )
+                    if state["overflow"] and usage:
+                        # `describe_completion` never re-parses a truncated
+                        # body — stop reason and stream-completeness come
+                        # from the tail's own `message_delta` instead.
+                        summary.stop_reason = usage.get("stop_reason")
+                        summary.stream_complete = bool(usage.get("stop_reason"))
                     record = _record_completion(
                         context=completion_context,
                         span=otel_span,
@@ -1743,6 +1788,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                         status_code=resp.status_code,
                         latency_ms=int((time.monotonic() - forward_started) * 1000),
                         summary=summary,
+                        response_truncated=state["overflow"],
                     )
                 if otel_span is not None:
                     _otel.end_completion_span(
