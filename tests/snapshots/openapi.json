@@ -5452,6 +5452,42 @@
         "title": "FactsSearchRequest",
         "type": "object"
       },
+      "FeedbackBody": {
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "turn_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "up",
+              "down"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "verdict"
+        ],
+        "title": "FeedbackBody",
+        "type": "object"
+      },
       "FeedbackCreate": {
         "description": "One report. Only the question is required.\n\nThe caps are the point of declaring these at all: the columns are ``TEXT``,\nthe submitter is any signed-in caller, and an uncapped field is an\ninvitation to store a megabyte of paste per row. They are generous enough\nthat no genuine report hits them.",
         "properties": {
@@ -42925,6 +42961,79 @@
           }
         },
         "summary": "Set Session Archived",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/feedback": {
+      "post": {
+        "description": "Thumbs up/down on one completed chat turn (LLM observability design \u00a73.5).\n\nKeyed on the TURN, not the message: the client learns ``turn_id`` from the\nframes it already receives (\u00a73.2), while the assistant row is written only\nafter the frame is broadcast. One row per ``(turn_id, user_id)`` \u2014 a second\nsubmit for the same turn UPDATEs it rather than piling up a second opinion.\nGated like the session's other routes (owner or a live participant, 404\nfor a stranger \u2014 never 403, matching the sibling routes above). The\nfeedback repo is resolved as a FastAPI dependency so a DuckDB-backed\ninstance answers the typed 501 before the body is even validated.\nAudited as ``chat.feedback`` with the verdict, never the comment.",
+        "operationId": "submit_feedback_api_chat_sessions__chat_id__feedback_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Feedback",
         "tags": [
           "chat"
         ]
