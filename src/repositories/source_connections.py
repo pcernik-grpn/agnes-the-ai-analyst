@@ -25,6 +25,16 @@ _CONFIG_PATCH_CONFLICT_RETRIES = 3
 _CONFIG_PATCH_CONFLICT_BACKOFF_S = 0.05
 
 
+def _next_run_generation(current: Any) -> int:
+    """``current + 1``, treating a missing or unparseable persisted value as
+    ``0``. Mirrored verbatim in the Postgres sibling — see
+    :meth:`SourceConnectionsRepository.claim_run_generation`."""
+    try:
+        return int(current or 0) + 1
+    except (TypeError, ValueError):
+        return 1
+
+
 class SourceConnectionsRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection):
         self.conn = conn
@@ -272,6 +282,72 @@ class SourceConnectionsRepository:
                 )
                 self.conn.execute("COMMIT")
                 return self.get(connection_id)
+            except duckdb.TransactionException as e:
+                self._safe_rollback()
+                last_err = e
+                time.sleep(_CONFIG_PATCH_CONFLICT_BACKOFF_S * (attempt + 1))
+            except Exception:
+                self._safe_rollback()
+                raise
+        if last_err is not None:
+            raise last_err
+        return None
+
+    def claim_run_generation(self, connection_id: str) -> Optional[int]:
+        """Bump ``config.extraction.run_generation`` and return the NEW
+        value — the monotonic per-connection counter that says who owns this
+        connection's extraction right now (issue #2333). ``None`` if
+        ``connection_id`` doesn't exist.
+
+        ONE transaction, one read-modify-write: a caller that read the
+        counter and then wrote ``current + 1`` itself would let two
+        concurrent triggers claim the SAME generation, and the whole point
+        of the counter is that a claim can never be shared. This is the
+        compare-and-set — the storage layer, under its own conflict retry
+        (Postgres: the row lock), is what makes "bump" atomic, never the
+        caller.
+
+        Deliberately not backed by ``extraction_runs`` and deliberately not
+        a new column: the counter has to work on BOTH app-state backends,
+        because a DuckDB-backed instance always takes the INLINE crawl path
+        (A3 ratchet) — exactly the path on which a zombie handler outlives
+        its own force-cancelled job. It lives one key over from the
+        cooperative-stop flag, in the same JSON sub-object, for the same
+        reason that flag does (see :meth:`merge_extraction`).
+
+        A missing or unparseable persisted value counts as ``0``, so the
+        first claim on any connection — including one that predates this
+        counter — is generation ``1`` and nothing has to backfill.
+        """
+        last_err: Optional[duckdb.Error] = None
+        for attempt in range(_CONFIG_PATCH_CONFLICT_RETRIES):
+            try:
+                self.conn.execute("BEGIN")
+                row = self.conn.execute(
+                    "SELECT config FROM source_connections WHERE id = ?",
+                    [connection_id],
+                ).fetchone()
+                if row is None:
+                    self.conn.execute("ROLLBACK")
+                    return None
+                current = row[0]
+                if isinstance(current, str):
+                    try:
+                        current = json.loads(current)
+                    except (json.JSONDecodeError, TypeError):
+                        current = {}
+                elif not isinstance(current, dict):
+                    current = {}
+                extraction = dict(current.get("extraction") or {})
+                claimed = _next_run_generation(extraction.get("run_generation"))
+                extraction["run_generation"] = claimed
+                merged = {**current, "extraction": extraction}
+                self.conn.execute(
+                    "UPDATE source_connections SET config = ? WHERE id = ?",
+                    [json.dumps(merged), connection_id],
+                )
+                self.conn.execute("COMMIT")
+                return claimed
             except duckdb.TransactionException as e:
                 self._safe_rollback()
                 last_err = e

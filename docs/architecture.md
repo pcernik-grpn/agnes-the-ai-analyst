@@ -822,7 +822,15 @@ both app-state backends, and polled by the crawl at the SAME two points the
 timeout already checks (unconditionally between delta pages, every 10
 completed items between files), recording `interrupted_reason: "stopped"`.
 A stale flag left over from a previous run is cleared at the START of the
-next one, so a stop can never reach forward past the run it was meant for.
+next one — by comparing the job the flag names (`stop_job_id`) against the
+job that is triggering, so a stop can never reach forward past the run it was
+meant for, and one aimed at a trigger that was merely still queued is never
+mistaken for stale. A separate, monotonic per-connection **run generation**
+(claimed atomically by every trigger, re-checked by the inline crawl, the
+shard planner and every shard child before their own side effects) is what
+stops a handler that outlived its own force-cancelled job: unlike the stop
+flag, which a legitimate retrigger deliberately clears, a generation cannot
+be cleared out from under a zombie.
 Those three reasons, and only those three, mean the persisted state
 describes exactly what was ingested, so a reader may promise that the next
 run resumes. The live checkpoint also carries an `activity` block (current
@@ -1015,7 +1023,8 @@ load-bearing.
 | Ingest | `POST /api/collections/{id}/files` internals, `corpus_files` repos | collection + stable_id + markdown; source-neutral idempotence |
 | Facts extraction | `connectors/sharepoint/facts_extraction.py`, `facts_prompt.py` | reads ingested markdown from collections; no source types anywhere |
 | Run observability | `extraction_runs` (PG), `app/api/admin_extraction.py` | keyed by `connection_id` only — any connector's runs land here |
-| Cooperative stop | `config.extraction.stop_requested_at` on `source_connections` | generic column, generic endpoint mechanics |
+| Cooperative stop | `config.extraction.stop_requested_at`/`stop_job_id` on `source_connections` | generic column, generic endpoint mechanics |
+| Run ownership | `config.extraction.run_generation` on `source_connections` | generic counter; supersedes a zombie handler on any connector |
 | Configuration | instance-wide `extraction.*` (timeouts, concurrency, LLM stages) | not namespaced per source |
 | Cost accounting | stage-keyed `usage` (`ner`/`ocr`/`facts`), `src/llm_pricing.py` | per run, source-blind |
 | UI | the data-sources card's Run / Run history / activity / preview panels | render the generic endpoints above |

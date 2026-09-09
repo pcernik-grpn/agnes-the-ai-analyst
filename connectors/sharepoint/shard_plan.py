@@ -204,6 +204,23 @@ class _PlanProgress:
                 logger.debug("sharepoint shard planner: on_progress callback failed", exc_info=True)
 
 
+class PlanningAborted(BaseException):
+    """The caller's ``on_progress`` callback asked planning to stop NOW.
+
+    Inherits :class:`BaseException`, not :class:`Exception`, for one
+    reason: every ``except Exception`` in this module — including
+    :meth:`_PlanProgress._emit`'s own "a checkpoint failure must never
+    abort planning" guard, which is correct for a checkpoint WRITE failure
+    — would otherwise swallow it, and the caller's abort would be silently
+    downgraded into "keep enumerating for another twenty minutes". The
+    crawler raises it from its progress wrapper when the run has been
+    superseded or stopped, and converts it back to an ordinary exception at
+    its own ``compute_shard_plan`` call site
+    (``connectors/sharepoint/crawler.py::_plan_or_run_inline``) — it never
+    escapes into worker code as a ``BaseException``.
+    """
+
+
 class PlanningBudgetExhausted(RuntimeError):
     """Raised by :func:`compute_shard_plan` when the shared search budget
     ran out before ANY signal (known/childCount/Search) resolved for any

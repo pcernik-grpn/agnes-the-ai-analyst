@@ -12,6 +12,16 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 
+def _next_run_generation(current: Any) -> int:
+    """``current + 1``, treating a missing or unparseable persisted value as
+    ``0`` — mirrors the DuckDB sibling's helper of the same name (see
+    :meth:`SourceConnectionsPgRepository.claim_run_generation`)."""
+    try:
+        return int(current or 0) + 1
+    except (TypeError, ValueError):
+        return 1
+
+
 class SourceConnectionsPgRepository:
     def __init__(self, engine: Engine):
         self._engine = engine
@@ -227,6 +237,40 @@ class SourceConnectionsPgRepository:
                 .first()
             )
         return self._decode(dict(updated) if updated else None)
+
+    def claim_run_generation(self, connection_id: str) -> Optional[int]:
+        """Mirrors the DuckDB sibling — see its docstring for what the
+        counter is for (issue #2333) and why it lives on the connection row
+        rather than in ``extraction_runs`` or a new column. The row lock
+        (``SELECT ... FOR UPDATE``) inside this same transaction is what
+        makes the read and the bump one atomic claim, so two concurrent
+        triggers can never be handed the same generation — Postgres needs no
+        separate retry loop here either, same as ``config_patch``.
+        """
+        with self._engine.begin() as cx:
+            row = cx.execute(
+                sa.text("SELECT config FROM source_connections WHERE id = :id FOR UPDATE"),
+                {"id": connection_id},
+            ).first()
+            if row is None:
+                return None
+            current = row[0]
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except (json.JSONDecodeError, TypeError):
+                    current = {}
+            elif not isinstance(current, dict):
+                current = {}
+            extraction = dict(current.get("extraction") or {})
+            claimed = _next_run_generation(extraction.get("run_generation"))
+            extraction["run_generation"] = claimed
+            merged = {**current, "extraction": extraction}
+            cx.execute(
+                sa.text("UPDATE source_connections SET config = :c WHERE id = :id"),
+                {"c": json.dumps(merged), "id": connection_id},
+            )
+        return claimed
 
     def clear_stop_requested_if_unchanged(self, connection_id: str, expected_stop_at: str) -> bool:
         """Mirrors the DuckDB sibling — see its docstring for the race this

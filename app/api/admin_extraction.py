@@ -1525,6 +1525,13 @@ def cancel_extraction_run(
        now-stale lease token and is a guaranteed no-op against the state
        this call just wrote — the same reclaim-race guard every stale
        worker call already respects.
+    A zombie handler that keeps running past this call is bounded by the
+    connection's run generation, not by this call: the NEXT trigger claims
+    a new one and the zombie raises ``CrawlSuperseded`` at its next
+    checkpoint (``connectors.sharepoint.crawler.claim_run_generation`` —
+    issue #2333). Until such a trigger arrives it is the cooperative flag
+    set in step 1 that stops it, exactly as for an ordinary stop.
+
     3. The ``extraction_runs`` row is closed HERE, immediately, as
        ``interrupted`` with ``interrupted_reason: "cancelled"`` — never
        waiting on the crawl to notice, because a genuinely stuck loop might
@@ -1569,7 +1576,10 @@ def cancel_extraction_run(
 
     from connectors.sharepoint.crawler import request_stop
 
-    stop_requested_at = request_stop(connection_id) if connection_id else None
+    # Aimed at the job that OWNS the run being cancelled — the exact
+    # identity the flag has to name so that this connection's NEXT,
+    # unrelated trigger clears it instead of inheriting it.
+    stop_requested_at = request_stop(connection_id, job_id=str(job_id) if job_id else None) if connection_id else None
 
     job_cancelled = False
     if job_id:
@@ -2008,6 +2018,41 @@ def extraction_status(
     }
 
 
+def _crawl_trigger_job_id_for_stop(connection_id: str) -> Optional[str]:
+    """The id of this connection's in-flight (``queued`` or ``running``)
+    ``corpus-extraction`` job, or ``None`` when there is none.
+
+    This is the identity a Stop request is AIMED at
+    (``connectors.sharepoint.crawler.request_stop``'s ``job_id`` ->
+    ``config.extraction.stop_job_id``): it is what lets the run that job
+    eventually becomes tell "this flag is mine" apart from "this flag is
+    leftover from an earlier run", WITHOUT comparing two wall clocks
+    written by two different roles (issue #2333 finding 3).
+
+    Deliberately the index-backed exact-key lookup
+    (``list_by_idempotency_prefix``) rather than :func:`_crawl_job_in_
+    flight`'s ``list(kind=…, status=…, limit=200)`` scan, for the same
+    reason ``crawler._shard_children_still_live`` uses it: a fleet busy
+    enough to have 200+ other connections' extraction jobs in the same
+    status would make that scan miss THIS connection's own job, and a miss
+    here silently un-aims the operator's stop. Best-effort — a repo failure
+    returns ``None`` (an unattributed flag, cleared by the next trigger)
+    rather than failing the Stop request, which still reaches any run
+    already in progress either way.
+    """
+    try:
+        from app.api.admin_sharepoint import _extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        key = _extraction_idempotency_key(connection_id)
+        for job in jobs_repo().list_by_idempotency_prefix(key, statuses=_CRAWL_JOB_LIVE_STATUSES):
+            if job.get("idempotency_key") == key and job.get("kind") == _CRAWL_JOB_KIND:
+                return str(job["id"])
+    except Exception as exc:  # noqa: BLE001 — best-effort attribution only
+        logger.debug("extraction stop: could not resolve the in-flight crawl job for %s: %s", connection_id, exc)
+    return None
+
+
 @router.post("/connections/{connection_id}/extraction/stop", status_code=202)
 def request_extraction_stop(
     connection_id: str,
@@ -2048,7 +2093,11 @@ def request_extraction_stop(
     _sharepoint_connection_or_404(connection_id)
     from connectors.sharepoint.crawler import request_stop
 
-    stop_requested_at = request_stop(connection_id)
+    # Aimed at whichever `corpus-extraction` job is in flight for this
+    # connection right now, so a stop pressed while that job is still
+    # QUEUED (or still planning a large site) survives that same run's
+    # own start-up clear — see `_crawl_trigger_job_id_for_stop`.
+    stop_requested_at = request_stop(connection_id, job_id=_crawl_trigger_job_id_for_stop(connection_id))
 
     note: Optional[str] = None
     try:

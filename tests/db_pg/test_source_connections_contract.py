@@ -278,3 +278,69 @@ def test_clear_stop_requested_if_unchanged_is_a_noop_when_nothing_is_set(repo):
 
 def test_clear_stop_requested_if_unchanged_unknown_id_returns_false(repo):
     assert repo.clear_stop_requested_if_unchanged("nope", "t1") is False
+
+# ---------------------------------------------------------------------------
+# claim_run_generation — the monotonic per-connection extraction-ownership
+# counter (issue #2333). A cancel force-finalizes the owning job row and
+# closes `extraction_runs` immediately, but cannot kill the handler thread;
+# this counter is what makes "you are superseded" a signal that handler must
+# see and a retrigger cannot clear. It must behave identically on both
+# app-state backends, because a DuckDB-backed instance always takes the
+# INLINE crawl path — exactly the path a zombie handler outlives its job on.
+# ---------------------------------------------------------------------------
+
+
+def test_claim_run_generation_starts_at_one_and_is_strictly_monotonic(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={})
+
+    claimed = [repo.claim_run_generation("c1") for _ in range(3)]
+
+    assert claimed == [1, 2, 3]
+    assert repo.get("c1")["config"]["extraction"]["run_generation"] == 3
+
+
+def test_claim_run_generation_continues_from_the_persisted_value(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"extraction": {"run_generation": 41}})
+
+    assert repo.claim_run_generation("c1") == 42
+
+
+def test_claim_run_generation_preserves_sibling_extraction_keys(repo):
+    """It shares `config.extraction` with the stop flag and the dispatch
+    bookkeeping — a claim must never wipe either."""
+    repo.create(
+        id="c1",
+        name="a",
+        source_type="sharepoint",
+        config={"extraction": {"stop_requested_at": "t1", "stop_job_id": "job1", "last_run_at": "t0"}},
+    )
+
+    repo.claim_run_generation("c1")
+
+    extraction = repo.get("c1")["config"]["extraction"]
+    assert extraction["run_generation"] == 1
+    assert extraction["stop_requested_at"] == "t1"
+    assert extraction["stop_job_id"] == "job1"
+    assert extraction["last_run_at"] == "t0"
+
+
+def test_claim_run_generation_preserves_config_siblings_outside_extraction(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"tenant_id": "t", "scopes": [{"id": "s"}]})
+
+    repo.claim_run_generation("c1")
+
+    config = repo.get("c1")["config"]
+    assert config["tenant_id"] == "t"
+    assert config["scopes"] == [{"id": "s"}]
+
+
+def test_claim_run_generation_treats_a_corrupt_counter_as_zero(repo):
+    """A hand-edited or otherwise unparseable counter must not make every
+    future claim raise — the crawl checks it at every checkpoint."""
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"extraction": {"run_generation": "banana"}})
+
+    assert repo.claim_run_generation("c1") == 1
+
+
+def test_claim_run_generation_unknown_id_returns_none(repo):
+    assert repo.claim_run_generation("nope") is None
