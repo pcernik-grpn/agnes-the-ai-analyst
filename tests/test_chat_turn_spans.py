@@ -12,7 +12,7 @@ session ready for the next turn.
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -74,8 +74,8 @@ def _attach_live(mgr: ChatManager, chat_id: str, user_email: str, sink, *, surfa
         user_email=user_email,
         state=SessionState.ACTIVE,
         handle=handle,
-        started_at=datetime.now(timezone.utc),
-        last_activity=datetime.now(timezone.utc),
+        started_at=datetime.now(UTC),
+        last_activity=datetime.now(UTC),
         surface=surface,
         sinks=[SinkEntry(participant_email=user_email, sink=sink)],
     )
@@ -244,6 +244,39 @@ def test_turn_key_survives_turn_end_and_the_next_turn_overwrites(manager: ChatMa
         await manager._deliver_local_user_message(live, "two")
         second = read_turn(live.chat_id)
         assert second is not None and second.turn_id == live.turn_id != first
+
+    asyncio.run(_run())
+
+
+def test_close_turn_republishes_with_ended_at_set_and_keeps_ids(manager: ChatManager):
+    """``_close_turn`` re-publishes the SAME record with ``ended_at`` set
+    rather than deleting it — a reader after this point (memory provenance,
+    finding B) can tell the turn is over; the broker's late-completion
+    linkage (finding A) still finds every other id unchanged."""
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager._deliver_local_user_message(live, "one", message_id="msg_1")
+
+        before = read_turn(live.chat_id)
+        assert before is not None and before.ended_at is None and before.is_open() is True
+
+        await _pump(manager, live, [dict(_ASSISTANT)])
+
+        after = read_turn(live.chat_id)
+        assert after is not None
+        assert after.turn_id == before.turn_id
+        assert after.ended_at is not None
+        assert after.is_open() is False
+        # every other field survives the re-publish unchanged
+        assert after.trace_id == before.trace_id
+        assert after.span_id == before.span_id
+        assert after.user_id == before.user_id
+        assert after.agent_id == before.agent_id
+        assert after.surface == before.surface
+        assert after.workload == before.workload
+        assert after.message_id == before.message_id == "msg_1"
 
     asyncio.run(_run())
 

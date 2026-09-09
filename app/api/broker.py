@@ -44,6 +44,7 @@ import os
 import random
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
 
@@ -72,7 +73,7 @@ from app.api.broker_vertex import (
 )
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
-from app.chat.turn_context import TurnRecord, read_turn
+from app.chat.turn_context import TurnRecord, read_turn, started_no_later_than
 from app.chat.turn_usage import add_turn_usage
 from src.observability import content_policy as _content_policy
 from src.observability import otel as _otel
@@ -903,17 +904,32 @@ def _completion_request_hints(raw_body: bytes, vertex_target: Any) -> "tuple[Opt
     return model, stream
 
 
-def _turn_for_row(row: Dict[str, Any]) -> Optional[TurnRecord]:
+def _turn_for_row(row: Dict[str, Any], *, started_at: datetime) -> Optional[TurnRecord]:
     """The live chat turn for the ticket's session, if one was published.
 
     ``None`` when the ticket carries no session, when no turn is in flight,
-    and when the coordination backend cannot say — a completion whose turn
-    is unknown is a root span with a null ``turn_id``, never a failed
-    forward (spec 3.2).
+    when the coordination backend cannot say, and when the record IS there
+    but its own turn started AFTER ``started_at`` — a completion whose turn
+    is unknown, or whose only candidate record cannot possibly be the turn
+    that caused it (a co-driver's next turn landing mid-completion, see the
+    module notes on overlap), is a root span with a null ``turn_id``, never
+    a failed forward, and never a wrong attribution (spec 3.2, finding A).
     """
     try:
         session_id = row.get("session_id")
-        return read_turn(session_id) if session_id else None
+        if not session_id:
+            return None
+        turn = read_turn(session_id)
+        if turn is None:
+            return None
+        if not started_no_later_than(turn, started_at):
+            logger.debug(
+                "broker: turn %s for session %s started after this completion began; not attributing",
+                turn.turn_id,
+                session_id,
+            )
+            return None
+        return turn
     except Exception:  # noqa: BLE001 - a measurement never costs a forward
         logger.debug("broker: could not read the turn record", exc_info=True)
         return None
@@ -1508,7 +1524,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # sent one; until then this is the only link that exists.
     turn: Optional[TurnRecord] = None
     if is_completion:
-        turn = _turn_for_row(row)
+        # The completion's own start, wall-clock — the reference finding A
+        # compares the turn record's ``started_at`` against. Captured here,
+        # before the coordination read, rather than reusing the monotonic
+        # ``forward_started`` below (that clock has no wall-clock epoch to
+        # compare against a published ISO timestamp with).
+        completion_started_at = datetime.now(timezone.utc)
+        turn = _turn_for_row(row, started_at=completion_started_at)
         completion_context = _completion_context(row, agent_row=agent_row, caller_user_id=caller_user_id, turn=turn)
         requested_model, _requested_stream = _completion_request_hints(raw_body, vertex_target)
     otel_span = None

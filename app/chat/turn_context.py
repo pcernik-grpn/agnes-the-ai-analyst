@@ -10,6 +10,14 @@ different replicas; the collector stitches on ``trace_id``. The key is
 overwritten by the next turn and never deleted at turn end, so a completion
 that lands after the assistant frame still attributes to the turn that
 caused it. Coordination unavailable → no linkage, everything else recorded.
+
+``ChatManager._close_turn`` re-publishes the SAME record with ``ended_at``
+set instead of deleting it, so a reader can tell "still open" from "already
+answered" without losing the ids a late completion still needs
+(``started_no_later_than`` below). A record whose turn started AFTER the
+reader's own reference point (a completion's start, a memory write's start)
+is refused rather than attributed — an unattributed row is honest, a
+wrongly attributed one is not.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.coordination.base import CoordinationUnavailable
@@ -47,6 +56,16 @@ class TurnRecord:
 
     Ids and labels only: what the completion span needs for its parent and
     what its ledger row needs for attribution. No message text ever.
+
+    ``ended_at`` is ``None`` while the turn is open and an ISO timestamp
+    once ``ChatManager._close_turn`` re-publishes the SAME record (same
+    key, same TTL, every other field unchanged — the broker's late-
+    completion linkage still needs a closed turn's ids) with it set.
+    ``ended_at_known`` distinguishes a record that genuinely has no
+    ``ended_at`` because a replica running before this field existed
+    published it — ``from_json`` sets it ``False`` only for that legacy
+    shape, so ``is_open()`` can tell "known open" from "can't say" instead
+    of guessing open for both.
     """
 
     turn_id: str
@@ -58,9 +77,20 @@ class TurnRecord:
     surface: Optional[str]
     workload: str
     message_id: Optional[str] = None
+    ended_at: Optional[str] = None
+    ended_at_known: bool = True
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
+
+    def is_open(self) -> Optional[bool]:
+        """Whether this turn is still live. ``None`` when a legacy record
+        (published before ``ended_at`` existed) leaves it unknowable — a
+        caller that needs certainty (memory provenance, finding B) must
+        treat that as "do not stamp", never as "assume open"."""
+        if not self.ended_at_known:
+            return None
+        return self.ended_at is None
 
     @classmethod
     def from_json(cls, text: Optional[str]) -> Optional["TurnRecord"]:
@@ -73,7 +103,9 @@ class TurnRecord:
             data = json.loads(text)
             if not isinstance(data, dict) or not data.get("turn_id"):
                 return None
-            return cls(**{k: data.get(k) for k in cls.__dataclass_fields__})
+            kwargs = {k: data.get(k) for k in cls.__dataclass_fields__}
+            kwargs["ended_at_known"] = "ended_at" in data
+            return cls(**kwargs)
         except (ValueError, TypeError):
             return None
 
@@ -101,11 +133,30 @@ def read_turn(session_id: str) -> Optional[TurnRecord]:
         return None
 
 
+def started_no_later_than(record: TurnRecord, reference: datetime) -> bool:
+    """True when ``record``'s turn indisputably started at or before
+    ``reference`` — the rule two callers apply for different reasons: the
+    broker refuses to attribute a late completion to a turn that started
+    AFTER the completion began (finding A — an overlapping co-driver turn
+    must not steal a call that was not its own), and memory provenance
+    refuses to stamp a turn that started after the write it would be
+    labelling (finding B). A missing or malformed ``started_at`` makes the
+    record unusable rather than trusted true or false on a guess."""
+    try:
+        started = datetime.fromisoformat(record.started_at)
+    except (TypeError, ValueError):
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return started <= reference
+
+
 __all__ = [
     "TURN_TTL_SECONDS",
     "TurnRecord",
     "publish_turn",
     "read_turn",
+    "started_no_later_than",
     "turn_key",
     "workload_for_surface",
 ]
