@@ -95,9 +95,12 @@
   usage entirely past the mirror's cap.
 
 ### Internal
-- A batch extraction result that errored, was canceled or expired now writes
-  its own zero-cost `llm_calls` row, so a failed batch is visible in the call
-  counts and the error summary instead of leaving no trace at all.
+- Every batch extraction outcome now reaches the ledger: a result that
+  errored, was canceled, expired or never came back writes a zero-cost
+  `llm_calls` row, and an answer whose document vanished before it could be
+  ingested writes a normal priced row, since those tokens were really spent.
+  Previously only the succeeded-and-ingested path was recorded, so a failed
+  batch left no trace in the call counts or the error summary at all.
 - Every LLM call site is now traced with `trace_generation`, including ones that
   previously bypassed it entirely (document fact extraction, OCR, vision, the
   NER anonymizer, auto-title, the admin usage assistant) — closed by a static

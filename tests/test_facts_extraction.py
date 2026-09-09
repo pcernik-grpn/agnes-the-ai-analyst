@@ -3243,9 +3243,7 @@ class TestFailedBatchResultsReachTheLedger:
 
     def test_a_failed_batch_result_records_one_zero_usage_error_row(self, monkeypatch):
         calls = []
-        monkeypatch.setattr(
-            "src.observability.record_generation", lambda **kw: calls.append(kw), raising=False
-        )
+        monkeypatch.setattr("src.observability.record_generation", lambda **kw: calls.append(kw), raising=False)
 
         fe.record_batch_failure("anthropic", "claude-haiku-4-5", "cf_1", "expired")
 
@@ -3265,15 +3263,39 @@ class TestFailedBatchResultsReachTheLedger:
 
         fe.record_batch_failure("anthropic", "claude-haiku-4-5", "cf_1", "errored")  # must not raise
 
-    def test_both_failure_branches_call_it(self):
+    def test_an_answer_whose_document_vanished_still_records_its_real_usage(self, monkeypatch):
+        """The model answered and the tokens were spent; only the document is
+        gone. The ledger records what was SPENT, so this is a normal priced
+        row rather than nothing at all (review finding)."""
+        calls = []
+        monkeypatch.setattr("src.observability.record_generation", lambda **kw: calls.append(kw), raising=False)
+
+        class _Msg:
+            usage = {"input_tokens": 10, "output_tokens": 2}
+            model = "claude-haiku-4-5"
+            stop_reason = "end_turn"
+
+        fe.record_generation_for_batch_message("anthropic", "claude-haiku-4-5", "cf_gone", _Msg())
+
+        assert len(calls) == 1
+        (call,) = calls
+        assert call["subject_id"] == "cf_gone"
+        assert call["usage"] == {"input_tokens": 10, "output_tokens": 2}
+        assert call.get("error_type") is None
+
+    def test_every_non_outcome_records_something(self):
         """The recorder is reached from a closure the unit tests cannot
         drive, so this pins the wiring at the source level — the same shape
-        `tests/test_chat_sources_verdict.py` uses for `manager.py`."""
+        `tests/test_chat_sources_verdict.py` uses for `manager.py`. Four
+        paths must record: a missing result, an answer whose document
+        vanished, an errored result, and canceled/expired."""
         import inspect
 
         src = inspect.getsource(fe)
         collector = src.split("def _collect_batch(batch_id: str) -> None:", 1)[1].split("\n    def ", 1)[0]
-        assert collector.count("record_batch_failure(") == 2, (
-            "the errored and the canceled/expired branch must each record a ledger row"
+        assert collector.count("record_batch_failure(") == 3, (
+            "missing_result, errored and canceled/expired must each record a ledger row"
         )
-
+        assert collector.count("record_generation_for_batch_message(") == 1, (
+            "an answer whose document vanished must still record its real usage"
+        )

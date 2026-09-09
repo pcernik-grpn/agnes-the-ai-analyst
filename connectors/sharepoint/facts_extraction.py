@@ -3975,6 +3975,31 @@ def _poll_batch_until_ended(
         sleep(poll_s)
 
 
+def record_generation_for_batch_message(provider: Any, model: str, file_id: str, message: Any) -> None:
+    """One ``llm_calls`` row for a batch result that DID come back, priced
+    from its own usage — used where the answer cannot be ingested (the
+    document vanished meanwhile) but the tokens were spent all the same.
+    Never raises: a measurement never costs an extraction pass.
+    """
+    try:
+        from src.observability import llm_context, record_generation
+        from src.observability.llm_tracing import provider_label
+
+        with llm_context(workload="extraction"):
+            record_generation(
+                provider=provider_label(provider),
+                model=model,
+                purpose="facts_batch",
+                usage=getattr(message, "usage", None),
+                subject_id=file_id,
+                batch=True,
+                model_response=getattr(message, "model", None),
+                stop_reason=getattr(message, "stop_reason", None),
+            )
+    except Exception:  # noqa: BLE001 - a measurement never costs the pass
+        logger.debug("facts extraction: could not record the orphaned batch result", exc_info=True)
+
+
 def record_batch_failure(provider: Any, model: str, file_id: str, error_type: str) -> None:
     """One zero-cost ``llm_calls`` row for a batch result that never produced
     a message — errored, canceled, expired.
@@ -5036,6 +5061,10 @@ def _run_batch_pass(
             phase = entry.get("phase", "initial")
             result = results.get(file_id)
             if result is None:
+                # Submitted, and the batch came back without it. Recorded
+                # like the other non-outcomes so the call counts match what
+                # was actually asked of the model.
+                record_batch_failure(provider, resolved_model, file_id, "missing_result")
                 _requeue(file_id, reason="missing_result", permanent=False)
                 requeued += 1
                 continue
@@ -5050,6 +5079,15 @@ def _run_batch_pass(
                     max_prompt_tokens=resolved_max_prompt_tokens,
                 )
                 if loaded is None:
+                    # The model answered and the tokens were really spent --
+                    # only the document is gone. The ledger records what was
+                    # SPENT, so this is a normal generation row (with its
+                    # real usage) rather than an error or, as before, no row
+                    # at all: a batch whose documents vanished used to cost
+                    # money that appeared nowhere in the cost reads.
+                    record_generation_for_batch_message(
+                        provider, resolved_model, file_id, getattr(result, "message", None)
+                    )
                     docs_state.pop(file_id, None)
                     batch_attempts.pop(file_id, None)
                     report.facts_failed += 1
