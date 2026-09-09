@@ -278,6 +278,19 @@ the DuckDB sibling accepts and drops them, the same pattern the
 them from the live turn record at write time, so "why did this memory get
 written" traces back to the exact turn and message that caused it.
 
+The turn record `chat:turn:{session_id}` is never deleted at turn end, only
+re-published with `ended_at` set, so it always answers with the session's
+LAST turn — open or closed, however old. A write that happens outside any
+live turn (an owner note through the API, a curator job) must not borrow
+that last turn's identity just because one is still there to read:
+`remember` stamps provenance only from a record that is BOTH still open
+(`ended_at is None`) AND not newer than the write itself (the same
+`started_at` freshness rule the broker applies to a late completion — see
+*What is exported* below). A closed turn, a turn that started after the
+write began, or a legacy record published before `ended_at` existed (no
+such key at all, read as "unknown", never as "open") all get no provenance
+rather than a wrong one.
+
 ### DuckDB-backed instances
 
 `llm_calls` and `chat_message_feedback` are Postgres-only by construction
@@ -611,12 +624,17 @@ that refuses the batches shows up as the SDK's own
   the arguments or the result.
 - **Completion spans open as children of the turn.** The broker reads
   `chat:turn:{session_id}` — a coordination record with a 24 h TTL that is
-  never deleted at turn end, only overwritten by the next turn — and opens
-  its completion span as a child of the stored context, even when the turn
-  and the completion run in different replicas (the collector stitches the
-  two on `trace_id`). With the coordination backend unavailable the
-  completion span is a root span instead, `turn_id` is null on it, and
-  everything else records as usual — degrade, never fail.
+  never deleted at turn end, only re-published (with `ended_at` set) when
+  the turn closes and overwritten outright by the next turn — and opens its
+  completion span as a child of the stored context, even when the turn and
+  the completion run in different replicas (the collector stitches the two
+  on `trace_id`). A record whose own `started_at` is AFTER this completion
+  began is refused rather than attributed — a co-driver's message can start
+  turn N+1 before turn N's completion returns, and the session's last turn
+  is not necessarily the turn that made this call. With the coordination
+  backend unavailable, or with no usable record, the completion span is a
+  root span instead, `turn_id` is null on it, and everything else records
+  as usual — degrade, never fail.
 - **One `agnes.chat.feedback` span per thumbs submission**, carrying one
   event `agnes.feedback` (`agnes.verdict`, `agnes.has_comment`), parented
   under the turn's own span context when it is still the turn the feedback

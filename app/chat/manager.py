@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,7 @@ from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
-from app.chat.turn_context import TurnRecord, publish_turn, workload_for_surface
+from app.chat.turn_context import TurnRecord, publish_turn, read_turn, workload_for_surface
 from app.chat.turn_usage import drain_turn_usage
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
 from app.chat.workdir import WorkdirManager
@@ -1075,8 +1075,27 @@ class ChatManager:
                 cost_usd=cost,
                 error_kind=live.turn_error_kind,
             )
+            self._mark_turn_closed(live)
         except Exception:
             logger.debug("turn close failed for %s (non-fatal)", live.chat_id, exc_info=True)
+
+    def _mark_turn_closed(self, live: LiveSession) -> None:
+        """Re-publish the turn record with ``ended_at`` set (same key, same
+        TTL, every other field unchanged) so a reader outside this turn —
+        memory provenance is the one that matters (finding B) — can tell the
+        turn is over instead of assuming it is still live. Never deletes the
+        record: the broker's late-completion linkage (finding A) still needs
+        a closed turn's ids for a completion that lands after this point.
+
+        Best-effort and non-fatal, like every other step in ``_close_turn``:
+        a read/publish failure just leaves the record looking open, which is
+        the same degraded (not wrong) behavior this feature did not exist
+        without.
+        """
+        record = read_turn(live.chat_id)
+        if record is None or record.turn_id != str(live.turn_id):
+            return  # already overwritten by a newer turn; nothing to close
+        publish_turn(live.chat_id, replace(record, ended_at=datetime.now(UTC).isoformat()))
 
     @staticmethod
     def _msg_window_key(sender: str) -> str:

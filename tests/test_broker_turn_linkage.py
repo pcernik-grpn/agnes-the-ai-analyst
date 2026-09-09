@@ -39,16 +39,16 @@ def _completion(app, session_id: str):
 
 
 def _turn(**kw) -> TurnRecord:
-    base = dict(
-        turn_id="t-1",
-        trace_id="c" * 32,
-        span_id="d" * 16,
-        started_at="2026-09-08T00:00:00+00:00",
-        user_id="u-1",
-        agent_id="ag-1",
-        surface="api",
-        workload="agent_api",
-    )
+    base = {
+        "turn_id": "t-1",
+        "trace_id": "c" * 32,
+        "span_id": "d" * 16,
+        "started_at": "2026-09-08T00:00:00+00:00",
+        "user_id": "u-1",
+        "agent_id": "ag-1",
+        "surface": "api",
+        "workload": "agent_api",
+    }
     base.update(kw)
     return TurnRecord(**base)  # type: ignore[arg-type]
 
@@ -117,6 +117,32 @@ def test_coordination_outage_degrades_to_a_root_span(otel_broker, otel_exporter,
     assert span.parent is None
     (row,) = ledger
     assert row["turn_id"] is None and row["session_id"] == "chat_link_down"
+
+
+def test_a_turn_record_published_after_the_completion_began_is_not_attributed(
+    otel_broker,  # noqa: F811
+    otel_exporter,  # noqa: F811
+    ledger,  # noqa: F811
+):
+    """A co-driver's message can land mid-completion and publish turn N+1
+    before turn N's completion returns (finding A). The record's own
+    ``started_at`` is in the future relative to when this completion began,
+    so it must not be attributed — an unattributed row is honest, a
+    wrongly-attributed one is not."""
+    from app.api.broker_agent_policy import usage_accumulator
+
+    publish_turn("chat_link_future", _turn(turn_id="t-future", started_at="2099-01-01T00:00:00+00:00"))
+    _FakeUpstream.body = _json_body()
+
+    r = _completion(otel_broker, "chat_link_future")
+    assert r.status_code == 200, r.text
+    usage_accumulator.flush()
+
+    (span,) = otel_exporter.get_finished_spans()
+    assert span.parent is None
+    (row,) = ledger
+    assert row["turn_id"] is None
+    assert row["session_id"] == "chat_link_future"
 
 
 def test_a_turn_without_span_ids_still_labels_the_call(otel_broker, otel_exporter, ledger):  # noqa: F811
