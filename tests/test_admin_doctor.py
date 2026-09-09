@@ -274,10 +274,15 @@ class TestAgentScope:
 
 
 class TestBranding:
-    def test_default_brand_is_info(self, seeded_app, monkeypatch):
+    def test_neither_knob_customized_is_error(self, seeded_app, monkeypatch):
+        # #2329: customizing neither instance.brand nor instance.name is
+        # precisely the unattributed state an install agent reads as
+        # impersonation risk — it must be caught, not skipped as "info".
         monkeypatch.delenv("AGNES_INSTANCE_BRAND", raising=False)
         report = _run(seeded_app["client"], seeded_app["admin_token"])
-        assert _check(report, "branding")["status"] == "info"
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
 
     def test_brand_set_but_default_title_is_error(self, seeded_app, monkeypatch):
         import app.web.router as web_router
@@ -287,7 +292,7 @@ class TestBranding:
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         check = _check(report, "branding")
         assert check["status"] == "error"
-        assert "instance.name" in check["detail"]
+        assert "operator identity" in check["detail"]
 
     def test_brand_set_with_named_instance_is_ok(self, seeded_app, monkeypatch):
         import app.web.router as web_router
@@ -297,6 +302,64 @@ class TestBranding:
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         check = _check(report, "branding")
         assert check["status"] == "ok"
+
+    def test_customized_name_that_contains_the_word_agnes_is_ok(self, seeded_app, monkeypatch):
+        """A legitimate customization can contain the product word "Agnes" as
+        part of a larger, operator-identifying name ("Acme Agnes Portal") —
+        the operator identity this check requires ("Acme") is right there.
+        Only the BARE title ("Login - Agnes") is the unattributed state,
+        indistinguishable from the OSS product itself."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Acme Agnes Portal")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "ok"
+
+    def test_bare_agnes_name_is_still_an_error(self, seeded_app, monkeypatch):
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Agnes")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
+
+    def test_non_latin_operator_name_is_ok(self, seeded_app, monkeypatch):
+        """A non-Latin custom name must not have every identifying character
+        stripped before the filler-word check runs — `[A-Za-z0-9]+` would
+        leave nothing for a name like this, incorrectly reporting it as
+        unattributed."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "日本語データ分析")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "ok"
+
+    def test_underscore_only_name_is_still_an_error(self, seeded_app, monkeypatch):
+        """A run of underscores is not an identifying word — `\\w+` would
+        treat it as one and wrongly pass an unattributed title."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "___")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
+
+    def test_product_word_plus_generic_filler_is_still_an_error(self, seeded_app, monkeypatch):
+        """ "Agnes Portal" is no more attributed than bare "Agnes" — "Portal"
+        is generic filler any deployment could carry, so it supplies no
+        operator identity either. Distinguishes this from the legitimate
+        "Acme Agnes Portal" case above, where "Acme" is the identity."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Agnes Portal")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
 
 
 class TestProbeProviders:

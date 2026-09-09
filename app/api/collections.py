@@ -1956,6 +1956,54 @@ class MoveFileBody(BaseModel):
     target_collection_id: str = Field(min_length=1)
 
 
+def _undo_content_move(file_id: str, source_corpus_id: str, attempted_corpus_id: str) -> None:
+    """Put a file's chunks (and claims) back under ``source_corpus_id``.
+
+    Compensation for a move whose final file-row write failed after the
+    denormalized rows had already been repointed — see ``move_file``.
+
+    Conditional on ``attempted_corpus_id``: only rows still sitting under the
+    target THIS attempt moved them to are reverted. An unconditional revert
+    would be a race — a concurrent move of the same file that SUCCEEDED in
+    the meantime would have its content dragged back to our source, leaving
+    the winner's file row in one collection and its body in another, which is
+    the leak this endpoint exists to close, recreated by the cleanup for it.
+
+    Every failure here is logged and swallowed: the caller is already
+    receiving the original error, and replacing it with a failure from the
+    cleanup would hide what actually broke. A cleanup that fails leaves a
+    split the log names in full (file, both collections) so it can be
+    reconciled by hand; it is not silently reported as restored, because the
+    request still fails.
+    """
+    try:
+        corpus_chunks_repo().reassign_file_corpus(file_id, source_corpus_id, expected_corpus_id=attempted_corpus_id)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            "move_file: INCONSISTENT — chunks for file_id=%s may still be under %s while the file row is in %s "
+            "(restore failed: %s)",
+            file_id,
+            attempted_corpus_id,
+            source_corpus_id,
+            e,
+        )
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        facts_repo().reassign_file_corpus(file_id, source_corpus_id, expected_corpus_id=attempted_corpus_id)
+    except RequiresPostgresBackend:
+        pass
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            "move_file: INCONSISTENT — claims for file_id=%s may still be under %s while the file row is in %s "
+            "(restore failed: %s)",
+            file_id,
+            attempted_corpus_id,
+            source_corpus_id,
+            e,
+        )
+
+
 @router.post("/{collection_id}/files/{file_id}/move")
 async def move_file(
     collection_id: str,
@@ -1972,6 +2020,17 @@ async def move_file(
     When the source collection is left empty it is soft-deleted: a single-file
     artifact IS its file in the Library, so dragging that file into a folder
     must not strand an empty husk in the listing.
+
+    The file's body and its extracted facts move with it, so search and the
+    fact graph follow the file into the target collection rather than
+    continuing to answer under the one it left. A move either completes or
+    leaves the file and its content together where they were; it never
+    reports success having applied only part of that.
+
+    Answers ``409 move_conflict`` when someone else moved the same file while
+    this request was in flight. The response names the collection the file
+    actually ended up in, so a client can re-target or refresh rather than
+    retry blindly into the same race.
     """
     target_id = payload.target_collection_id
     if target_id == collection_id:
@@ -2000,16 +2059,38 @@ async def move_file(
     if managing is not None:
         _refuse_source_managed(managing)
 
-    if not cf_repo.move_to_corpus(file_id, target_id):
-        raise HTTPException(status_code=404, detail="file_not_found")
+    # Two columns are denormalized from `corpus_files.corpus_id` and do not
+    # follow the file on their own: `corpus_chunks.corpus_id` (what body
+    # search scopes candidates on — `search_with_meta` → `search_candidates`)
+    # and `claims.corpus_id` (what fact visibility is filtered on). A row left
+    # behind does not merely file the content under the old collection in the
+    # facets — it leaves it READABLE to the collection the file just left.
+    #
+    # Both are repointed BEFORE the file row moves, and the order is the
+    # safety property, not a detail: these writes commit separately (distinct
+    # repositories, and distinct connections on the frozen DuckDB backend), so
+    # one can land without the other. Failing before the file row moves leaves
+    # the file and its content together in the source — nothing stranded in a
+    # collection the file has left, and the same request replays cleanly,
+    # because the caller's source collection still owns the file. Doing it the
+    # other way round would fail into exactly the leak this fixes, and into a
+    # state where the retry 404s (the file no longer belongs to the source the
+    # caller addressed).
+    #
+    # The chunk write is NOT best-effort: chunks exist on both app-state
+    # backends, so a failure there is a real error, never a missing optional
+    # feature.
+    moved_chunks = corpus_chunks_repo().reassign_file_corpus(file_id, target_id)
+    if moved_chunks:
+        logger.info(
+            "corpus_file move repointed %s chunk(s) file_id=%s to=%s",
+            moved_chunks,
+            file_id,
+            target_id,
+        )
 
-    # The file row has moved; its CLAIMS have not. `claims.corpus_id` is
-    # denormalized from `corpus_files` and is the column fact visibility is
-    # filtered on, so leaving it behind does not merely file the facts under
-    # the old collection in the graph facets — it leaves them readable to the
-    # collection the file just left. Best-effort by design: the fact graph is
-    # Postgres-only and optional, so an instance without it must still be able
-    # to move a file.
+    # Claims stay best-effort by design: the fact graph is Postgres-only and
+    # optional, so an instance without it must still be able to move a file.
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
 
@@ -2025,6 +2106,47 @@ async def move_file(
         pass  # no fact graph on this backend — nothing to repoint
     except Exception as e:
         logger.warning("move_file: could not repoint claims for %s: %s", file_id, e)
+
+    # The content is already under the target; the file row is the last write.
+    # If it fails, put the content back rather than leaving the request's
+    # visible effect half-applied: this direction is the benign one (the
+    # caller has proven access to the target, and the retry works because the
+    # source still owns the file), but it is still a split nobody asked for.
+    # A compensation that itself fails is logged and never masks the original
+    # error — the caller must see what actually broke.
+    try:
+        moved = cf_repo.move_to_corpus(file_id, target_id, expected_corpus_id=collection_id)
+    except Exception:
+        _undo_content_move(file_id, collection_id, target_id)
+        raise
+    if not moved:
+        # Either the file is gone, or a CONCURRENT move of it committed while
+        # we were repointing the content: both requests validated the same
+        # source, so both got this far, and without the compare-and-set above
+        # the later write would silently overwrite the earlier one while our
+        # content sat at OUR target — the file in one collection, its body in
+        # another. Put the content wherever the file actually is (which is the
+        # winner's target, not the source it has already left), and say we
+        # lost rather than report a success we did not achieve.
+        current = cf_repo.get(file_id)
+        if current is None:
+            _undo_content_move(file_id, collection_id, target_id)
+            raise HTTPException(status_code=404, detail="file_not_found")
+        _undo_content_move(file_id, current["corpus_id"], target_id)
+        logger.info(
+            "corpus_file move lost a race file_id=%s wanted=%s actual=%s",
+            file_id,
+            target_id,
+            current["corpus_id"],
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "move_conflict",
+                "message": "The file was moved by someone else while this move was in progress.",
+                "collection_id": current["corpus_id"],
+            },
+        )
 
     source_emptied = False
     try:

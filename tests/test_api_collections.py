@@ -982,6 +982,340 @@ def test_delete_file_removes_its_chunks(seeded_app):
     assert corpus_chunks_repo().list_for_file(fid) == []
 
 
+def test_move_file_rehomes_its_chunks_for_search(seeded_app):
+    """Moving a file must carry its body chunks to the target collection.
+
+    Body search scopes candidates on ``corpus_chunks.corpus_id``, not on the
+    file row's current collection — so a moved file whose chunks stayed
+    behind kept answering under the SOURCE collection: readable to a reader
+    granted only the collection the file just left, and invisible under the
+    target. Asserted from both sides, and the leak side as a non-admin
+    reader who was granted the source only.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Move Src Chunks"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Move Dst Chunks"}, headers=admin).json()["id"]
+    _seed_collection_grant(src_id, "analyst1")  # the analyst can read the SOURCE only
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="moved.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many(
+        [{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "the quokka sentence lives here"}]
+    )
+    # A second file keeps the source alive after the move (a single-file
+    # source is soft-deleted, which would take it out of the searchable set
+    # and make the source-side assertions below vacuous).
+    _seed_files_direct(src_id, ["stays.txt"])
+
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["source_emptied"] is False
+
+    def _hits(token: str, corpus_id: str | None = None) -> list[str]:
+        params = {"q": "quokka sentence"}
+        if corpus_id:
+            params["corpus_id"] = corpus_id
+        resp = c.get("/api/collections/search", params=params, headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        return [res["file_id"] for res in resp.json()["results"]]
+
+    # Under the target: found. Under the source: gone — for the admin
+    # narrowing to it, and for the reader who holds the source grant only.
+    assert fid in _hits(seeded_app["admin_token"], dst_id)
+    assert fid not in _hits(seeded_app["admin_token"], src_id)
+    assert _hits(seeded_app["analyst_token"]) == []
+    # And the chunk rows themselves now point at the target.
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
+def test_move_file_chunk_failure_leaves_nothing_behind_in_the_source(seeded_app, monkeypatch):
+    """A failure re-homing the chunks must never leave the file moved with its
+    body still answering under the source.
+
+    The two writes commit separately (different repositories, and on the
+    frozen DuckDB backend different connections), so one can land without the
+    other. The chunks move FIRST for that reason: a failure then stops the
+    move before the file row is touched, so the content is never stranded in
+    the collection the caller is taking it OUT of — the exact leak this
+    endpoint is being fixed for. The half-done state is also replayable: the
+    file row still sits in the source, so the same request retries cleanly.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Fail Src"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Fail Dst"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="halfway.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "half moved body"}])
+
+    real_chunks_repo = corpus_chunks_repo
+    faulty = {"on": True}
+
+    def _maybe_exploding_chunks_repo():
+        repo = real_chunks_repo()
+        if not faulty["on"]:
+            return repo
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "reassign_file_corpus":
+                    raise RuntimeError("simulated chunk re-home failure")
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_chunks_repo", _maybe_exploding_chunks_repo)
+    with pytest.raises(RuntimeError, match="simulated chunk re-home failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": dst_id},
+            headers=admin,
+        )
+
+    # The file did not move, so its body is not stranded under a collection
+    # the file has left — file and chunks are both still in the source.
+    assert corpus_files_repo().get(fid)["corpus_id"] == src_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [src_id]
+
+    # And the same request replays to completion once the fault clears.
+    # (Clearing the fault by flag, not `monkeypatch.undo()` — that would also
+    # revert the fixture's own patches and log the caller out.)
+    faulty["on"] = False
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert corpus_files_repo().get(fid)["corpus_id"] == dst_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
+def test_move_file_file_row_failure_puts_the_content_back(seeded_app, monkeypatch):
+    """The mirror of the test above: when the FILE-ROW write is the one that
+    fails, the already-committed content move is compensated back.
+
+    Re-homing the content first is what keeps a failure from stranding the
+    body in the collection the file is leaving, but on its own it left the
+    opposite split: content under the target, file still in the source. That
+    is the benign direction — the caller has proven access to the target and
+    the request replays — but it is still a split nobody asked for, so the
+    endpoint undoes it before surfacing the error.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Undo Src"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Undo Dst"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="rolled-back.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "rolled back body"}])
+
+    real_files_repo = corpus_files_repo
+    faulty = {"on": True}
+
+    def _maybe_exploding_files_repo():
+        repo = real_files_repo()
+        if not faulty["on"]:
+            return repo
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+                    raise RuntimeError("simulated file-row move failure")
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _maybe_exploding_files_repo)
+    with pytest.raises(RuntimeError, match="simulated file-row move failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": dst_id},
+            headers=admin,
+        )
+
+    # Compensated: the content is back with the file it belongs to, and the
+    # target never keeps the body of a file that did not arrive.
+    assert corpus_files_repo().get(fid)["corpus_id"] == src_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [src_id]
+    assert corpus_chunks_repo().list_for_corpus(dst_id) == []
+
+    faulty["on"] = False
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
+def test_move_file_rollback_never_undoes_a_concurrent_successful_move(seeded_app, monkeypatch):
+    """A failed move's compensation must not drag back content that a
+    concurrent, SUCCESSFUL move of the same file has since claimed.
+
+    Two moves of one file overlap: ours re-homes the content, then its
+    file-row write fails; in that window the other request completes to a
+    different collection. Putting the content back unconditionally would
+    leave the file under the winner with its body under our source — the
+    exact leak this endpoint exists to close, produced by the cleanup for it.
+    The compensation is a compare-and-set: it reverts only rows still under
+    the target of the attempt that failed.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Race Src"}, headers=admin).json()["id"]
+    mine_id = c.post("/api/collections", json={"name": "Race Mine"}, headers=admin).json()["id"]
+    winner_id = c.post("/api/collections", json={"name": "Race Winner"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="contested.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "contested body"}])
+
+    real_files_repo = corpus_files_repo
+
+    def _losing_files_repo():
+        repo = real_files_repo()
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+
+                    def _fail(*_a, **_kw):
+                        # The competing request completes while we are here.
+                        corpus_chunks_repo().reassign_file_corpus(fid, winner_id)
+                        repo.move_to_corpus(fid, winner_id)
+                        raise RuntimeError("simulated file-row move failure")
+
+                    return _fail
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _losing_files_repo)
+    with pytest.raises(RuntimeError, match="simulated file-row move failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": mine_id},
+            headers=admin,
+        )
+
+    # The winner's move stands whole — file and body together, nothing of it
+    # left under the source our failed attempt started from.
+    assert corpus_files_repo().get(fid)["corpus_id"] == winner_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [winner_id]
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []
+
+
+def test_two_concurrent_moves_leave_the_file_and_its_body_together(seeded_app, monkeypatch):
+    """Two moves of one file to DIFFERENT collections must not split it.
+
+    Both requests validate the source before writing, so both reach the
+    file-row write. Without a guard the later one silently overwrites the
+    earlier, while the loser's body sits at ITS target — file in one
+    collection, content in another, which is the split this whole endpoint
+    exists to prevent. The file-row write is a compare-and-set on the source
+    the caller validated: the loser is refused, and its content is moved to
+    wherever the file actually ended up rather than back to a source the file
+    has left.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Both Src"}, headers=admin).json()["id"]
+    mine_id = c.post("/api/collections", json={"name": "Both Mine"}, headers=admin).json()["id"]
+    other_id = c.post("/api/collections", json={"name": "Both Other"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="raced.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "raced body"}])
+
+    real_files_repo = corpus_files_repo
+    other_done = {"yet": False}
+
+    def _interleaving_files_repo():
+        repo = real_files_repo()
+
+        class _Interleave:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+
+                    def _with_a_competitor(*args, **kwargs):
+                        # The competing move completes in full — content and
+                        # file row — just before ours writes its file row.
+                        if not other_done["yet"]:
+                            other_done["yet"] = True
+                            corpus_chunks_repo().reassign_file_corpus(fid, other_id)
+                            repo.move_to_corpus(fid, other_id)
+                        return repo.move_to_corpus(*args, **kwargs)
+
+                    return _with_a_competitor
+                return getattr(repo, name)
+
+        return _Interleave()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _interleaving_files_repo)
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": mine_id},
+        headers=admin,
+    )
+
+    # Our move lost the race and says so, rather than reporting a success it
+    # did not achieve.
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "move_conflict"
+
+    # Whoever won, the file and its body are in the SAME collection, and it is
+    # not the source they both left.
+    row = corpus_files_repo().get(fid)
+    chunk_homes = {ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)}
+    assert chunk_homes == {row["corpus_id"]}, "the file and its body must not be split"
+    assert row["corpus_id"] == other_id
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []
+
+
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
     """A name with no alphanumerics must not yield an empty slug."""
     c = seeded_app["client"]

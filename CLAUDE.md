@@ -479,9 +479,20 @@ records all four kinds per message (`chat_messages.cache_read_tokens` /
 `cache_creation_tokens`, PG-only, migration `0092`), which is what makes
 `GET /api/admin/telemetry/chat-cost` (`agnes admin usage chat-cost`) a
 measurement rather than a model — see
-[`docs/observability.md`](docs/observability.md) → *Chat cost*. The daily
+[`docs/observability.md`](docs/observability.md) → *Chat cost*. The same
+message row carries the turn's LLM latency as the secret broker measured
+it per completion (`llm_calls` / `llm_duration_ms` / `llm_ttfb_ms`, PG-only,
+migration `0115`), summed per turn through `app/chat/turn_usage.py`. The daily
 spend cap remains deliberately coarser (a two-bucket counter with no model
-attached) and says so.
+attached) and says so. Since the 2026-09-08 LLM observability design every
+call — brokered or server-side — also lands as one priced row in the
+Postgres-only `llm_calls` ledger (`src/observability/llm_record.py` prices
+it with the same table at write time; `GET /api/admin/telemetry/llm-cost`
+groups it by workload/agent/user/model/purpose), carrying the `turn_id`
+that `chat_messages`, `usage_turns` and the exported spans share. Content
+export (spans and the engine's relay) is governed by
+`observability.content_export` in `instance.yaml`, never by an environment
+variable — see `docs/observability.md` → *Content policy*.
 
 ### Config Loading
 1. `config/loader.py` loads `instance.yaml`.
@@ -670,7 +681,7 @@ state machine in `src/db_state_machine.py` already reserves the enum value.
 
 ### Git commits & pull requests
 - Keep commit messages clean and concise.
-- Do not include AI attribution in commits or PRs.
+- **AI attribution:** the `Co-Authored-By: Claude …` commit trailer and the standard `🤖 Generated with [Claude Code](https://claude.com/claude-code)` PR-body footer are accepted — the agent tooling appends them and `main` already carries them. Nothing else advertises AI authorship: not commit subjects or bodies beyond that trailer, not PR titles, not code comments or docs.
 - **Treat "ready for review" as "ready to merge".** Taking a PR out of draft (`gh pr ready <N>`) is not a request for someone to look at it — it is handing the change over to be merged, and nobody will come back to ask whether you meant it. Do it only when you would be comfortable with the PR landing on `main` as-is: the change is complete, the `changelog.d/` CHANGELOG fragment is in, the test lane you owe is green, and any review feedback you were waiting on is addressed.
 - **Anything not ready to merge stays a draft** (`gh pr create --draft`) — work in progress, a branch opened early just for CI, a PR blocked on a question, one opened purely for discussion, a stack's safety-net branch. Draft is the normal state for in-flight work here; at any given moment most open PRs are drafts, and that is the system working.
 - **What lands a ready PR is the merge queue, not a review badge and not a human train.** Since 2026-09-07 `main` has a GitHub merge queue (ruleset *Merge queue on main*: merge-commit method, every entry in a group must be green) and the "require branch up to date" rule is off. To land a ready PR: `gh pr merge <N> --merge --auto` (or "Merge when ready" in the UI). The queue builds `main` + your PR (+ whatever else is queued), runs the required checks — `test` and `docker-build`, which `ci.yml` runs on the `merge_group` event — on that merged result once, and merges. **Never merge `main` into a PR because `main` moved**; the queue does that, and a PR sitting BEHIND is normal. Entry to the queue needs one approving review, evaluated by the queue itself, so ruleset bypass does not help there; for an organization member's PR a clean Devin verdict supplies it automatically (`.github/workflows/devin-clean-approves.yml`, dismissed again by a later Devin review that lists issues), so the gate is CI green + Devin clean, while an outside collaborator's PR and the daily cut PR need a human approval — what an agent waits on is Devin's verdict or that named approver, never the badge ([`docs/RELEASING.md`](docs/RELEASING.md) → *Landing PRs through the merge queue*). The hand-driven `Train N: #…` merges are retired: CHANGELOG fragments removed the collisions that made the train's resolution role necessary.

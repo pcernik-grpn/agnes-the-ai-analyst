@@ -5,6 +5,7 @@ See tests/test_chat_subprocess_provider.py for precedent.
 """
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3520,6 +3521,91 @@ class TestRestoreContext:
             handles[0].killed = True
             await _wait_until(lambda: any(m.get("type") == "ready" for m in ws.sent))
             assert _stdin_user_texts(handles[1]) == []
+
+            await manager.kill(s.id, reason="test_done")
+            handles[1].emit_eof()
+            await attach_task
+
+        asyncio.run(_run())
+
+    def test_crash_respawn_redelivery_reuses_persisted_turn_id(self, manager: ChatManager, monkeypatch):
+        """#2365 review finding: the redelivered pending question must join
+        the SAME turn as the answer that follows it, exactly like every
+        other delivery path this PR touched (the direct send, the
+        role-split producer, the interrupted _partial_save). The stored
+        row's turn_id/id (set on Postgres, since both persist-before-deliver
+        paths mint one before the INSERT) must be threaded into
+        ``_deliver_local_user_message`` rather than letting it mint a brand
+        new one — otherwise the answer never pairs with the question it
+        answers."""
+        monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
+
+        async def _run():
+            from app.chat.turn_context import read_turn
+
+            handles = [FakeHandle(), FakeHandle()]
+            spawn_calls = iter(handles)
+
+            async def fake_spawn(**kw):
+                return next(spawn_calls)
+
+            manager._provider.spawn = fake_spawn
+
+            s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+            ws = FakeWS()
+            attach_task = asyncio.create_task(manager.attach(s.id, ws))
+            await _wait_until(lambda: _ws_seated(manager, s.id, ws))
+            stored = manager._repo.append_message(session_id=s.id, role="user", content="pending question?")
+            # The DuckDB backend above always drops turn_id on write (A3) --
+            # stand in for the Postgres row, which keeps it.
+            with_turn = dataclasses.replace(stored, turn_id="turn-abc-123")
+            monkeypatch.setattr(manager._repo, "list_recent_messages", lambda *a, **k: [with_turn])
+            handles[0].emit_eof()
+            handles[0].killed = True
+            await _wait_until(lambda: any(m.get("type") == "ready" for m in ws.sent))
+            await _wait_until(lambda: "pending question?" in _stdin_user_texts(handles[1]))
+
+            assert manager._live[s.id].turn_id == "turn-abc-123"
+            record = read_turn(s.id)
+            assert record is not None
+            assert record.message_id == stored.id
+
+            await manager.kill(s.id, reason="test_done")
+            handles[1].emit_eof()
+            await attach_task
+
+        asyncio.run(_run())
+
+    def test_crash_respawn_redelivery_mints_fresh_turn_id_when_stored_row_has_none(
+        self, manager: ChatManager, monkeypatch
+    ):
+        """A legacy row written before the turn_id column existed -- and
+        every row on the frozen DuckDB backend, which drops the column on
+        write (A3) -- has turn_id=None. Redelivery must fall back to
+        minting a fresh one exactly as it always has, never deliver with a
+        None turn id."""
+        monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
+
+        async def _run():
+            handles = [FakeHandle(), FakeHandle()]
+            spawn_calls = iter(handles)
+
+            async def fake_spawn(**kw):
+                return next(spawn_calls)
+
+            manager._provider.spawn = fake_spawn
+
+            s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+            ws = FakeWS()
+            attach_task = asyncio.create_task(manager.attach(s.id, ws))
+            await _wait_until(lambda: _ws_seated(manager, s.id, ws))
+            manager._repo.append_message(session_id=s.id, role="user", content="pending question?")
+            handles[0].emit_eof()
+            handles[0].killed = True
+            await _wait_until(lambda: any(m.get("type") == "ready" for m in ws.sent))
+            await _wait_until(lambda: "pending question?" in _stdin_user_texts(handles[1]))
+
+            assert manager._live[s.id].turn_id, "must still mint a fresh turn id"
 
             await manager.kill(s.id, reason="test_done")
             handles[1].emit_eof()

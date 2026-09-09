@@ -1978,6 +1978,37 @@ def get_llm_usage_retention_days() -> int:
         return 0
 
 
+def get_chat_feedback_retention_days() -> int:
+    """Days to keep ``chat_message_feedback`` rows.
+
+    Reads ``retention.chat_feedback_days``. Default 0 = keep forever, the
+    same posture every other trail's knob has; the rows carry a person's
+    free-text comment, so an operator who wants a clock on them has one.
+    """
+    val = get_value("retention", "chat_feedback_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_llm_calls_retention_days() -> int:
+    """How many days to keep ``llm_calls`` rows (the LLM observability
+    ledger, design 2026-09-08) before the daily ``retention-prune``
+    scheduler job deletes them.
+
+    Reads ``retention.llm_calls_days``. Default 0 = keep forever (the
+    prune is a no-op until an admin opts in). Postgres-only table — on a
+    DuckDB-backed instance the pruner resolves no repo and reports nothing
+    pruned rather than raising.
+    """
+    val = get_value("retention", "llm_calls_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
 def get_collections_search_max_chunks() -> int:
     """Server-side cap on how many chunks ``GET /api/collections/search`` (and
     the ``/api/knowledge/search`` chunk leg) may rank per request (#2151).
@@ -2354,3 +2385,104 @@ def warn_retired_sharepoint_flags() -> list[str]:
             f"it was replaced by the single sharepoint.enabled switch. {tail}",
         )
     return warned
+
+
+_REJECTED_EXPORT_ENDPOINTS: set[str] = set()
+
+
+def _conversation_export_endpoint_is_acceptable(endpoint: str) -> bool:
+    """The push sink posts customer conversations plus the headers from
+    ``headers_secret_env`` to ``endpoint`` — an outbound request to an
+    operator-chosen URL with a secret attached, which is exactly the shape
+    a server-side request forgery abuses. The URL is therefore held to a
+    narrow shape before it is ever used: ``https://`` to a named host, or
+    plain ``http://`` only to the loopback host (a local relay), never a
+    URL carrying credentials in its netloc, never another scheme. Anything
+    else disables the sink (the same "off" a blank endpoint means) with one
+    warning per distinct value, so a typo is loud instead of a leak.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(endpoint)
+        hostname = (parts.hostname or "").lower()
+    except ValueError:
+        parts = None
+        hostname = ""
+    ok = (
+        parts is not None
+        and bool(hostname)
+        and parts.username is None
+        and parts.password is None
+        and (parts.scheme == "https" or (parts.scheme == "http" and hostname in ("localhost", "127.0.0.1", "::1")))
+    )
+    if not ok and endpoint not in _REJECTED_EXPORT_ENDPOINTS:
+        _REJECTED_EXPORT_ENDPOINTS.add(endpoint)
+        logging.getLogger(__name__).warning(
+            "observability.conversation_export.endpoint is not an https URL to a named host "
+            "(or http to localhost) without credentials; the push sink stays off"
+        )
+    return ok
+
+
+def get_conversation_export_config() -> Optional[dict]:
+    """Resolved ``observability.conversation_export`` block (design
+    2026-09-08 §3.12, Task 11) — the settings the scheduler's
+    ``conversation-export`` tick and the worker job kind of the same name
+    (``app/worker/kinds_conversation_export.py``) both read, or ``None``
+    when the feature is off.
+
+    Reads ``observability.conversation_export.{endpoint,headers_secret_env,
+    interval_minutes,surfaces}`` from instance.yaml. ``endpoint`` blank/unset
+    means the push sink is off; that single ``None`` return is what both the
+    scheduler (whether to enqueue the job at all) and the worker job's own
+    no-op guard (a stray manual enqueue via ``POST /api/jobs``) key off, so
+    there is exactly one place that decides "is push export configured".
+    Unlike most knobs in this module there is no env-var override for
+    ``endpoint`` — an outbound export destination is exactly the kind of
+    decision this module keeps out of the environment (see
+    ``docs/CONFIGURATION.md``).
+
+    ``headers_secret_env`` names an environment variable holding
+    ``OTEL_EXPORTER_OTLP_HEADERS``-shaped ``k1=v1,k2=v2`` header pairs
+    (``src.observability.otel.parse_otlp_headers``) — never the header
+    value itself, mirroring the ``token_env``/``access_key_env`` indirection
+    :func:`distribution_object_store_config` above already uses, so a
+    credential never round-trips through the instance.yaml editor.
+
+    ``interval_minutes`` defaults to ``60``; a non-positive or unparsable
+    value falls back to that default rather than producing a runaway
+    "every 0m" schedule. ``surfaces`` is an optional allowlist (empty tuple
+    = every surface) the worker job pushes into the underlying
+    ``list_completed_between`` query itself (``surface = ANY(...)``), not a
+    client-side filter on the returned records — an excluded surface is
+    never fetched at all.
+    """
+    endpoint = str(get_value("observability", "conversation_export", "endpoint", default="") or "").strip()
+    if not endpoint:
+        return None
+    if not _conversation_export_endpoint_is_acceptable(endpoint):
+        return None
+
+    raw_headers_env = get_value("observability", "conversation_export", "headers_secret_env", default=None)
+    headers_secret_env = str(raw_headers_env).strip() or None if raw_headers_env else None
+
+    raw_interval = get_value("observability", "conversation_export", "interval_minutes", default=60)
+    try:
+        interval_minutes = int(raw_interval)
+        if interval_minutes <= 0:
+            raise ValueError("interval_minutes must be positive")
+    except (TypeError, ValueError):
+        interval_minutes = 60
+
+    raw_surfaces = get_value("observability", "conversation_export", "surfaces", default=None)
+    surfaces: tuple[str, ...] = ()
+    if isinstance(raw_surfaces, (list, tuple)):
+        surfaces = tuple(str(s).strip() for s in raw_surfaces if str(s).strip())
+
+    return {
+        "endpoint": endpoint,
+        "headers_secret_env": headers_secret_env,
+        "interval_minutes": interval_minutes,
+        "surfaces": surfaces,
+    }

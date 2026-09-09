@@ -13,11 +13,19 @@ What is exported, and why it lives here:
   (``app/api/broker.py``) — every chat surface, every engine, because every
   byte of a session's LLM traffic goes through that one route. The span
   carries the OTel GenAI attributes (model, the four token kinds, finish
-  reason) plus the Agnes identity of the call (session, user, agent, ticket
-  scope). Prompt and completion content is exported ONLY when
-  ``AGNES_OTEL_CAPTURE_CONTENT`` is set: in this product it routinely
-  carries customer data, so the default is the same as for logs — sizes and
-  counts, never the text. When it is on, the text rides two span EVENTS
+  reason) plus the Agnes labels of the call — the call context
+  (``src/observability/llm_context.py``: workload, purpose, session, turn,
+  job, subject) and its identity, which is ``agnes.user_id`` and the agent
+  id. The user's EMAIL is deliberately not exported: it is personal data
+  with no join value off-instance, where the stable id is the key.
+  Prompt and completion content is exported ONLY under the instance's
+  recorded content-export policy (``observability.content_export`` —
+  :mod:`src.observability.content_policy`; ``AGNES_OTEL_CAPTURE_CONTENT``
+  is a deprecated alias that no longer enables anything on its own): in
+  this product content routinely carries customer data, so the default is
+  the same as for logs — sizes and counts, never the text. Under
+  ``pseudonymized`` the text passes the instance anonymizer first. When it
+  is on, the text rides two span EVENTS
   (``gen_ai.content.prompt`` / ``gen_ai.content.completion``), never span
   attributes: a collector stores attributes as one JSON object with keys in
   alphabetical order, and a prompt that is hundreds of KiB pushes every key
@@ -46,10 +54,14 @@ import logging
 import os
 import socket
 import threading
+from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import Any, Mapping, Optional
+from typing import Any
 from urllib.parse import unquote
+
+from src.observability.llm_context import LlmCallContext
 
 try:
     from opentelemetry import trace
@@ -109,7 +121,7 @@ def _app_version() -> str:
         return "0.0.0+dev"
 
 
-def _build_resource(role: Optional[str]) -> Any:
+def _build_resource(role: str | None) -> Any:
     from opentelemetry.sdk.resources import OTELResourceDetector, Resource
 
     defaults: dict[str, Any] = {
@@ -150,7 +162,7 @@ def parse_otlp_headers(raw: str) -> dict[str, str]:
     return out
 
 
-def collector() -> Optional[tuple[str, dict[str, str]]]:
+def collector() -> tuple[str, dict[str, str]] | None:
     """The collector a broker route can forward a sandbox's batches to: the
     BASE endpoint (``/v1/<signal>`` appended per call) plus the operator's
     headers — or ``None``.
@@ -170,7 +182,7 @@ def collector() -> Optional[tuple[str, dict[str, str]]]:
     return endpoint, parse_otlp_headers(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
 
 
-def configure_otel(*, role: Optional[str] = None, exporter: Any = None) -> bool:  # noqa: C901
+def configure_otel(*, role: str | None = None, exporter: Any = None) -> bool:
     """Install the process-wide tracer provider. Idempotent; returns whether
     export is on.
 
@@ -204,14 +216,14 @@ def configure_otel(*, role: Optional[str] = None, exporter: Any = None) -> bool:
                 processor = BatchSpanProcessor(OTLPSpanExporter())
             provider = TracerProvider(resource=_build_resource(role))
             provider.add_span_processor(processor)
-        except Exception:  # noqa: BLE001 - tracing setup must never take the process down
+        except Exception:
             logger.exception("otel: exporter setup failed; trace export stays off")
             return False
         _provider = provider
         if not injected:
             try:
                 trace.set_tracer_provider(provider)
-            except Exception:  # noqa: BLE001 - the module-level tracer works without the global
+            except Exception:
                 logger.debug("otel: global tracer provider already set", exc_info=True)
             logger.info(
                 "otel: OTLP trace export enabled",
@@ -233,13 +245,13 @@ class _NoopSpan:
     def set_attribute(self, key: str, value: Any) -> None:
         return None
 
-    def set_status(self, status: Any, description: Optional[str] = None) -> None:
+    def set_status(self, status: Any, description: str | None = None) -> None:
         return None
 
-    def add_event(self, name: str, attributes: Optional[Mapping[str, Any]] = None) -> None:
+    def add_event(self, name: str, attributes: Mapping[str, Any] | None = None) -> None:
         return None
 
-    def end(self, end_time: Optional[int] = None) -> None:
+    def end(self, end_time: int | None = None) -> None:
         return None
 
 
@@ -270,12 +282,23 @@ def shutdown_otel(timeout_ms: int = 5000) -> None:
     try:
         provider.force_flush(timeout_ms)
         provider.shutdown()
-    except Exception:  # noqa: BLE001 - shutdown is best-effort
+    except Exception:
         logger.debug("otel: provider shutdown failed", exc_info=True)
 
 
-def capture_content_enabled() -> bool:
-    return os.environ.get(CAPTURE_CONTENT_VAR, "").strip().lower() in ("1", "true", "yes", "on")
+def capture_content_enabled(workload: str | None = None) -> bool:
+    """Content leaves the instance only under a recorded policy
+    (``observability.content_export`` — src/observability/content_policy.py:
+    mode + placement + basis + approver). ``AGNES_OTEL_CAPTURE_CONTENT`` is a
+    deprecated alias that no longer enables anything on its own.
+
+    ``workload`` narrows the check to the policy's per-workload allowlist
+    (spec 3.6): a completion or generation span passes its own workload so
+    an operator can export ``builder`` content while keeping ``chat`` off.
+    """
+    from src.observability.content_policy import content_export_mode
+
+    return content_export_mode(workload) != "off"
 
 
 # ---------------------------------------------------------------------------
@@ -290,93 +313,165 @@ def _clean(attrs: Mapping[str, Any]) -> dict[str, Any]:
 def start_completion_span(
     *,
     upstream: str,
-    model: Optional[str],
+    model: str | None,
     stream: bool,
-    session_id: Optional[str],
-    ticket_scope: Optional[str],
-    user_email: Optional[str] = None,
-    user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
+    session_id: str | None,
+    ticket_scope: str | None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    context: LlmCallContext | None = None,
+    parent_context: Any = None,
 ) -> Any:
     """Open the span for one brokered completion. ``upstream`` names where
     the request goes (``anthropic``, ``vertex``, ``dispatcher``); the GenAI
-    ``system`` is the provider whose API shape the call speaks."""
+    ``system`` is the provider whose API shape the call speaks.
+
+    ``context`` supplies the call's labels (workload, purpose, turn, job,
+    subject); the explicit ``session_id`` / ``user_id`` / ``agent_id``
+    arguments win over the context's when both are given, because the caller
+    holding the ticket knows those first-hand. ``parent_context`` is the OTel
+    ``Context`` to open under — the chat turn's span, which normally lives in
+    another process (see :func:`remote_parent_context`).
+    """
     system = "gcp.vertex_ai" if upstream == "vertex" else "anthropic"
-    attrs = _clean(
-        {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.system": system,
-            "gen_ai.request.model": model,
-            "agnes.kind": "completion",
-            "agnes.upstream": upstream,
-            "agnes.stream": stream,
-            "agnes.session_id": session_id,
-            "agnes.ticket_scope": ticket_scope,
-            "agnes.user_email": user_email,
-            "agnes.user_id": user_id,
-            "agnes.agent_id": agent_id,
-        }
-    )
+    # The context first, the caller's own values over it — but only the ones
+    # it actually has: cleaning BEFORE the merge is what keeps an absent
+    # explicit argument from blanking a label the context did carry.
+    attrs = {
+        **(context.span_attributes() if context else {}),
+        **_clean(
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.system": system,
+                "gen_ai.request.model": model,
+                "agnes.kind": "completion",
+                "agnes.upstream": upstream,
+                "agnes.stream": stream,
+                "agnes.session_id": session_id,
+                "agnes.ticket_scope": ticket_scope,
+                "agnes.user_id": user_id,
+                "agnes.agent_id": agent_id,
+            }
+        ),
+    }
     name = f"chat {model}" if model else "chat"
-    return _open_span(name, attrs)
+    return _open_span(name, attrs, parent_context=parent_context)
 
 
-def _open_span(name: str, attrs: Mapping[str, Any]) -> Any:
+def _open_span(name: str, attrs: Mapping[str, Any], *, kind: Any = None, parent_context: Any = None) -> Any:
     """``tracer().start_span`` that cannot raise: a span processor that
     fails on ``on_start`` costs the span, never the LLM call it observes."""
     if not _OTEL_API:
         return _NoopSpan()
     try:
-        return tracer().start_span(name, kind=SpanKind.CLIENT, attributes=dict(attrs))
-    except Exception:  # noqa: BLE001 - see the module docstring
+        return tracer().start_span(
+            name,
+            kind=kind or SpanKind.CLIENT,
+            attributes=dict(attrs),
+            context=parent_context,
+        )
+    except Exception:
         logger.debug("otel: could not open span %s", name, exc_info=True)
         return _NoopSpan()
 
 
-def start_generation_span(*, provider: str, model: str) -> Any:
-    """Open the span for one server-side generation (``trace_generation``)."""
-    attrs = _clean(
-        {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.system": provider,
-            "gen_ai.request.model": model,
-            "agnes.kind": "generation",
-        }
-    )
+def start_generation_span(*, provider: str, model: str, context: LlmCallContext | None = None) -> Any:
+    """Open the span for one server-side generation (``trace_generation``).
+    ``context`` labels it with workload / purpose / identity so a builder
+    turn, an extraction and an auto-title stop looking identical."""
+    attrs = {
+        **(context.span_attributes() if context else {}),
+        **_clean(
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.system": provider,
+                "gen_ai.request.model": model,
+                "agnes.kind": "generation",
+            }
+        ),
+    }
     return _open_span(f"chat {model}" if model else "chat", attrs)
+
+
+def _set_cost(span: Any, cost_usd: float | None) -> None:
+    """``agnes.cost_usd`` — the price the producer computed, so a collector
+    never has to re-implement the price table."""
+    if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool):
+        span.set_attribute("agnes.cost_usd", float(cost_usd))
+
+
+def _add_generation_content_events(span: Any, prompt_text: str | None, completion_text: str | None) -> None:
+    """The two content events for a server-side generation, in the same GenAI
+    message shape (``[{role, parts}]``) the completion spans use, so one
+    collector query reads both. Each text goes through the policy's
+    ``export_text`` and the shared per-event cap."""
+    from src.observability.content_policy import export_text
+
+    truncated = False
+    for text_value, role, event_name, attribute in (
+        (prompt_text, "user", PROMPT_EVENT, "gen_ai.prompt"),
+        (completion_text, "assistant", COMPLETION_EVENT, "gen_ai.completion"),
+    ):
+        if not isinstance(text_value, str):
+            continue
+        exported = export_text(text_value)
+        payload = json.dumps([{"role": role, "parts": [{"type": "text", "content": exported}]}], ensure_ascii=False)
+        text, cut = truncate_content(payload)
+        truncated = truncated or cut
+        span.add_event(event_name, {attribute: text})
+    if truncated:
+        span.set_attribute("agnes.content_truncated", True)
 
 
 def end_generation_span(
     span: Any,
     *,
-    input_tokens: Optional[int] = None,
-    output_tokens: Optional[int] = None,
-    prompt_chars: Optional[int] = None,
-    completion_chars: Optional[int] = None,
-    error_type: Optional[str] = None,
-    user_id: Optional[str] = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
+    cost_usd: float | None = None,
+    prompt_chars: int | None = None,
+    completion_chars: int | None = None,
+    error_type: str | None = None,
+    user_id: str | None = None,
+    prompt_text: str | None = None,
+    completion_text: str | None = None,
+    workload: str | None = None,
 ) -> None:
     """Finish a generation span with the counts ``trace_generation`` collected.
-    Sizes, never text: these calls run over documents and query results."""
+
+    Sizes always; the TEXT only under the recorded content-export policy
+    (:func:`capture_content_enabled`) and then on the same two events a
+    completion span uses — a builder turn and a brokered chat turn answer
+    "what did the model actually see" the same way, or neither does.
+    ``workload`` is this generation's own (spec 3.6's per-workload
+    allowlist) — a builder generation can carry content while a chat one
+    stays silent under the same base mode."""
     try:
         if not span.is_recording():
             return
         for attr, value in (
             ("gen_ai.usage.input_tokens", input_tokens),
             ("gen_ai.usage.output_tokens", output_tokens),
+            ("gen_ai.usage.cache_read_input_tokens", cache_read_tokens),
+            ("gen_ai.usage.cache_creation_input_tokens", cache_creation_tokens),
             ("agnes.prompt_chars", prompt_chars),
             ("agnes.completion_chars", completion_chars),
         ):
             if isinstance(value, int) and not isinstance(value, bool):
                 span.set_attribute(attr, value)
+        _set_cost(span, cost_usd)
         if user_id:
             span.set_attribute("agnes.user_id", user_id)
+        if capture_content_enabled(workload):
+            _add_generation_content_events(span, prompt_text, completion_text)
         if error_type:
             span.set_attribute("error.type", error_type)
             span.set_status(StatusCode.ERROR, error_type)
         else:
             span.set_status(StatusCode.OK)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not finish the generation span", exc_info=True)
     finally:
         try:
@@ -385,7 +480,7 @@ def end_generation_span(
             pass
 
 
-def set_usage_attributes(span: Any, usage: Optional[Mapping[str, Any]]) -> None:
+def set_usage_attributes(span: Any, usage: Mapping[str, Any] | None) -> None:
     """Map the broker's normalized usage shape (``parse_usage``) onto the
     GenAI usage attributes. Cache tokens are emitted separately — Anthropic
     reports ``input_tokens`` as the UNCACHED input only, so folding them in
@@ -407,65 +502,143 @@ def set_usage_attributes(span: Any, usage: Optional[Mapping[str, Any]]) -> None:
         span.set_attribute("gen_ai.response.model", str(model))
 
 
-def end_completion_span(  # noqa: C901
-    span: Any,
+@dataclass
+class CompletionSummary:
+    """What one completion's request and response say about themselves —
+    the parse both sinks need, done once.
+
+    The span sets its attributes from this and the ledger row copies the
+    same figures, so a row and a span can never disagree about the model,
+    the stop reason or the sizes. Text (``prompt_json`` /
+    ``completion_json``) is carried for the content EVENTS only; it is
+    never written to an attribute and never leaves the process unless
+    content capture is on.
+    """
+
+    model: str | None = None
+    stop_reason: str | None = None
+    prompt_chars: int | None = None
+    completion_chars: int | None = None
+    prompt_json: str | None = None
+    completion_json: str | None = None
+    stream_complete: bool | None = None
+    response_bytes: int | None = None
+
+
+def describe_completion(
     *,
-    status_code: Optional[int] = None,
-    usage: Optional[Mapping[str, Any]] = None,
-    request_body: Optional[bytes] = None,
-    response_body: Optional[bytes] = None,
-    content_type: str = "",
-    error: Optional[BaseException] = None,
+    request_body: bytes | None,
+    response_body: bytes | None,
+    content_type: str,
     response_truncated: bool = False,
-) -> None:
-    """Finish a completion span with whatever the forward produced. Never
-    raises — the response has already been (or is being) delivered."""
+) -> CompletionSummary:
+    """Parse one completion exchange into a :class:`CompletionSummary`.
+
+    Pure and total: a malformed body, a half-written stream or a body far
+    past the mirror cap yields a summary with fewer fields set, never an
+    exception — the response has already been (or is being) delivered.
+    """
+    out = CompletionSummary()
     try:
-        if not span.is_recording():
-            return
-        if status_code is not None:
-            span.set_attribute("http.response.status_code", int(status_code))
-        set_usage_attributes(span, usage)
-        summary: dict[str, Any] = {}
         if response_body is not None:
             # A completion the client walked away from (or that never got
             # past the headers) leaves an empty or partial body: no usage,
-            # no answer. Say so on the span, so an analysis can tell a turn
-            # the model never finished from one it did — the two look the
-            # same otherwise, and a burst of them is a broken engine, not a
-            # gap in the export.
-            span.set_attribute("agnes.response_bytes", len(response_body))
+            # no answer. Say so, so an analysis can tell a turn the model
+            # never finished from one it did — the two look the same
+            # otherwise, and a burst of them is a broken engine, not a gap
+            # in the export.
+            out.response_bytes = len(response_body)
         if response_body is not None and not response_truncated:
             summary = summarize_completion(response_body, content_type)
+            out.model = summary.get("model")
+            out.stop_reason = summary.get("stop_reason")
             if "text/event-stream" in (content_type or "").lower():
-                span.set_attribute("agnes.stream_complete", bool(summary.get("stop_reason")))
-            if summary.get("model") and not (usage and usage.get("model")):
-                span.set_attribute("gen_ai.response.model", str(summary["model"]))
-            if summary.get("stop_reason"):
-                span.set_attribute("gen_ai.response.finish_reasons", [str(summary["stop_reason"])])
+                out.stream_complete = bool(summary.get("stop_reason"))
+            if summary.get("blocks") is not None:
+                out.completion_json = json.dumps(
+                    [{"role": "assistant", "parts": _parts_from_content(summary["blocks"])}], ensure_ascii=False
+                )
+                out.completion_chars = len(out.completion_json)
+        if request_body is not None:
+            out.prompt_json = json.dumps(input_messages_from_request(request_body), ensure_ascii=False)
+            out.prompt_chars = len(out.prompt_json)
+    except Exception:
+        logger.debug("otel: could not describe the completion", exc_info=True)
+    return out
+
+
+def end_completion_span(
+    span: Any,
+    *,
+    status_code: int | None = None,
+    usage: Mapping[str, Any] | None = None,
+    request_body: bytes | None = None,
+    response_body: bytes | None = None,
+    content_type: str = "",
+    error: BaseException | None = None,
+    response_truncated: bool = False,
+    cost_usd: float | None = None,
+    summary: CompletionSummary | None = None,
+    workload: str | None = None,
+) -> None:
+    """Finish a completion span with whatever the forward produced. Never
+    raises — the response has already been (or is being) delivered.
+
+    ``summary`` is the parse the caller already did (the broker describes
+    the exchange once and builds its ledger row from the same object); when
+    it is absent the parse happens here — but only after the non-recording
+    early return, so an instance with export off still pays nothing.
+
+    ``workload`` is this completion's own (the call context's — ``chat`` for
+    an ordinary turn, ``agent_api`` for an agent-bound one): the content
+    events below obey the policy's per-workload allowlist (spec 3.6), not
+    just its base mode.
+    """
+    try:
+        if not span.is_recording():
+            return
+        described = summary or describe_completion(
+            request_body=request_body,
+            response_body=response_body,
+            content_type=content_type,
+            response_truncated=response_truncated,
+        )
+        if status_code is not None:
+            span.set_attribute("http.response.status_code", int(status_code))
+        set_usage_attributes(span, usage)
+        _set_cost(span, cost_usd)
+        if described.response_bytes is not None:
+            span.set_attribute("agnes.response_bytes", described.response_bytes)
+        if described.stream_complete is not None:
+            span.set_attribute("agnes.stream_complete", described.stream_complete)
+        if described.model and not (usage and usage.get("model")):
+            span.set_attribute("gen_ai.response.model", str(described.model))
+        if described.stop_reason:
+            span.set_attribute("gen_ai.response.finish_reasons", [str(described.stop_reason)])
         if response_truncated:
             span.set_attribute("agnes.response_truncated", True)
-        prompt_json: Optional[str] = None
-        completion_json: Optional[str] = None
-        if request_body is not None:
-            prompt_json = json.dumps(input_messages_from_request(request_body), ensure_ascii=False)
-            span.set_attribute("agnes.prompt_chars", len(prompt_json))
-        if summary.get("blocks") is not None:
-            out = [{"role": "assistant", "parts": _parts_from_content(summary["blocks"])}]
-            completion_json = json.dumps(out, ensure_ascii=False)
-            span.set_attribute("agnes.completion_chars", len(completion_json))
-        if capture_content_enabled():
+        if described.prompt_chars is not None:
+            span.set_attribute("agnes.prompt_chars", described.prompt_chars)
+        if described.completion_chars is not None:
+            span.set_attribute("agnes.completion_chars", described.completion_chars)
+        if capture_content_enabled(workload):
             # Content goes on EVENTS (see the module docstring): the span's
             # attribute object stays small and parseable however long the
             # conversation is, and each side of the exchange is its own
             # record a collector can map, cap or drop independently.
+            # Every text passes the policy's ``export_text`` first: under
+            # ``pseudonymized`` that is the instance anonymizer, and a
+            # pseudonymisation that cannot run withholds the text rather than
+            # falling back to the raw exchange.
+            from src.observability.content_policy import export_text
+
             truncated = False
-            if prompt_json is not None:
-                text, cut = truncate_content(prompt_json)
+            if described.prompt_json is not None:
+                text, cut = truncate_content(export_text(described.prompt_json))
                 truncated = truncated or cut
                 span.add_event(PROMPT_EVENT, {"gen_ai.prompt": text})
-            if completion_json is not None:
-                text, cut = truncate_content(completion_json)
+            if described.completion_json is not None:
+                text, cut = truncate_content(export_text(described.completion_json))
                 truncated = truncated or cut
                 span.add_event(COMPLETION_EVENT, {"gen_ai.completion": text})
             if truncated:
@@ -478,13 +651,53 @@ def end_completion_span(  # noqa: C901
             span.set_status(StatusCode.ERROR, f"upstream {status_code}")
         else:
             span.set_status(StatusCode.OK)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not finish the completion span", exc_info=True)
     finally:
         try:
             span.end()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------------------
+# Span identity — the ids a ledger row carries, and the parent a span in
+# another process can be opened under
+# ---------------------------------------------------------------------------
+
+
+def span_ids(span: Any) -> tuple[str | None, str | None]:
+    """``(trace_id, span_id)`` as lowercase hex for a recording span — the
+    ids a ledger row stores so it can be joined to the exported span.
+    ``(None, None)`` for a non-recording span (export off) or any failure."""
+    try:
+        if not span.is_recording():
+            return None, None
+        sc = span.get_span_context()
+        return format(sc.trace_id, "032x"), format(sc.span_id, "016x")
+    except Exception:  # noqa: BLE001 - see the module docstring
+        return None, None
+
+
+def remote_parent_context(trace_id_hex: str | None, span_id_hex: str | None) -> Any:
+    """An OTel ``Context`` whose current span is a remote, sampled
+    ``NonRecordingSpan`` — the parent a completion span opens under when the
+    turn span lives in another process. ``None`` on bad input."""
+    if not _OTEL_API or not trace_id_hex or not span_id_hex:
+        return None
+    try:
+        from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+
+        sc = SpanContext(
+            trace_id=int(trace_id_hex, 16),
+            span_id=int(span_id_hex, 16),
+            is_remote=True,
+            trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        )
+        return trace.set_span_in_context(NonRecordingSpan(sc))
+    except Exception:
+        logger.debug("otel: could not build a remote parent context", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -584,18 +797,18 @@ def summarize_completion(body: bytes, content_type: str) -> dict[str, Any]:
             "stop_reason": data.get("stop_reason"),
             "blocks": data.get("content") if isinstance(data.get("content"), list) else [],
         }
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("otel: unreadable completion body", exc_info=True)
         return {}
 
 
 def _summarize_sse(body: bytes) -> dict[str, Any]:
     text = body.decode("utf-8", errors="replace")
-    model: Optional[str] = None
-    stop_reason: Optional[str] = None
+    model: str | None = None
+    stop_reason: str | None = None
     blocks: dict[int, dict[str, Any]] = {}
     partial_json: dict[int, list[str]] = {}
-    event_type: Optional[str] = None
+    event_type: str | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -655,25 +868,193 @@ def _summarize_sse(body: bytes) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Chat turn structure — the spans a chat turn is made of
+#
+# One ``agnes.chat.turn`` per delivered user message, one
+# ``agnes.chat.tool <tool>`` per tool call under it, and the completions the
+# broker forwards for that turn parented under the same context (they are
+# opened in another process — see :func:`remote_parent_context` and
+# ``app/chat/turn_context.py``). Structure only: a tool's arguments and its
+# result never reach a span, in this product they routinely carry customer
+# data. Nothing here may cost a turn, so every call is wrapped exactly like
+# the completion helpers above.
+# ---------------------------------------------------------------------------
+
+
+def child_context(span: Any) -> Any:
+    """The OTel ``Context`` whose current span is ``span`` — the parent for a
+    span opened in THIS process (the remote sibling is
+    :func:`remote_parent_context`). ``None`` when there is nothing to parent
+    under, which makes the child a root span rather than an error."""
+    if not _OTEL_API:
+        return None
+    try:
+        return trace.set_span_in_context(span) if span.is_recording() else None
+    except Exception:  # noqa: BLE001 - see the module docstring
+        return None
+
+
+def start_turn_span(
+    *,
+    session_id: str | None,
+    turn_id: str | None,
+    user_id: str | None,
+    agent_id: str | None,
+    surface: str | None,
+    workload: str | None,
+) -> Any:
+    """Open the span for one chat turn. Labels only — no message text."""
+    attrs = _clean(
+        {
+            "agnes.kind": "turn",
+            "agnes.session_id": session_id,
+            "agnes.turn_id": turn_id,
+            "agnes.user_id": user_id,
+            "agnes.agent_id": agent_id,
+            "agnes.surface": surface,
+            "agnes.workload": workload,
+        }
+    )
+    return _open_span("agnes.chat.turn", attrs, kind=SpanKind.INTERNAL if _OTEL_API else None)
+
+
+def end_turn_span(
+    span: Any,
+    *,
+    tool_calls: int,
+    usage: Mapping[str, Any] | None = None,
+    cost_usd: float | None = None,
+    error_kind: str | None = None,
+) -> None:
+    """Finish a turn span with what the turn cost: how many tools it ran, the
+    tokens it burned and the price of them. ``error_kind`` is the ``kind`` of
+    the turn's error frame (``turn_idle_timeout`` and friends) — a label, not
+    a message, so nothing a model or a user wrote leaks into it."""
+    try:
+        if not span.is_recording():
+            return
+        span.set_attribute("agnes.tool_calls", int(tool_calls))
+        set_usage_attributes(span, usage)
+        _set_cost(span, cost_usd)
+        if error_kind:
+            span.set_attribute("error.type", str(error_kind))
+            span.set_status(StatusCode.ERROR, str(error_kind)[:200])
+        else:
+            span.set_status(StatusCode.OK)
+    except Exception:
+        logger.debug("otel: could not finish the turn span", exc_info=True)
+    finally:
+        try:
+            span.end()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def start_tool_span(*, tool: str | None, args_hash: str | None, parent: Any) -> Any:
+    """Open the span for one tool call of a turn. ``args_hash`` is the same
+    digest the ``chat.tool_call`` audit record carries — enough to tell two
+    calls of one tool apart, never enough to read what they did."""
+    attrs = _clean({"agnes.kind": "tool", "agnes.tool": tool, "agnes.args_hash": args_hash})
+    return _open_span(
+        f"agnes.chat.tool {tool}",
+        attrs,
+        kind=SpanKind.INTERNAL if _OTEL_API else None,
+        parent_context=child_context(parent),
+    )
+
+
+def end_tool_span(span: Any, *, is_error: bool) -> None:
+    """Finish a tool span. Whether it failed, never how."""
+    try:
+        if not span.is_recording():
+            return
+        span.set_attribute("agnes.is_error", bool(is_error))
+        span.set_status(StatusCode.ERROR if is_error else StatusCode.OK)
+    except Exception:
+        logger.debug("otel: could not finish the tool span", exc_info=True)
+    finally:
+        try:
+            span.end()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def emit_feedback_span(
+    *,
+    session_id: str | None,
+    turn_id: str | None,
+    user_id: str | None,
+    verdict: str | None,
+    has_comment: bool,
+    parent_context: Any = None,
+) -> None:
+    """A short span for one thumbs up/down submission (design 2026-09-08
+    §3.5): ``agnes.chat.feedback`` carrying one event ``agnes.feedback``,
+    opened and ended in the same call — there is nothing to time, only to
+    record that it happened. ``parent_context`` is the turn's own span
+    context (:func:`remote_parent_context`, read back from
+    ``chat:turn:{session_id}``) when the caller resolved one; ``None`` makes
+    this a root span rather than an error. No-op when export is off (the
+    tracer hands back a non-recording span either way) and never raises —
+    a feedback submission must land regardless of what the collector does
+    with it."""
+    attrs = _clean(
+        {
+            "agnes.kind": "feedback",
+            "agnes.session_id": session_id,
+            "agnes.turn_id": turn_id,
+            "agnes.user_id": user_id,
+            "agnes.verdict": verdict,
+        }
+    )
+    span = _open_span(
+        "agnes.chat.feedback",
+        attrs,
+        kind=SpanKind.INTERNAL if _OTEL_API else None,
+        parent_context=parent_context,
+    )
+    try:
+        span.add_event("agnes.feedback", {"agnes.verdict": verdict or "", "agnes.has_comment": bool(has_comment)})
+        span.set_status(StatusCode.OK)
+    except Exception:
+        logger.debug("otel: could not record the feedback event", exc_info=True)
+    finally:
+        try:
+            span.end()
+        except Exception:  # noqa: BLE001, S110 - see the sibling span-end blocks above
+            pass
+
+
 __all__ = [
     "CAPTURE_CONTENT_VAR",
     "COMPLETION_EVENT",
-    "PROMPT_EVENT",
     "ENDPOINT_VAR",
     "MAX_CONTENT_CHARS",
+    "PROMPT_EVENT",
+    "CompletionSummary",
     "capture_content_enabled",
+    "child_context",
     "collector",
     "configure_otel",
+    "describe_completion",
+    "emit_feedback_span",
     "end_completion_span",
     "end_generation_span",
+    "end_tool_span",
+    "end_turn_span",
     "endpoint_configured",
     "input_messages_from_request",
     "is_enabled",
     "parse_otlp_headers",
+    "remote_parent_context",
     "set_usage_attributes",
     "shutdown_otel",
+    "span_ids",
     "start_completion_span",
     "start_generation_span",
+    "start_tool_span",
+    "start_turn_span",
     "summarize_completion",
     "tracer",
     "truncate_content",

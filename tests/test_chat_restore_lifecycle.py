@@ -28,7 +28,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import duckdb
 import pytest
@@ -196,6 +196,33 @@ class TestPartialSaveNeverDeadEnds:
             _seat_live(mgr, s.id, turn_in_flight=False)
             await mgr.kill(s.id, reason="idle_ttl")
             assert mgr._repo.list_messages(s.id) == []
+
+    def test_partial_save_passes_the_turns_turn_id_to_append_message(self, tmp_path):
+        """#2365 review finding: the user row of an interrupted turn is
+        persisted with a ``turn_id`` (minted before persist, see
+        ``send_user_message``); the partial assistant row ``_partial_save``
+        writes on kill() must carry the SAME id, or the reloaded interrupted
+        answer can never be matched back to its own turn -- unratable, and
+        absent from the corpus export's turn join. The frozen DuckDB backend
+        drops the value on write (no such column there, A3), so this asserts
+        on the call itself rather than the round-tripped row -- the PG round
+        trip is covered by tests/db_pg/test_chat_messages_turn_id_pg.py."""
+        mgr = _make_manager(tmp_path)
+
+        async def _run():
+            s = await mgr.create_session(user_email="u@x", surface=Surface.WEB)
+            live = _seat_live(
+                mgr,
+                s.id,
+                turn_in_flight=True,
+                turn_buffer=[{"type": "token", "text": "partial", "seq": 1}],
+            )
+            live.turn_id = "turn-partial-1"
+            with patch.object(mgr._repo, "append_message", wraps=mgr._repo.append_message) as spy:
+                await mgr.kill(s.id, reason="ws_disconnect")
+            assert spy.call_args.kwargs["turn_id"] == "turn-partial-1"
+
+        asyncio.run(_run())
 
         asyncio.run(_run())
 

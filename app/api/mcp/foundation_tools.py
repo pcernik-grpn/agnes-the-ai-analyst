@@ -21,13 +21,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
-
-from pydantic import Field
+from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from src.mcp_tooling import (
     compact_search_results,
@@ -4100,6 +4100,9 @@ def register_foundation_tools(
         source: str = "",
         trail: str = "",
         q: str = "",
+        cursor_ts: str = "",
+        cursor_id: str = "",
+        since_ts: str = "",
     ) -> dict:
         """Tail the unified Activity Center timeline (admin only).
 
@@ -4122,12 +4125,57 @@ def register_foundation_tools(
                             "llm" | "agent_scope". Empty (default) returns the
                             unified timeline across all four.
             q:             Free-text search over the row's params JSON.
+            cursor_ts:      Pagination cursor, timestamp half — pass the prior
+                             page's ``next_cursor["ts"]`` verbatim. Both
+                             ``cursor_ts`` and ``cursor_id`` must be set
+                             together — setting only one raises ValueError
+                             naming the missing half, rather than silently
+                             restarting the read from page one.
+            cursor_id:      Pagination cursor, id half — pass the prior page's
+                             ``next_cursor["id"]`` verbatim.
+            since_ts:       Pagination floor — pass the prior page's
+                             ``next_cursor["since_ts"]`` verbatim alongside
+                             cursor_ts/cursor_id. Continuation-only: setting
+                             it without both cursor halves raises ValueError,
+                             and the server independently rejects it as more
+                             than since_minutes before cursor_ts, so it can
+                             never widen a single read's scan past what
+                             since_minutes already allows. ``since_minutes``
+                             computes a floor relative to "now", which drifts
+                             forward between calls; forwarding the pinned
+                             since_ts keeps a multi-page read over the same
+                             window the first call saw, so a row near the
+                             window's edge cannot silently fall out between
+                             pages. Omit only on the first (uncursored) call.
+
+        When a returned page's ``next_cursor`` is non-null, continue by
+        calling again with ``cursor_ts=next_cursor["ts"]``,
+        ``cursor_id=next_cursor["id"]``, and ``since_ts=next_cursor["since_ts"]``
+        — every other filter must stay identical across pages, since the
+        cursor only makes sense relative to the same query. Dropping
+        since_ts on a continuation call still works, but re-derives the
+        floor from since_minutes at call time instead of the one the first
+        call pinned — always forward it.
 
         Returns ``{"rows": [{"timestamp", "trail", "source", "action",
         "resource", "user_id", "user_email", "result", "params", ...}, ...],
-        "next_cursor"}``. Mirrors ``GET /api/admin/activity`` and
-        ``agnes admin activity``. Requires an admin PAT.
+        "next_cursor": {"ts", "id", "since_ts"} | null}``. Mirrors
+        ``GET /api/admin/activity`` and ``agnes admin activity``. Requires
+        an admin PAT.
         """
+        if bool(cursor_ts) != bool(cursor_id):
+            missing = "cursor_id" if cursor_ts else "cursor_ts"
+            raise ValueError(
+                f"activity: cursor_ts and cursor_id must be passed together — {missing} is "
+                "missing. Pass both halves from a prior page's next_cursor (or neither, for "
+                "a fresh read)."
+            )
+        if since_ts and not (cursor_ts and cursor_id):
+            raise ValueError(
+                "activity: since_ts is continuation-only — pass it together with a complete "
+                "cursor_ts and cursor_id from a prior page's next_cursor, never on a fresh "
+                "(uncursored) read."
+            )
         params: dict[str, Any] = {"since_minutes": since_minutes, "limit": limit}
         if action_prefix:
             params["action_prefix"] = action_prefix
@@ -4143,6 +4191,11 @@ def register_foundation_tools(
             params["trail"] = trail
         if q:
             params["q"] = q
+        if cursor_ts and cursor_id:
+            params["cursor_ts"] = cursor_ts
+            params["cursor_id"] = cursor_id
+        if since_ts:
+            params["since_ts"] = since_ts
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
             _raise_for_status_with_detail(r)

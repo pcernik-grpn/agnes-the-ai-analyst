@@ -160,13 +160,16 @@ def find_and_judge(
         candidates_block=format_candidates_block(candidates),
     )
 
+    from src.observability.llm_context import llm_context
+
     try:
-        result = extractor.extract_json(
-            prompt=prompt,
-            max_tokens=4096,
-            json_schema=BATCH_CONTRADICTION_SCHEMA,
-            schema_name="batch_contradiction",
-        )
+        with llm_context(workload="corporate_memory", purpose="contradiction"):
+            result = extractor.extract_json(
+                prompt=prompt,
+                max_tokens=4096,
+                json_schema=BATCH_CONTRADICTION_SCHEMA,
+                schema_name="batch_contradiction",
+            )
     except LLMError as e:
         logger.error("Batch contradiction judgment failed: %s", e)
         return []
@@ -242,13 +245,16 @@ def check_contradiction(
         new_content=item_a.get("content", ""),
         candidates_block=format_candidates_block([item_b]),
     )
+    from src.observability.llm_context import llm_context
+
     try:
-        result = extractor.extract_json(
-            prompt=prompt,
-            max_tokens=1024,
-            json_schema=BATCH_CONTRADICTION_SCHEMA,
-            schema_name="batch_contradiction",
-        )
+        with llm_context(workload="corporate_memory", purpose="contradiction"):
+            result = extractor.extract_json(
+                prompt=prompt,
+                max_tokens=1024,
+                json_schema=BATCH_CONTRADICTION_SCHEMA,
+                schema_name="batch_contradiction",
+            )
     except LLMError as e:
         logger.error("Pair contradiction check failed: %s", e)
         return {"contradicts": False, "explanation": f"Check failed: {e}"}

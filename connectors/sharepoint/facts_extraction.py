@@ -2457,19 +2457,34 @@ class _Extractor:
                 )
             return self._client, (self._call_model or self.model)
 
-    def _create(self, user_message: str) -> Any:
+    def _create(self, user_message: str, *, subject_id: str | None = None) -> Any:
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
         client, model = self._ensure_client()
-        return client.messages.create(
-            model=model,
-            max_tokens=self.max_output_tokens,
-            # The rules + ontology ride the system channel behind a cache
-            # breakpoint: byte-identical for every document of the run, so
-            # a corpus pass pays for the prefix once instead of per
-            # document. That is the single largest cost lever this stage
-            # has — see the per-document cost note in instance.yaml.example.
-            system=[{"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user_message}],
-        )
+        with (
+            llm_context(workload="extraction"),
+            trace_generation(
+                provider=provider_label(self.provider),
+                model=model,
+                purpose="facts_extraction",
+                subject_id=subject_id,
+            ) as cap,
+        ):
+            cap.set_input(user_message)
+            response = client.messages.create(
+                model=model,
+                max_tokens=self.max_output_tokens,
+                # The rules + ontology ride the system channel behind a cache
+                # breakpoint: byte-identical for every document of the run, so
+                # a corpus pass pays for the prefix once instead of per
+                # document. That is the single largest cost lever this stage
+                # has — see the per-document cost note in instance.yaml.example.
+                system=[{"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_message}],
+            )
+            cap.set_output_from_anthropic(response)
+        return response
 
     def _record(self, response: Any) -> None:
         from src.anonymization_ner import _usage_value
@@ -2499,8 +2514,14 @@ class _Extractor:
         with self._usage_lock:
             return dict(self.usage)
 
-    def call(self, user_message: str) -> str:
+    def call(self, user_message: str, *, subject_id: str | None = None) -> str:
         """One bounded-retry call.
+
+        ``subject_id`` is the document's own id (``_Work.file_id``, the
+        caller's join key) — passed straight through to :meth:`_create` so
+        the ``llm_calls`` row this call produces says which document it
+        was, the same way the batch transport's own generation record
+        already does.
 
         Raises :class:`ProviderLimitHit` IMMEDIATELY (no retry, no backoff
         sleep) for an error :func:`classify_provider_limit_error` recognizes
@@ -2531,7 +2552,7 @@ class _Extractor:
         for attempt in range(1, self.max_attempts + 1):
             attempts_made = attempt
             try:
-                response = self._create(user_message)
+                response = self._create(user_message, subject_id=subject_id)
             except FactsExtractionUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001 — classified below
@@ -3561,7 +3582,7 @@ def extract_one(
     if reply is not None:
         cache_hits += 1
     else:
-        reply = extractor.call(work.user_message)
+        reply = extractor.call(work.user_message, subject_id=work.file_id)
         _cache_store(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="", reply=reply)
     nodes, edges, parse_errors = parse_streams(reply)
     # See `_normalize_evidence_doc_ids`'s docstring: a cache hit replays a
@@ -3627,7 +3648,7 @@ def extract_one(
         if retry_reply is not None:
             cache_hits += 1
         else:
-            retry_reply = extractor.call(_retry_message(work.user_message, bounded_failures))
+            retry_reply = extractor.call(_retry_message(work.user_message, bounded_failures), subject_id=work.file_id)
             _cache_store(
                 cache,
                 sha256=work.sha256,
@@ -3952,6 +3973,61 @@ def _poll_batch_until_ended(
         if _deadline_expired(deadline):
             return None
         sleep(poll_s)
+
+
+def record_generation_for_batch_message(provider: Any, model: str, file_id: str, message: Any) -> None:
+    """One ``llm_calls`` row for a batch result that DID come back, priced
+    from its own usage — used where the answer cannot be ingested (the
+    document vanished meanwhile) but the tokens were spent all the same.
+    Never raises: a measurement never costs an extraction pass.
+    """
+    try:
+        from src.observability import llm_context, record_generation
+        from src.observability.llm_tracing import provider_label
+
+        with llm_context(workload="extraction"):
+            record_generation(
+                provider=provider_label(provider),
+                model=model,
+                purpose="facts_batch",
+                usage=getattr(message, "usage", None),
+                subject_id=file_id,
+                batch=True,
+                model_response=getattr(message, "model", None),
+                stop_reason=getattr(message, "stop_reason", None),
+            )
+    except Exception:  # noqa: BLE001 - a measurement never costs the pass
+        logger.debug("facts extraction: could not record the orphaned batch result", exc_info=True)
+
+
+def record_batch_failure(provider: Any, model: str, file_id: str, error_type: str) -> None:
+    """One zero-cost ``llm_calls`` row for a batch result that never produced
+    a message — errored, canceled, expired.
+
+    The succeeded path records its call through ``record_generation``;
+    without this, a batch whose results all failed leaves no trace in the
+    ledger at all, so the call counts read as "we never asked" and the error
+    summary meant to answer "why did extraction pull nothing for this
+    document" is blind to exactly the runs that went wrong (design
+    2026-09-08 §3.3/§3.5). Never raises: a measurement never costs an
+    extraction pass.
+    """
+    try:
+        from src.observability import llm_context, record_generation
+        from src.observability.llm_tracing import provider_label
+
+        with llm_context(workload="extraction"):
+            record_generation(
+                provider=provider_label(provider),
+                model=model,
+                purpose="facts_batch",
+                usage=None,
+                subject_id=file_id,
+                batch=True,
+                error_type=error_type,
+            )
+    except Exception:  # noqa: BLE001 - a measurement never costs the pass
+        logger.debug("facts extraction: could not record the failed batch result", exc_info=True)
 
 
 def _collect_batch_results(client: Any, batch_id: str) -> Dict[str, Any]:
@@ -4862,15 +4938,28 @@ def _run_batch_pass(
         docs_done += 1
         _report_progress()
 
-    def _sync_retry(message: str) -> str:
+    def _sync_retry(message: str, *, subject_id: str | None = None) -> str:
         from src.anonymization_ner import _reply_text
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
 
-        response = client.messages.create(
-            model=resolved_model,
-            max_tokens=max_output_tokens,
-            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": message}],
-        )
+        with (
+            llm_context(workload="extraction"),
+            trace_generation(
+                provider=provider_label(provider),
+                model=resolved_model,
+                purpose="facts_retry",
+                subject_id=subject_id,
+            ) as cap,
+        ):
+            cap.set_input(message)
+            response = client.messages.create(
+                model=resolved_model,
+                max_tokens=max_output_tokens,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": message}],
+            )
+            cap.set_output_from_anthropic(response)
         _record_usage("sync", getattr(response, "usage", None))
         return _reply_text(response)
 
@@ -4918,7 +5007,7 @@ def _run_batch_pass(
                 - len(work.user_message),
             )
             bounded_failures, _overflow = _bound_failures_for_retry(failures, char_budget=retry_char_budget)
-            retry_reply = _sync_retry(_retry_message(work.user_message, bounded_failures))
+            retry_reply = _sync_retry(_retry_message(work.user_message, bounded_failures), subject_id=work.file_id)
             final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
                 work=work,
                 nodes=nodes,
@@ -4972,6 +5061,10 @@ def _run_batch_pass(
             phase = entry.get("phase", "initial")
             result = results.get(file_id)
             if result is None:
+                # Submitted, and the batch came back without it. Recorded
+                # like the other non-outcomes so the call counts match what
+                # was actually asked of the model.
+                record_batch_failure(provider, resolved_model, file_id, "missing_result")
                 _requeue(file_id, reason="missing_result", permanent=False)
                 requeued += 1
                 continue
@@ -4986,6 +5079,15 @@ def _run_batch_pass(
                     max_prompt_tokens=resolved_max_prompt_tokens,
                 )
                 if loaded is None:
+                    # The model answered and the tokens were really spent --
+                    # only the document is gone. The ledger records what was
+                    # SPENT, so this is a normal generation row (with its
+                    # real usage) rather than an error or, as before, no row
+                    # at all: a batch whose documents vanished used to cost
+                    # money that appeared nowhere in the cost reads.
+                    record_generation_for_batch_message(
+                        provider, resolved_model, file_id, getattr(result, "message", None)
+                    )
                     docs_state.pop(file_id, None)
                     batch_attempts.pop(file_id, None)
                     report.facts_failed += 1
@@ -4998,8 +5100,21 @@ def _run_batch_pass(
                     report.docs_truncated += 1
                 message = getattr(result, "message", None)
                 from src.anonymization_ner import _reply_text
+                from src.observability import llm_context, record_generation
+                from src.observability.llm_tracing import provider_label
 
                 reply_text = _reply_text(message)
+                with llm_context(workload="extraction"):
+                    record_generation(
+                        provider=provider_label(provider),
+                        model=resolved_model,
+                        purpose="facts_batch",
+                        usage=getattr(message, "usage", None),
+                        subject_id=file_id,
+                        batch=True,
+                        model_response=getattr(message, "model", None),
+                        stop_reason=getattr(message, "stop_reason", None),
+                    )
                 _record_usage("batch", getattr(message, "usage", None))
                 if phase == "retry":
                     _finalize_retry(work, entry, reply_text)
@@ -5009,6 +5124,7 @@ def _run_batch_pass(
             elif result_type == "errored":
                 error = getattr(result, "error", None)
                 error_type = str(getattr(error, "type", "") or "")
+                record_batch_failure(provider, resolved_model, file_id, error_type or "errored")
                 if error_type.startswith("invalid_request"):
                     _requeue(
                         file_id, reason=f"invalid_request: {getattr(error, 'message', error_type)}", permanent=True
@@ -5018,6 +5134,7 @@ def _run_batch_pass(
                     _requeue(file_id, reason=f"errored: {error_type or 'unknown'}", permanent=False)
                     requeued += 1
             else:  # "canceled" / "expired" / anything unrecognized
+                record_batch_failure(provider, resolved_model, file_id, str(result_type or "unknown"))
                 _requeue(file_id, reason=str(result_type or "unknown"), permanent=False)
                 requeued += 1
         elapsed = time.monotonic() - started

@@ -162,6 +162,9 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     # per-type companion to fact_collection_stats (0110) — PG-only with no
     # DuckDB source; keyed by (collection, type), not "id".
     "fact_collection_type_counts": ["corpus_id", "type"],
+    # conversation-corpus push sink resume point (0118) — PG-only with no
+    # DuckDB source; keyed by the sink's name, not "id".
+    "export_watermarks": ["name"],
 }
 
 

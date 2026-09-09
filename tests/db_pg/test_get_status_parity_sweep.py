@@ -136,6 +136,27 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "memory_detection_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/memory_detection_runs_pg.py"
     ),
+    # LLM observability read surfaces (design 2026-09-08 §3.4/§3.5) —
+    # parameter-free (every query param has a default) and each resolves a
+    # PG-only repo as a FastAPI dependency before its own body runs.
+    "GET /api/admin/telemetry/llm-cost": (
+        "cost_summary() reads `llm_calls`, a PG-only table (LLM observability design 2026-09-08)"
+    ),
+    "GET /api/admin/telemetry/llm-calls": (
+        "list_calls() reads `llm_calls`, a PG-only table (LLM observability design 2026-09-08)"
+    ),
+    "GET /api/admin/telemetry/feedback": (
+        "list_feedback() reads `chat_message_feedback`, a PG-only table (LLM observability design 2026-09-08)"
+    ),
+    # Conversation corpus export (design 2026-09-08 §3.12) -- genuinely
+    # parameter-free (every query param has a default; a bare call is
+    # missing `since` too, but the PG-only repo dependency resolves BEFORE
+    # that check runs) -- DuckDB -> typed 501, Postgres -> 400
+    # `since_required` (nothing seeded, and `since` is required regardless).
+    "GET /api/admin/conversations/corpus": (
+        "llm_calls_repo() / chat_message_feedback_repo() are PG-only (A3 ratchet) "
+        "-- DuckDB has no implementation to resolve; see src/repositories/llm_calls_pg.py"
+    ),
 }
 
 

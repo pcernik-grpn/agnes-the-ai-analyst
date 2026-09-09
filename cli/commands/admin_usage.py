@@ -30,6 +30,26 @@ def _handle_error(resp, context: str) -> None:
         raise typer.Exit(1)
 
 
+def _handle_llm_error(resp, context: str) -> None:
+    """``_handle_error`` plus the LLM-observability-specific hint: a typed
+    ``501 requires_postgres_backend`` means this instance's app-state backend
+    is still DuckDB — the ledger and the feedback table are Postgres-only
+    under the A3 ratchet, so there is nothing this command can do until the
+    instance migrates (docs/migrations.md)."""
+    if resp.status_code == 501:
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if body.get("error") == "requires_postgres_backend":
+            typer.echo(
+                f"[err] {context} needs the Postgres app-state backend (see docs/migrations.md)",
+                err=True,
+            )
+            raise typer.Exit(1)
+    _handle_error(resp, context)
+
+
 @app.command()
 def export(
     format: str = typer.Option("csv", "--format", help="csv|json|parquet"),
@@ -156,6 +176,13 @@ def summary(
         typer.echo("  * not in the table registry (parsed from query SQL)")
 
 
+def _ms(value) -> str:
+    """``1234`` → ``1.2s``; ``None`` (no timed completion) → ``n/a``."""
+    if not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value / 1000:.1f}s"
+
+
 @app.command("chat-cost")
 def chat_cost(
     window: str = typer.Option("7d", "--window", help="1d|7d|30d|all"),
@@ -174,6 +201,10 @@ def chat_cost(
 
     A row marked `cache:unavailable` predates the recording of prompt-cache
     figures: its cached tokens are unknown, not zero, and its cost is a floor.
+
+    `llm/call` is the session's average completion wall time as the secret
+    broker measured it (request start → last upstream byte); `n/a` means no
+    timed completion was recorded for that session, not that it was instant.
     """
     if window not in ("1d", "7d", "30d", "all"):
         typer.echo(f"[err] window must be 1d|7d|30d|all, got {window!r}", err=True)
@@ -208,13 +239,19 @@ def chat_cost(
         f"cache read {t.get('cache_read_tokens', 0):,}   cache write {t.get('cache_creation_tokens', 0):,}"
     )
     typer.echo(f"  share of read input served from cache: {share_str}")
+    if t.get("llm_calls"):
+        typer.echo(
+            f"  llm: {t.get('llm_calls', 0):,} completions   "
+            f"avg {_ms(t.get('avg_completion_ms'))} per completion   "
+            f"avg first byte {_ms(t.get('avg_ttfb_ms'))}"
+        )
 
     sessions = data.get("sessions") or []
     if not sessions:
         typer.echo("  (no assistant messages in this window)")
     else:
         typer.echo("")
-        typer.echo(f"  {'session':<26} {'model':<20} {'msgs':>5} {'cost':>10} {'cached%':>8}  cache")
+        typer.echo(f"  {'session':<26} {'model':<20} {'msgs':>5} {'cost':>10} {'cached%':>8} {'llm/call':>9}  cache")
         for row in sessions:
             read_input = (
                 (row.get("input_tokens") or 0)
@@ -227,12 +264,206 @@ def chat_cost(
                 f"{str(row.get('model') or '-')[:19]:<20} "
                 f"{row.get('messages', 0):>5} "
                 f"${row.get('cost_usd', 0):>9.4f} "
-                f"{pct:>8}  {row.get('cache_accounting', '?')}"
+                f"{pct:>8} {_ms(row.get('avg_completion_ms')):>9}  {row.get('cache_accounting', '?')}"
             )
 
     for note in data.get("notes") or []:
         typer.echo("")
         typer.echo(f"  note: {note}")
+
+
+@app.command("llm-cost")
+def llm_cost(
+    window: str = typer.Option("7d", "--window", help="1d|7d|30d|all"),
+    by: str = typer.Option("workload", "--by", help="workload|agent|user|model|purpose"),
+    json_out: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
+):
+    """Measured LLM cost across every workload, priced at write time.
+
+    Unlike `chat-cost` (chat sessions only), this reads the `llm_calls`
+    ledger — every call from every call site (chat, builders, extraction,
+    corporate memory, ...) — grouped by workload/agent/user/model/purpose.
+    """
+    if window not in ("1d", "7d", "30d", "all"):
+        typer.echo(f"[err] window must be 1d|7d|30d|all, got {window!r}", err=True)
+        raise typer.Exit(1)
+    if by not in ("workload", "agent", "user", "model", "purpose"):
+        typer.echo(f"[err] by must be workload|agent|user|model|purpose, got {by!r}", err=True)
+        raise typer.Exit(1)
+
+    client = get_client(timeout=60)
+    try:
+        resp = client.get("/api/admin/telemetry/llm-cost", params={"window": window, "by": by})
+    except Exception as e:
+        typer.echo(f"[err] cannot reach server: {e}", err=True)
+        raise typer.Exit(1)
+    _handle_llm_error(resp, "llm-cost")
+    data = resp.json()
+
+    if json_out:
+        import json
+
+        typer.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    t = data.get("totals") or {}
+    typer.echo(
+        f"LLM cost — window {data.get('window', window)} by {data.get('by', by)}: "
+        f"${t.get('cost_usd', 0):.4f} over {t.get('calls', 0)} calls"
+    )
+    groups = data.get("groups") or []
+    if not groups:
+        typer.echo(
+            "  (no LLM calls recorded in this window — the ledger fills as calls happen; see docs/observability.md)"
+        )
+    else:
+        typer.echo("")
+        typer.echo(
+            f"  {'group':<28} {'calls':>6} {'in':>10} {'out':>8} {'cache rd':>10} {'cache wr':>9} "
+            f"{'cached%':>8} {'cost':>10}"
+        )
+        for g in groups:
+            share = g.get("cached_input_share")
+            share_str = f"{share:.1%}" if isinstance(share, (int, float)) else "n/a"
+            typer.echo(
+                f"  {str(g.get('key') or '-')[:27]:<28} {g.get('calls', 0):>6} "
+                f"{g.get('input_tokens', 0):>10,} {g.get('output_tokens', 0):>8,} "
+                f"{g.get('cache_read_tokens', 0):>10,} {g.get('cache_creation_tokens', 0):>9,} "
+                f"{share_str:>8} ${g.get('cost_usd', 0):>9.4f}"
+            )
+    for note in data.get("notes") or []:
+        typer.echo("")
+        typer.echo(f"  note: {note}")
+
+
+@app.command("llm-calls")
+def llm_calls(
+    session_id: Optional[str] = typer.Option(None, "--session-id"),
+    turn_id: Optional[str] = typer.Option(None, "--turn-id"),
+    job_id: Optional[str] = typer.Option(None, "--job-id"),
+    user_id: Optional[str] = typer.Option(None, "--user-id"),
+    limit: int = typer.Option(50, "--limit", help="Max rows to show."),
+    before: Optional[str] = typer.Option(None, "--before", help="ISO cursor — fetch rows older than this."),
+    before_id: Optional[str] = typer.Option(
+        None, "--before-id", help="Row-id tiebreaker for --before; pass the previous page's next_before_id."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
+):
+    """Detail rows for one session/turn/job/user from the LLM call ledger.
+
+    One of --session-id, --turn-id, --job-id, --user-id is required — this
+    is a drill-down into ONE unit of work, never an unbounded dump of every
+    call the instance ever made.
+    """
+    if not any([session_id, turn_id, job_id, user_id]):
+        typer.echo("[err] one of --session-id, --turn-id, --job-id, --user-id is required", err=True)
+        raise typer.Exit(1)
+
+    params: dict = {"limit": limit}
+    if session_id:
+        params["session_id"] = session_id
+    if turn_id:
+        params["turn_id"] = turn_id
+    if job_id:
+        params["job_id"] = job_id
+    if user_id:
+        params["user_id"] = user_id
+    if before:
+        params["before"] = before
+    if before_id:
+        params["before_id"] = before_id
+
+    client = get_client(timeout=60)
+    try:
+        resp = client.get("/api/admin/telemetry/llm-calls", params=params)
+    except Exception as e:
+        typer.echo(f"[err] cannot reach server: {e}", err=True)
+        raise typer.Exit(1)
+    _handle_llm_error(resp, "llm-calls")
+    data = resp.json()
+
+    if json_out:
+        import json
+
+        typer.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    rows = data.get("rows") or []
+    if not rows:
+        typer.echo("  no calls recorded for that id — is this instance Postgres-backed? see docs/observability.md")
+    else:
+        typer.echo(
+            f"  {'time':<26} {'kind':<11} {'workload':<12} {'purpose':<18} {'model':<22} "
+            f"{'in':>8} {'out':>7} {'cache rd':>9} {'cost':>9}  status"
+        )
+        for row in rows:
+            model = row.get("model_response") or row.get("model_requested") or "-"
+            typer.echo(
+                f"  {str(row.get('created_at') or '')[:25]:<26} {str(row.get('kind') or '-')[:10]:<11} "
+                f"{str(row.get('workload') or '-')[:11]:<12} {str(row.get('purpose') or '-')[:17]:<18} "
+                f"{str(model)[:21]:<22} {row.get('input_tokens', 0):>8,} {row.get('output_tokens', 0):>7,} "
+                f"{row.get('cache_read_tokens', 0):>9,} ${row.get('cost_usd', 0):>8.4f}  {row.get('status', '-')}"
+            )
+        if data.get("next_before"):
+            next_before_id = data.get("next_before_id")
+            cursor_hint = f"--before {data['next_before']}"
+            if next_before_id:
+                cursor_hint += f" --before-id {next_before_id}"
+            typer.echo(f"  more available — rerun with {cursor_hint}")
+    for note in data.get("notes") or []:
+        typer.echo(f"  note: {note}")
+
+
+@app.command("feedback")
+def feedback(
+    window: str = typer.Option("7d", "--window", help="1d|7d|30d|all"),
+    verdict: Optional[str] = typer.Option(None, "--verdict", help="up|down"),
+    limit: int = typer.Option(50, "--limit", help="Max rows to show."),
+    json_out: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
+):
+    """Chat-turn thumbs feedback — never prints the comment text in the
+    table (use --json for that); the table shows only its length."""
+    if window not in ("1d", "7d", "30d", "all"):
+        typer.echo(f"[err] window must be 1d|7d|30d|all, got {window!r}", err=True)
+        raise typer.Exit(1)
+    if verdict is not None and verdict not in ("up", "down"):
+        typer.echo(f"[err] verdict must be up|down, got {verdict!r}", err=True)
+        raise typer.Exit(1)
+
+    params: dict = {"window": window, "limit": limit}
+    if verdict:
+        params["verdict"] = verdict
+
+    client = get_client(timeout=60)
+    try:
+        resp = client.get("/api/admin/telemetry/feedback", params=params)
+    except Exception as e:
+        typer.echo(f"[err] cannot reach server: {e}", err=True)
+        raise typer.Exit(1)
+    _handle_llm_error(resp, "feedback")
+    data = resp.json()
+
+    if json_out:
+        import json
+
+        typer.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    rows = data.get("rows") or []
+    if not rows:
+        typer.echo(
+            "  no feedback recorded in this window — is this instance Postgres-backed? see docs/observability.md"
+        )
+        return
+    typer.echo(f"  {'time':<26} {'session':<20} {'turn':<20} {'user':<24} {'verdict':<8} comment")
+    for row in rows:
+        comment = row.get("comment") or ""
+        comment_label = f"{len(comment)} chars" if comment else "-"
+        typer.echo(
+            f"  {str(row.get('created_at') or '')[:25]:<26} {str(row.get('session_id') or '-')[:19]:<20} "
+            f"{str(row.get('turn_id') or '-')[:19]:<20} {str(row.get('user_id') or '-')[:23]:<24} "
+            f"{row.get('verdict', '-'):<8} {comment_label}"
+        )
 
 
 @app.command()

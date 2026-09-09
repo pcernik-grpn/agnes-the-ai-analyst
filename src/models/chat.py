@@ -144,15 +144,30 @@ class ChatMessage(Base):
     #: schema step) — NULL means "not recorded", never "zero".
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_creation_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: The turn's LLM latency, summed over its completions by the secret
+    #: broker (migration 0117): completion count, total wall time, total
+    #: time-to-first-byte. Same NULL-means-unrecorded rule as the two
+    #: prompt-cache columns above.
+    llm_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    llm_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    llm_ttfb_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     sender_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: The chat turn that produced this row — the same id `usage_turns.
+    #: turn_uuid` and `llm_calls.turn_id` carry (migration 0117). Postgres-
+    #: only (A3): the frozen DuckDB backend has no matching column and drops
+    #: the value on write.
+    turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 
-    __table_args__ = (Index("idx_chat_messages_session", "session_id", "created_at"),)
+    __table_args__ = (
+        Index("idx_chat_messages_session", "session_id", "created_at"),
+        Index("idx_chat_messages_turn", "turn_id"),
+    )
 
 
 class ChatSessionParticipant(Base):

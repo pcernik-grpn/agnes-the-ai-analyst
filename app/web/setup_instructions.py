@@ -42,7 +42,8 @@ backward compatibility with existing callers, but are IGNORED:
 
 The analyst's access token is deliberately NOT a placeholder in this
 template. It is written to `~/.agnes/token` out-of-band, before this
-prompt is generated (see `{server_url}/home` step 4) — so the raw token
+prompt is generated (see `{server_url}/how-it-works#connect`, the CLI tab's
+"Set up a new Claude Code" button) — so the raw token
 value never has to appear in the prompt text or a pasted chat transcript.
 (Scope of that guarantee: THIS payload. Step 4's own copied shell command
 does carry the token through the browser clipboard transiently — that is
@@ -269,8 +270,10 @@ def _preamble_lines(*, custom_preamble: str = "", instance_brand: str = "Agnes")
     login token already lives, and the idempotence promise.
 
     The token is written to `~/.agnes/token` out-of-band, before this prompt
-    is generated (step 4 on `{server_url}/home` — the delivery mechanism
-    itself is out of this module's scope), so the steps only need the path.
+    is generated (`{server_url}/how-it-works#connect`'s CLI tab — the delivery
+    mechanism itself is out of this module's scope), so the steps only need
+    the path.
+
     That is stated as a plain fact: earlier wording told the agent to
     "never print the token, echo it, or paste it into this chat", which
     reads as instructions to conceal a credential rather than as a note
@@ -322,6 +325,9 @@ def _preamble_lines(*, custom_preamble: str = "", instance_brand: str = "Agnes")
         "Server: {server_url}",
         "",
         *brand_lines,
+        "",
+        "Requirements: `uv` (https://docs.astral.sh/uv/) and `curl`, plus network",
+        "access to the server above.",
         "",
         "Your login token is already saved on this machine at ~/.agnes/token",
         "(written by step 4 of the install guide at {server_url}). The steps below",
@@ -375,6 +381,16 @@ def _token_precheck_lines() -> list[str]:
     rather than a one-liner that exits non-zero: the CLI isn't installed yet
     at this point in the prompt (step 1 installs it), so `agnes auth
     whoami` — which would answer this directly — is not available here.
+
+    Restored after a false start: an earlier revision of this module dropped
+    this precheck, reasoning that `agnes onboard` resolves auth itself with
+    its own browser-sign-in fallback when nothing is found
+    (`cli/commands/onboard.py::_resolve_onboard_credential`). True — but only
+    on a branch that HAS that resolver. This module's own `cli/` tree does
+    not (that capability ships in a separate, not-yet-merged PR), so a fresh
+    install following this prompt with no saved token would sail past step 1
+    and dead-end at step 2 with no fallback at all. The precheck stays until
+    the resolver it was designed to lean on actually ships here.
     """
     return [
         "Before you start, confirm the login token file is in place:",
@@ -385,8 +401,27 @@ def _token_precheck_lines() -> list[str]:
         "   no server, and the installer writes server: before anyone has signed in:",
         "      test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml",
         "   Prints {server_url} → continue. Anything else, including no output →",
-        "   not signed in to {server_url}: stop, send the user to {server_url}/home step 4.",
+        "   not signed in to {server_url}: stop, send the user to {server_url}/how-it-works#connect.",
         "",
+    ]
+
+
+def _install_cli_commands(*, has_ca: bool, server_url_placeholder: str = "{server_url}") -> list[str]:
+    """The shell lines that put the `agnes` wheel on a machine — nothing else.
+
+    Shared by `_install_cli_lines` (the user-voiced /setup prompt) and the
+    documentation-voiced `/llms.txt` body, so there is still exactly one
+    place that knows how the CLI is downloaded and installed. Three-space
+    indent matches the prompt's step layout; `/llms.txt` re-indents.
+    """
+    cacert = " --cacert ~/.agnes/ca.pem" if has_ca else ""
+    native_tls = " --native-tls" if has_ca else ""
+    return [
+        "   TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)",
+        f'   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0{cacert} -OJ {server_url_placeholder}/cli/download)',
+        '   WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)',
+        '   [ -n "$WHEEL" ] || { echo "error: wheel download failed (no .whl in $TMPDIR_WHEEL)" >&2; exit 1; }',
+        f'   uv tool install{native_tls} --force "$WHEEL"',
     ]
 
 
@@ -457,16 +492,14 @@ def _install_cli_lines(*, has_ca: bool, server_url_placeholder: str = "{server_u
             "   so direct `uv tool install <https-url>` against the server fails (even",
             "   with --native-tls). Workaround: curl-then-local-install.",
             "",
+            '   If someone else runs this, copy the commands below into the reply in full — not a reference to "step 1".',
+            "",
             "   If uv is missing first, install it from the official instructions at",
             "   https://docs.astral.sh/uv/ — on Windows `winget install --id=astral-sh.uv`,",
             "   on macOS `brew install uv`. If you use the shell installer instead,",
             "   download it to a file and show it to me before running it.",
             "",
-            "   TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)",
-            f'   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 --cacert ~/.agnes/ca.pem -OJ {server_url_placeholder}/cli/download)',
-            '   WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)',
-            '   [ -n "$WHEEL" ] || { echo "error: wheel download failed (no .whl in $TMPDIR_WHEEL)" >&2; exit 1; }',
-            '   uv tool install --native-tls --force "$WHEEL"',
+            *_install_cli_commands(has_ca=True, server_url_placeholder=server_url_placeholder),
             "",
             "   If `agnes --version` fails after install because ~/.local/bin is not on PATH:",
             '     export PATH="$HOME/.local/bin:$PATH"',
@@ -480,11 +513,8 @@ def _install_cli_lines(*, has_ca: bool, server_url_placeholder: str = "{server_u
         ]
     return [
         "1) Install the CLI:",
-        "   TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)",
-        f'   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {server_url_placeholder}/cli/download)',
-        '   WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)',
-        '   [ -n "$WHEEL" ] || { echo "error: wheel download failed (no .whl in $TMPDIR_WHEEL)" >&2; exit 1; }',
-        '   uv tool install --force "$WHEEL"',
+        '   If someone else runs this, copy the commands below into the reply in full — not a reference to "step 1".',
+        *_install_cli_commands(has_ca=False, server_url_placeholder=server_url_placeholder),
         "",
         "   If uv is not installed yet, install it from the official instructions at",
         "   https://docs.astral.sh/uv/ — on Windows `winget install --id=astral-sh.uv`,",
@@ -513,7 +543,7 @@ def _onboard_lines(server_url_placeholder: str = "{server_url}") -> list[str]:
     prompt neither enumerates the stages as instructions nor triages their
     errors.
 
-    Two things still need the agent, and they are all this step says:
+    Three things still need the agent, and they are all this step says:
 
       * The directory decision is the user's. The CLI declines home and
         system directories and asks before adopting a directory that
@@ -525,9 +555,23 @@ def _onboard_lines(server_url_placeholder: str = "{server_url}") -> list[str]:
       * `{workspace_dir}` is named only as the folder the install guide
         suggested, so the agent can echo the same suggestion the user
         already saw.
+      * Same relay note as step 1 (`_install_cli_lines`): a real session hit
+        this — declined to run step 1 itself (reasonably: downloading and
+        executing a wheel), relayed those commands, but then reached this
+        step, tried a handful of read-only CLI probes to answer an
+        unrelated question instead of running THIS command, had every one
+        of those probes blocked by its own tool-permission classifier, and
+        left the person with no command to run themselves at all. Step 1
+        already prints its commands regardless of who runs them; step 2
+        did not, because it names the placeholder folder `.` rather than
+        the substituted decision — nothing here forced the agent to surface
+        the finished command line.
     """
     return [
         "2) Set up the {instance_brand} workspace in the current directory:",
+        "",
+        "   If someone else runs this, copy the exact command (with the agreed folder) into",
+        '   the reply in full — not a reference to "step 2".',
         "",
         f'   agnes onboard --server-url "{server_url_placeholder}" --workspace .',
         "",
@@ -566,6 +610,14 @@ def _confirm_lines() -> list[str]:
     of what `agnes onboard` itself reported. The bullets deliberately name
     only things the CLI prints, so the agent summarizes an observed
     transcript instead of re-deriving state (or hallucinating it).
+
+    The closing "good first question" line mirrors `_default_llms_txt_body`'s
+    "Verify the connection and try your first question" section — that newer,
+    setup-code-based prompt already nudges the person toward `agnes catalog`
+    and a data-oriented opener; this older, saved-token prompt was missing
+    the same nudge, which meant the reply landed on installation ceremony
+    (diagnose status, connectors) with nothing pointing the person at their
+    actual data.
     """
     return [
         "",
@@ -576,6 +628,10 @@ def _confirm_lines() -> list[str]:
         "   - the diagnose status it finished on",
         "   - which connectors are available to set up later — nothing to do now,",
         '     just ask when you want one (e.g. "set up Jira")',
+        "",
+        '   A good first question from here: "What data can I access through',
+        "   {instance_brand}? Give me a brief overview and suggest three useful",
+        '   questions you can answer."',
     ]
 
 

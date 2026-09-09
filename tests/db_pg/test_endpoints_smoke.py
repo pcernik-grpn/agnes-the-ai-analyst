@@ -3204,6 +3204,16 @@ KNOWN_UNTESTED = {
     # actually ran, cached reads priced as cached, unrecorded cache reported
     # as unavailable rather than as zero.
     "GET /api/admin/telemetry/chat-cost",
+    # LLM observability read surfaces (design 2026-09-08 §3.4/§3.5) — all
+    # three are admin-gated and resolve a Postgres-only repo (llm_calls /
+    # chat_message_feedback, A3 ratchet) as a FastAPI dependency, so this
+    # sweep's DuckDB-backed instance would only ever exercise the typed 501,
+    # not the actual grouping/paging/filtering. Behaviourally covered in
+    # tests/db_pg/test_admin_llm_cost_pg.py (grouping, paging, 400s) and
+    # tests/test_admin_llm_cost_api.py (admin gate, typed 501).
+    "GET /api/admin/telemetry/llm-cost",
+    "GET /api/admin/telemetry/llm-calls",
+    "GET /api/admin/telemetry/feedback",
     "GET /api/admin/telemetry/export",
     "GET /api/admin/telemetry/facets",
     "GET /api/admin/telemetry/kpis",
@@ -3353,6 +3363,13 @@ KNOWN_UNTESTED = {
     "GET /api/chat/sessions/{chat_id}/files/preview",
     "GET /api/chat/sessions/{chat_id}/files/raw",
     "POST /api/chat/sessions/{chat_id}/files/save-artefact",
+    # Thumbs feedback on a chat turn (LLM observability design §3.5) — a
+    # PG-only repo resolved as a dependency (typed 501 on DuckDB) rating a
+    # live turn on the caller's own session, same class as the sibling
+    # `{chat_id}` routes above; covered end to end in
+    # tests/test_chat_feedback_api.py (DuckDB gate/501/validation) and
+    # tests/db_pg/test_chat_feedback_pg.py (upsert, audit, log, span event).
+    "POST /api/chat/sessions/{chat_id}/feedback",
     "POST /api/chat/sessions/{chat_id}/ticket",
     "POST /api/chat/{session_id}/fork",
     "POST /api/chat/{session_id}/invite",
@@ -3927,6 +3944,15 @@ KNOWN_UNTESTED = {
     # in the list, and agreement with the sync manifest for the same
     # caller); not duplicated here.
     "GET /api/knowledge/digests",
+    # Conversation corpus export (design 2026-09-08 §3.12) — admin-gated,
+    # Postgres-only, keyset-paginated jsonl/json stream: not
+    # parameter-free-GET shaped for this smoke sweep (`since` is required,
+    # `format`/`cursor` vary the response shape). Covered instead by
+    # tests/test_conversation_export.py (pure record builder), tests/
+    # test_conversation_export_api.py (admin gate + DuckDB typed 501), and
+    # tests/db_pg/test_conversation_export_pg.py (admin gate, policy gate,
+    # cursor pagination across pages, format=json, audit row).
+    "GET /api/admin/conversations/corpus",
 }
 
 

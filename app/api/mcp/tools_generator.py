@@ -14,6 +14,7 @@ and ``catalog`` tools from @mf's foundation.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -467,7 +468,17 @@ def install_tool_call_audit(
 
     Emits ``params={"tool": name, "args_hash": hash_args(arguments)}`` —
     never the raw arguments, which may carry SQL text, filter values, or
-    upstream secrets. Also stamps ``audit_context.set_client_kind("mcp")``
+    upstream secrets. The row is written AFTER the dispatch returns, with
+    ``duration_ms`` measured around the tool itself and ``result`` set to
+    ``success`` or ``error:<ExceptionClass>`` (the ``result LIKE 'error%'``
+    convention ``src.audit_helpers.RESULT_CLASS_CASE_SQL`` classifies).
+    Written before dispatch — as this wrapper originally did — the row's
+    duration was the repository's request-start→write autofill, i.e. only
+    the transport and auth gates: the observability KPIs reported a ~100 ms
+    p95 for ``mcp.tool_call`` while the underlying searches took seconds.
+    The exception itself propagates unchanged, so the low-level server
+    still turns it into the MCP error result the client expects. Also
+    stamps ``audit_context.set_client_kind("mcp")``
     before dispatching: this wrapper IS the shared session/call-resolution
     point both transports install it from, so any audit row a tool writes
     directly in its OWN process — e.g. the ``fact_search``/``fact_neighbors``/
@@ -492,14 +503,26 @@ def install_tool_call_audit(
             caller_user_id = caller_id_fn() if caller_id_fn else None
         except Exception:
             caller_user_id = None
-        if caller_user_id:
+        if not caller_user_id:
+            return await base_call_tool(name, arguments)
+        started = time.perf_counter()
+        result_marker = "success"
+        try:
+            return await base_call_tool(name, arguments)
+        except BaseException as exc:
+            # Includes a cancelled call (client gone mid-tool): that is a
+            # call that did not complete, and the row should say so.
+            result_marker = f"error:{type(exc).__name__}"
+            raise
+        finally:
             log_safe(
                 user_id=caller_user_id,
                 action="mcp.tool_call",
                 resource=f"mcp_tool:{name}",
                 params={"tool": name, "args_hash": hash_args(arguments)},
+                result=result_marker,
+                duration_ms=int((time.perf_counter() - started) * 1000),
             )
-        return await base_call_tool(name, arguments)
 
     mcp_instance._mcp_server.call_tool(validate_input=False)(_audited_call_tool)
     return _audited_call_tool

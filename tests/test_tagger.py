@@ -1,6 +1,5 @@
 """Tests for services/corporate_memory/tagger.py — auto topic tagging."""
 
-import pytest
 from services.corporate_memory.tagger import (
     TOPIC_VOCABULARY,
     auto_tag_items,
@@ -65,12 +64,14 @@ class TestAutoTagItems:
         assert extractor.calls == []
 
     def test_parses_valid_response(self):
-        extractor = _FakeExtractor(response={
-            "assignments": [
-                {"id": "item1", "topics": ["data", "queries"]},
-                {"id": "item2", "topics": ["automation"]},
-            ]
-        })
+        extractor = _FakeExtractor(
+            response={
+                "assignments": [
+                    {"id": "item1", "topics": ["data", "queries"]},
+                    {"id": "item2", "topics": ["automation"]},
+                ]
+            }
+        )
         items = [
             {"id": "item1", "title": "SQL tips", "content": "use indexes"},
             {"id": "item2", "title": "CI setup", "content": "automate builds"},
@@ -81,22 +82,26 @@ class TestAutoTagItems:
 
     def test_filters_out_vocabulary_hallucinations(self):
         """Topics not in TOPIC_VOCABULARY must be dropped."""
-        extractor = _FakeExtractor(response={
-            "assignments": [
-                {"id": "x", "topics": ["data", "MADE_UP_TOPIC", "queries"]},
-            ]
-        })
+        extractor = _FakeExtractor(
+            response={
+                "assignments": [
+                    {"id": "x", "topics": ["data", "MADE_UP_TOPIC", "queries"]},
+                ]
+            }
+        )
         result = auto_tag_items([{"id": "x", "title": "T", "content": "C"}], extractor)
         assert "MADE_UP_TOPIC" not in result.get("x", [])
         assert "data" in result.get("x", [])
 
     def test_skips_entries_without_id(self):
-        extractor = _FakeExtractor(response={
-            "assignments": [
-                {"id": "", "topics": ["data"]},
-                {"id": "good", "topics": ["reports"]},
-            ]
-        })
+        extractor = _FakeExtractor(
+            response={
+                "assignments": [
+                    {"id": "", "topics": ["data"]},
+                    {"id": "good", "topics": ["reports"]},
+                ]
+            }
+        )
         result = auto_tag_items([{"id": "good", "title": "T", "content": "C"}], extractor)
         assert "" not in result
         assert result.get("good") == ["reports"]
@@ -117,8 +122,26 @@ class TestAutoTagItems:
         assert result == {}
 
     def test_handles_empty_topics_list(self):
-        extractor = _FakeExtractor(response={
-            "assignments": [{"id": "a", "topics": []}]
-        })
+        extractor = _FakeExtractor(response={"assignments": [{"id": "a", "topics": []}]})
         result = auto_tag_items([{"id": "a", "title": "T", "content": "C"}], extractor)
         assert result.get("a") == []
+
+
+class TestTheCallIsLabelled:
+    def test_tagging_says_what_workload_it_belongs_to(self):
+        """Best-effort tagging still costs tokens — it is recorded under the
+        corporate-memory workload with its own purpose."""
+        from src.observability.llm_context import current_llm_context
+
+        seen = {}
+
+        class _RecordingExtractor(_FakeExtractor):
+            def extract_json(self, *args, **kwargs):
+                seen["context"] = current_llm_context()
+                return super().extract_json(*args, **kwargs)
+
+        extractor = _RecordingExtractor(response={"assignments": []})
+        auto_tag_items([{"id": "a", "title": "T", "content": "C"}], extractor)
+
+        ctx = seen["context"]
+        assert (ctx.workload, ctx.purpose) == ("corporate_memory", "tagger")

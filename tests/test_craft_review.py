@@ -51,6 +51,28 @@ def _patch_extractor(verdict=None, side_effect=None):
     return patcher
 
 
+class TestTheReviewCallIsLabelled:
+    def test_the_craft_review_says_which_workload_it_belongs_to(self):
+        """Guardrail review spend belongs to the store, not to whoever
+        happened to trigger the submission — the record says so."""
+        from src.observability.llm_context import current_llm_context
+
+        seen = {}
+
+        def _record(**_kwargs):
+            seen["context"] = current_llm_context()
+            return {"trigger_clear": True, "single_purpose": True, "duplicates": []}
+
+        patcher = _patch_extractor(side_effect=_record)
+        try:
+            craft_review(_ENTITY, _SKILL_MD, _CANDIDATES, api_key="sk-test", model="claude-haiku-4-5-20251001")
+        finally:
+            patcher.stop()
+
+        ctx = seen["context"]
+        assert (ctx.workload, ctx.purpose) == ("store_guardrails", "craft_review")
+
+
 class TestCraftReviewConstructorFailure:
     def test_constructor_failure_degrades_to_no_findings(self):
         """Extractor construction (which lazily imports the SDK) failing must

@@ -20,17 +20,6 @@
   [`docs/feature-flags.md`](docs/feature-flags.md).
 
 ### Internal
-- **A leaked test stub is fixed at its source, not worked around.** Two tests in
-  `tests/test_ui_layout_theme.py` stood the admin setup chain down by assigning
-  the `admin_setup_rail` Jinja global directly and never restoring it, so the
-  stub outlived them and every later test in the same xdist worker read
-  `lambda: None` from a process-wide global. That is what turned
-  `test_the_chain_is_wired_end_to_end_without_a_stub` red on CI shard 7 while
-  every local run passed: in file order a later test happens to repair the
-  global in its own `finally`, and under xdist's load distribution that repair
-  lands on another worker or after it. Both now use `monkeypatch.setitem`, like
-  every other stub of that global in the suite. No assertion was weakened and
-  no test was skipped.
 - The design-system reference's accent vocabulary named `--ds-kai-*`, a token
   family that no longer exists — it was renamed to `--ds-assistant-*` when the
   assistant name was retired, and only `--ds-assistant-*` is defined in

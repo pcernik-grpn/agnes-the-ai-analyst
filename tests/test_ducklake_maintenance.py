@@ -146,6 +146,7 @@ class TestRegistration:
             "distribution-mirror",
             "webhook-deliver",
             "knowledge-packaging",
+            "conversation-export",
             "analytics-rebuild",
             "collections-purge",
             "corpus-extraction",

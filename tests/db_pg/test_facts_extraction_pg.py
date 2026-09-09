@@ -211,7 +211,7 @@ class StubExtractor:
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
         self.seen: list[str] = []
 
-    def call(self, user_message: str) -> str:
+    def call(self, user_message: str, *, subject_id: str | None = None) -> str:
         self.seen.append(user_message)
         self.usage["calls"] += 1
         self.usage["input_tokens"] += 1000
@@ -684,7 +684,7 @@ def test_one_document_failing_never_costs_the_others_their_results(pg_env):
     }
 
     class Flaky(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             if "doc1" in user_message:
                 self.seen.append(user_message)
                 raise ValueError("model returned nonsense for this one")
@@ -723,7 +723,7 @@ def test_a_permanent_model_error_fails_only_that_document(pg_env):
     from connectors.sharepoint.facts_extraction import FactsDocumentError
 
     class OneDocPermanentlyFails(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             if "doc1" in user_message:
                 self.seen.append(user_message)
                 raise FactsDocumentError(
@@ -1099,7 +1099,7 @@ def test_concurrency_does_not_change_the_outcome(pg_env, workers):
         )
 
     class Scripted(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             self.seen.append(user_message)
             self.usage["calls"] += 1
             self.usage["input_tokens"] += 1000
@@ -1158,7 +1158,7 @@ def test_a_multi_batch_pass_reports_each_batchs_own_spend(pg_env, monkeypatch):
         )
 
     class Scripted(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             self.seen.append(user_message)
             self.usage["calls"] += 1
             self.usage["input_tokens"] += 1000
@@ -1227,7 +1227,7 @@ def test_a_multi_batch_pass_sweeps_orphans_exactly_once(pg_env, monkeypatch):
         )
 
     class Scripted(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             self.seen.append(user_message)
             self.usage["calls"] += 1
             self.usage["input_tokens"] += 1000
@@ -1280,7 +1280,7 @@ def test_an_expired_deadline_stops_between_documents_and_keeps_what_it_paid_for(
         )
 
     class Scripted(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             self.seen.append(user_message)
             self.usage["calls"] += 1
             return reply(user_message)
@@ -1366,7 +1366,7 @@ def test_on_progress_counts_a_failed_document_as_done_too(pg_env):
     }
 
     class Flaky(StubExtractor):
-        def call(self, user_message: str) -> str:
+        def call(self, user_message: str, *, subject_id: str | None = None) -> str:
             if "doc1" in user_message:
                 self.seen.append(user_message)
                 raise ValueError("model returned nonsense")
@@ -1502,6 +1502,27 @@ class FakeBatchClient:
         self.messages = type("_FMessages", (), {"batches": api})()
 
 
+class SyncRetryBatchClient(FakeBatchClient):
+    """A :class:`FakeBatchClient` that ALSO answers ``client.messages.
+    create(...)`` — the corrective retry's own client when
+    ``extraction.facts.retry_transport: sync`` skips the follow-up batch
+    and calls the model directly (``_run_batch_pass``'s nested
+    ``_sync_retry``). Every call is recorded in ``sync_calls`` so a test can
+    assert it fired (or didn't) without instrumenting the model itself."""
+
+    def __init__(self, api: FakeBatchesAPI, *, retry_reply: str) -> None:
+        super().__init__(api)
+        self.sync_calls: list[dict] = []
+        calls = self.sync_calls
+        reply_text = retry_reply
+
+        def _create(*, model, max_tokens, system, messages):
+            calls.append({"model": model, "max_tokens": max_tokens, "messages": messages})
+            return _fake_message(reply_text, usage={"input_tokens": 10, "output_tokens": 5})
+
+        self.messages.create = _create
+
+
 def _run_batch(batch_client, **kwargs):
     from connectors.sharepoint.facts_extraction import run_facts_extraction
 
@@ -1617,6 +1638,49 @@ def test_batch_gate_failure_defers_to_a_follow_up_retry_batch_by_default(pg_env)
 
     state = load_state(CONNECTION_ID)
     assert state["docs"]["cf_1"]["status"] == "done"
+
+
+def test_batch_gate_failure_with_sync_retry_transport_labels_the_call_with_the_document_id(pg_env, monkeypatch):
+    """``extraction.facts.retry_transport: sync`` skips the follow-up batch
+    and calls the model directly (``_run_batch_pass``'s nested
+    ``_sync_retry``) — recorded as ``purpose=facts_retry`` with
+    ``subject_id`` equal to the document's own file id, the same join key
+    the batch transport's own generation record already carries."""
+    import connectors.sharepoint.facts_extraction as stage
+
+    monkeypatch.setattr(stage, "_retry_transport_mode", lambda: "sync")
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March for Contoso.")
+
+    bad = {
+        "id": "client:contoso",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "This sentence was never in the document."}],
+    }
+    fixed = {
+        "id": "client:contoso",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "for Contoso"}],
+    }
+    api = FakeBatchesAPI({"cf_1": ("succeeded", _stream(bad))})
+    client = SyncRetryBatchClient(api, retry_reply=_stream(fixed))
+    report = _run_batch(client)
+
+    assert len(api.created) == 1, "retry_transport: sync must never submit a follow-up batch"
+    assert len(client.sync_calls) == 1, "the gate failure must call the model directly"
+    assert report["claims_written"] == 1
+
+    retry_records = [r for r in records if r.purpose == "facts_retry"]
+    assert len(retry_records) == 1
+    assert retry_records[0].workload == "extraction"
+    assert retry_records[0].subject_id == "cf_1"
 
 
 def test_batch_retry_batch_that_still_fails_is_dropped_and_counted(pg_env):
@@ -1938,7 +2002,7 @@ def _reply_for(message: str) -> str:
 
 
 class _ScriptedExtractor(StubExtractor):
-    def call(self, user_message: str) -> str:
+    def call(self, user_message: str, *, subject_id: str | None = None) -> str:
         self.seen.append(user_message)
         self.usage["calls"] += 1
         return _reply_for(user_message)

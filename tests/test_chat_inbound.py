@@ -240,6 +240,20 @@ class TestInboundPrimitives:
     def test_read_new_unknown_chat_id_returns_empty(self):
         assert inbound.read_new("chat-never-published", after_seq=0) == []
 
+    def test_publish_inbound_includes_message_id_only_when_given(self):
+        """#2365 review: message_id rides the same envelope turn_id already
+        does — included when the caller has one, omitted (not null) when it
+        doesn't, so an entry from an older replica round-trips unchanged."""
+
+        async def _run():
+            await inbound.publish_inbound("chat-msgid", "with-id", turn_id="t1", message_id="msg-1")
+            await inbound.publish_inbound("chat-msgid", "without-id")
+            entries = inbound.read_new("chat-msgid", after_seq=0)
+            assert entries[0]["message_id"] == "msg-1"
+            assert "message_id" not in entries[1]
+
+        asyncio.run(_run())
+
     def test_publish_inbound_raises_inbound_publish_failed_on_coordination_unavailable(self, monkeypatch):
         class _Broken:
             def incr(self, *a, **k):
@@ -337,6 +351,127 @@ class TestCrossGatewayRouting:
             # redeliver the same already-consumed entry.
             await asyncio.sleep(0.2)
             assert _stdin_texts(handle_a) == ["hi-from-b"]
+
+            _as_gateway(monkeypatch, "gw-a")
+            await mgr_a.kill(chat_id, reason="test_done")
+
+        asyncio.run(_run())
+
+    def test_forwarded_turn_id_links_user_row_to_delivered_turn(self, two_gateways, monkeypatch):
+        """The bug this closes: the thin-producer forward path used to
+        persist the user row with NO turn_id at all, while
+        ``_deliver_local_user_message`` minted a fresh one for the live
+        turn — an exported forwarded conversation could never pair the
+        question with its answer. The producer must mint the id BEFORE
+        persisting the user row (mirroring ``send_user_message``) and it
+        must survive the trip through the chat-in stream to become the
+        turn's actual id, so the user row and the assistant row that
+        follows share one turn_id."""
+        mgr_a, mgr_b = two_gateways
+        repo = mgr_a._repo  # two_gateways shares one repo/connection across both managers
+
+        captured_turn_ids: list[str | None] = []
+        orig_append = repo.append_message
+
+        def _spy_append(*, role, **kwargs):
+            if role == "user":
+                captured_turn_ids.append(kwargs.get("turn_id"))
+            return orig_append(role=role, **kwargs)
+
+        monkeypatch.setattr(repo, "append_message", _spy_append)
+
+        async def _run():
+            _as_gateway(monkeypatch, "gw-a")
+            chat_id, handle_a = await _spawn_owned_session(mgr_a)
+
+            _as_gateway(monkeypatch, "gw-b")
+            await mgr_b.send_user_message(chat_id, "hi-from-b")
+
+            await _wait_until(lambda: len(_stdin_texts(handle_a)) >= 1)
+
+            assert len(captured_turn_ids) == 1
+            persisted_turn_id = captured_turn_ids[0]
+            assert persisted_turn_id  # minted before persist, not None/empty
+            assert mgr_a._live[chat_id].turn_id == persisted_turn_id
+
+            _as_gateway(monkeypatch, "gw-a")
+            await mgr_a.kill(chat_id, reason="test_done")
+
+        asyncio.run(_run())
+
+    def test_forwarded_message_id_links_to_delivered_turn(self, two_gateways, monkeypatch):
+        """#2365 review finding: ``produce_inbound_user_message`` discarded
+        the row ``repo.append_message`` returned, so the published chat-in
+        entry carried the turn id (an earlier fix) but never the MESSAGE id
+        -- a memory written during a forwarded turn could record
+        ``source_turn_id`` but not ``source_message_id``. The persisted
+        user row's id must survive the trip through the chat-in stream and
+        land on the delivered turn record, exactly as the direct-owner
+        path's ``message_id`` already does."""
+        mgr_a, mgr_b = two_gateways
+        repo = mgr_a._repo  # two_gateways shares one repo/connection across both managers
+
+        captured_user_msg_ids: list[str] = []
+        orig_append = repo.append_message
+
+        def _spy_append(*, role, **kwargs):
+            result = orig_append(role=role, **kwargs)
+            if role == "user":
+                captured_user_msg_ids.append(result.id)
+            return result
+
+        monkeypatch.setattr(repo, "append_message", _spy_append)
+
+        async def _run():
+            from app.chat.turn_context import read_turn
+
+            _as_gateway(monkeypatch, "gw-a")
+            chat_id, handle_a = await _spawn_owned_session(mgr_a)
+
+            _as_gateway(monkeypatch, "gw-b")
+            await mgr_b.send_user_message(chat_id, "hi-from-b")
+
+            await _wait_until(lambda: len(_stdin_texts(handle_a)) >= 1)
+
+            assert len(captured_user_msg_ids) == 1
+            persisted_msg_id = captured_user_msg_ids[0]
+            assert persisted_msg_id
+
+            record = read_turn(chat_id)
+            assert record is not None
+            assert record.message_id == persisted_msg_id
+
+            _as_gateway(monkeypatch, "gw-a")
+            await mgr_a.kill(chat_id, reason="test_done")
+
+        asyncio.run(_run())
+
+    def test_legacy_inbound_entry_with_no_turn_id_still_delivers(self, two_gateways, monkeypatch):
+        """An entry published by an older replica before turn_id/message_id
+        existed carries neither key — the consumer must still deliver it and
+        mint a fresh turn id locally, exactly as before either fix, never
+        raise. The delivered turn record's message_id stays None rather
+        than crashing on the missing key."""
+        mgr_a, _mgr_b = two_gateways
+
+        async def _run():
+            from app.chat.turn_context import read_turn
+
+            _as_gateway(monkeypatch, "gw-a")
+            chat_id, handle_a = await _spawn_owned_session(mgr_a)
+
+            coordination().stream_append(
+                inbound.stream_key(chat_id),
+                {"seq": 1, "type": "user_message", "text": "legacy"},
+                maxlen=inbound.STREAM_MAXLEN,
+            )
+
+            await _wait_until(lambda: len(_stdin_texts(handle_a)) >= 1)
+            assert _stdin_texts(handle_a) == ["legacy"]
+            assert mgr_a._live[chat_id].turn_id  # minted locally, non-empty
+            record = read_turn(chat_id)
+            assert record is not None
+            assert record.message_id is None
 
             _as_gateway(monkeypatch, "gw-a")
             await mgr_a.kill(chat_id, reason="test_done")

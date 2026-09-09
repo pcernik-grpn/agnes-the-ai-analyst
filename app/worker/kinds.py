@@ -1580,6 +1580,26 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
     return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s, partition=partition)
 
 
+def _run_conversation_export(payload: dict) -> dict:
+    """``conversation-export`` — push the conversation-corpus export to
+    ``observability.conversation_export.endpoint`` (design 2026-09-08
+    §3.12, Task 11).
+
+    A thin delegate, exactly like every other kind here: the config/policy
+    checks, the watermark read/advance, the batching, retry and delivery
+    all live in ``app.worker.kinds_conversation_export
+    .run_conversation_export`` — which ALSO wraps the actual work in the
+    module's own advisory-lease belt-and-braces
+    (``src.db_pg.conversation_export_lease``), same two-layer shape as
+    ``_run_knowledge_packaging`` above. No payload fields are consumed —
+    the scheduler enqueues an empty payload, mirroring
+    ``_run_marketplaces_sync``/``_run_session_collector`` above.
+    """
+    from app.worker.kinds_conversation_export import run_conversation_export
+
+    return run_conversation_export(payload)
+
+
 #: Kinds whose payload gets this claimed job's own ``id`` merged in before
 #: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
 #: per-kind flag on ``JobKind``: ``corpus-extraction`` and
@@ -1936,6 +1956,27 @@ def register_all_kinds() -> None:
             retry_in_seconds=None,
             # Same TCRD-296 C.11 opt-in as corpus-extraction above.
             transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
+        )
+    )
+    register_kind(
+        JobKind(
+            # design 2026-09-08 §3.12, Task 11: conversation-corpus export
+            # push sink. Registered UNCONDITIONALLY, same no-op posture as
+            # distribution-mirror/ducklake-maintenance above — the handler
+            # itself (app/worker/kinds_conversation_export.py) no-ops when
+            # observability.conversation_export.endpoint is unset, when the
+            # content-export policy excludes workload chat, or on a
+            # DuckDB-backed instance (swallows RequiresPostgresBackend), so
+            # a stray/manual enqueue on an instance that never turned this
+            # on is harmless.
+            name="conversation-export",
+            handler=_run_conversation_export,
+            lane=LIGHT_LANE,
+            # Heartbeat-protected, same default as the other LIGHT kinds —
+            # bounded by the destination endpoint's own responsiveness plus
+            # a fixed number of retries, not multi-minute by design.
+            lease_seconds=_DEFAULT_LIGHT_LEASE_S,
+            retry_in_seconds=300,
         )
     )
     from app.chat.manager import get_current_chat_manager

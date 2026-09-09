@@ -1006,19 +1006,47 @@ class LLMDetector:
         }
         if self._send_temperature:
             kwargs["temperature"] = 0
-        try:
-            return client.messages.create(**kwargs)
-        # Broad on purpose: re-raised or retried below, never swallowed.
-        except Exception as exc:
-            if self._send_temperature and _mentions_temperature(exc) and not _is_retryable(exc):
-                logger.info(
-                    "model %s rejected temperature; retrying without it for the rest of this run",
-                    self.model,
-                )
-                self._send_temperature = False
-                kwargs.pop("temperature", None)
-                return client.messages.create(**kwargs)
-            raise
+        from src.observability import llm_context, trace_generation
+        from src.observability.llm_tracing import provider_label
+
+        provider, _source = resolve_llm_provider("extraction", "anonymization", "provider")
+        # ONE PRICED record for the pair below: the temperature-retry
+        # re-sends the SAME logical detection with one keyword dropped, and
+        # pricing it twice would double-count a chunk's cost — see the class
+        # docstring. The rejected attempt still gets its own ZERO-COST error
+        # row (`record_generation` below): the provider refused the request
+        # outright, so there are no tokens to double-count, and a rejection
+        # that appears in no call count is exactly the kind of failure the
+        # ledger exists to make visible.
+        from src.observability import record_generation
+
+        with (
+            llm_context(workload="anonymization"),
+            trace_generation(provider=provider_label(provider), model=model, purpose="ner_detect") as cap,
+        ):
+            try:
+                response = client.messages.create(**kwargs)
+            # Broad on purpose: re-raised or retried below, never swallowed.
+            except Exception as exc:
+                if self._send_temperature and _mentions_temperature(exc) and not _is_retryable(exc):
+                    logger.info(
+                        "model %s rejected temperature; retrying without it for the rest of this run",
+                        self.model,
+                    )
+                    record_generation(
+                        provider=provider_label(provider),
+                        model=model,
+                        purpose="ner_detect",
+                        usage=None,
+                        error_type="temperature_rejected",
+                    )
+                    self._send_temperature = False
+                    kwargs.pop("temperature", None)
+                    response = client.messages.create(**kwargs)
+                else:
+                    raise
+            cap.set_output_from_anthropic(response)
+        return response
 
     def _record(self, response: Any) -> None:
         usage = getattr(response, "usage", None)

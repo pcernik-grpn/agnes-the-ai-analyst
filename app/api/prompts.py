@@ -43,13 +43,11 @@ alive (grandfathered) for the old standalone editors.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import re
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from jinja2 import TemplateError
-
-from src.prompt_render import make_prompt_env
 from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin
@@ -59,6 +57,7 @@ from app.auth.dependencies import _get_db
 # built-in default text plus this endpoint's `kind` token for it.
 from connectors.sharepoint.facts_prompt import PROMPT_KIND as FACTS_PROMPT_KIND
 from connectors.sharepoint.facts_prompt import default_prompt as facts_default_prompt
+from src.prompt_render import make_prompt_env
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +171,49 @@ def _reject_token_placeholder(content: str) -> None:
     )
 
 
+# Matches a bare single-brace `{server_url}` — the non-Jinja placeholder
+# `compute_default_agent_prompt()`'s output uses, meant to be substituted by
+# a later `str.replace("{server_url}", ...)` pass (see
+# app/web/setup_instructions.py, _claude_setup_instructions.jinja). An admin
+# override is instead rendered through Jinja2 (`env.from_string(content)`),
+# which only processes double-brace `{{ }}` syntax — single braces pass
+# through completely unprocessed. Excludes `{{server_url}}` (no-space
+# double-brace, valid Jinja) via the lookaround so a legitimate override
+# isn't rejected.
+_BARE_SERVER_URL_RE = re.compile(r"(?<!\{)\{server_url\}(?!\})")
+
+
+def _reject_bare_server_url_placeholder(content: str) -> None:
+    """400 when install-prompt content carries the un-substitutable
+    single-brace ``{server_url}``.
+
+    A real install transcript hit this: an admin seeded the override editor
+    from the live default (which legitimately uses this placeholder, since
+    it's substituted by a later ``str.replace`` pass outside Jinja — see
+    ``compute_default_agent_prompt``) and saved it verbatim. Jinja2 only
+    processes ``{{ }}`` (and the render context has no top-level
+    ``server_url`` anyway — it's ``server.url``, see
+    ``src/welcome_template.py::build_context``), so the single-brace
+    placeholder survived the render untouched and reached the install agent
+    as the literal text ``{server_url}`` — no server to contact, every
+    download/onboard step unusable. Reject at save time (editor PUT) and at
+    bind time (git mode), mirroring :func:`_reject_token_placeholder`.
+    """
+    if not _BARE_SERVER_URL_RE.search(content):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Template invalid: `{server_url}` (single brace) is not "
+            "substituted in an editor/git override — the override renders "
+            "through Jinja2, which only processes `{{ }}`, and the render "
+            "context has no top-level `server_url` anyway (see "
+            "src/welcome_template.py::build_context). Use "
+            "`{{ server.url }}` instead."
+        ),
+    )
+
+
 def _validate_template(kind: str, content: str) -> None:
     """Two-pass Jinja validation matching the legacy editors' contract.
 
@@ -211,6 +253,7 @@ def _validate_template(kind: str, content: str) -> None:
 
     if kind == "install":
         _reject_token_placeholder(content)
+        _reject_bare_server_url_placeholder(content)
 
     env = make_prompt_env()  # F4: sandboxed — admin-authored content
     try:
@@ -231,17 +274,17 @@ class PromptGetResponse(BaseModel):
     #: stored; ``default`` below is what runs), ``admin`` (the editor
     #: override in ``content``), or ``git`` (bound to an IWT file).
     origin: str = "builtin"
-    content: Optional[str]
-    git_path: Optional[str] = None
-    base_sha: Optional[str] = None
+    content: str | None
+    git_path: str | None = None
+    base_sha: str | None = None
     default: str
-    updated_at: Optional[str] = None
-    updated_by: Optional[str] = None
+    updated_at: str | None = None
+    updated_by: str | None = None
     iwt_configured: bool = False
     # --- Slice 2 (#622): per-file blob-sha divergence ---
     diverged: bool = False
     # True iff the bound file's current blob sha != the stored base_sha.
-    current_blob_sha: Optional[str] = None
+    current_blob_sha: str | None = None
     # Live blob sha of git_path in the IWT clone (None when absent/unbound).
 
 
@@ -494,11 +537,13 @@ async def bind_git(
     if kind == "install":
         # Git-bound content never passes through _validate_template (PUT is
         # refused with prompt_in_git_mode), so the retired-`{token}` guard
-        # fires here at bind time; the seed-sync render dry-run covers later
-        # syncs moving already-bound content onto a legacy seed.
+        # and the bare-`{server_url}` guard fire here at bind time; the
+        # seed-sync render dry-run covers later syncs moving already-bound
+        # content onto a legacy seed.
         resolved_seed = resolve_seed_file(payload.git_path)
         if resolved_seed is not None:
             _reject_token_placeholder(resolved_seed[0])
+            _reject_bare_server_url_placeholder(resolved_seed[0])
 
     # Stamp the per-file git BLOB sha as the binding's base (Slice 2):
     # precise divergence — flips only when THIS file's content changes, not
@@ -542,4 +587,10 @@ async def preview_prompt(
         rendered = template.render(**ctx)
     except TemplateError as e:
         raise HTTPException(status_code=400, detail=f"Template invalid: {e}")
+    if kind == "install":
+        # The shipped default still carries the single-brace {server_url}
+        # placeholder (substituted at bind time, not through Jinja) — an
+        # override that doesn't touch it must still resolve, so the preview
+        # matches what a real install prompt would send.
+        rendered = rendered.replace("{server_url}", server_url)
     return {"content": rendered}
