@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any
+from typing import Any, List, Optional
 
 import duckdb
 
@@ -468,22 +468,37 @@ class CorpusFilesRepository:
             [status, detail_json, file_id],
         )
 
-    def move_to_corpus(self, file_id: str, target_corpus_id: str) -> bool:
+    def move_to_corpus(
+        self, file_id: str, target_corpus_id: str, *, expected_corpus_id: Optional[str] = None
+    ) -> bool:
         """Reparent a file into another corpus (the Library's drag-and-drop).
 
         Returns False if the file doesn't exist. ``path`` is cleared: it is
         unique per ``(corpus_id, path)`` and describes a location inside the
         OLD corpus, so carrying it over could collide with an existing file in
         the target and would misdescribe the file either way.
+
+        ``expected_corpus_id`` makes the reparent a compare-and-set, and also
+        returns False when the file has since moved elsewhere. Two concurrent
+        moves both validate the source before writing anything, so both reach
+        this call; last-writer-wins would let the later one overwrite a move
+        that already completed while the loser's chunks sit at ITS target,
+        leaving the file in one collection and its body in another. The caller
+        (``app/api/collections.py::move_file``) passes the source it
+        validated, and on False looks up where the file actually is.
         """
         row = self.get(file_id)
         if row is None:
             return False
-        self.conn.execute(
-            "UPDATE corpus_files SET corpus_id = ?, path = NULL, updated_at = current_timestamp WHERE id = ?",
-            [target_corpus_id, file_id],
-        )
-        return True
+        if expected_corpus_id is not None and row.get("corpus_id") != expected_corpus_id:
+            return False
+        sql = "UPDATE corpus_files SET corpus_id = ?, path = NULL, updated_at = current_timestamp WHERE id = ?"
+        params: List[Any] = [target_corpus_id, file_id]
+        if expected_corpus_id is not None:
+            sql += " AND corpus_id = ?"
+            params.append(expected_corpus_id)
+        updated = self.conn.execute(sql + " RETURNING id", params).fetchall()
+        return bool(updated)
 
     def delete(self, file_id: str) -> None:
         """Hard-delete a file row (individual files are not soft-deleted)."""

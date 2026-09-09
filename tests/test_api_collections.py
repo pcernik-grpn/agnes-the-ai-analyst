@@ -1241,6 +1241,80 @@ def test_move_file_rollback_never_undoes_a_concurrent_successful_move(seeded_app
     assert corpus_chunks_repo().list_for_corpus(src_id) == []
 
 
+def test_two_concurrent_moves_leave_the_file_and_its_body_together(seeded_app, monkeypatch):
+    """Two moves of one file to DIFFERENT collections must not split it.
+
+    Both requests validate the source before writing, so both reach the
+    file-row write. Without a guard the later one silently overwrites the
+    earlier, while the loser's body sits at ITS target — file in one
+    collection, content in another, which is the split this whole endpoint
+    exists to prevent. The file-row write is a compare-and-set on the source
+    the caller validated: the loser is refused, and its content is moved to
+    wherever the file actually ended up rather than back to a source the file
+    has left.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Both Src"}, headers=admin).json()["id"]
+    mine_id = c.post("/api/collections", json={"name": "Both Mine"}, headers=admin).json()["id"]
+    other_id = c.post("/api/collections", json={"name": "Both Other"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="raced.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "raced body"}])
+
+    real_files_repo = corpus_files_repo
+    other_done = {"yet": False}
+
+    def _interleaving_files_repo():
+        repo = real_files_repo()
+
+        class _Interleave:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+
+                    def _with_a_competitor(*args, **kwargs):
+                        # The competing move completes in full — content and
+                        # file row — just before ours writes its file row.
+                        if not other_done["yet"]:
+                            other_done["yet"] = True
+                            corpus_chunks_repo().reassign_file_corpus(fid, other_id)
+                            repo.move_to_corpus(fid, other_id)
+                        return repo.move_to_corpus(*args, **kwargs)
+
+                    return _with_a_competitor
+                return getattr(repo, name)
+
+        return _Interleave()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _interleaving_files_repo)
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": mine_id},
+        headers=admin,
+    )
+
+    # Our move lost the race and says so, rather than reporting a success it
+    # did not achieve.
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "move_conflict"
+
+    # Whoever won, the file and its body are in the SAME collection, and it is
+    # not the source they both left.
+    row = corpus_files_repo().get(fid)
+    chunk_homes = {ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)}
+    assert chunk_homes == {row["corpus_id"]}, "the file and its body must not be split"
+    assert row["corpus_id"] == other_id
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []
+
+
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
     """A name with no alphanumerics must not yield an empty slug."""
     c = seeded_app["client"]

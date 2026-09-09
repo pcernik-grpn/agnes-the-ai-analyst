@@ -2020,6 +2020,16 @@ async def move_file(
     When the source collection is left empty it is soft-deleted: a single-file
     artifact IS its file in the Library, so dragging that file into a folder
     must not strand an empty husk in the listing.
+
+    A file's body (``corpus_chunks``) and facts (``claims``) carry their own
+    denormalized collection id and are repointed here too — see the ordering
+    comment below for why they move first and what happens when a write in
+    the middle of that sequence fails.
+
+    Answers ``409 move_conflict`` when someone else moved the same file while
+    this request was in flight; the body carries the collection the file
+    actually ended up in, so a client can re-target or refresh rather than
+    retry blindly into the same race.
     """
     target_id = payload.target_collection_id
     if target_id == collection_id:
@@ -2104,13 +2114,38 @@ async def move_file(
     # A compensation that itself fails is logged and never masks the original
     # error — the caller must see what actually broke.
     try:
-        moved = cf_repo.move_to_corpus(file_id, target_id)
+        moved = cf_repo.move_to_corpus(file_id, target_id, expected_corpus_id=collection_id)
     except Exception:
         _undo_content_move(file_id, collection_id, target_id)
         raise
     if not moved:
-        _undo_content_move(file_id, collection_id, target_id)
-        raise HTTPException(status_code=404, detail="file_not_found")
+        # Either the file is gone, or a CONCURRENT move of it committed while
+        # we were repointing the content: both requests validated the same
+        # source, so both got this far, and without the compare-and-set above
+        # the later write would silently overwrite the earlier one while our
+        # content sat at OUR target — the file in one collection, its body in
+        # another. Put the content wherever the file actually is (which is the
+        # winner's target, not the source it has already left), and say we
+        # lost rather than report a success we did not achieve.
+        current = cf_repo.get(file_id)
+        if current is None:
+            _undo_content_move(file_id, collection_id, target_id)
+            raise HTTPException(status_code=404, detail="file_not_found")
+        _undo_content_move(file_id, current["corpus_id"], target_id)
+        logger.info(
+            "corpus_file move lost a race file_id=%s wanted=%s actual=%s",
+            file_id,
+            target_id,
+            current["corpus_id"],
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "move_conflict",
+                "message": "The file was moved by someone else while this move was in progress.",
+                "collection_id": current["corpus_id"],
+            },
+        )
 
     source_emptied = False
     try:

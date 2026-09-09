@@ -12,6 +12,13 @@
   content back, so a failed move never leaves the two split — and that undo is
   a compare-and-set, so it cannot disturb a concurrent move of the same file
   that succeeded in the meantime.
+- **Two people moving the same file at once no longer split it.** Both requests
+  validated the source before writing, so the later file-row write silently
+  overwrote the earlier one while the loser's body sat at its own target,
+  leaving the file in one collection and its content in another. The file-row
+  write is now a compare-and-set on the validated source: the losing request
+  answers `409 move_conflict` naming the collection the file actually ended up
+  in, and its content follows the file there.
 - **An ingest running while its file is moved no longer writes the chunks into
   the old collection.** Ingestion read the file's collection once at the start
   and wrote chunks under that value minutes later, after conversion and
