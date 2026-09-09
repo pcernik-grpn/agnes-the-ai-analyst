@@ -11920,6 +11920,7 @@ async def run_retention_prune(
     """
     from app.instance_config import (
         get_agent_scope_snapshots_retention_days,
+        get_chat_feedback_retention_days,
         get_llm_calls_retention_days,
         get_llm_usage_retention_days,
         get_sync_history_retention_days,
@@ -11931,6 +11932,7 @@ async def run_retention_prune(
         "llm_usage": get_llm_usage_retention_days(),
         "agent_scope_snapshots": get_agent_scope_snapshots_retention_days(),
         "llm_calls": get_llm_calls_retention_days(),
+        "chat_feedback": get_chat_feedback_retention_days(),
     }
     result = run_retention_sweep(windows)
 

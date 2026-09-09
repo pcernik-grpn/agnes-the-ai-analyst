@@ -1978,6 +1978,20 @@ def get_llm_usage_retention_days() -> int:
         return 0
 
 
+def get_chat_feedback_retention_days() -> int:
+    """Days to keep ``chat_message_feedback`` rows.
+
+    Reads ``retention.chat_feedback_days``. Default 0 = keep forever, the
+    same posture every other trail's knob has; the rows carry a person's
+    free-text comment, so an operator who wants a clock on them has one.
+    """
+    val = get_value("retention", "chat_feedback_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
 def get_llm_calls_retention_days() -> int:
     """How many days to keep ``llm_calls`` rows (the LLM observability
     ledger, design 2026-09-08) before the daily ``retention-prune``

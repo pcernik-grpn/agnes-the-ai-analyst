@@ -105,6 +105,11 @@
   usage entirely past the mirror's cap.
 
 ### Internal
+- Deleting a conversation, or purging an account, now takes its feedback rows
+  with it and strips the session, turn and user ids from the matching
+  `llm_calls` rows — the spend record survives (deleting it would rewrite cost
+  history) but stops naming anyone. `retention.chat_feedback_days` puts a
+  clock on feedback comments through the daily retention sweep.
 - Every batch extraction outcome now reaches the ledger: a result that
   errored, was canceled, expired or never came back writes a zero-cost
   `llm_calls` row, and an answer whose document vanished before it could be

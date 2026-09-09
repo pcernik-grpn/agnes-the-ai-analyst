@@ -122,8 +122,13 @@ class ChatMessageFeedbackPgRepository:
         return [dict(r) for r in rows]
 
     def prune_older_than(self, days: int) -> int:
-        """Not wired to the retention sweep (kept for symmetry with the
-        other trails, in case an operator wants it later)."""
+        """Delete feedback rows older than ``days``.
+
+        Wired to the daily ``retention-prune`` sweep as the ``chat_feedback``
+        trail (``retention.chat_feedback_days``, default 0 = keep forever):
+        a thumbs-down comment is a person's free text about an answer, so an
+        operator has to be able to put a clock on it.
+        """
         cutoff = datetime.now(UTC) - timedelta(days=days)
         with self._engine.begin() as conn:
             result = conn.execute(

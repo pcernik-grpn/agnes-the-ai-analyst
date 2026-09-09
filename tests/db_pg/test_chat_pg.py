@@ -414,6 +414,122 @@ def test_hard_delete_cascades_messages(sessions, messages, engine):
     assert remaining == 0  # ON DELETE CASCADE removed children
 
 
+def _ledger_row(call_id: str, **fields):
+    """A complete `llm_calls` row, built the way the product builds one --
+    the table has several NOT NULL columns, so a hand-written dict rots."""
+    from src.observability.llm_context import LlmCallContext
+    from src.observability.llm_record import build_record
+
+    ctx = LlmCallContext(**{k: fields.pop(k) for k in list(fields) if k in LlmCallContext.__dataclass_fields__})
+    row = build_record(
+        kind="completion",
+        context=ctx,
+        provider="anthropic",
+        upstream="anthropic",
+        model_requested="claude-haiku-4-5",
+        model_response=None,
+        usage={"input_tokens": 10, "output_tokens": 2},
+        latency_ms=5,
+        status="ok",
+        **fields,
+    ).to_row()
+    row["id"] = call_id
+    return row
+
+
+def _seed_feedback_and_a_call(engine, session_id: str, *, user_id: str = "u_1") -> None:
+    """One feedback row and one ledger row pointing at ``session_id`` --
+    the two tables migration 0115 added, neither of which has an ON DELETE
+    cascade to lean on."""
+    from src.repositories.chat_message_feedback_pg import ChatMessageFeedbackPgRepository
+    from src.repositories.llm_calls_pg import LlmCallsPgRepository
+
+    # The feedback key is (turn_id, user_id), so each session needs its own
+    # turn id or the upsert would just move one row between them.
+    turn_id = f"t_{session_id}"
+    ChatMessageFeedbackPgRepository(engine).upsert(
+        session_id=session_id,
+        turn_id=turn_id,
+        user_id=user_id,
+        verdict="down",
+        comment="the answer named the wrong client",
+        message_id=None,
+    )
+    LlmCallsPgRepository(engine).insert_batch(
+        [_ledger_row(f"call_{session_id}", session_id=session_id, turn_id=turn_id, user_id=user_id)]
+    )
+
+
+def test_hard_delete_takes_the_feedback_and_scrubs_the_ledgers_identity(sessions, engine):
+    """Review finding: neither table cascades, and the delete paths only
+    dropped `chat_sessions`. A thumbs-down comment is a person's free text
+    about this conversation and must not outlive it; the ledger row is the
+    spend record, so it stays and loses only its identity -- deleting it
+    would rewrite cost history retroactively."""
+    s = sessions.create_session(user_email="gone@x.com", surface=Surface.WEB)
+    _seed_feedback_and_a_call(engine, s.id)
+
+    assert sessions.hard_delete_session(s.id) is True
+
+    with engine.connect() as conn:
+        feedback_left = conn.execute(
+            sa.text("SELECT COUNT(*) FROM chat_message_feedback WHERE session_id = :sid"), {"sid": s.id}
+        ).scalar()
+        call = conn.execute(
+            sa.text("SELECT session_id, user_id, turn_id, cost_usd FROM llm_calls WHERE id = :cid"),
+            {"cid": f"call_{s.id}"},
+        ).first()
+    assert feedback_left == 0
+    assert call is not None, "the spend row must survive -- only its identity goes"
+    assert call[0] is None and call[1] is None and call[2] is None
+    assert call[3] is not None and float(call[3]) > 0, "the priced cost must survive the delete"
+
+
+def test_the_account_purge_takes_feedback_across_every_session(sessions, engine):
+    s1 = sessions.create_session(user_email="gone@x.com", surface=Surface.WEB)
+    s2 = sessions.create_session(user_email="gone@x.com", surface=Surface.WEB)
+    stays = sessions.create_session(user_email="other@x.com", surface=Surface.WEB)
+    for sid in (s1.id, s2.id, stays.id):
+        _seed_feedback_and_a_call(engine, sid)
+
+    assert sessions.hard_delete_user_sessions("gone@x.com") == 2
+
+    with engine.connect() as conn:
+        gone = conn.execute(
+            sa.text("SELECT COUNT(*) FROM chat_message_feedback WHERE session_id = ANY(:ids)"),
+            {"ids": [s1.id, s2.id]},
+        ).scalar()
+        kept = conn.execute(
+            sa.text("SELECT COUNT(*) FROM chat_message_feedback WHERE session_id = :sid"), {"sid": stays.id}
+        ).scalar()
+    assert gone == 0
+    assert kept == 1, "another user's feedback must be untouched"
+
+
+def test_scrub_user_identity_reaches_rows_with_no_session(engine):
+    """A builder turn or an extraction run carries a user id and no session
+    id at all, so a session delete cannot reach it -- the account purge
+    calls this."""
+    from src.repositories.llm_calls_pg import LlmCallsPgRepository
+
+    repo = LlmCallsPgRepository(engine)
+    repo.insert_batch(
+        [
+            _ledger_row("call_builder", user_id="u_gone", workload="builder"),
+            _ledger_row("call_other", user_id="u_stays", workload="builder"),
+        ]
+    )
+
+    assert repo.scrub_user_identity("u_gone") == 1
+
+    with engine.connect() as conn:
+        rows = dict(
+            conn.execute(sa.text("SELECT id, user_id FROM llm_calls WHERE id IN ('call_builder', 'call_other')")).all()
+        )
+    assert rows["call_builder"] is None
+    assert rows["call_other"] == "u_stays"
+
+
 # --- workdirs --------------------------------------------------------------
 
 

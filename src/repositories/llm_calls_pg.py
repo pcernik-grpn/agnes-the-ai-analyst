@@ -261,6 +261,24 @@ class LlmCallsPgRepository:
             out.append(row)
         return out
 
+    def scrub_user_identity(self, user_id: str) -> int:
+        """Drop the identity columns from every row this user's id appears
+        on, keeping the spend itself.
+
+        The account purge (``app/api/users.py``) reaches rows a session
+        delete cannot: a builder turn or an extraction run has a
+        ``user_id`` and no ``session_id`` at all. Returns the number of
+        rows changed.
+        """
+        if not user_id:
+            return 0
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                sa.text("UPDATE llm_calls SET user_id = NULL, session_id = NULL, turn_id = NULL WHERE user_id = :uid"),
+                {"uid": user_id},
+            )
+        return result.rowcount or 0
+
     def prune_older_than(self, days: int) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=days)
         with self._engine.begin() as conn:

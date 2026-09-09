@@ -277,6 +277,7 @@ and `agent_scope_snapshots` is pruned while the `agents` rows are not.
 | `llm_usage` retention (days, `0` = keep forever) | `retention.llm_usage_days` | `0` | `get_llm_usage_retention_days()` |
 | `agent_scope_snapshots` retention (days, `0` = keep forever) | `retention.agent_scope_snapshots_days` | `0` | `get_agent_scope_snapshots_retention_days()` |
 | `llm_calls` retention (days, `0` = keep forever) | `retention.llm_calls_days` | `0` | `get_llm_calls_retention_days()` |
+| `chat_message_feedback` retention (days, `0` = keep forever) | `retention.chat_feedback_days` | `0` | `get_chat_feedback_retention_days()` |
 | `usage_events` retention (days, `0` = keep forever) — `USAGE_EVENTS_RETENTION_DAYS` env var wins when set; pruned by its own `POST /api/admin/usage/prune` job, not the sweep | `retention.usage_events_days` | `0` | `get_usage_events_retention_days()` |
 
 ### Conversation corpus export (push sink)

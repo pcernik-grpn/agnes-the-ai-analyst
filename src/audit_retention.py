@@ -98,6 +98,17 @@ def _prune_agent_scope_snapshots(days: int, repo: Optional[Any] = None) -> int:
     return repo.prune_scope_snapshots_older_than(days)
 
 
+def _prune_chat_feedback(days: int, repo: Optional[Any] = None) -> int:
+    if repo is None:
+        from src.repositories import RequiresPostgresBackend, chat_message_feedback_repo
+
+        try:
+            repo = chat_message_feedback_repo()
+        except RequiresPostgresBackend:
+            return 0  # the feedback table is Postgres-only; nothing to prune on DuckDB
+    return repo.prune_older_than(days)
+
+
 def _prune_llm_calls(days: int, repo: Optional[Any] = None) -> int:
     if repo is None:
         from src.repositories import RequiresPostgresBackend, llm_calls_repo
@@ -120,6 +131,7 @@ _TRAIL_PRUNERS: Dict[str, Callable[..., int]] = {
     "llm_usage": _prune_llm_usage,
     "agent_scope_snapshots": _prune_agent_scope_snapshots,
     "llm_calls": _prune_llm_calls,
+    "chat_feedback": _prune_chat_feedback,
 }
 
 

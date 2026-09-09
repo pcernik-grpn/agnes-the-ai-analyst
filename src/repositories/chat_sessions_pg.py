@@ -180,8 +180,26 @@ class ChatSessionPgRepository:
         migration 0015, ``chat_session_participants`` in 0017), so the deletes
         the DuckDB sibling has to spell out happen here for free — the
         observable contract is identical.
+
+        The two tables migration 0115 added carry no such cascade and are
+        handled explicitly, in the SAME transaction, because they are not
+        the same kind of data: ``chat_message_feedback`` holds a person's
+        free-text comment ABOUT this conversation and must not outlive it,
+        while ``llm_calls`` is the spend record — deleting those rows would
+        rewrite cost history retroactively, so the row stays and only its
+        identity (session, turn, user) is scrubbed.
         """
         with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("DELETE FROM chat_message_feedback WHERE session_id = :id"),
+                {"id": chat_id},
+            )
+            conn.execute(
+                sa.text(
+                    "UPDATE llm_calls SET session_id = NULL, turn_id = NULL, user_id = NULL WHERE session_id = :id"
+                ),
+                {"id": chat_id},
+            )
             result = conn.execute(
                 sa.text("DELETE FROM chat_sessions WHERE id = :id"),
                 {"id": chat_id},
@@ -261,7 +279,24 @@ class ChatSessionPgRepository:
                 ).scalar()
                 or 0
             )
-            # ON DELETE CASCADE removes child chat_messages automatically.
+            # ON DELETE CASCADE removes child chat_messages automatically;
+            # migration 0115's tables have no cascade, so they are handled
+            # here (see `hard_delete_session` for why one is deleted and the
+            # other only loses its identity columns).
+            conn.execute(
+                sa.text(
+                    "DELETE FROM chat_message_feedback WHERE session_id IN "
+                    "(SELECT id FROM chat_sessions WHERE user_email = :ue)"
+                ),
+                {"ue": user_email},
+            )
+            conn.execute(
+                sa.text(
+                    "UPDATE llm_calls SET session_id = NULL, turn_id = NULL, user_id = NULL "
+                    "WHERE session_id IN (SELECT id FROM chat_sessions WHERE user_email = :ue)"
+                ),
+                {"ue": user_email},
+            )
             conn.execute(
                 sa.text("DELETE FROM chat_sessions WHERE user_email = :ue"),
                 {"ue": user_email},
