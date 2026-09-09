@@ -262,6 +262,10 @@ def test_stdio_report_issue_calls_api_post_json():
 
     assert result == {"id": "iss_abc", "number": 1}
     assert post.call_args[0] == ("/api/issues", {"title": "x", "kind": "bug"})
+    # `api_post_json` grew a `headers=` kwarg for exactly this: the stdio
+    # transport can now send the same `X-Agnes-Client: mcp` signal the HTTP
+    # transport sends, so a report filed here lands with `source_surface="mcp"`.
+    assert post.call_args[1]["headers"] == {"X-Agnes-Client": "mcp"}
 
 
 def test_stdio_list_my_issues_calls_api_get_json():
@@ -272,7 +276,7 @@ def test_stdio_list_my_issues_calls_api_get_json():
         result = stdio_server.list_my_issues()
 
     assert result == {"data": [], "count": 0}
-    get.assert_called_once_with("/api/issues/mine", status="open", limit=50)
+    get.assert_called_once_with("/api/issues/mine", status="open", limit=50, headers={"X-Agnes-Client": "mcp"})
 
 
 def test_stdio_get_issue_calls_api_get_json():
@@ -283,7 +287,7 @@ def test_stdio_get_issue_calls_api_get_json():
         result = stdio_server.get_issue("42")
 
     assert result == {"id": "iss_abc"}
-    get.assert_called_once_with("/api/issues/42")
+    get.assert_called_once_with("/api/issues/42", headers={"X-Agnes-Client": "mcp"})
 
 
 def test_stdio_issue_comment_calls_api_post_json():
@@ -294,7 +298,7 @@ def test_stdio_issue_comment_calls_api_post_json():
         result = stdio_server.issue_comment("42", "more detail")
 
     assert result == {"id": "isc_1"}
-    post.assert_called_once_with("/api/issues/42/comments", {"body": "more detail"})
+    post.assert_called_once_with("/api/issues/42/comments", {"body": "more detail"}, headers={"X-Agnes-Client": "mcp"})
 
 
 def test_stdio_translates_v2_client_error():

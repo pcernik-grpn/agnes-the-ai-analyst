@@ -147,6 +147,11 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "sso_config_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/sso_config_pg.py"
     ),
+    # Issue reporting (step 1). `title` is required, no default -- same shape
+    # as `POST /api/semantic-feedback` above: the repo dependency resolves
+    # (and raises RequiresPostgresBackend on DuckDB) BEFORE FastAPI validates
+    # the body, so an empty `{}` 501s on DuckDB rather than 422ing.
+    "POST /api/issues": "filing an issue report writes `issue_reports`, a PG-only table (issue reporting step 1)",
 }
 
 

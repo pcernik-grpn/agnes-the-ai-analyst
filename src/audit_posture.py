@@ -754,6 +754,11 @@ POSTURE: dict[str, str] = {
     # not the emitter.
     "POST /admin/view-as": "view_as.start",
     "POST /admin/view-as/exit": "view_as.end",
+    # -- app.api.issues (issue reporting, step 1) -------------------------
+    "POST /api/issues": "issue.report",
+    "PUT /api/issues/{issue_id}/screenshot": "issue.screenshot",
+    "POST /api/issues/{issue_id}/comments": "issue.comment",
+    "POST /api/admin/issues/{issue_id}/resolve": "issue.resolved",
 }
 
 
@@ -1492,6 +1497,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /stack": "exempt:ui_support",
     "GET /store/examples": "exempt:ui_support",
     "GET /store/new": "exempt:ui_support",
+    # -- app.api.issues (issue reporting, step 1) -------------------------
+    "GET /api/admin/issues": "exempt:ui_support",
+    "GET /api/issues/mine": "exempt:ui_support",
+    "GET /api/issues/{issue_id}": "exempt:ui_support",
+    "GET /api/issues/{issue_id}/screenshot": "exempt:ui_support",
     "GET /{full_path:path}": "exempt:ui_support",
 }
 

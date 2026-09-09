@@ -671,11 +671,11 @@ def pull(skip_materialize: bool = False) -> dict:
 # stays HTTP-only: the admin queue is not something the sandboxed chat
 # agent needs, and #1707 Block 6 already closed this tool set to what
 # genuinely needs a local process. `cli.v2_client.api_post_json`/
-# `api_get_json` carry no `headers=` kwarg (unlike `cli.client.api_get`,
-# used above), so — unlike the HTTP transport — these do NOT send
-# `X-Agnes-Client: mcp`; a report filed this way lands with
-# `source_surface="web"` server-side rather than `"mcp"` until that helper
-# grows one.
+# `api_get_json` now carry a `headers=` kwarg (merged over the default
+# Authorization header, never replacing it), so every call below sends
+# `X-Agnes-Client: mcp` — the same signal the HTTP transport sends — and a
+# report filed this way lands with `source_surface="mcp"` server-side.
+_ISSUE_HEADERS = {"X-Agnes-Client": "mcp"}
 
 
 @tool(read_only=False, idempotent=False)
@@ -696,7 +696,7 @@ def report_issue(
         if v is not None
     }
     try:
-        return api_post_json("/api/issues", payload)
+        return api_post_json("/api/issues", payload, headers=_ISSUE_HEADERS)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("report_issue", exc)) from exc
 
@@ -708,7 +708,7 @@ def list_my_issues(status: str = "open", limit: int = 50) -> dict:
     Same tool as the server's `list_my_issues`.
     """
     try:
-        return api_get_json("/api/issues/mine", status=status, limit=limit)
+        return api_get_json("/api/issues/mine", status=status, limit=limit, headers=_ISSUE_HEADERS)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("list_my_issues", exc)) from exc
 
@@ -723,7 +723,7 @@ def get_issue(issue_id: str) -> dict:
     Same tool as the server's `get_issue`.
     """
     try:
-        return api_get_json(f"/api/issues/{issue_id}")
+        return api_get_json(f"/api/issues/{issue_id}", headers=_ISSUE_HEADERS)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("get_issue", exc)) from exc
 
@@ -735,7 +735,7 @@ def issue_comment(issue_id: str, body: str) -> dict:
     Same tool as the server's `issue_comment`.
     """
     try:
-        return api_post_json(f"/api/issues/{issue_id}/comments", {"body": body})
+        return api_post_json(f"/api/issues/{issue_id}/comments", {"body": body}, headers=_ISSUE_HEADERS)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("issue_comment", exc)) from exc
 
