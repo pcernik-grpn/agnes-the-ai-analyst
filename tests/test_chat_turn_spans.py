@@ -308,6 +308,40 @@ def test_usage_turns_row_uses_the_turn_id(manager: ChatManager, monkeypatch):
     asyncio.run(_run())
 
 
+def test_assistant_persist_passes_the_turn_id_to_append_message(manager: ChatManager):
+    """The PG-only ``chat_messages.turn_id`` column (migration 0113): the
+    assistant persist call at the ``assistant_message`` frame branch must
+    carry ``turn_id=live.turn_id``. A recording fake stands in for
+    ``_messages_pg`` (the DuckDB path silently drops the kwarg — there is no
+    column to read it back from), same technique as the PG delegation the
+    real ``ChatRepository.append_message`` already performs."""
+
+    class _RecordingMessagesPg:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def append_message(self, **kwargs):
+            self.calls.append(kwargs)
+            return object()
+
+    recorder = _RecordingMessagesPg()
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager._deliver_local_user_message(live, "hello")
+        turn_id = live.turn_id
+        manager._repo._messages_pg = recorder
+        try:
+            await _pump(manager, live, [dict(_ASSISTANT)])
+        finally:
+            manager._repo._messages_pg = None
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["turn_id"] == turn_id
+
+    asyncio.run(_run())
+
+
 def test_send_user_message_threads_the_message_id_into_the_record(manager: ChatManager):
     async def _run():
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)

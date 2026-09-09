@@ -11877,7 +11877,8 @@ async def run_audit_prune(
 
 # ---------------------------------------------------------------------------
 # Track E3 Slice 1: scheduled retention pruning of the other unbounded
-# audit/activity trails (sync_history, llm_usage, agent_scope_snapshots)
+# audit/activity trails (sync_history, llm_usage, agent_scope_snapshots,
+# llm_calls)
 # ---------------------------------------------------------------------------
 
 
@@ -11886,7 +11887,7 @@ async def run_retention_prune(
     user: dict = Depends(require_admin),
 ):
     """Trigger the opt-in retention sweep for ``sync_history``,
-    ``llm_usage``, and ``agent_scope_snapshots``.
+    ``llm_usage``, ``agent_scope_snapshots``, and ``llm_calls``.
 
     Wraps :func:`src.audit_retention.run_retention_sweep`. The scheduler
     service hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as
@@ -11898,10 +11899,13 @@ async def run_retention_prune(
     standalone job (``run-audit-prune`` above, unchanged); ``usage_events``
     keeps its own standalone job (``POST /api/admin/usage/prune``) — see
     ``src/audit_retention.py``'s module docstring for why those two aren't
-    folded into this sweep.
+    folded into this sweep. ``llm_calls`` is Postgres-only (the LLM
+    observability ledger, design 2026-09-08); its pruner reports nothing
+    pruned on a DuckDB-backed instance rather than raising.
     """
     from app.instance_config import (
         get_agent_scope_snapshots_retention_days,
+        get_llm_calls_retention_days,
         get_llm_usage_retention_days,
         get_sync_history_retention_days,
     )
@@ -11911,6 +11915,7 @@ async def run_retention_prune(
         "sync_history": get_sync_history_retention_days(),
         "llm_usage": get_llm_usage_retention_days(),
         "agent_scope_snapshots": get_agent_scope_snapshots_retention_days(),
+        "llm_calls": get_llm_calls_retention_days(),
     }
     result = run_retention_sweep(windows)
 

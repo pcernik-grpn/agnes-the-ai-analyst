@@ -101,6 +101,12 @@ class ChatMessage:
     #: reports as unavailable rather than as zero.
     cache_read_tokens: Optional[int] = None
     cache_creation_tokens: Optional[int] = None
+    #: The chat turn that produced this row — the same id `usage_turns.
+    #: turn_uuid` and `llm_calls.turn_id` carry (design 2026-09-08 §3.2,
+    #: migration 0113). Postgres app-state only, same reasoning as the
+    #: cache columns above: NULL on the frozen DuckDB backend, which drops
+    #: the value on write.
+    turn_id: Optional[str] = None
 
 
 @dataclass

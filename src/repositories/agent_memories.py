@@ -41,7 +41,14 @@ class AgentMemoriesRepository:
         content: str,
         source_session_id: Optional[str],
         status: str = "pending",
+        source_turn_id: Optional[str] = None,
+        source_message_id: Optional[str] = None,
     ) -> None:
+        # `source_turn_id`/`source_message_id` (migration 0113, design
+        # 2026-09-08 §3.5) are Postgres-only — the frozen DuckDB app-state
+        # backend has no matching columns (A3), so both are accepted and
+        # silently dropped here rather than refused, the same accept-and-drop
+        # pattern as the chat_messages cache columns.
         now = datetime.now(timezone.utc)
         activated_at = now if status == "active" else None
         self.conn.execute(

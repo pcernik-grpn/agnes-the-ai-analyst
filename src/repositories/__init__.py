@@ -212,6 +212,9 @@ __all__ = [
     "sharepoint_collection_consolidation_repo",
     # SharePoint split-merge (crawl/facts state union) — Postgres-only
     "sharepoint_connection_merge_repo",
+    # LLM observability ledger + chat feedback (design 2026-09-08) — Postgres-only
+    "llm_calls_repo",
+    "chat_message_feedback_repo",
 ]
 
 
@@ -706,6 +709,20 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     # a separate, finer-grained table, not a second backend for it.
     "usage_turns": {
         PG: ("src.repositories.usage_turns_pg", "UsageTurnsPgRepository"),
+    },
+    # LLM observability ledger (design 2026-09-08) — POSTGRES-ONLY, A3
+    # ratchet: no DuckDB backend. Resolving this key on a DuckDB-backed
+    # instance raises RequiresPostgresBackend; the ledger sink
+    # (src.observability.llm_ledger) and UsageAccumulator.flush() both
+    # catch that and drop the rows at DEBUG rather than failing the call
+    # they are observing.
+    "llm_calls": {
+        PG: ("src.repositories.llm_calls_pg", "LlmCallsPgRepository"),
+    },
+    # Chat turn thumbs feedback (design 2026-09-08) — POSTGRES-ONLY, same
+    # reasoning as the entry above.
+    "chat_message_feedback": {
+        PG: ("src.repositories.chat_message_feedback_pg", "ChatMessageFeedbackPgRepository"),
     },
     # Corporate-memory detection run logs (issue #1971 Part 3) — POSTGRES-ONLY,
     # A3 ratchet: no DuckDB backend. Resolving this key on a DuckDB-backed
@@ -1265,3 +1282,18 @@ def sharepoint_collection_consolidation_repo() -> Any:
 
 def sharepoint_connection_merge_repo() -> Any:
     return _build("sharepoint_connection_merge")
+
+
+# LLM observability ledger (design 2026-09-08) — POSTGRES-ONLY. Raises
+# RequiresPostgresBackend on a DuckDB-backed instance; the ledger sink
+# (src.observability.llm_ledger.record_call) and UsageAccumulator.flush()
+# both catch that and drop the rows at DEBUG rather than failing the call
+# being observed.
+def llm_calls_repo() -> Any:
+    return _build("llm_calls")
+
+
+# Chat turn thumbs feedback (design 2026-09-08) — POSTGRES-ONLY, same
+# posture as llm_calls_repo above.
+def chat_message_feedback_repo() -> Any:
+    return _build("chat_message_feedback")

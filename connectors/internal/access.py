@@ -337,6 +337,59 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
             "edges_skipped_missing_endpoint": "Edges not written because their src/dst fact was gone by INSERT time — a race between concurrent extraction passes, never a producer mistake.",
         },
     ),
+    # Postgres-only, same reasoning as `agnes_turns`/`agnes_extraction_runs`/
+    # `agnes_facts_ingest_runs` above: `llm_calls` landed after the A3 freeze
+    # (Alembic revision 0113, no `src/db.py` ladder step), so it exists on
+    # Postgres alone.
+    InternalTable(
+        registry_id="agnes_llm_calls",
+        source_table="llm_calls",
+        filter_column="user_id",
+        filter_kind="user_id",
+        display_name="Agnes LLM calls",
+        description=(
+            "One row per LLM call across every workload — chat, agent API, "
+            "builders, extraction, corporate memory and the rest — with the "
+            "four token kinds, the USD cost as priced at write time and the "
+            "ids that join it to a chat turn, a worker job or an exported "
+            "trace. Your own rows only (admins see all). Postgres-backed "
+            "instances only. Server-side only; query with `agnes query`."
+        ),
+        column_descriptions={
+            "id": "Call id (uuid).",
+            "created_at": "When the call ended (when the row was written).",
+            "kind": "completion (chat broker forward) or generation (server-side trace_generation call).",
+            "workload": "Coarse kind of work: chat, agent_api, builder, extraction, corporate_memory, knowledge, semantic_layer, anonymization, ocr, vision, auto_title, readiness, store_guardrails, verification.",
+            "purpose": "Fine-grained call-site label, e.g. entity_builder_turn, facts_extraction, digest, tagger.",
+            "session_id": "Chat session id, when the call happened inside one.",
+            "turn_id": "Chat turn id (same id chat_messages.turn_id and usage_turns.turn_uuid carry), when known.",
+            "user_id": "Canonical caller id (users.id); the row-level filter keys on this. Never an email.",
+            "agent_id": "Owning agent profile id, when the call ran under one.",
+            "job_id": "Worker job id, when the call ran inside a background job.",
+            "subject_id": "What the call is about: an entity id for a builder, a document id for extraction, a session id for auto-title.",
+            "trace_id": "Exported span's trace id (hex), when OTLP export is on. NULL when export is off.",
+            "span_id": "Exported span's own id (hex), when OTLP export is on. NULL when export is off.",
+            "provider": "LLM SDK provider, e.g. anthropic, openai.",
+            "upstream": "Upstream label the broker forwarded to, or the provider name for a server-side generation.",
+            "model_requested": "Model the caller asked for.",
+            "model_response": "Model the provider actually reported serving, when different from model_requested (e.g. an alias resolved).",
+            "input_tokens": "Uncached input tokens for this call.",
+            "output_tokens": "Output tokens for this call.",
+            "cache_read_tokens": "Prompt-cache READ tokens (input served from cache; billed far below input_tokens).",
+            "cache_creation_tokens": "Prompt-cache WRITE tokens (input written into cache; billed above input_tokens).",
+            "cost_usd": "USD cost as priced at write time (src.llm_pricing), using priced_as's rates.",
+            "priced_as": "The rates this row was priced with: {price_key, input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok, batch_multiplier}. price_key='default' means the model was unknown and priced at the most expensive general-purpose tier.",
+            "latency_ms": "Call duration in milliseconds, when measured.",
+            "status": "ok or error.",
+            "error_type": "Error classification, when status=error.",
+            "http_status": "Upstream HTTP status code, when the call went through the broker.",
+            "prompt_chars": "Character length of the prompt content, when captured.",
+            "completion_chars": "Character length of the completion content, when captured.",
+            "stop_reason": "Model's own stop/finish reason, when reported.",
+            "stream_complete": "Whether a streamed completion reached its terminal event, when known.",
+            "response_truncated": "True when this row's usage was recovered from bounded head/tail buffers after an oversized stream overflowed the full-body mirror — tokens and cost are still real, only the content summary was cut short.",
+        },
+    ),
 )
 
 INTERNAL_TABLES_BY_ID: dict[str, InternalTable] = {t.registry_id: t for t in INTERNAL_TABLES}

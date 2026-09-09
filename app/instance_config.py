@@ -1978,6 +1978,23 @@ def get_llm_usage_retention_days() -> int:
         return 0
 
 
+def get_llm_calls_retention_days() -> int:
+    """How many days to keep ``llm_calls`` rows (the LLM observability
+    ledger, design 2026-09-08) before the daily ``retention-prune``
+    scheduler job deletes them.
+
+    Reads ``retention.llm_calls_days``. Default 0 = keep forever (the
+    prune is a no-op until an admin opts in). Postgres-only table — on a
+    DuckDB-backed instance the pruner resolves no repo and reports nothing
+    pruned rather than raising.
+    """
+    val = get_value("retention", "llm_calls_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
 def get_collections_search_max_chunks() -> int:
     """Server-side cap on how many chunks ``GET /api/collections/search`` (and
     the ``/api/knowledge/search`` chunk leg) may rank per request (#2151).
