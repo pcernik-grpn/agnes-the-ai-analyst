@@ -3363,6 +3363,13 @@ KNOWN_UNTESTED = {
     "GET /api/chat/sessions/{chat_id}/files/preview",
     "GET /api/chat/sessions/{chat_id}/files/raw",
     "POST /api/chat/sessions/{chat_id}/files/save-artefact",
+    # Thumbs feedback on a chat turn (LLM observability design §3.5) — a
+    # PG-only repo resolved as a dependency (typed 501 on DuckDB) rating a
+    # live turn on the caller's own session, same class as the sibling
+    # `{chat_id}` routes above; covered end to end in
+    # tests/test_chat_feedback_api.py (DuckDB gate/501/validation) and
+    # tests/db_pg/test_chat_feedback_pg.py (upsert, audit, log, span event).
+    "POST /api/chat/sessions/{chat_id}/feedback",
     "POST /api/chat/sessions/{chat_id}/ticket",
     "POST /api/chat/{session_id}/fork",
     "POST /api/chat/{session_id}/invite",

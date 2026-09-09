@@ -980,6 +980,52 @@ def end_tool_span(span: Any, *, is_error: bool) -> None:
             pass
 
 
+def emit_feedback_span(
+    *,
+    session_id: str | None,
+    turn_id: str | None,
+    user_id: str | None,
+    verdict: str | None,
+    has_comment: bool,
+    parent_context: Any = None,
+) -> None:
+    """A short span for one thumbs up/down submission (design 2026-09-08
+    §3.5): ``agnes.chat.feedback`` carrying one event ``agnes.feedback``,
+    opened and ended in the same call — there is nothing to time, only to
+    record that it happened. ``parent_context`` is the turn's own span
+    context (:func:`remote_parent_context`, read back from
+    ``chat:turn:{session_id}``) when the caller resolved one; ``None`` makes
+    this a root span rather than an error. No-op when export is off (the
+    tracer hands back a non-recording span either way) and never raises —
+    a feedback submission must land regardless of what the collector does
+    with it."""
+    attrs = _clean(
+        {
+            "agnes.kind": "feedback",
+            "agnes.session_id": session_id,
+            "agnes.turn_id": turn_id,
+            "agnes.user_id": user_id,
+            "agnes.verdict": verdict,
+        }
+    )
+    span = _open_span(
+        "agnes.chat.feedback",
+        attrs,
+        kind=SpanKind.INTERNAL if _OTEL_API else None,
+        parent_context=parent_context,
+    )
+    try:
+        span.add_event("agnes.feedback", {"agnes.verdict": verdict or "", "agnes.has_comment": bool(has_comment)})
+        span.set_status(StatusCode.OK)
+    except Exception:
+        logger.debug("otel: could not record the feedback event", exc_info=True)
+    finally:
+        try:
+            span.end()
+        except Exception:  # noqa: BLE001, S110 - see the sibling span-end blocks above
+            pass
+
+
 __all__ = [
     "CAPTURE_CONTENT_VAR",
     "COMPLETION_EVENT",
@@ -992,6 +1038,7 @@ __all__ = [
     "collector",
     "configure_otel",
     "describe_completion",
+    "emit_feedback_span",
     "end_completion_span",
     "end_generation_span",
     "end_tool_span",

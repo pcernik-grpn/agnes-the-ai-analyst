@@ -321,8 +321,9 @@ def test_cli_subcommands_registered():
     (``admin semantic coverage tables``). Hidden registrations count — a
     deprecated alias is still a reachable surface.
     """
-    from cli.main import app
     from typer.models import DefaultPlaceholder
+
+    from cli.main import app
 
     def invoke_without_command(group_info) -> bool:
         """Is this GROUP runnable on its own, per Typer's own resolution order?
@@ -1912,6 +1913,19 @@ _EXEMPT: dict[str, str] = {
         "web chat history-panel affordance — renames one of the caller's own "
         "conversations, the same column the Haiku auto-title writes; no "
         "analyst CLI/MCP analogue"
+    ),
+    # Thumbs on a completed assistant bubble (LLM observability design §3.5) —
+    # a web-chat UI affordance keyed on the live turn id the client learns
+    # from the WS frames. The admin read side is GET
+    # /api/admin/telemetry/feedback with `agnes admin usage feedback`; no
+    # analyst CLI/MCP analogue — an agent rating its own answers is not a
+    # signal.
+    "/api/chat/sessions/{chat_id}/feedback": (
+        "web-chat UI affordance keyed on the live turn id the client learns "
+        "from the WS frames; the admin read side is GET "
+        "/api/admin/telemetry/feedback with `agnes admin usage feedback`; no "
+        "analyst CLI/MCP analogue — an agent rating its own answers is not a "
+        "signal"
     ),
     # Chats page (/chats) archive lifecycle. Same class as pin/title: these
     # manage how the WEB inventory presents the caller's own conversations.

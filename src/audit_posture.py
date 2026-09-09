@@ -367,6 +367,7 @@ POSTURE: dict[str, str] = {
     "DELETE /api/chat/sessions/{chat_id}": "chat.session.archive",
     "DELETE /api/chat/sessions/{chat_id}/permanent": "chat.session.delete",
     "POST /api/chat/sessions": "chat.session.create",
+    "POST /api/chat/sessions/{chat_id}/feedback": "chat.feedback",
     "POST /api/chat/sessions/{chat_id}/ticket": "chat.session.ticket",
     "PUT /api/chat/journey": "chat.journey_update",
     "PUT /api/chat/sessions/{chat_id}/archived": "chat.session.archive",
