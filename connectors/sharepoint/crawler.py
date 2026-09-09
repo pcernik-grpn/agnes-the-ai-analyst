@@ -4385,6 +4385,59 @@ class _PreparedDocument:
     error_class: str = ""
 
 
+def anonymize_path_prefix(
+    rel_path: str, *, key: bytes, detector: Any, cache: Optional[Dict[str, str]] = None
+) -> str:
+    """Per-segment anonymization of a drive-relative FOLDER path — the folder
+    half of :func:`_anonymize_identity`, factored out because a SECOND caller
+    needs exactly it.
+
+    That caller is the ACL sweep's retroactive cleanup
+    (``connectors.sharepoint.acl_sync._cleanup_connection_content``, #2011):
+    the admin's exclusion/zone config holds the REAL folder path while an
+    anonymize-marked scope's ``corpus_files.path`` holds the redacted one, so
+    the cleanup has to derive the second from the first before it can
+    prefix-match anything at all. It must derive it through THIS function
+    rather than a second copy of the segment loop — two copies that drift
+    apart would silently reintroduce the exact "the purge finds nothing" bug
+    they exist to fix.
+
+    Each segment goes through the anonymizer independently and the ``"/"``
+    structure survives, so a real folder prefix maps to the anonymized prefix
+    every file under it was stored with (see :func:`_anonymize_identity` for
+    why the crawl stores it that way). Empty segments are dropped, so a
+    leading, trailing or doubled ``"/"`` normalizes identically on both sides
+    of that comparison.
+
+    Deterministic under one key *for a given detector and rule set* — which
+    is what makes the derivation possible at all. The regex tier is exactly
+    deterministic; the LLM tier is a reader, so a segment whose redaction
+    depended on an LLM detection (or on a custom term an operator has since
+    changed) may not reproduce identically on a later run. Reconstruction is
+    therefore best-effort on those tiers: it can miss a match, it can never
+    invent a wrong one.
+
+    ``cache`` (optional, ``segment -> anonymized segment``) memoizes across
+    calls that share it. On the LLM tier every distinct segment otherwise
+    costs its own model call, and a set of sibling folders shares nearly all
+    of its ancestor segments; passing one dict for a whole derivation pass
+    also guarantees that two prefixes sharing an ancestor get the SAME twin
+    even on a tier whose detections need not repeat.
+    """
+    segments: List[str] = []
+    for segment in rel_path.split("/"):
+        if not segment:
+            continue
+        if cache is not None and segment in cache:
+            segments.append(cache[segment])
+            continue
+        twin = str(anonymize_markdown(segment, key=key, detector=detector).text)
+        if cache is not None:
+            cache[segment] = twin
+        segments.append(twin)
+    return "/".join(segments)
+
+
 def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
     """The ``(path, filename)`` an anonymize-marked scope stores instead of
     the real ones — same key, same detector as the document body.
@@ -4396,10 +4449,11 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
     while the body is redacted.
 
     Each path SEGMENT is anonymized independently — not the path as one
-    string — and the ``"/"`` separator structure is kept: two files under
-    the same real folder still share the same anonymized folder prefix
-    (the substitution is deterministic under one key), so prefix matching,
-    the exclusion index and the corpus-map resolver keep working the same
+    string, see :func:`anonymize_path_prefix` — and the ``"/"`` separator
+    structure is kept: two files under the same real folder still share the
+    same anonymized folder prefix (the substitution is deterministic under
+    one key), so prefix matching, the exclusion index, the corpus-map
+    resolver and the ACL sweep's retroactive cleanup keep working the same
     SHAPE against the anonymized tree they worked against the real one, even
     though no segment is readable any more.
 
@@ -4418,10 +4472,9 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
     anonymized_stem = str(anonymize_markdown(stem, key=key, detector=detector).text)
     filename = f"{anonymized_stem}.md"
     folder = path.rsplit("/", 1)[0] if "/" in path else ""
-    segments = [
-        str(anonymize_markdown(segment, key=key, detector=detector).text) for segment in folder.split("/") if segment
-    ]
-    anonymized_path = "/".join([*segments, f"{anonymized_stem}{suffix}"])
+    prefix = anonymize_path_prefix(folder, key=key, detector=detector)
+    leaf = f"{anonymized_stem}{suffix}"
+    anonymized_path = f"{prefix}/{leaf}" if prefix else leaf
     return anonymized_path, filename
 
 
@@ -4434,46 +4487,6 @@ def _convert_failure_detail(detail_type: str, detail_message: str, *, anonymize:
     if not anonymize and detail_message:
         return detail_message
     return detail_type
-
-
-def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
-    """The ``(path, filename)`` an anonymize-marked scope stores instead of
-    the real ones — same key, same detector as the document body.
-
-    The source name and folder path are routinely the single most
-    re-identifying string in a document (a deal name, a client name); an
-    anonymize-marked scope's promise that "Agnes never holds the original at
-    all" (``docs/anonymization.md``) is broken if they survive verbatim
-    while the body is redacted.
-
-    Each path SEGMENT is anonymized independently — not the path as one
-    string — and the ``"/"`` separator structure is kept: two files under
-    the same real folder still share the same anonymized folder prefix
-    (the substitution is deterministic under one key), so prefix matching,
-    the exclusion index and the corpus-map resolver keep working the same
-    SHAPE against the anonymized tree they worked against the real one, even
-    though no segment is readable any more.
-
-    The returned ``path``'s leaf segment keeps the SOURCE file's extension
-    (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
-    mirroring the exact relationship the un-anonymized values already have.
-    Only the identity-bearing STEM changes, never the suffix.
-
-    Routing decisions (which collection, which exclusion rule) are made
-    EARLIER in the pipeline against the RAW path — those decisions come from
-    admin-configured real folder names and must see the real thing. This
-    function only prepares what gets PERSISTED.
-    """
-    stem = Path(name).stem or name
-    suffix = Path(name).suffix
-    anonymized_stem = str(anonymize_markdown(stem, key=key, detector=detector).text)
-    filename = f"{anonymized_stem}.md"
-    folder = path.rsplit("/", 1)[0] if "/" in path else ""
-    segments = [
-        str(anonymize_markdown(segment, key=key, detector=detector).text) for segment in folder.split("/") if segment
-    ]
-    anonymized_path = "/".join([*segments, f"{anonymized_stem}{suffix}"])
-    return anonymized_path, filename
 
 
 #: Signals whose only realistic cause on this pool is memory pressure
@@ -6727,6 +6740,23 @@ def _resolve_anonymization_key(scopes: Sequence[Dict[str, Any]]) -> Optional[byt
     return str(resolve()).encode("utf-8")
 
 
+def resolve_anonymizer(scopes: Sequence[Dict[str, Any]]) -> Tuple[Optional[bytes], Any]:
+    """``(key, detector)`` for a set of scopes — ``(None, None)`` when not one
+    of them anonymizes.
+
+    This pair was resolved by the same two lines at each of the crawl's own
+    entry points; it lives here once so a THIRD caller — the ACL sweep's
+    retroactive cleanup (``connectors.sharepoint.acl_sync``, #2011), which
+    has to re-derive an anonymize-marked scope's stored paths — gets the
+    identical resolution instead of a private lookalike. The detector is
+    built only when a key actually resolved, so an instance on the regex tier
+    never imports the LLM stack and one on the LLM tier never pays for a
+    detector nothing in this call will use.
+    """
+    key = _resolve_anonymization_key(scopes)
+    return key, (_entity_detector() if key is not None else None)
+
+
 async def _run_crawl_async(
     connection: Dict[str, Any],
     *,
@@ -6761,11 +6791,9 @@ async def _run_crawl_async(
     # `min_modified` is resolved PER SCOPE, inside the loop below (TCRD-296
     # gap #80 — a scope's own filter, falling back to the connection-wide
     # default) — see `resolve_min_modified`'s own docstring.
-    anonymization_key = _resolve_anonymization_key(scopes)
-    # Built once per run, and only when something in this run will actually
-    # anonymize — an instance on the regex tier never imports the LLM stack,
-    # and an instance on the LLM tier never pays for a detector no scope uses.
-    detector = _entity_detector() if anonymization_key is not None else None
+    # Both resolved once per run, and the detector only when something in this
+    # run will actually anonymize — see `resolve_anonymizer`.
+    anonymization_key, detector = resolve_anonymizer(scopes)
     max_file_mb = _max_file_mb()
     cap, configured_concurrency, concurrency_source = _resolve_concurrency(concurrency)
     deadline = _Deadline(_timeout_seconds() if timeout_s is None else timeout_s)
@@ -7958,8 +7986,7 @@ async def _run_shard_crawl_async(
     # (TCRD-296 gap #80) — a shard child crawls exactly ONE scope, so this
     # is the same per-scope resolution the inline path's loop does.
     min_modified, _min_modified_source = resolve_min_modified(connection, scope=scope)
-    anonymization_key = _resolve_anonymization_key([scope])
-    detector = _entity_detector() if anonymization_key is not None else None
+    anonymization_key, detector = resolve_anonymizer([scope])
     max_file_mb = _max_file_mb()
     cap, configured_concurrency, concurrency_source = _resolve_concurrency(payload.get("concurrency"))
     deadline = _Deadline(_timeout_seconds() if payload.get("timeout_s") is None else payload.get("timeout_s"))

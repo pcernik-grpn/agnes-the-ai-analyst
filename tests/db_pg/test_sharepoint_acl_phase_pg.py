@@ -88,7 +88,14 @@ def _make_connection(connection_id: str = "conn-s1-pg") -> str:
     return connection_id
 
 
-def _add_scope(connection_id: str, *, source_scope_id: str, collection_id: str, drive_id: str = "drive-1") -> None:
+def _add_scope(
+    connection_id: str,
+    *,
+    source_scope_id: str,
+    collection_id: str,
+    drive_id: str = "drive-1",
+    anonymize: bool = False,
+) -> None:
     from src.repositories import source_connections_repo
 
     repo = source_connections_repo()
@@ -99,7 +106,7 @@ def _add_scope(connection_id: str, *, source_scope_id: str, collection_id: str, 
         {
             "source_scope_id": source_scope_id,
             "display_path": source_scope_id,
-            "anonymize": False,
+            "anonymize": anonymize,
             "collection_id": collection_id,
             "drive_id": drive_id,
             "access_mode": "mirrored",
@@ -260,4 +267,55 @@ def test_stable_id_match_purges_file_outside_excluded_folder(pg_env, monkeypatch
     assert corpus_files_repo().list_for_corpus(col_id) == [], (
         "the file must be purged by its Graph stable id even though its local path "
         "falls outside the excluded item's own rel_path"
+    )
+
+
+def test_stable_id_match_is_unaffected_by_an_anonymize_marked_scope(pg_env, monkeypatch):
+    """#2011's fix only widens PATH matching for an anonymize-marked scope.
+    The file-kind (stable-id) branch never looked at ``path`` and must keep
+    purging by the Graph item id alone — here with the anonymizer's own key
+    deliberately absent from the environment, so a fix that had made the
+    stable-id branch depend on resolving one would fail this test."""
+    from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo, users_repo
+
+    monkeypatch.delenv("AGNES_ANONYMIZATION_HMAC_KEY", raising=False)
+
+    users_repo().create(id="uploader2", email="uploader2@test.com", name="Uploader")
+    col_id = file_corpora_repo().create(
+        name="Anon Stable Id Col", slug="anon-stable-id-col", description=None, created_by="uploader2"
+    )
+    conn_id = _make_connection("conn-s6-anon-pg")
+    _add_scope(conn_id, source_scope_id="root", collection_id=col_id, anonymize=True)
+
+    file_id = corpus_files_repo().add(
+        corpus_id=col_id,
+        filename="REDACTED.md",
+        sha256="sha-anon-f",
+        file_type="text/plain",
+        size_bytes=1,
+        storage_path=None,
+        # An anonymize-marked scope's stored path: redacted, and outside the
+        # excluded item's own rel_path either way.
+        path="PERSON_abc/PERSON_def.docx",
+    )
+    corpus_file_sources_repo().upsert(corpus_file_id=file_id, corpus_id=col_id, source_stable_id="graph:F")
+
+    monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+    async def fake_children(token, drive_id, item_id):
+        if item_id == "root":
+            return [{"id": "F", "name": "F.docx", "is_folder": False, "child_count": 0}]
+        raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+    async def fake_probe(token, drive_id, item_ids):
+        return {i: True for i in item_ids}
+
+    monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+    monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+    result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+    assert result["errors"] == []
+    assert corpus_files_repo().list_for_corpus(col_id) == [], (
+        "a file-kind exclusion must still purge by Graph stable id on an anonymize-marked scope"
     )

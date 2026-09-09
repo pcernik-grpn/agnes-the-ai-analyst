@@ -1755,6 +1755,48 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     return {"scopes": len(scopes), "excluded": excluded_total, "error": error}
 
 
+def _anonymized_prefixes(prefixes: List[str], *, key: bytes, detector: Any) -> List[str]:
+    """The anonymized twin of each real folder prefix, for an anonymize-marked
+    scope's retroactive cleanup (#2011) — see
+    :func:`_cleanup_connection_content`'s docstring for the whole picture.
+
+    Derived through the crawl's OWN segment anonymization
+    (``crawler.anonymize_path_prefix``), never a local re-implementation of
+    it: the two must agree exactly or the comparison this feeds is dead code.
+    Imported lazily — the crawler module imports THIS one at module level, so
+    the dependency can only run in this direction at call time.
+
+    One segment cache is shared across the whole list — sibling excluded
+    folders share ancestor segments, and on the LLM detector tier each
+    distinct segment is a model call.
+
+    A twin that comes back unchanged (nothing in the prefix was detectable) or
+    already present is dropped: it would only duplicate a comparison the
+    caller already makes. A prefix that cannot be derived at all is skipped
+    with a warning naming only the failure TYPE — never the message, which for
+    this call could quote the folder name being redacted.
+    """
+    from connectors.sharepoint.crawler import anonymize_path_prefix
+
+    derived: List[str] = []
+    segment_cache: Dict[str, str] = {}
+    for prefix in prefixes:
+        try:
+            twin = anonymize_path_prefix(prefix, key=key, detector=detector, cache=segment_cache)
+        except Exception as exc:  # noqa: BLE001 — any anonymizer failure (missing
+            # module, unusable custom terms, an LLM detector that cannot answer)
+            # costs this ONE prefix its anonymized form, never the pass.
+            logger.warning(
+                "sharepoint acl cleanup: could not derive the anonymized form of an excluded "
+                "prefix (%s) — already-ingested content under it may survive this pass",
+                type(exc).__name__,
+            )
+            continue
+        if twin and twin not in prefixes and twin not in derived:
+            derived.append(twin)
+    return derived
+
+
 def _cleanup_connection_content(
     connection: Dict[str, Any],
     exclusions_by_scope: Dict[str, List[Dict[str, Any]]],
@@ -1776,14 +1818,27 @@ def _cleanup_connection_content(
     — its subtree was never crawled, so nothing arrives for it under that
     path anyway.
 
-    KNOWN GAP, not yet closed (#2011): for an anonymize-marked scope, path
-    matching above compares an ANONYMIZED ``corpus_files.path`` against a
-    REAL ``rel_path`` (the admin's exclusion/zone config never was, and
-    should never be, anonymized) — they can never agree, so a folder
-    exclusion or zone dissolution added after a document was already
-    ingested into such a scope no longer retroactively purges it. Stable-id
-    (file-kind exclusion) matching is unaffected. See the inline comment at
-    the match site.
+    **Anonymize-marked scopes (#2011).** Such a scope's stored
+    ``corpus_files.path`` is the per-segment-redacted one the crawl wrote
+    (``crawler._anonymize_identity``), while the admin's exclusion/zone
+    config carries the REAL folder path — and must never carry anything
+    else. Comparing those two directly can never agree, so for such a scope
+    every real prefix is ALSO run through the crawl's own segment
+    anonymization (:func:`_anonymized_prefixes` ->
+    ``crawler.anonymize_path_prefix``, under the same instance key and
+    detector the crawl used — ``crawler.resolve_anonymizer``) and BOTH forms
+    are matched. Additive, never a swap: a scope crawled BEFORE an admin
+    marked it still holds rows carrying the real path, and an exclusion has
+    to keep reaching those. Stable-id (file-kind exclusion) matching never
+    looked at ``path`` and is untouched by any of this.
+
+    Reconstruction is exact on the deterministic (regex) detector tier. On
+    the LLM tier — or after an operator edits the custom-term list — a
+    segment whose redaction does not reproduce identically yields a prefix
+    that simply fails to match: a MISSED purge, never a wrong one. If the
+    key cannot be resolved at all, path matching for that scope falls back
+    to the real prefixes alone and says so in the log, rather than failing
+    the whole cleanup pass.
 
     Deletion uses the EXACT machinery ``DELETE /files/{id}`` uses
     (``app.api.collections._purge_file_row`` / ``_record_corpus_file_event``
@@ -1831,6 +1886,27 @@ def _cleanup_connection_content(
             return None
         return anchor.get("source_stable_id") if anchor else None
 
+    anonymizer: Optional["tuple[Optional[bytes], Any]"] = None
+
+    def _anonymizer() -> "tuple[Optional[bytes], Any]":
+        """This connection's ``(key, detector)``, resolved through the crawl's
+        own ``resolve_anonymizer`` (never a second copy of that resolution,
+        which owns the allowlist gate on the admin-writable env var NAME) at
+        most ONCE per call and only when a marked scope needs it. A failure to
+        resolve degrades to ``(None, None)`` — the caller then matches real
+        paths only and logs it — rather than taking down a cleanup pass whose
+        other scopes and whose whole stable-id half are unaffected."""
+        nonlocal anonymizer
+        if anonymizer is None:
+            from connectors.sharepoint.crawler import resolve_anonymizer
+
+            try:
+                anonymizer = resolve_anonymizer(list(scopes_by_id.values()))
+            except Exception as exc:  # noqa: BLE001 — see docstring
+                logger.warning("sharepoint acl cleanup: anonymization key unavailable: %s", exc)
+                anonymizer = (None, None)
+        return anonymizer
+
     zones_by_parent: Dict[str, List[Dict[str, Any]]] = {}
     for zone in zone_rows_all:
         parent = zone.get("parent_scope_id")
@@ -1853,26 +1929,32 @@ def _cleanup_connection_content(
             if z.get("status") == "active" and z.get("rel_path")
         ]
         prefixes = folder_prefixes + zone_prefixes
+        if prefixes and scope.get("anonymize"):
+            # An anonymize-marked scope stores the REDACTED path, so the real
+            # prefixes above can never match one of its rows on their own
+            # (#2011). Add each one's anonymized twin — additive, so a row
+            # ingested before the scope was marked still matches the real
+            # form. Resolved at most once per call, and only once a marked
+            # scope actually has a prefix to derive.
+            key, detector = _anonymizer()
+            if key is None:
+                logger.warning(
+                    "sharepoint acl cleanup: scope %s is anonymize-marked but no anonymization key "
+                    "resolved — matching real paths only, so already-ingested content under a newly "
+                    "excluded folder or a newly promoted zone may survive this pass",
+                    source_scope_id,
+                )
+            else:
+                prefixes = prefixes + _anonymized_prefixes(prefixes, key=key, detector=detector)
         if not prefixes and not excluded_file_ids:
             continue
 
         removed_here = 0
         for row in corpus_files_repo().list_for_corpus(collection_id):
-            # KNOWN GAP for an anonymize-marked scope: `row["path"]` is the
-            # ANONYMIZED path once the source scope anonymizes (the crawler
-            # never stores the real one — see
-            # `connectors.sharepoint.crawler._anonymize_identity`), but
-            # `prefix` below is the REAL folder path an admin picked in the
-            # exclusion/zone UI. The two can never prefix-match each other,
-            # so a folder-kind exclusion or a zone dissolution added AFTER a
-            # document was already ingested into such a scope silently stops
-            # retroactively purging it here — file-kind exclusions (the
-            # `excluded_file_ids` stable-id branch below) are UNAFFECTED.
-            # Tracked, not silently accepted (#2011): reconstructing `prefix`
-            # through the same per-instance anonymization (deterministic, so
-            # it CAN be derived) is the fix; it needs the scope's own
-            # key/detector threaded in here, which is more than this pass
-            # does today.
+            # `prefixes` already carries the anonymized twin of every real
+            # prefix when this scope is anonymize-marked (see above and
+            # #2011), which is what lets one comparison serve both a scope
+            # that redacts its stored paths and one that does not.
             path = row.get("path")
             matched = bool(path and any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes))
             if not matched and excluded_file_ids:
