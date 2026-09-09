@@ -37,9 +37,12 @@
 - **The corpus can also be pushed on a schedule.**
   `observability.conversation_export` (`endpoint`, `headers_secret_env`,
   `interval_minutes`, `surfaces`) turns on a `conversation-export` worker job
-  that delivers newline-delimited JSON batches to the endpoint, advancing a
-  Postgres-persisted watermark only after a 2xx, under the same
-  content-export policy as the pull. Migration `0114_export_watermarks`.
+  that delivers newline-delimited JSON batches to the endpoint (at most 200
+  records or 8 MiB each; three retries with backoff on a 5xx or a connection
+  error, never on a 4xx), advancing a Postgres-persisted keyset watermark
+  (`last_message_at`, session id) only after a 2xx, under the same
+  content-export policy as the pull. A run that fails mid-walk is audited as
+  failed, never raised into the worker. Migration `0114_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and
   `agnes.subject_id`; the `llm_generation` log line gains `workload`, `purpose`
