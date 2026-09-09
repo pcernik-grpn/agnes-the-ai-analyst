@@ -1354,6 +1354,37 @@ class TestActivityTool:
         params = get_mock.call_args.kwargs["params"]
         assert params["since_ts"] == "2026-09-09T09:00:00+00:00"
 
+    def test_whitespace_only_cursor_id_is_forwarded_and_the_servers_400_propagates(self):
+        """`bool(cursor_id)` only catches an EXACTLY-empty cursor_id — a
+        whitespace-only one ("   ") is truthy in Python, so it passes the
+        tool's own `bool(cursor_ts) != bool(cursor_id)` check and gets
+        forwarded like any real id (PR #2400 follow-up: verified, not
+        assumed, that this layer cannot silently reproduce the row-loss
+        defect). The server's own guard (app/api/activity.py) is what
+        actually rejects it — this tool has no local check for it — and
+        that 400 must surface here as a loud error, never a silently
+        accepted page."""
+        import httpx
+
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "cursor_id must not be empty or whitespace-only."}, status=400)
+            resp.text = "cursor_id must not be empty or whitespace-only."
+            resp.reason_phrase = "Bad Request"
+            resp.request = httpx.Request("GET", "http://server/api/admin/activity")
+            get_mock = AsyncMock(return_value=resp)
+            MC.return_value.__aenter__.return_value.get = get_mock
+
+            with pytest.raises(httpx.HTTPStatusError, match="cursor_id"):
+                _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00", cursor_id="   "))
+
+        # It really was forwarded, not silently dropped — confirms the
+        # server-side guard is the layer actually doing the rejecting.
+        params = get_mock.call_args.kwargs["params"]
+        assert params["cursor_id"] == "   "
+
 
 # ── my_secret_test tool ──────────────────────────────────────────────────────
 

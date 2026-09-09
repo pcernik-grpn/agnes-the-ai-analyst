@@ -717,3 +717,94 @@ def test_half_cursor_id_only_is_rejected_at_endpoint(seeded_app, admin_user):
     )
     assert r.status_code == 400
     assert "cursor_ts" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Empty/whitespace cursor_id — row loss, not just a half-cursor pair
+#
+# "" and "   " are not None, so `(cursor_ts is None) != (cursor_id is None)`
+# waves them through as a "complete" cursor. Keyset pagination then compares
+# `(timestamp, id) < (cursor_ts, cursor_id)` — no real id is ever less than
+# an empty (or whitespace-only) string, so every row sharing cursor_ts's
+# exact timestamp silently vanishes from every remaining page. This is
+# silent row loss, not a 4xx: the response looks like a normal, valid page.
+# ---------------------------------------------------------------------------
+
+
+def test_blank_cursor_id_would_silently_drop_every_row_tied_on_cursor_ts(seeded_app, admin_user):
+    """Prove the row-loss mechanism itself, then prove the endpoint now
+    refuses to ever let a caller reach it.
+
+    Two rows share the exact same timestamp. At the repository layer, a
+    cursor whose id is "" excludes BOTH of them — real, demonstrated data
+    loss, not a hypothetical (`id < ""` is false for every real id, so the
+    tie-break the id half exists to resolve can never fire). The endpoint
+    must reject a blank cursor_id outright rather than let this call shape
+    ever reach the repository.
+    """
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    id_a = repo.log(action="test.tied.a", result="success")
+    id_b = repo.log(action="test.tied.b", result="success")
+    tied_ts = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+    conn.execute("UPDATE audit_log SET timestamp = ? WHERE id IN (?, ?)", [tied_ts, id_a, id_b])
+
+    # The mechanism: a cursor with an empty id, pinned at the exact tied
+    # timestamp, excludes BOTH rows that share it.
+    rows, _ = repo.query_unified(action_prefix="test.tied.", cursor=(tied_ts, ""), limit=10)
+    assert rows == [], (
+        "sanity check on the row-loss mechanism failed — if this fires, the repository "
+        "changed its tie-break semantics and the rest of this test no longer proves anything"
+    )
+
+    # Confirm the rows are real and reachable with a genuine id — the
+    # emptiness of the id above, not the rows' absence, is what caused
+    # the loss.
+    rows_with_real_cursor, _ = repo.query_unified(action_prefix="test.tied.", cursor=(tied_ts, "￿"), limit=10)
+    conn.close()
+    returned = {r["action"] for r in rows_with_real_cursor}
+    assert {"test.tied.a", "test.tied.b"} <= returned
+
+    # The endpoint must never let a caller reach the empty-id call shape —
+    # loud 400, not a silent 200 that drops both tied rows.
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"action_prefix": "test.tied.", "cursor_ts": tied_ts.isoformat(), "cursor_id": ""},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_id" in r.json()["detail"]
+
+
+def test_whitespace_only_cursor_id_is_rejected_at_endpoint(seeded_app, admin_user):
+    """Same defect, different degenerate value — a whitespace-only id is
+    also not None and is lexicographically ahead of every alphanumeric id,
+    so it silently drops tied rows the same way "" does. Must be rejected
+    the same way, not merely the exact-empty-string case."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_ts": "2026-09-09T12:00:00+00:00", "cursor_id": "   "},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_id" in r.json()["detail"]
+
+
+def test_cursor_ts_cannot_arrive_as_an_empty_string(seeded_app, admin_user):
+    """Unlike cursor_id (a plain str), cursor_ts is typed as a datetime —
+    FastAPI/pydantic rejects an empty-string value with 422 before this
+    endpoint's own validation ever runs, so there is no equivalent
+    empty-string degenerate form to guard here. This test pins that
+    verified behavior rather than leaving it assumed."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_ts": "", "cursor_id": "abc-123"},
+        headers=admin_user,
+    )
+    assert r.status_code == 422

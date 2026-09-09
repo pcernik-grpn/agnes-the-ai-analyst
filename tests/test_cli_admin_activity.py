@@ -305,6 +305,21 @@ class TestCursorPagination:
         assert r.exit_code != 0
         assert "--cursor" in _clean(r.output)
 
+    def test_whitespace_only_cursor_id_reaches_the_server_and_is_rejected_there(self, cli_admin):
+        """`_parse_cursor`'s `not cid` check only catches an EXACTLY-empty
+        id — a whitespace-only one ("   ") is truthy, so it passes local
+        validation and is forwarded like any real id (PR #2400 follow-up:
+        verified, not assumed, that the CLI cannot silently reproduce the
+        row-loss defect this way). The real FastAPI backend behind
+        `cli_admin` is what rejects it — the CLI has no local check for
+        this specific shape — and that 400 must surface as a clean,
+        non-zero exit, never a silently accepted (and row-dropping) page."""
+        runner, app = cli_admin
+        cursor_arg = json.dumps({"ts": "2026-09-09T10:00:00+00:00", "id": "   "})
+        r = runner.invoke(app, ["--cursor", cursor_arg, "--json"])
+        assert r.exit_code != 0
+        assert "cursor_id" in _clean(r.output)
+
     def test_empty_cursor_flag_value_is_rejected(self, cli_admin):
         """`--cursor ''` used to guard with `if cursor:`, and the empty
         string is falsy — the empty value skipped _parse_cursor entirely,

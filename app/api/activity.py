@@ -120,6 +120,22 @@ def activity_timeline(
             "Pass both halves from a prior page's next_cursor, or neither for a fresh read.",
         )
 
+    # An empty or whitespace-only cursor_id ("" or "?cursor_id=  ") is not
+    # None, so the pair check above waves it through as a "complete"
+    # cursor. Keyset pagination then compares (timestamp, id) < (cursor_ts,
+    # cursor_id) — no real id is ever less than "" (or a whitespace-only
+    # string, which is lexicographically ahead of every alphanumeric id
+    # too), so every row sharing cursor_ts's exact timestamp silently
+    # vanishes from every remaining page. Reject the blank value as
+    # malformed instead of letting it reach the repository as a value.
+    if cursor_id is not None and not cursor_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="cursor_id must not be empty or whitespace-only. Pass the id half "
+            "verbatim from a prior page's next_cursor, or omit both cursor_ts and "
+            "cursor_id for a fresh read.",
+        )
+
     if since_ts is not None:
         if cursor_ts is None:
             raise HTTPException(
