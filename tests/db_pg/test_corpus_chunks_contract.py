@@ -619,22 +619,22 @@ def test_search_candidates_finds_a_chunk_matching_only_some_query_terms(repo):
     )
 
 
-def test_search_candidates_multi_term_does_not_drop_the_rare_term(pg_repo):
+def test_search_candidates_multi_term_does_not_drop_the_rare_term(repo):
     """Per-term fairness: a term common to every chunk must not crowd the
     rare term's chunk out of a tight candidate window.
 
     ``scope`` is in all four chunks, ``riveron`` in exactly one. One OR'd
-    ``LIMIT`` fills entirely with ``scope`` rows; a window per term does
-    not.
+    ``LIMIT`` fills entirely with ``scope`` rows; a reserved share per term
+    does not.
 
-    PG-only on purpose. The DuckDB sibling does no ranking in this query at
-    all — rows come back in ``(file_id, ordinal)`` order and ``rank_chunks``
-    re-sorts them — so per-term windows would return the identical row set,
-    and which rows survive a FILLED cap is arbitrary there by documented
-    design (that backend is frozen at the scale it already has; the corpus
-    this matters for is Postgres). See ``search_candidates`` on both.
+    Cross-engine, and it took a review round to get there: this was first
+    written PG-only on the theory that the DuckDB sibling — which does no
+    ranking in this query — would return the identical row set either way,
+    and that the defect only bit a large corpus. Both halves were wrong.
+    Four chunks and a window of two reproduce it, and the row set differs.
+    The DuckDB implementation now reserves a share per term in its own
+    flavor (see its ``search_candidates``).
     """
-    repo = pg_repo
     repo.add_many(
         [
             {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "scope of work one"},

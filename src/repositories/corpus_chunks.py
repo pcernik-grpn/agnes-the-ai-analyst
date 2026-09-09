@@ -288,19 +288,29 @@ class CorpusChunksRepository:
         ``list_embeddings_for_ids``. Empty ``corpus_ids`` or a query with
         no indexable tokens → ``[]``.
 
-        This backend has ALWAYS been any-term (each token OR'd), which is
-        why the 2026-09 multi-word-selection bug — a natural-language
-        question selecting no candidates at all because no single chunk
-        carried every word — was Postgres-only: that sibling selected with
-        ``plainto_tsquery`` alone, whose semantics are AND. Nothing about
-        the any-term prefilter here needed changing, and it is NOT given
-        the PG sibling's per-term-window fan-out: with no ranking in this
-        query (rows come back in ``(file_id, ordinal)`` order either way and
-        ``rank_chunks`` re-sorts them), per-term windows would return the
-        identical row set for the identical cost. Which rows survive a
-        FILLED cap is therefore arbitrary on this backend and stays
-        arbitrary — a large-corpus concern, and this backend is frozen at
-        the scale it already has.
+        Two things the 2026-09 multi-word fix changed, and one it did not.
+
+        Not changed: this backend has ALWAYS been any-term (each token
+        OR'd), which is why the multi-word-SELECTION bug — a
+        natural-language question selecting no candidates at all because no
+        single chunk carried every word — was Postgres-only. That sibling
+        selected with ``plainto_tsquery`` alone, whose semantics are AND.
+
+        Changed: per-term FAIRNESS, mirroring the PG sibling in this
+        backend's own flavor. One OR'd ``LIMIT`` lets the query's commonest
+        term consume the whole window and crowd out the rare term that
+        identifies the document — with four chunks and a window of two, the
+        single chunk containing the rare term was dropped, so this is not a
+        large-corpus-only concern; any FILLED window has it. Each term now
+        gets a reserved share of the window (``ceil(limit / len(terms))``),
+        and the remainder is topped up by the original OR'd query, so a
+        query whose only matching term is one of eight still fills its
+        window instead of being starved by the reservation. Ordering within
+        the candidate set is not meaningful either way — ``rank_chunks``
+        re-sorts it — so only WHICH rows survive the cap changes.
+
+        The single-term case is unchanged by construction: one term's share
+        IS the whole window, so it runs exactly the query it always did.
 
         ``path_prefix`` narrows to files under one folder; see the PG
         sibling's ``_path_prefix_clause`` for why.
@@ -310,17 +320,56 @@ class CorpusChunksRepository:
         terms = _ilike_terms(query)
         if not terms:
             return []
+        rows: list[Any] = []
+        seen: set[str] = set()
+        if len(terms) > 1:
+            share = -(-limit // len(terms))  # ceil, so every term gets >= 1
+            for term in terms:
+                for row in self._ilike_candidates(corpus_ids, [term], limit=share, path_prefix=path_prefix):
+                    if row[0] not in seen:
+                        seen.add(row[0])
+                        rows.append(row)
+        # Top up (or, for a single term, fill) from the plain any-term query:
+        # de-duplication can leave the reserved shares short, and a query
+        # whose matches all sit under one term must not be capped at that
+        # term's share.
+        if len(rows) < limit:
+            for row in self._ilike_candidates(corpus_ids, terms, limit=limit, path_prefix=path_prefix):
+                if row[0] in seen:
+                    continue
+                seen.add(row[0])
+                rows.append(row)
+                if len(rows) >= limit:
+                    break
+        return [dict(zip(_COLS_NO_EMBED, r), embedding=None) for r in rows[:limit]]
+
+    def _ilike_candidates(
+        self,
+        corpus_ids: list[str],
+        terms: list[str],
+        *,
+        limit: int,
+        path_prefix: str | None = None,
+    ) -> list[Any]:
+        """Raw rows for chunks matching ANY of ``terms``, bounded by ``limit``.
+
+        The one query ``search_candidates`` used to be, factored out so it
+        can serve both a single term's reserved share and the any-term
+        top-up without the two drifting apart. Returns raw tuples (the
+        caller builds the dicts) so the de-duplication above can key on
+        ``row[0]`` — ``id``, the first column of ``_SELECT_NO_EMBED`` —
+        without materializing a dict per candidate it may discard.
+        """
         placeholders = ", ".join("?" for _ in corpus_ids)
         term_clause = " OR ".join("text ILIKE ?" for _ in terms)
         scope_sql, scope_params = self._path_prefix_clause(path_prefix, corpus_ids, alias="")
         params: list[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + scope_params + [limit]
-        rows = self.conn.execute(
+        return self.conn.execute(
             f"SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
             f"WHERE corpus_id IN ({placeholders}) AND ({term_clause}) {scope_sql} "
             f"ORDER BY file_id, ordinal LIMIT ?",
             params,
         ).fetchall()
-        return [dict(zip(_COLS_NO_EMBED, r), embedding=None) for r in rows]
 
     def search_by_filename(
         self, corpus_ids: list[str], terms: list[str], *, limit: int, path_prefix: str | None = None
