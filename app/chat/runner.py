@@ -249,6 +249,7 @@ _READ_ONLY_AGNES_MCP_TOOLS = frozenset(
         "collections_search",
         "data_app_get",
         "data_app_logs",
+        "data_app_share_get",
         "data_apps_list",
         "describe",
         "knowledge_search",

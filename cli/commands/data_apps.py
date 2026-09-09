@@ -14,9 +14,26 @@ Consumes the control-plane REST surface documented in
   - ``open <slug>``                   GET    /api/data-apps/{slug}          (prints url only)
   - ``stop <slug>``                   POST   /api/data-apps/{slug}/stop
   - ``delete <slug>``                 DELETE /api/data-apps/{slug}
+  - ``share <slug>``                  GET    /api/sharing/data_app/{slug}
+  - ``share <slug> --group/--everyone/--private``
+                                       PUT    /api/sharing/data_app/{slug}
+  - ``set-identity <slug> owner|viewer``
+                                       PATCH  /api/data-apps/{slug}
 
 ``open`` is deliberately print-only — no browser launch — so headless
 environments (CI, remote shells) behave identically to a desktop one.
+
+``share`` mirrors the owner-scoped Library sharing API
+(``app/api/sharing.py``) for the ``data_app`` resource type: with no mutation
+flags it shows the current sharing state (visibility, group names); with
+``--group``/``--everyone``/``--private`` it sets the desired END STATE — the
+call replaces the whole audience list, it never adds to it.
+
+``set-identity`` sets which identity the app's own server-side data calls run
+as (``owner`` — the creator, today's default — or ``viewer`` — the caller
+currently loading the app), and redeploys the app when it's already running.
+Postgres-backed instances only (A3 PG-first ratchet) — a DuckDB-backed
+instance answers a typed 501, surfaced as a friendly message.
 
 ``draft create``/``draft delete``/``git-credential`` are wave 3B's
 draft-iteration surface (Task 8) — a draft shares its prod parent's git
@@ -38,7 +55,7 @@ from typing import Optional
 import httpx
 import typer
 
-from cli.client import api_delete, api_get, api_patch, api_post
+from cli.client import api_delete, api_get, api_patch, api_post, api_put
 from cli.config import get_token
 
 data_apps_app = typer.Typer(help="Manage hosted data apps")
@@ -82,6 +99,8 @@ _ERROR_MESSAGES = {
         " data_apps.deploy_checks is set to 'block', which refuses a deploy it can't scan."
         " Ask an admin to switch it to 'warn' (or 'off') for external-repo apps."
     ),
+    # Sharing (`app share`) — mirrors app/api/sharing.py's set_shares ValueError.
+    "group_not_shareable": "You can only share with a group you belong to, plus Everyone.",
 }
 
 
@@ -115,6 +134,15 @@ def _detail(resp) -> str:
         body = resp.json()
     except Exception:
         return resp.text
+    # A3 PG-first ratchet: a PG-only feature (e.g. `set-identity`) on a
+    # DuckDB-backed instance — the typed 501 body's `detail` is already a full
+    # sentence (see `RequiresPostgresBackend`), but this is a friendlier,
+    # consistent one-liner every PG-only CLI command uses.
+    if isinstance(body, dict) and body.get("error") == "requires_postgres_backend":
+        return (
+            "Requires the Postgres app-state backend — this instance still runs the frozen"
+            " DuckDB backend. Migrate it (see docs/migrations.md) to use this command."
+        )
     detail = body.get("detail", "") if isinstance(body, dict) else str(body)
     if isinstance(detail, dict):
         # Deploy-time exposure scan (#1946): a structured `{"error": ...}`
@@ -148,6 +176,17 @@ def _print_deploy_check(report: Optional[dict]) -> None:
 def _not_found(slug: str) -> None:
     typer.echo(f"Data app not found: {slug}", err=True)
     typer.echo("Try: agnes app list  — to see the apps you can access.", err=True)
+    raise typer.Exit(1)
+
+
+def _sharing_not_found(slug: str) -> None:
+    """The sharing endpoints 404 (never 403) a caller who doesn't own the app —
+    see ``app/api/sharing.py::_require_owned`` — so this reads exactly like a
+    missing app, not a permission wall."""
+    typer.echo(
+        f"Data app not found or not yours: {slug} — only the owner or an Admin can manage sharing.",
+        err=True,
+    )
     raise typer.Exit(1)
 
 
@@ -585,3 +624,172 @@ def delete_app(
         _fail(resp)
 
     typer.echo(f"Deleted: {slug}")
+
+
+# ---------------------------------------------------------------------------
+# share
+# ---------------------------------------------------------------------------
+
+# The "share with the whole workspace" sentinel — a literal, not a real
+# group's uuid — see src.grant_scopes.EVERYONE_TARGET_ID and app/api/sharing.py.
+_EVERYONE_TARGET_ID = "everyone"
+
+
+def _fetch_share_groups() -> list[dict]:
+    """Audiences the caller may share into, per ``GET /api/sharing/groups`` —
+    ``[{id, name, is_everyone}]``, the "everyone" sentinel included."""
+    resp = api_get("/api/sharing/groups")
+    if resp.status_code != 200:
+        _fail(resp)
+    return resp.json()
+
+
+def _resolve_group_ids(names: list[str], groups: list[dict]) -> list[str]:
+    """Resolve each ``--group`` value to a group id — a raw id as-is, a name
+    case-insensitively. Unknown values fail loudly, listing what IS available,
+    rather than silently dropping an audience the caller asked for."""
+    by_id = {g["id"] for g in groups}
+    by_name = {g["name"].lower(): g["id"] for g in groups}
+    resolved: list[str] = []
+    unknown: list[str] = []
+    for raw in names:
+        if raw in by_id:
+            resolved.append(raw)
+        elif raw.lower() in by_name:
+            resolved.append(by_name[raw.lower()])
+        else:
+            unknown.append(raw)
+    if unknown:
+        available = ", ".join(sorted(g["name"] for g in groups))
+        typer.echo(f"Unknown group(s): {', '.join(unknown)}. Available: {available}", err=True)
+        raise typer.Exit(1)
+    return resolved
+
+
+def _print_share_state(state: dict, groups: list[dict]) -> None:
+    names_by_id = {g["id"]: g["name"] for g in groups}
+    typer.echo(f"Visibility: {state.get('visibility', '')}")
+    group_ids = state.get("group_ids") or []
+    if group_ids:
+        # A group id with no matching name (not in `/api/sharing/groups`,
+        # e.g. one the caller can no longer share into) is printed raw rather
+        # than dropped — the audience is still real even if unnamed here.
+        typer.echo(f"Shared with: {', '.join(names_by_id.get(gid, gid) for gid in group_ids)}")
+    else:
+        typer.echo("Shared with: (private)")
+    pending = state.get("pending_group_ids") or []
+    if pending:
+        typer.echo(f"Pending approval: {', '.join(names_by_id.get(gid, gid) for gid in pending)}")
+
+
+@data_apps_app.command("share")
+def share_app(
+    slug: str = typer.Argument(..., help="App slug"),
+    group: list[str] = typer.Option(
+        [], "--group", help="Group name (or id) to share with — repeatable; case-insensitive"
+    ),
+    everyone: bool = typer.Option(False, "--everyone", help="Share with the whole workspace"),
+    private: bool = typer.Option(False, "--private", help="Make the app private again (clears all sharing)"),
+    json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Show or set who a data app is shared with (owner/Admin only).
+
+    With no flags, prints the current sharing state — visibility plus the
+    group names it's shared with. With ``--group``/``--everyone``/
+    ``--private``, sets the DESIRED END STATE: the call replaces the whole
+    audience list, it does not add to it, so a repeat with a narrower
+    ``--group`` set drops the groups left out. ``--private`` clears sharing
+    entirely and cannot be combined with ``--group``/``--everyone``.
+    """
+    if private and (group or everyone):
+        typer.echo("--private cannot be combined with --group/--everyone.", err=True)
+        raise typer.Exit(1)
+
+    if not group and not everyone and not private:
+        resp = api_get(f"/api/sharing/data_app/{slug}")
+        if resp.status_code == 404:
+            _sharing_not_found(slug)
+        if resp.status_code != 200:
+            _fail(resp)
+        state = resp.json()
+        if json:
+            typer.echo(json_lib.dumps(state, indent=2, default=str))
+            return
+        _print_share_state(state, _fetch_share_groups())
+        return
+
+    groups = _fetch_share_groups()
+    group_ids: list[str] = [] if private else _resolve_group_ids(group, groups)
+    if everyone and _EVERYONE_TARGET_ID not in group_ids:
+        group_ids.append(_EVERYONE_TARGET_ID)
+
+    resp = api_put(f"/api/sharing/data_app/{slug}", json={"group_ids": group_ids})
+    if resp.status_code == 404:
+        _sharing_not_found(slug)
+    # 403 (`group_not_shareable`) falls through to `_fail`, same as any other
+    # unmapped status — `_ERROR_MESSAGES` gives it a friendly line.
+    if resp.status_code not in (200, 202):
+        _fail(resp)
+
+    state = resp.json()
+    if json:
+        typer.echo(json_lib.dumps(state, indent=2, default=str))
+        return
+    _print_share_state(state, groups)
+    if resp.status_code == 202:
+        typer.echo("(some groups are queued for admin approval — see 'Pending approval' above)")
+
+
+# ---------------------------------------------------------------------------
+# set-identity
+# ---------------------------------------------------------------------------
+
+
+def _print_redeploy(redeploy: dict | None) -> None:
+    if not redeploy:
+        return
+    if not redeploy.get("triggered"):
+        typer.echo("Redeploy: not triggered (app has no active deployment).")
+        return
+    ok = redeploy.get("ok")
+    if ok is False:
+        detail = redeploy.get("detail", "")
+        typer.echo(f"Redeploy: triggered, failed — {detail}" if detail else "Redeploy: triggered, failed")
+    else:
+        typer.echo("Redeploy: triggered")
+
+
+@data_apps_app.command("set-identity")
+def set_identity(
+    slug: str = typer.Argument(..., help="App slug"),
+    data_identity: str = typer.Argument(..., help="'owner' or 'viewer'"),
+    json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Set which identity a data app's own server-side data calls run as (owner/Admin only).
+
+    ``owner`` (today's default) runs the app's data calls as the app's
+    creator — the app sees everything its owner can. ``viewer`` narrows that
+    to the caller currently loading the app, so a shared app's data access
+    follows whoever is looking at it rather than always its creator.
+    Redeploys the app when it's already running (see the ``Redeploy:`` line).
+
+    Postgres-backed instances only (A3 PG-first ratchet) — a DuckDB-backed
+    instance answers a friendly "requires the Postgres app-state backend"
+    error instead.
+    """
+    if data_identity not in ("owner", "viewer"):
+        typer.echo("data_identity must be 'owner' or 'viewer'.", err=True)
+        raise typer.Exit(1)
+
+    resp = api_patch(f"/api/data-apps/{slug}", json={"data_identity": data_identity})
+    if resp.status_code == 404:
+        _not_found(slug)
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    if json:
+        typer.echo(json_lib.dumps(body, indent=2, default=str))
+        return
+    typer.echo(f"Data identity: {body.get('data_identity', data_identity)}")
+    _print_redeploy(body.get("redeploy"))

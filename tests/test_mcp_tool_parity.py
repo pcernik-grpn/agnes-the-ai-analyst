@@ -188,6 +188,15 @@ def test_data_apps_preview_tools_are_foundation_tools():
         assert name in FOUNDATION_TOOL_NAMES
 
 
+def test_data_apps_sharing_tools_are_foundation_tools():
+    """Owner-scoped sharing + data-identity for the `data_app` resource type
+    (TCRD-291)."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in ("data_app_share_get", "data_app_share", "data_app_set_data_identity"):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
 def test_data_app_tool_names_is_subset_of_foundation():
     """The data-app family constant may not drift from the foundation list."""
     from app.api.mcp.foundation_tools import (
@@ -257,6 +266,9 @@ STDIO_TOOL_NAMES = frozenset(
         "data_app_git_credential",
         "data_app_logs",
         "data_app_set_description",
+        "data_app_share_get",
+        "data_app_share",
+        "data_app_set_data_identity",
         "agnes_data_app_preview",
         "agnes_data_app_refresh",
         "agnes_data_app_close",

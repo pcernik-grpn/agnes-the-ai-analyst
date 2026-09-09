@@ -67,6 +67,7 @@ from app.api.data_apps import (
     same_origin_serving_allowed,
     try_acquire_op_lease,
 )
+from app.auth.data_app_viewer import VIEWER_HEADER_PREFIX, build_viewer_headers, viewer_via
 from app.auth.dependencies import _get_db, get_current_user
 from app.auth.rate_limit import limiter as _rate_limiter
 from app.auth.jwt import verify_token
@@ -173,6 +174,12 @@ _HOP_BY_HOP = {
 # headers are never checked against this set — a data app setting its OWN
 # `Set-Cookie` on the way back is legitimate and none of this proxy's business.
 _CREDENTIAL_HEADERS = {"authorization", "cookie"}
+
+# Every inbound header in the `x-agnes-viewer*` family is stripped too, by
+# lowercase PREFIX (`VIEWER_HEADER_PREFIX`), before the proxy adds its own
+# `X-Agnes-Viewer` / `X-Agnes-Viewer-Token` (`app/auth/data_app_viewer.py`).
+# A plain dict → httpx would otherwise emit BOTH the caller's forged copy and
+# ours; stripping first is what makes the header the app receives ours alone.
 
 _TOUCH_DEBOUNCE_TTL_S = 30
 
@@ -604,9 +611,10 @@ def _error_response(row: dict) -> Response:
     )
 
 
-async def _proxy(request: Request, slug: str, path: str) -> Response:
+async def _proxy(request: Request, slug: str, path: str, viewer_headers: Optional[dict[str, str]] = None) -> Response:
     """Stream-proxy one request to ``agnes-dataapp-<slug>``'s runtime
-    container.
+    container. ``viewer_headers`` (``build_viewer_headers``) are added after
+    the caller's own `x-agnes-viewer*` headers have been stripped.
 
     Deliberately does NOT use ``async with _upstream_client() as client:
     ...; return StreamingResponse(...)`` (a shape that would close the
@@ -620,7 +628,9 @@ async def _proxy(request: Request, slug: str, path: str) -> Response:
     headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in _CREDENTIAL_HEADERS
+        if k.lower() not in _HOP_BY_HOP
+        and k.lower() not in _CREDENTIAL_HEADERS
+        and not k.lower().startswith(VIEWER_HEADER_PREFIX)
     }
     # A subdomain-origin request (rewritten by
     # app/data_apps_subdomain.py, which stamps this scope marker) serves
@@ -628,6 +638,8 @@ async def _proxy(request: Request, slug: str, path: str) -> Response:
     # unlike the `/apps/<slug>/...` path-prefix form of the same route.
     if not request.scope.get("agnes_data_app_subdomain"):
         headers["X-Forwarded-Prefix"] = f"/apps/{slug}"
+    if viewer_headers:
+        headers.update(viewer_headers)
 
     client = _upstream_client()
     try:
@@ -719,8 +731,13 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
     state = row["state"]
 
     if state == "running":
+        # Minted HERE and nowhere earlier: after RBAC, after the same-origin
+        # gate, and only for a request that is actually going to be served
+        # from the container — a holding page carries no identity. Off the
+        # event loop: the group lookup behind the assertion is a DB read.
+        viewer_headers = await run_in_threadpool(build_viewer_headers, row, user, viewer_via(user, via_preview))
         try:
-            return await _proxy(request, slug, path)
+            return await _proxy(request, slug, path, viewer_headers)
         except (httpx.ConnectError, httpx.ConnectTimeout):
             # A refused connection is not proof the app is broken, and this
             # is a latch: nothing clears `error` except a redeploy, because
@@ -854,6 +871,10 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
 
     _touch(row)
 
+    # Same placement rule as the HTTP handler: after every gate, only for a
+    # handshake that is actually going upstream.
+    viewer_headers = await run_in_threadpool(build_viewer_headers, row, user, viewer_via(user, via_preview))
+
     await websocket.accept()
 
     query = f"?{websocket.url.query}" if websocket.url.query else ""
@@ -861,13 +882,14 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
 
     import websockets
 
-    # No caller headers (incl. `Authorization`/`Cookie`) are forwarded to the
+    # No CALLER headers (incl. `Authorization`/`Cookie`) are forwarded to the
     # upstream handshake at all — same credential-hygiene guarantee as the
-    # HTTP proxy's `_CREDENTIAL_HEADERS` strip, just trivially satisfied here
-    # since this bridge never builds a header dict from `websocket.headers`
-    # in the first place.
+    # HTTP proxy's `_CREDENTIAL_HEADERS` strip, trivially satisfied here since
+    # this bridge never builds a header dict from `websocket.headers`. The
+    # ONLY headers added are the proxy's own viewer identity headers
+    # (`app/auth/data_app_viewer.py`), exactly as on the HTTP path.
     try:
-        async with websockets.connect(upstream_url) as upstream:
+        async with websockets.connect(upstream_url, additional_headers=viewer_headers) as upstream:
 
             async def client_to_upstream() -> None:
                 try:

@@ -456,14 +456,20 @@ def _identity_for_audit(user) -> tuple:
     ``AgentPrincipal`` reports its owner (the request legitimately runs on
     the owner's behalf, just intersection-narrowed — same call
     ``app.marketplace_server.packager._diag_identity`` makes for
-    ``/marketplace/info``); a ``SessionPrincipal`` reports neither, since a
-    co-session has several live participants and naming one would
-    misattribute the others' actions.
+    ``/marketplace/info``); a ``DataAppViewerPrincipal`` reports its VIEWER
+    (a hosted app querying as whoever is looking at it — the owner would be
+    the wrong name on the row); a ``SessionPrincipal`` reports neither, since
+    a co-session has several live participants and naming one would
+    misattribute the others' actions. Mirrors
+    ``src.audit_helpers.identity_for_audit``.
     """
     from app.auth.session_principal import PRINCIPAL_TYPES
 
     if isinstance(user, PRINCIPAL_TYPES):
-        return getattr(user, "owner_user_id", None), getattr(user, "owner_email", None)
+        return (
+            getattr(user, "viewer_user_id", None) or getattr(user, "owner_user_id", None),
+            getattr(user, "viewer_email", None) or getattr(user, "owner_email", None),
+        )
     return user.get("id"), user.get("email")
 
 

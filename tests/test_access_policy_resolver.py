@@ -571,3 +571,38 @@ class TestEndToEndDuckDbPathResolutionRefusal:
         assert body["detail"]["reason"] == "policy_error"
         assert body["detail"]["table"] == "invoices"
         assert "rows" not in body, "an error response must never carry a rows key"
+
+
+class TestDataAppViewerPrincipalBindsViewer:
+    """A hosted data app in viewer mode (`data_identity='viewer'`) queries as
+    a ``DataAppViewerPrincipal`` -- ``$user_*`` binds to whoever is LOOKING
+    at the app, never to the app's owner, and never the Admin bypass."""
+
+    @staticmethod
+    def _viewer_principal(viewer_user_id="u_solo", viewer_email="solo@example.com"):
+        from app.auth.session_principal import DataAppViewerPrincipal
+
+        return DataAppViewerPrincipal(
+            slug="sales",
+            app_id="app_1",
+            owner_user_id="u_owner",
+            owner_email="owner@example.com",
+            viewer_user_id=viewer_user_id,
+            viewer_email=viewer_email,
+            intersection={},
+        )
+
+    def test_binds_the_viewer_not_the_owner(self, policy_env):
+        result = policied_relation("tbl_contracts", self._viewer_principal())
+
+        assert result.policied is True
+        assert result.params["user_id"] == "u_solo"
+        assert result.params["user_email"] == "solo@example.com"
+        assert set(result.params["user_groups"]) == {"Finance", "Marketing"}
+
+    def test_an_admin_viewer_is_still_filtered(self, policy_env):
+        """A restricted principal is never admin, whichever identity it names."""
+        result = policied_relation("tbl_contracts", self._viewer_principal("u_admin", "admin@example.com"))
+
+        assert result.policied is True
+        assert result.params["user_id"] == "u_admin"

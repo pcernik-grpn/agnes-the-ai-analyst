@@ -39,7 +39,7 @@ import duckdb
 from fastapi import Depends, HTTPException, Request, status
 
 from app.auth.dependencies import _get_db, get_current_user
-from app.auth.session_principal import AgentPrincipal, PRINCIPAL_TYPES, Principal, SessionPrincipal
+from app.auth.session_principal import PRINCIPAL_TYPES, Principal
 from app.resource_types import ResourceType
 from src.db import SYSTEM_ADMIN_GROUP
 
@@ -530,12 +530,14 @@ def can_access_session(
     already built without the admin short-circuit, so consulting either here
     would re-introduce god-mode through the back door.
 
-    Any future ``Principal`` outside this pair may carry no
-    ``intersection`` at all. Fail closed here rather than raise ``AttributeError`` — this
-    is what makes ``require_resource_access``/``require_collection_access``
-    403 such a principal cleanly on every route that doesn't know it
-    exists, instead of 500ing."""
-    if not isinstance(principal, (SessionPrincipal, AgentPrincipal)):
+    Keyed on ``PRINCIPAL_TYPES`` (not a hard-coded pair) so a new
+    restricted-principal kind — ``DataAppViewerPrincipal`` was the one that
+    exposed this — is admitted here the moment it joins the tuple, instead of
+    being silently denied on every ``require_resource_access`` route. Anything
+    outside the tuple may carry no ``intersection`` at all: fail closed rather
+    than raise ``AttributeError``, which is what makes those dependencies 403
+    an unknown principal cleanly instead of 500ing."""
+    if not isinstance(principal, PRINCIPAL_TYPES):
         return False
     return resource_id in principal.intersection.get(resource_type, frozenset())
 

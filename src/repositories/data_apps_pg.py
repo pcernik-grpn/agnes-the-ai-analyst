@@ -430,3 +430,20 @@ class DataAppsPgRepository:
                 {"t": text, "slug": slug},
             )
             return (result.rowcount or 0) > 0
+
+    def set_data_identity(self, slug: str, value: str) -> bool:
+        """Set ``data_identity`` (``'owner'`` | ``'viewer'``) on a row —
+        Postgres-only column (revision 0113); the DuckDB sibling raises
+        ``RequiresPostgresBackend``. Returns False if the slug does not
+        exist. ``ValueError`` on any other value: the column has no CHECK
+        constraint, so this is where the vocabulary is enforced."""
+        from src.data_apps.identity import DATA_IDENTITIES
+
+        if value not in DATA_IDENTITIES:
+            raise ValueError(f"data_identity must be one of {sorted(DATA_IDENTITIES)}, got {value!r}")
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                sa.text("UPDATE data_apps SET data_identity = :v, updated_at = now() WHERE slug = :slug"),
+                {"v": value, "slug": slug},
+            )
+            return (result.rowcount or 0) > 0

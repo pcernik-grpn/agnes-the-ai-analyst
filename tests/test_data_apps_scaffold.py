@@ -19,6 +19,7 @@ def test_scaffold_has_runtime_contract():
     assert (ROOT / "keboola-config" / "setup.sh").is_file()
     assert (ROOT / "server" / "index.ts").is_file()
     assert (ROOT / "server" / "agnesQuery.ts").is_file()
+    assert (ROOT / "server" / "agnesViewer.ts").is_file()
     assert (ROOT / "supervisord.conf").is_file()
     assert (ROOT / "src" / "App.tsx").is_file()
     assert (ROOT / "src" / "main.tsx").is_file()
@@ -43,6 +44,34 @@ def test_agnesquery_uses_env_token():
 def test_no_keboola_design_dependency():
     pkg = (ROOT / "package.json").read_text()
     assert "@keboola/design" not in pkg
+
+
+def test_agnes_viewer_uses_node_crypto_only():
+    """agnesViewer.ts verifies the signed viewer header with node:crypto
+    alone — no JWT library, no new npm dependency."""
+    src = (ROOT / "server" / "agnesViewer.ts").read_text()
+    import_lines = [line for line in src.splitlines() if line.strip().startswith("import ")]
+    assert import_lines, "expected at least one import statement"
+    for line in import_lines:
+        assert '"node:crypto"' in line or '"express"' in line, f"unexpected import: {line}"
+    assert "createHmac" in src
+    assert "timingSafeEqual" in src
+
+    pkg = (ROOT / "package.json").read_text()
+    assert '"jsonwebtoken"' not in pkg
+    assert '"jose"' not in pkg
+    assert "jwt" not in pkg.lower()
+
+
+def test_agnesquery_prefers_viewer_token():
+    """runQuery must send the viewer token (when present) rather than always
+    falling back to the owner-scoped AGNES_TOKEN — see agnes-query.md
+    "X-Agnes-Viewer-Token"."""
+    src = (ROOT / "server" / "agnesQuery.ts").read_text()
+    assert "viewerToken" in src
+    assert "viewerToken ?? AGNES_TOKEN" in src
+    assert "AGNES_DATA_IDENTITY" in src
+    assert "DATA_IDENTITY" in src
 
 
 def test_nginx_routes_8888_to_3000():

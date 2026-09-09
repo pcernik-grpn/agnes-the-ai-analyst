@@ -42,7 +42,7 @@ from mcp.server.fastmcp import FastMCP
 from cli.client import api_get
 from cli.config import get_server_url, get_token
 from cli.query_hints import missing_table, remote_table_hint
-from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
+from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json, api_put_json
 from src.duckdb_conn import _open_duckdb
 from src.mcp_tooling import (
     compact_search_results,
@@ -895,6 +895,128 @@ def data_app_set_description(slug: str, description: str) -> dict:
         return api_patch_json(f"/api/data-apps/{slug}", {"description": description})
     except V2ClientError as exc:
         raise ValueError(_mcp_error(f"data_app_set_description({slug})", exc)) from exc
+
+
+def _get_share_groups() -> list[dict]:
+    """``GET /api/sharing/groups`` returns a JSON array, not the ``dict``
+    ``api_get_json`` is typed for (the same pre-existing looseness
+    ``data_apps_list`` above hits for ``GET /api/data-apps``) — narrow it back
+    here so the sharing helpers below get an honest ``list[dict]``."""
+    return api_get_json("/api/sharing/groups")  # type: ignore[return-value]
+
+
+def _resolve_share_group_ids(names: list[str], available: list[dict]) -> list[str]:
+    """Resolve each ``--group``-style value (raw id or case-insensitive name)
+    to a group id, mirroring ``cli/commands/data_apps.py::_resolve_group_ids``.
+    Raises ``ValueError`` (not a bare mismatch) so an unknown name surfaces as
+    a tool error the caller/model can act on."""
+    by_id = {g["id"] for g in available}
+    by_name = {g["name"].lower(): g["id"] for g in available}
+    resolved: list[str] = []
+    unknown: list[str] = []
+    for raw in names:
+        if raw in by_id:
+            resolved.append(raw)
+        elif raw.lower() in by_name:
+            resolved.append(by_name[raw.lower()])
+        else:
+            unknown.append(raw)
+    if unknown:
+        known = ", ".join(sorted(g["name"] for g in available))
+        raise ValueError(f"unknown group(s) {unknown}; available: {known}")
+    return resolved
+
+
+def _share_state_dict(state: dict, available: list[dict]) -> dict:
+    names_by_id = {g["id"]: g["name"] for g in available}
+    group_ids = state.get("group_ids") or []
+    return {
+        "visibility": state.get("visibility"),
+        "group_ids": group_ids,
+        "groups": [{"id": gid, "name": names_by_id.get(gid, gid)} for gid in group_ids],
+        "pending_group_ids": state.get("pending_group_ids") or [],
+        "available_groups": available,
+    }
+
+
+@tool(read_only=True)
+def data_app_share_get(slug: str) -> dict:
+    """Show a hosted data app's sharing state — app owner or Admin only.
+
+    Args:
+        slug: The app's slug.
+
+    Returns ``{"visibility", "group_ids", "groups": [{"id", "name"}],
+    "pending_group_ids", "available_groups": [{"id", "name", "is_everyone"}]}``
+    — ``groups`` resolves ``group_ids`` to names via ``available_groups`` (a
+    group id not found there is left as-is rather than guessed).
+    Mirrors ``GET /api/sharing/data_app/{slug}`` + ``GET /api/sharing/groups``
+    and ``agnes app share <slug>``.
+    """
+    try:
+        state = api_get_json(f"/api/sharing/data_app/{slug}")
+        available = _get_share_groups()
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error(f"data_app_share_get({slug})", exc)) from exc
+    return _share_state_dict(state, available)
+
+
+#: `data_app_share` is a bare noun on its own — pin a title with a verb rather
+#: than let it derive to one, matching the HTTP foundation tool's explicit
+#: title (test_stdio_and_http_agree_on_shared_tool_behaviour).
+@tool(read_only=False, idempotent=True, title="Update Data App Sharing")
+def data_app_share(slug: str, groups: list[str] | None = None, everyone: bool = False) -> dict:
+    """Set which groups a hosted data app is shared with — app owner or Admin only.
+
+    Sets the DESIRED END STATE: replaces the whole audience list rather than
+    adding to it, so the default (``groups`` empty, ``everyone=False``) makes
+    the app private.
+
+    Args:
+        slug:     The app's slug.
+        groups:   Group names (case-insensitive) or ids from
+                  ``data_app_share_get``'s ``available_groups``. Empty/omitted
+                  (default) shares with no named group.
+        everyone: Share with the whole workspace in addition to ``groups``.
+
+    Returns the same shape as ``data_app_share_get``. Mirrors
+    ``PUT /api/sharing/data_app/{slug}`` and ``agnes app share <slug>
+    --group ... [--everyone] [--private]``.
+    """
+    try:
+        available = _get_share_groups()
+        group_ids = _resolve_share_group_ids(groups or [], available)
+        if everyone and "everyone" not in group_ids:
+            group_ids.append("everyone")
+        state = api_put_json(f"/api/sharing/data_app/{slug}", {"group_ids": group_ids})
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error(f"data_app_share({slug})", exc)) from exc
+    return _share_state_dict(state, available)
+
+
+@tool(read_only=False, idempotent=True)
+def data_app_set_data_identity(slug: str, data_identity: Literal["owner", "viewer"]) -> dict:
+    """Set which identity a hosted data app's own data calls run as — app owner or Admin only.
+
+    ``"owner"`` (today's default) runs the app's server-side data calls as its
+    creator; ``"viewer"`` narrows that to the caller currently loading the
+    app, so a shared app's data access follows the viewer rather than always
+    the creator. Redeploys the app when it's already running.
+
+    Args:
+        slug:          The app's slug.
+        data_identity: ``"owner"`` or ``"viewer"``.
+
+    Returns the updated app dict plus
+    ``{"redeploy": {"triggered": bool, "ok"?: bool, "detail"?: str}}``. Mirrors
+    ``PATCH /api/data-apps/{slug}`` and ``agnes app set-identity``.
+    Postgres-backed instances only (A3 PG-first ratchet) — a DuckDB-backed
+    instance raises a ``requires_postgres_backend`` error.
+    """
+    try:
+        return api_patch_json(f"/api/data-apps/{slug}", {"data_identity": data_identity})
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error(f"data_app_set_data_identity({slug})", exc)) from exc
 
 
 @tool(read_only=False)
