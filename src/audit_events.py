@@ -1531,12 +1531,15 @@ CATALOG: dict[str, AuditEvent] = {
         "The instance's effective content-export policy (mode, placement, approver) at startup.",
     ),
     # -- 2026-09-08 LLM observability design §3.12 -- the evaluation-corpus
-    # export (pull). One row per request: window, count, content_mode,
-    # placement and delivery -- never the exported content itself.
+    # export, both deliveries (pull and the scheduled push sink). One row
+    # per pull request or push batch: window, count, content_mode,
+    # placement and delivery ("pull"/"push") -- never the exported content
+    # itself.
     "conversations.export": AuditEvent(
         "conversations.export",
         "read",
-        "A conversation-corpus export was read (admin pull, under the content-export policy).",
+        "A conversation-corpus export was delivered -- an admin's pull request or a "
+        "scheduled push-sink batch -- under the content-export policy.",
     ),
 }
 

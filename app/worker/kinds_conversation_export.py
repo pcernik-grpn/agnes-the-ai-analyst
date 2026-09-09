@@ -13,6 +13,26 @@ newline-delimited JSON batches to ``observability.conversation_export
 answers 2xx, so a failed delivery is retried on the next tick rather than
 silently skipped, and a delivered one is never resent from scratch.
 
+**The watermark is a keyset position, not a record timestamp.** It is
+``(last_message_at, id)`` of the last DELIVERED ``chat_sessions`` row —
+straight from ``iter_conversations``'s own ``keys`` return, never from a
+delivered record's own ``conversation_end`` (the last MESSAGE's
+timestamp, which can diverge from the session's ``last_message_at`` — a
+forked session bumps the latter without moving the former). Resuming with
+``list_completed_between(..., after=(watermark, cursor_id))`` — the same
+strict ``>`` keyset clause an in-run page uses to turn its own page — is
+what makes a run's first page and a run's Nth page (and the FIRST page of
+the NEXT run) all resume identically, and is what stops the trailing
+conversation of a run from being re-sent on every subsequent tick.
+
+**``surfaces`` is pushed into the query, not filtered after the fact.**
+``observability.conversation_export.surfaces`` reaches
+``list_completed_between``'s own ``surface = ANY(...)`` clause via
+``iter_conversations``, so a row this instance will never deliver is never
+fetched at all — the walk's keyset only ever advances across rows that
+were actually sent, and an excluded surface never causes the same filtered
+tail to be re-fetched and re-discarded on every tick.
+
 **Registered unconditionally, no-ops when unconfigured** — the same
 posture as ``distribution-mirror``/``ducklake-maintenance`` in
 ``app/worker/kinds.py``: a stray/manual enqueue on an instance that never
@@ -37,15 +57,26 @@ watermark never moves. Warned once per process, not once per tick — an
 operator who never turns the policy on should not get a scheduler-cadence
 flood of the same warning.
 
+**Errors never escape this job** (spec 3.9: a sink swallows its own
+exceptions). A ``RequiresPostgresBackend`` becomes a clean skip; any other
+exception raised mid-walk is caught, logged, audited with
+``result="failed"`` and the exception's CLASS NAME (never its message,
+which could carry content or a header value) in ``params``, and the job
+returns ``{"failed": "<ClassName>"}`` rather than raising — the worker
+runtime's own generic failure handling is for a truly unexpected fault
+elsewhere in the dispatch path, not for this job's own delivery loop.
+
 Single-run discipline: the scheduler's own enqueue is idempotency-keyed
 (``idempotency_key="conversation-export"``, see
 ``services/scheduler/__main__.py``) so a second tick while one run is
 still queued/running is a no-op at the QUEUE level; this module's
-``run_once`` additionally takes a non-blocking Postgres advisory lock
-(``src.db_pg.conversation_export_lease``) as belt-and-braces against a
-stray manual enqueue or two worker replicas racing to claim two different
-job rows — the exact same two-layer shape ``knowledge-packaging`` already
-uses (see ``app/worker/kinds.py::_run_knowledge_packaging``).
+``run_conversation_export`` additionally takes a non-blocking Postgres
+advisory lock (``src.db_pg.conversation_export_lease``) as belt-and-braces
+against a stray manual enqueue or two worker replicas racing to claim two
+different job rows — the exact same two-layer shape ``knowledge-packaging``
+already uses (see ``app/worker/kinds.py::_run_knowledge_packaging``). The
+lease is acquired only AFTER the cheap config/policy gates below (no DB
+connection at all on an unconfigured or policy-off instance).
 """
 
 from __future__ import annotations
@@ -62,7 +93,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from src.audit_helpers import log_safe
-from src.conversation_export import ConversationExportRepoBundle, iter_conversations, serialize_jsonl
+from src.conversation_export import ConversationExportRepoBundle, encode_cursor, iter_conversations, serialize_jsonl
 from src.observability.content_policy import content_export_mode, export_text, load_content_export_policy
 from src.observability.otel import parse_otlp_headers
 
@@ -78,10 +109,13 @@ IDEMPOTENCY_KEY = "conversation-export"
 #: Spec 3.12: "batches of at most 200 records or 8 MiB".
 MAX_BATCH_RECORDS = 200
 MAX_BATCH_BYTES = 8 * 1024 * 1024
-#: Spec 3.12: "retried with backoff" — three attempts total (one send plus
-#: two retries), matching ``LLMDetector``'s own attempt/backoff shape
-#: (``src/anonymization_ner.py``).
-MAX_ATTEMPTS = 3
+#: Spec 3.12 / docs/observability.md: "retried three times" — three RETRIES
+#: after the first attempt, four attempts total, exponential backoff
+#: (1s, 2s, 4s between attempts). A non-5xx response (2xx success, or a
+#: 4xx — incl. 429 — the destination will never accept on retry within
+#: this run) never consumes a retry; only a 5xx or a connection-level
+#: error does.
+MAX_ATTEMPTS = 4
 RETRY_BACKOFF_S = 1.0
 HTTP_TIMEOUT_S = 30.0
 #: Page size for the underlying ``iter_conversations`` walk — independent
@@ -110,6 +144,27 @@ def _warn_policy_off_once() -> None:
             "observability.content_export in instance.yaml"
         )
         _warned_policy_off = True
+
+
+def _quick_skip_reason() -> str | None:
+    """The two gates that need no database connection at all: is the sink
+    configured, and does the content-export policy allow workload
+    ``chat``. Checked BEFORE the advisory lease (``run_conversation_export``
+    below) so a stray/manual enqueue on an unconfigured or policy-off
+    instance never opens a Postgres connection for nothing. Returns the
+    skip reason, or ``None`` when the run should proceed — in which case
+    :func:`run_conversation_export_once` re-checks both anyway (cheap, and
+    it is also called directly without going through this gate in tests
+    and in a hand-run pass).
+    """
+    from app.instance_config import get_conversation_export_config
+
+    if get_conversation_export_config() is None:
+        return "not_configured"
+    if content_export_mode(workload="chat") == "off":
+        _warn_policy_off_once()
+        return "content_export_disabled"
+    return None
 
 
 def _repo_bundle() -> dict[str, Any]:
@@ -154,50 +209,59 @@ def _resolve_headers(headers_secret_env: str | None) -> dict[str, str]:
     return parse_otlp_headers(raw)
 
 
+#: One yielded item: a corpus record paired with the exact keyset position
+#: (from the underlying ``chat_sessions`` row) it was built from.
+_RecordAndKey = tuple[dict[str, Any], tuple[datetime, str]]
+
+
 def _records(
     bundle: ConversationExportRepoBundle,
     *,
     since: datetime,
     until: datetime,
     surfaces: tuple[str, ...],
-) -> Iterator[dict[str, Any]]:
-    """Every conversation-corpus record completed in ``[since, until)``, in
-    one strictly-ordered walk across ALL surfaces (the underlying keyset
-    cursor is ``(last_message_at, id)`` regardless of surface) — filtering
-    by ``surfaces`` client-side rather than per-surface queries keeps the
-    walk a single ordered stream, which is what makes "advance the
-    watermark to this batch's latest record" safe: batches never
-    interleave out of order the way per-surface sub-loops could.
+    start_cursor: str | None,
+) -> Iterator[_RecordAndKey]:
+    """Every conversation-corpus record completed in ``[since, until)``,
+    paired with its ``(last_message_at, id)`` keyset key, in one
+    strictly-ordered walk. ``surfaces`` is pushed straight into
+    ``iter_conversations``'s own query (never filtered on the returned
+    records) so the walk only ever touches rows this run will actually
+    deliver. ``start_cursor`` resumes the walk from the persisted
+    watermark's exact position — the SAME cursor mechanism a second page
+    within this run uses, so "resume this run" and "resume the last run"
+    are one code path, not two.
     """
-    cursor: str | None = None
+    cursor = start_cursor
     while True:
-        page, next_cursor = iter_conversations(bundle, since=since, until=until, limit=PAGE_LIMIT, cursor=cursor)
-        for record in page:
-            if surfaces and record.get("surface") not in surfaces:
-                continue
-            yield record
+        page, next_cursor, keys = iter_conversations(
+            bundle, since=since, until=until, surfaces=surfaces or None, limit=PAGE_LIMIT, cursor=cursor
+        )
+        yield from zip(page, keys, strict=True)
         if next_cursor is None:
             return
         cursor = next_cursor
 
 
-def _batches(records: Iterable[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
-    """Split an ordered record stream into outbound batches of at most
-    :data:`MAX_BATCH_RECORDS` records or :data:`MAX_BATCH_BYTES` (whichever
-    is hit first). A single record whose own serialized line already
-    exceeds the byte cap is still sent alone — spec 3.12 says this export
-    is "complete, never truncated", so there is no smaller unit to split
-    it into.
+def _batches(items: Iterable[_RecordAndKey]) -> Iterator[list[_RecordAndKey]]:
+    """Split an ordered (record, key) stream into outbound batches of at
+    most :data:`MAX_BATCH_RECORDS` records or :data:`MAX_BATCH_BYTES`
+    (whichever is hit first) — batch boundaries, not page boundaries,
+    since a page and a batch are sized independently. A single record
+    whose own serialized line already exceeds the byte cap is still sent
+    alone — spec 3.12 says this export is "complete, never truncated", so
+    there is no smaller unit to split it into.
     """
-    batch: list[dict[str, Any]] = []
+    batch: list[_RecordAndKey] = []
     batch_bytes = 0
-    for record in records:
+    for item in items:
+        record, _key = item
         line_bytes = len(json.dumps(record, default=str).encode("utf-8")) + 1
         if batch and (len(batch) >= MAX_BATCH_RECORDS or batch_bytes + line_bytes > MAX_BATCH_BYTES):
             yield batch
             batch = []
             batch_bytes = 0
-        batch.append(record)
+        batch.append(item)
         batch_bytes += line_bytes
     if batch:
         yield batch
@@ -212,11 +276,14 @@ def _post_with_retry(
     sleep: Callable[[float], None],
 ) -> httpx.Response | None:
     """POST one ndjson batch, retrying up to :data:`MAX_ATTEMPTS` total
-    attempts on a 5xx response or a connection-level error (spec 3.12).
-    A non-5xx response (2xx success, or a 4xx the destination will never
-    accept on retry) returns immediately without consuming a retry.
-    Returns ``None`` only when every attempt raised a connection error;
-    otherwise returns the last response received, whatever its status.
+    attempts on a 5xx response or a connection-level error (spec 3.12),
+    with exponential backoff (1s, 2s, 4s between attempts). A non-5xx
+    response (2xx success, or a 4xx — incl. 429 — the destination will
+    never accept on retry within this run) returns immediately without
+    consuming a retry, and the run's watermark stays wherever the last
+    successful batch left it. Returns ``None`` only when every attempt
+    raised a connection error; otherwise returns the last response
+    received, whatever its status.
     """
     response: httpx.Response | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -226,7 +293,7 @@ def _post_with_retry(
             logger.warning("conversation-export: POST failed (attempt %d/%d): %s", attempt, MAX_ATTEMPTS, exc)
             response = None
             if attempt < MAX_ATTEMPTS:
-                sleep(RETRY_BACKOFF_S * attempt)
+                sleep(RETRY_BACKOFF_S * (2 ** (attempt - 1)))
                 continue
             return None
         if response.status_code >= 500:
@@ -237,7 +304,7 @@ def _post_with_retry(
                 MAX_ATTEMPTS,
             )
             if attempt < MAX_ATTEMPTS:
-                sleep(RETRY_BACKOFF_S * attempt)
+                sleep(RETRY_BACKOFF_S * (2 ** (attempt - 1)))
                 continue
         return response
     return response
@@ -250,13 +317,14 @@ def run_conversation_export_once(
 ) -> dict[str, Any]:
     """One push-sink pass: resolve config + policy, walk records since the
     watermark, POST them in batches, advance the watermark after each
-    batch a 2xx acknowledges, audit the run. Never raises
-    ``RequiresPostgresBackend`` — a DuckDB-backed instance gets a clean
-    ``{"skipped": "requires_postgres_backend"}`` instead. Any OTHER
-    exception (a DB error mid-walk, a malformed config) is allowed to
-    propagate — the caller (the registered job handler) lets that fail the
-    job normally, exactly like every other kind in
-    ``app/worker/kinds.py``.
+    batch a 2xx acknowledges, audit the run.
+
+    Never raises. A DuckDB-backed instance gets a clean
+    ``{"skipped": "requires_postgres_backend"}``. Any OTHER exception
+    raised while walking/posting is caught, logged, audited with
+    ``result="failed"``, and turned into ``{"failed": "<ClassName>"}`` —
+    spec 3.9: a sink swallows its own exceptions, it never fails the
+    caller.
 
     ``client``/``sleep`` are injection seams for tests (an
     ``httpx.MockTransport``-backed client, a no-op sleep) — production
@@ -282,7 +350,14 @@ def run_conversation_export_once(
         logger.debug("conversation-export: DuckDB-backed instance -- no push sink to run")
         return {"skipped": "requires_postgres_backend"}
 
-    since = watermark_repo.get(WATERMARK_NAME) or _EPOCH
+    watermark = watermark_repo.get(WATERMARK_NAME)
+    if watermark is None:
+        since = _EPOCH
+        start_cursor = None
+    else:
+        watermark_ts, watermark_cursor_id = watermark
+        since = watermark_ts
+        start_cursor = encode_cursor(watermark_ts, watermark_cursor_id)
     until = datetime.now(UTC)
 
     anonymizer = export_text if mode == "pseudonymized" else None
@@ -300,15 +375,18 @@ def run_conversation_export_once(
     endpoint = config["endpoint"]
     endpoint_host = urlsplit(endpoint).hostname or ""
     headers = {"Content-Type": "application/x-ndjson", **_resolve_headers(config["headers_secret_env"])}
+    surfaces = tuple(config["surfaces"]) if config["surfaces"] else ()
 
     own_client = client is None
     http_client = client or httpx.Client(timeout=HTTP_TIMEOUT_S)
     total_sent = 0
     batches_sent = 0
     batches_failed = 0
+    exc_class: str | None = None
     try:
-        for batch in _batches(_records(bundle, since=since, until=until, surfaces=config["surfaces"])):
-            body = b"".join(serialize_jsonl(batch))
+        for batch in _batches(_records(bundle, since=since, until=until, surfaces=surfaces, start_cursor=start_cursor)):
+            records = [record for record, _key in batch]
+            body = b"".join(serialize_jsonl(records))
             response = _post_with_retry(http_client, endpoint, headers, body, sleep=sleep)
             if response is None or not (200 <= response.status_code < 300):
                 logger.warning(
@@ -318,28 +396,43 @@ def run_conversation_export_once(
                 )
                 batches_failed += 1
                 break
-            ends = [r["conversation_end"] for r in batch if r.get("conversation_end")]
-            if ends:
-                watermark_repo.advance(WATERMARK_NAME, datetime.fromisoformat(max(ends)))
+            last_ts, last_id = batch[-1][1]
+            watermark_repo.set(WATERMARK_NAME, last_ts, last_id)
             total_sent += len(batch)
             batches_sent += 1
+    except Exception as exc:
+        exc_class = type(exc).__name__
+        logger.exception("conversation-export: unexpected failure mid-walk, run marked failed")
     finally:
         if own_client:
             http_client.close()
+
+    base_params = {
+        "since": since.isoformat(),
+        "until": until.isoformat(),
+        "count": total_sent,
+        "content_mode": mode,
+        "placement": load_content_export_policy().placement,
+        "delivery": "push",
+        "endpoint_host": endpoint_host,
+    }
+
+    if exc_class is not None:
+        log_safe(
+            user_id=None,
+            action="conversations.export",
+            resource="conversations:export",
+            params={**base_params, "error": exc_class},
+            result="failed",
+            client_kind="scheduler",
+        )
+        return {"failed": exc_class}
 
     log_safe(
         user_id=None,
         action="conversations.export",
         resource="conversations:export",
-        params={
-            "since": since.isoformat(),
-            "until": until.isoformat(),
-            "count": total_sent,
-            "content_mode": mode,
-            "placement": load_content_export_policy().placement,
-            "delivery": "push",
-            "endpoint_host": endpoint_host,
-        },
+        params=base_params,
         result="success" if batches_failed == 0 else "partial",
         client_kind="scheduler",
     )
@@ -348,14 +441,21 @@ def run_conversation_export_once(
 
 
 def run_conversation_export(payload: dict) -> dict:
-    """The registered ``conversation-export`` job handler — a thin adapter
-    over :func:`run_conversation_export_once`, wrapped in the same
-    idempotency-key-plus-advisory-lease belt-and-braces
+    """The registered ``conversation-export`` job handler.
+
+    Checks the cheap config/policy gates FIRST (:func:`_quick_skip_reason`)
+    so an unconfigured or policy-off instance never opens a database
+    connection for the advisory lease at all, then wraps the actual work
+    in the same idempotency-key-plus-advisory-lease belt-and-braces
     ``knowledge-packaging`` uses (see ``app/worker/kinds.py
     ::_run_knowledge_packaging``). Skipping (not failing) when the lock is
     already held is the correct outcome: the other run is doing the exact
     same work.
     """
+    skip_reason = _quick_skip_reason()
+    if skip_reason is not None:
+        return {"skipped": skip_reason}
+
     from src.db_pg import conversation_export_lease
 
     with conversation_export_lease() as acquired:
@@ -371,6 +471,7 @@ def run_conversation_export(payload: dict) -> dict:
 __all__ = [
     "IDEMPOTENCY_KEY",
     "KIND",
+    "MAX_ATTEMPTS",
     "MAX_BATCH_BYTES",
     "MAX_BATCH_RECORDS",
     "WATERMARK_NAME",

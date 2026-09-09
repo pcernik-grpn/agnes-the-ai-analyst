@@ -420,10 +420,11 @@ def iter_conversations(
     since: datetime,
     until: datetime,
     surface: str | None = None,
+    surfaces: tuple[str, ...] | None = None,
     agent_id: str | None = None,
     limit: int = 200,
     cursor: str | None = None,
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], str | None, list[tuple[datetime, str]]]:
     """One page of conversation-corpus records, newest-cursor-forward.
 
     Fetches ``limit + 1`` rows from ``repo_bundle.sessions.
@@ -432,17 +433,37 @@ def iter_conversations(
     exactly the sessions on this page (no per-session queries) before
     building each record. Raises ``ValueError`` for a malformed ``cursor``
     (the route turns that into a typed 400).
+
+    ``surface`` (single value — the pull endpoint's one-surface query
+    filter) and ``surfaces`` (a tuple — the push sink's config-driven
+    allowlist) are both pushed straight into ``list_completed_between``'s
+    own query rather than filtered on the returned rows: a client-side
+    filter would let a page come back empty of matches while still
+    consuming a keyset position, which is harmless for a one-shot pull but
+    wrong for a resumable walk (design 2026-09-08 §3.12, push-sink defect
+    fix). ``surfaces`` wins when both are given.
+
+    Returns ``(records, next_cursor, keys)`` — ``keys[i]`` is the
+    underlying ``(last_message_at, id)`` keyset position ``records[i]`` was
+    built from, straight off the ``chat_sessions`` row, NEVER derived from
+    the record's own ``conversation_end`` (the last MESSAGE's timestamp,
+    which can diverge from the session's own ``last_message_at`` — e.g. a
+    forked session). A caller that only paginates (the pull endpoint)
+    ignores ``keys``; a caller persisting how far it has delivered (the
+    push sink) uses them instead of anything inside the record body.
     """
     after = decode_cursor(cursor) if cursor else None
+    surface_filter = surfaces if surfaces else ((surface,) if surface else None)
     rows = repo_bundle.sessions.list_completed_between(
-        since, until, surface=surface, agent_id=agent_id, limit=limit + 1, after=after
+        since, until, surfaces=surface_filter, agent_id=agent_id, limit=limit + 1, after=after
     )
     has_more = len(rows) > limit
     rows = rows[:limit]
     if not rows:
-        return [], None
+        return [], None, []
 
     next_cursor = encode_cursor(rows[-1]["last_message_at"], rows[-1]["id"]) if has_more else None
+    keys = [(row["last_message_at"], row["id"]) for row in rows]
 
     session_ids = [r["id"] for r in rows]
     messages_by_session = repo_bundle.messages.list_for_sessions(session_ids)
@@ -474,7 +495,7 @@ def iter_conversations(
             anonymizer=repo_bundle.anonymizer,
         )
         records.append(record)
-    return records, next_cursor
+    return records, next_cursor, keys
 
 
 def serialize_jsonl(records: Iterable[Mapping[str, Any]]) -> Iterator[bytes]:

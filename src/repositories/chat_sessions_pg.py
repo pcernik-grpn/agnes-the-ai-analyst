@@ -366,7 +366,7 @@ class ChatSessionPgRepository:
         since: datetime,
         until: datetime,
         *,
-        surface: Optional[str] = None,
+        surfaces: Optional[tuple[str, ...]] = None,
         agent_id: Optional[str] = None,
         limit: int = 50,
         after: Optional[tuple[datetime, str]] = None,
@@ -385,12 +385,20 @@ class ChatSessionPgRepository:
         last_message_at), not a full :class:`ChatSession` -- the export never
         needs the other columns and a ``SELECT *`` would carry them for
         nothing.
+
+        ``surfaces`` (a tuple, ``surface = ANY(:surfaces)``) filters IN the
+        query itself -- one or many surfaces, or ``None``/empty for no
+        filter -- rather than the caller fetching every surface and
+        discarding rows client-side after the fact: a client-side filter on
+        a resumable walk lets an excluded row's position get skipped
+        without ever being reflected in what the caller can safely resume
+        from (push-sink defect fix, design 2026-09-08 §3.12).
         """
         clauses = ["last_message_at IS NOT NULL", "last_message_at >= :since", "last_message_at < :until"]
         params: dict = {"since": since, "until": until, "limit": limit}
-        if surface is not None:
-            clauses.append("surface = :surface")
-            params["surface"] = surface
+        if surfaces:
+            clauses.append("surface = ANY(:surfaces)")
+            params["surfaces"] = list(surfaces)
         if agent_id is not None:
             clauses.append("agent_id = :agent_id")
             params["agent_id"] = agent_id

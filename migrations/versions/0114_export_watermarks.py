@@ -35,6 +35,17 @@ def upgrade() -> None:
         "export_watermarks",
         sa.Column("name", sa.String(), nullable=False),
         sa.Column("watermark", sa.DateTime(timezone=True), nullable=True),
+        # The watermark's own keyset cursor position -- the id of the last
+        # DELIVERED row at ``watermark`` (design 2026-09-08 §3.12, push-sink
+        # defect fix). A bare ``watermark`` timestamp alone is not a safe
+        # resume point: an inclusive ``>=`` re-scan of it re-sends the last
+        # delivered row forever on an unchanged timestamp, and re-sends it
+        # on every tick when a later write (e.g. a forked session) bumps
+        # ``chat_sessions.last_message_at`` without moving the delivered
+        # row's own position. Paired with ``watermark``, resuming via
+        # ``list_completed_between(..., after=(watermark, cursor_id))``
+        # is exact.
+        sa.Column("cursor_id", sa.String(), nullable=True),
         sa.Column(
             "updated_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=False
         ),

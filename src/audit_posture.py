@@ -1704,6 +1704,13 @@ JOB_POSTURE: dict[str, str] = {
     # -- see register_all_kinds()'s docstring) but still a real, enumerable
     # kind name when it IS registered, so it still needs an entry here.
     "agent_response": "job.run",
+    # The conversation-corpus export push sink (design 2026-09-08 §3.12,
+    # Task 11) writes its OWN more-specific row -- `conversations.export`,
+    # `delivery="push"` -- via `log_safe` on every run (success, partial,
+    # or a caught mid-walk failure), same shape as the pull endpoint's own
+    # `conversations.export` row. Per the "Names a more specific action"
+    # bullet above, the generic `job.run` row still fires too.
+    "conversation-export": "conversations.export",
 }
 
 # MCP foundation tools (app/api/mcp/foundation_tools.py::FOUNDATION_TOOL_NAMES,

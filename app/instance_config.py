@@ -2401,7 +2401,10 @@ def get_conversation_export_config() -> Optional[dict]:
     ``interval_minutes`` defaults to ``60``; a non-positive or unparsable
     value falls back to that default rather than producing a runaway
     "every 0m" schedule. ``surfaces`` is an optional allowlist (empty tuple
-    = every surface) the worker job filters records against client-side.
+    = every surface) the worker job pushes into the underlying
+    ``list_completed_between`` query itself (``surface = ANY(...)``), not a
+    client-side filter on the returned records — an excluded surface is
+    never fetched at all.
     """
     endpoint = str(get_value("observability", "conversation_export", "endpoint", default="") or "").strip()
     if not endpoint:

@@ -161,7 +161,7 @@ def export_conversations(
     )
 
     try:
-        records, next_cursor = iter_conversations(
+        records, next_cursor, _keys = iter_conversations(
             bundle,
             since=since_dt,
             until=until_dt,

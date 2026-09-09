@@ -872,23 +872,35 @@ Every pull writes one `conversations.export` audit row (`since`, `until`,
 Set `observability.conversation_export.{endpoint, headers_secret_env,
 interval_minutes, surfaces}` in `instance.yaml` to turn on a scheduled push.
 A `conversation-export` worker job (LIGHT lane, one at a time — an
-idempotency key plus a Postgres advisory lease) reads a Postgres-persisted
-watermark (`export_watermarks`, Postgres-only), walks every conversation
-completed since it, and POSTs newline-delimited JSON batches (at most 200
-records or 8 MiB per request) to `endpoint`, with the auth headers parsed
+idempotency key plus a Postgres advisory lease acquired only once the config
+and content-export-policy gates below pass, so an unconfigured or
+policy-off instance never opens a database connection for it) reads a
+Postgres-persisted watermark (`export_watermarks`, Postgres-only — a
+`(last_message_at, id)` keyset position, not a bare timestamp, so the
+trailing conversation of a run is never re-sent on the next tick), walks
+every conversation completed since it, and POSTs newline-delimited JSON
+batches (at most 200 records or 8 MiB per request — a single record whose
+own line already exceeds 8 MiB is still sent alone, since this export is
+"complete, never truncated") to `endpoint`, with the auth headers parsed
 `OTEL_EXPORTER_OTLP_HEADERS`-style from the environment variable named by
 `headers_secret_env` — the header value itself never sits in
-`instance.yaml`. Delivery is retried three times with backoff on a 5xx or a
-connection error, and the watermark advances only after the destination
-answered 2xx, so a failed delivery is retried on the next tick rather than
-skipped or resent from scratch. `interval_minutes` (default 60) sets the
-scheduler cadence; with `endpoint` unset the scheduler has no such row at
-all. The same content-export policy gates it: when the policy is `off`,
-has no recorded basis, or excludes the `chat` workload, the job sends
-nothing and leaves the watermark alone (warned once per process, not once
-per tick). Audited as `conversations.export` with `delivery: "push"`,
-`count` and `endpoint_host` — never headers, never content. On a
-DuckDB-backed instance the job is a clean no-op.
+`instance.yaml`. `surfaces` narrows the underlying query itself, not just
+what gets POSTed, so an excluded surface is never fetched at all. Delivery
+is retried three times (four attempts total, exponential backoff: 1s, 2s,
+4s) on a 5xx or a connection error; a 4xx (including 429) is never retried
+within a run and leaves the watermark exactly where the last successful
+batch left it, to be retried on the next tick rather than skipped or
+resent from scratch. `interval_minutes` (default 60) sets the scheduler
+cadence; with `endpoint` unset the scheduler has no such row at all. The
+same content-export policy gates it: when the policy is `off`, has no
+recorded basis, or excludes the `chat` workload, the job sends nothing and
+leaves the watermark alone (warned once per process, not once per tick).
+Audited as `conversations.export` with `delivery: "push"`, `count` and
+`endpoint_host` — never headers, never content. A run that fails
+unexpectedly mid-walk is caught, logged, and audited with
+`result: "failed"` and the exception's class name (never its message) —
+the job itself never raises. On a DuckDB-backed instance the job is a
+clean no-op.
 
 ## No telemetry vendor
 

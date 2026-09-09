@@ -31,12 +31,17 @@ class ExportWatermark(Base):
     """One row per named export sink — how far it has successfully
     delivered. ``watermark`` is ``NULL`` until the sink's first successful
     batch; the worker job treats a missing row/``NULL`` watermark as "export
-    everything from the beginning of the transcript"."""
+    everything from the beginning of the transcript". ``cursor_id`` is the
+    id of the last DELIVERED row AT ``watermark`` — the pair is the sink's
+    own keyset resume position, never derived from anything inside a
+    delivered record's own body (design 2026-09-08 §3.12, push-sink defect
+    fix: a bare timestamp alone re-sends the trailing row on every tick)."""
 
     __tablename__ = "export_watermarks"
 
     name: Mapped[str] = mapped_column(String, primary_key=True)
     watermark: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cursor_id: Mapped[str | None] = mapped_column(String, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )

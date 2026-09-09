@@ -344,11 +344,11 @@ class _FakeSessionsRepo:
         self._rows = rows
         self.calls = 0
 
-    def list_completed_between(self, since, until, *, surface=None, agent_id=None, limit=50, after=None):
+    def list_completed_between(self, since, until, *, surfaces=None, agent_id=None, limit=50, after=None):
         self.calls += 1
         rows = [r for r in self._rows if since <= r["last_message_at"] < until]
-        if surface is not None:
-            rows = [r for r in rows if r["surface"] == surface]
+        if surfaces:
+            rows = [r for r in rows if r["surface"] in surfaces]
         if agent_id is not None:
             rows = [r for r in rows if r["agent_id"] == agent_id]
         rows = sorted(rows, key=lambda r: (r["last_message_at"], r["id"]))
@@ -422,14 +422,15 @@ class TestIterConversations:
         messages_by_session = {r["id"]: [_msg(role="user", content=f"hi {r['id']}", turn_id="t1")] for r in rows}
         bundle = _fake_bundle(rows, messages_by_session=messages_by_session)
 
-        records, next_cursor = iter_conversations(
+        records, next_cursor, keys = iter_conversations(
             bundle, since=_dt("2026-01-01T00:00:00"), until=_dt("2026-02-01T00:00:00"), limit=2
         )
         assert [r["thread_id"] for r in records] == ["chat_1", "chat_2"]
         assert next_cursor is not None
         assert records[0]["user_id"] == "user_1"
+        assert keys == [(rows[0]["last_message_at"], rows[0]["id"]), (rows[1]["last_message_at"], rows[1]["id"])]
 
-        records2, next_cursor2 = iter_conversations(
+        records2, next_cursor2, keys2 = iter_conversations(
             bundle,
             since=_dt("2026-01-01T00:00:00"),
             until=_dt("2026-02-01T00:00:00"),
@@ -438,27 +439,30 @@ class TestIterConversations:
         )
         assert [r["thread_id"] for r in records2] == ["chat_3"]
         assert next_cursor2 is None
+        assert keys2 == [(rows[2]["last_message_at"], rows[2]["id"])]
 
     def test_bulk_reads_are_one_call_per_page_not_one_per_session(self):
         rows = self._rows(5)
         messages_by_session = {r["id"]: [_msg(turn_id="t1")] for r in rows}
         bundle = _fake_bundle(rows, messages_by_session=messages_by_session)
 
-        records, _ = iter_conversations(
+        records, _, keys = iter_conversations(
             bundle, since=_dt("2026-01-01T00:00:00"), until=_dt("2026-02-01T00:00:00"), limit=5
         )
         assert len(records) == 5
+        assert len(keys) == 5
         assert bundle.sessions.calls == 1
         assert bundle.messages.calls == 1
         assert bundle.calls.calls == 1  # totals_for_sessions, one call for the whole page
 
     def test_empty_window_returns_no_records_and_no_cursor(self):
         bundle = _fake_bundle([])
-        records, next_cursor = iter_conversations(
+        records, next_cursor, keys = iter_conversations(
             bundle, since=_dt("2026-01-01T00:00:00"), until=_dt("2026-02-01T00:00:00"), limit=50
         )
         assert records == []
         assert next_cursor is None
+        assert keys == []
 
     def test_malformed_cursor_raises_value_error(self):
         bundle = _fake_bundle(self._rows(1))
@@ -470,6 +474,25 @@ class TestIterConversations:
                 limit=10,
                 cursor="garbage!!",
             )
+
+    def test_surfaces_tuple_is_pushed_into_the_query_not_filtered_after(self):
+        rows = self._rows(3)
+        rows[1]["surface"] = "slack_dm"
+        messages_by_session = {r["id"]: [_msg(role="user", content="hi", turn_id="t1")] for r in rows}
+        bundle = _fake_bundle(rows, messages_by_session=messages_by_session)
+
+        records, next_cursor, keys = iter_conversations(
+            bundle,
+            since=_dt("2026-01-01T00:00:00"),
+            until=_dt("2026-02-01T00:00:00"),
+            limit=50,
+            surfaces=("web",),
+        )
+        assert [r["thread_id"] for r in records] == ["chat_1", "chat_3"]
+        assert next_cursor is None
+        # the key is the SESSION row's own (last_message_at, id) -- never
+        # derived from the built record's conversation_end.
+        assert keys == [(rows[0]["last_message_at"], rows[0]["id"]), (rows[2]["last_message_at"], rows[2]["id"])]
 
 
 def test_serialize_jsonl_yields_one_line_per_record():
