@@ -102,10 +102,10 @@ class TestScriptLoadOrder:
         tag = text[tag_start : tag_end + 1]
         assert "defer" in tag, "issue_report.js must be deferred"
 
-    def test_html2canvas_url_is_stamped_next_to_mermaid(self):
+    def test_html_to_image_url_is_stamped_next_to_mermaid(self):
         text = _app_scripts_source()
-        assert "_agHtml2CanvasUrl" in text
-        assert "vendor/html2canvas.min.js" in text
+        assert "_agHtmlToImageUrl" in text
+        assert "vendor/html-to-image.min.js" in text
         assert "_agMermaidUrl" in text
 
 

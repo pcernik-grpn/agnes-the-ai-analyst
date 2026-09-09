@@ -58,8 +58,9 @@ version, and a link to the screenshot (which still requires login to view) —
 never the full body, the raw context JSON, or the screenshot image itself.
 
 The screenshot, when included, is a same-page render of `document.body`
-captured client-side by the vendored [html2canvas](https://html2canvas.hertzen.com/)
-(MIT license, `app/web/static/vendor/html2canvas.min.js`) — it never crosses
+captured client-side by the vendored [html-to-image](https://github.com/bubkoo/html-to-image)
+(MIT license, `app/web/static/vendor/html-to-image.min.js`; the browser paints the
+page into an SVG `<foreignObject>`, so modern CSS renders as on screen) — it never crosses
 an iframe boundary or captures anything outside the current tab, and the
 dialog itself is hidden for the moment of capture so the screenshot never
 shows the report form asking for a screenshot. The library is fetched lazily,

@@ -87,12 +87,12 @@ def test_highlight_css_present():
     assert p.stat().st_size > 1_000
 
 
-def test_html2canvas_present_and_substantial():
-    p = _VENDOR / "html2canvas.min.js"
-    assert p.exists(), "html2canvas.min.js missing — re-vendor per LICENSES.md"
-    assert p.stat().st_size > 100_000, "html2canvas.min.js suspiciously small"
-    head = p.read_bytes()[:200]
-    assert b"html2canvas" in head.lower()
+def test_html_to_image_present_and_substantial():
+    p = _VENDOR / "html-to-image.min.js"
+    assert p.exists(), "html-to-image.min.js missing — re-vendor per LICENSES.md"
+    assert p.stat().st_size > 15_000, "html-to-image.min.js suspiciously small"
+    head = p.read_bytes()[:400]
+    assert b"htmltoimage" in head.lower()
 
 
 def test_vendor_licenses_documented():
@@ -101,7 +101,7 @@ def test_vendor_licenses_documented():
     text = p.read_text(encoding="utf-8")
     assert "marked" in text.lower()
     assert "highlight" in text.lower()
-    assert "html2canvas" in text.lower()
+    assert "html-to-image" in text.lower()
     assert "MIT" in text  # marked
     assert "BSD-3" in text  # highlight.js
 

@@ -261,7 +261,7 @@ tokens only, no hex. Contents:
    nothing typed is lost.
 
 Submit flow: `POST /api/issues` with the envelope → on 201, if screenshot
-checked, lazy-load `html2canvas` (vendored, see below), render
+checked, lazy-load `html-to-image` (vendored, see below), render
 `document.body` at scale 1 with `useCORS: true`, `canvas.toBlob("image/png")`,
 `PUT /api/issues/{id}/screenshot`. A screenshot failure is reported as a
 toast but does not fail the report. The dialog closes on the 201.
@@ -274,10 +274,14 @@ status). Keeps the last 20 entries in memory only, messages truncated at
 300 chars, nothing sent anywhere until the dialog submits. Exposed as
 `window.AgnesDiag.snapshot()`.
 
-**Vendored library.** `html2canvas` 1.4.1 (MIT) at
-`app/web/static/vendor/html2canvas.min.js`, section appended to
+**Vendored library.** `html-to-image` 1.11.11 (MIT) at
+`app/web/static/vendor/html-to-image.min.js` — not html2canvas: the paper
+skin's `color-mix()` colors are reported by `getComputedStyle` as
+`color(srgb …)`, which html2canvas 1.4.1 cannot parse, so it failed on every
+page in the live check; html-to-image paints through an SVG `<foreignObject>`
+and the browser renders the CSS itself. Section appended to
 `app/web/static/vendor/LICENSES.md` in the existing format, URL published as
-`window._agHtml2CanvasUrl` next to `_agMermaidUrl`, loaded lazily on first
+`window._agHtmlToImageUrl` next to `_agMermaidUrl`, loaded lazily on first
 use like mermaid. `tests/test_web_static_assets.py` gets a presence + minimum
 size test. No CSP change is needed (`security_headers.py` sets no
 `script-src`).

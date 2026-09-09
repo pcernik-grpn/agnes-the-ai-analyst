@@ -18,10 +18,10 @@
       window._agLucideSpriteUrl = "{{ static_url('vendor/lucide-sprite.svg') }}";
       window._agMermaidUrl = "{{ static_url('vendor/mermaid.min.js') }}";
       window._agTourUrl = "{{ static_url('js/tour.js') }}";
-      // html2canvas (1.4.1, ~194 KB) — same lazy-load contract as mermaid
+      // html-to-image (1.11.11, ~19 KB) — same lazy-load contract as mermaid
       // above: only fetched by issue_report.js when a report includes a
       // screenshot, so a caller who never files one never pays for it.
-      window._agHtml2CanvasUrl = "{{ static_url('vendor/html2canvas.min.js') }}";
+      window._agHtmlToImageUrl = "{{ static_url('vendor/html-to-image.min.js') }}";
     </script>
     <!-- Lucide sprite loader (#1503) — injects vendor/lucide-sprite.svg inline
          so `ds.icon()` / `iconEl()` can use SAME-DOCUMENT <use href="#name">

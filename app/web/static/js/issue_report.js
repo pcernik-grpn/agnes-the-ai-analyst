@@ -6,7 +6,7 @@
  *
  * Submit flow: POST /api/issues with the auto-captured context envelope;
  * on 201, if the screenshot checkbox is on, lazy-load the vendored
- * html2canvas (window._agHtml2CanvasUrl, stamped by _app_scripts.html),
+ * html-to-image (window._agHtmlToImageUrl, stamped by _app_scripts.html),
  * capture the page with the dialog itself hidden, and PUT the PNG to
  * /api/issues/{id}/screenshot. A screenshot failure is reported as a toast
  * but never fails the already-filed report.
@@ -115,31 +115,59 @@
     if (fallback) fallback.hidden = true;
   }
 
-  function loadHtml2Canvas() {
-    if (window.html2canvas) return Promise.resolve(window.html2canvas);
+  function loadHtmlToImage() {
+    if (window.htmlToImage) return Promise.resolve(window.htmlToImage);
     return new Promise(function (resolve, reject) {
       var s = document.createElement("script");
-      s.src = window._agHtml2CanvasUrl || "/static/vendor/html2canvas.min.js";
+      s.src = window._agHtmlToImageUrl || "/static/vendor/html-to-image.min.js";
       s.onload = function () {
-        resolve(window.html2canvas);
+        resolve(window.htmlToImage);
       };
       s.onerror = reject;
       document.head.appendChild(s);
     });
   }
 
+  // html-to-image paints through an SVG <foreignObject>, so the browser
+  // renders the CSS itself — html2canvas 1.4.1 could not parse the paper
+  // skin's color-mix() colors (reported as `color(srgb …)`) and failed on
+  // every page. The filter drops what never belongs in a screenshot and
+  // what makes the capture slow: the inlined icon sprite (hundreds of
+  // <symbol>s) and any display:none subtree.
+  var SCREENSHOT_TIMEOUT_MS = 15000;
+
+  function _skipForScreenshot(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = (node.tagName || "").toUpperCase();
+    if (tag === "SCRIPT" || tag === "NOSCRIPT") return true;
+    if (tag === "SVG" && node.querySelectorAll("symbol").length > 20) return true;
+    if (node !== document.body && getComputedStyle(node).display === "none") return true;
+    return false;
+  }
+
   function screenshotBlob() {
     // Hide the dialog itself before capturing — a screenshot of the report
     // form asking for a screenshot is never what the reporter meant.
     dlg.classList.remove("is-open");
-    return loadHtml2Canvas()
-      .then(function (h2c) {
-        return h2c(document.body, { useCORS: true, scale: 1, logging: false });
-      })
-      .then(function (canvas) {
-        return new Promise(function (resolve) {
-          canvas.toBlob(resolve, "image/png");
-        });
+    var capture = loadHtmlToImage().then(function (lib) {
+      return lib.toBlob(document.body, {
+        pixelRatio: 1,
+        cacheBust: false,
+        skipFonts: true,
+        filter: function (node) {
+          return !_skipForScreenshot(node);
+        },
+      });
+    });
+    var timeout = new Promise(function (_resolve, reject) {
+      setTimeout(function () {
+        reject(new Error("screenshot timed out"));
+      }, SCREENSHOT_TIMEOUT_MS);
+    });
+    return Promise.race([capture, timeout])
+      .then(function (blob) {
+        if (!blob) throw new Error("empty screenshot");
+        return blob;
       })
       .finally(function () {
         dlg.classList.add("is-open");
@@ -190,6 +218,7 @@
           return;
         }
         var row = res.body;
+        if (wantShot) btn.textContent = "Capturing\u2026";
         var done = wantShot
           ? screenshotBlob()
               .then(function (blob) {
@@ -210,6 +239,7 @@
         return done.then(function () {
           close();
           btn.disabled = false;
+          btn.textContent = "Report";
           titleEl.value = "";
           bodyEl.value = "";
           _toast("ok", "Reported as #" + row.number + " — you'll hear back.");
