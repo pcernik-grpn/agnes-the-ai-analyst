@@ -31,7 +31,7 @@ from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvid
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
 from app.chat.turn_context import TurnRecord, publish_turn, read_turn, workload_for_surface
-from app.chat.turn_usage import drain_turn_usage
+from app.chat.turn_usage import drain_turn_timing, drain_turn_usage
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
 from app.chat.workdir import WorkdirManager
 from app.coordination.base import CoordinationUnavailable
@@ -380,6 +380,17 @@ class SinkEntry:
     sink: object
 
 
+def _producer_stamp(frame: dict) -> float | None:
+    """The frame's ``emitted_at`` — a monotonic reading from the clock of
+    whichever process built the frame — or ``None`` when absent or not a
+    number. Only ever used as a DIFFERENCE between two frames of the same
+    producer; never compared with this process's clock."""
+    value = frame.get("emitted_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 @dataclass
 class LiveSession:
     chat_id: str
@@ -433,6 +444,14 @@ class LiveSession:
     #: retirement and unattended-resolution must broadcast/deliver
     #: question-typed frames, not approval-typed ones.
     pending_questions: dict = field(default_factory=dict)
+    #: ``chat.tool_call`` audit rows waiting for their ``tool_result``, keyed
+    #: by ``tool_use_id`` → ``(perf_counter at the call frame's arrival, the
+    #: producer's own ``emitted_at`` stamp or None, params)``.
+    #: The row is written when the result arrives so it can carry the
+    #: tool's measured duration (``_audit_tool_call_finished``); whatever is
+    #: still here at turn end / kill / pump exit is written without one
+    #: (``_flush_pending_tool_audits``) so the attempt is never lost.
+    pending_tool_audits: dict[str, tuple[float, float | None, dict]] = field(default_factory=dict)
     turn_in_flight: bool = False
     #: Observability (spec 3.2). The id minted for the turn currently in
     #: flight — stamped onto every frame the turn broadcasts, written to
@@ -936,7 +955,19 @@ class ChatManager:
         the ``usage_turns`` row. ``drain_turn_usage`` never raises; a
         coordination outage leaves the frame untouched and the turn records
         exactly as before this feature existed.
+
+        Completion TIMING (``drain_turn_timing``) is hydrated on its own
+        rule: no frame producer reports it — only the broker, which forwards
+        every completion, can measure a completion's wall time — so it is
+        stamped whenever the counters hold any, even on a frame that carries
+        its own tokens. No double count is possible: nothing else ever
+        writes it.
         """
+        timing = drain_turn_timing(live.chat_id)
+        if timing is not None and frame.get("llm_calls") is None:
+            frame["llm_calls"] = timing["llm_calls"]
+            frame["llm_duration_ms"] = timing["llm_duration_ms"]
+            frame["llm_ttfb_ms"] = timing["llm_ttfb_ms"]
         drained = drain_turn_usage(live.chat_id)
         if drained is None:
             return
@@ -2745,6 +2776,16 @@ class ChatManager:
 
     async def _pump_subprocess_to_ws(self, live: LiveSession) -> None:
         assert live.handle is not None
+        try:
+            await self._pump_frames(live)
+        finally:
+            # The pump leaving — EOF from a dead sandbox, a cancel on
+            # respawn or teardown — means no further tool_result will ever
+            # pair with a call still in flight; record those attempts now.
+            self._flush_pending_tool_audits(live)
+
+    async def _pump_frames(self, live: LiveSession) -> None:
+        assert live.handle is not None
         while True:
             line = await live.handle.stdout.readline()
             if not line:
@@ -2753,6 +2794,11 @@ class ChatManager:
                 frame = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # Arrival mark for the chat.tool_call duration fallback — taken
+            # before the fan-out below, so a slow sink on THIS frame never
+            # reads as tool time (the producers' own ``emitted_at`` stamps
+            # are preferred; see _audit_tool_call_finished).
+            arrived = time.perf_counter()
             live.last_activity = datetime.now(UTC)
             if frame.get("type") in ("approval_request", "question_request"):
                 # Stamped BEFORE the fan-out so every sink sees the same
@@ -2895,6 +2941,9 @@ class ChatManager:
                     tokens_out=frame.get("tokens_out"),
                     cache_read_tokens=frame.get("cache_read_tokens"),
                     cache_creation_tokens=frame.get("cache_creation_tokens"),
+                    llm_calls=frame.get("llm_calls"),
+                    llm_duration_ms=frame.get("llm_duration_ms"),
+                    llm_ttfb_ms=frame.get("llm_ttfb_ms"),
                     model=frame.get("model"),
                     turn_id=live.turn_id,
                 )
@@ -2910,6 +2959,7 @@ class ChatManager:
                 # counter above: that counter gates the user's next turn, so
                 # it must never queue behind a telemetry write.
                 self._record_turn_usage(live, frame)
+                self._flush_pending_tool_audits(live)
                 # ...and close the turn's span with the same figures, so the
                 # trace and the usage row price one turn identically.
                 self._close_turn(live, frame)
@@ -2926,6 +2976,7 @@ class ChatManager:
                 if not live.auto_title_started:
                     self._retry_auto_title_if_untitled(live)
             elif ftype == "done":
+                self._flush_pending_tool_audits(live)
                 # Closes a turn that ended without an assistant frame (a
                 # cancelled or errored turn); a no-op after one.
                 self._close_turn(live, frame)
@@ -2936,18 +2987,96 @@ class ChatManager:
                 # see _schedule_artifact_harvest.
                 self._schedule_artifact_harvest(live)
             if ftype == "tool_call":
-                write_audit(
-                    user_email=live.user_email,
-                    action="chat.tool_call",
-                    details={
-                        "session_id": live.chat_id,
-                        "tool": frame.get("tool"),
-                        "args_hash": hash_args(frame.get("args", {})),
-                    },
-                )
+                self._audit_tool_call_started(live, frame, arrived)
                 self._open_tool_span(live, frame)
             elif ftype == "tool_result":
                 self._close_tool_span(live, frame)
+                self._audit_tool_call_finished(live, frame, arrived)
+
+    # ------------------------------------------------------------------
+    # chat.tool_call audit — one row per call, timed call → result
+    # ------------------------------------------------------------------
+
+    def _audit_tool_call_started(self, live: LiveSession, frame: dict, arrived: float) -> None:
+        """Hold a ``tool_call`` frame's audit row until its result arrives.
+
+        The row used to be written right here, before the tool had run, so
+        its ``duration_ms`` was always NULL and the observability KPIs could
+        say nothing about how long chat tools take. Both frame producers
+        (``app/chat/runner.py``, ``app/chat/kai_engine_provider.py``) stamp
+        ``tool_use_id`` on the call AND on its ``tool_result``, so the pair
+        is correlated on it and ``_audit_tool_call_finished`` writes the row
+        with the duration — an approval wait included, which is the latency
+        the user actually sat through. A frame with no pairing id cannot be
+        matched to a result and is written at once, exactly as before,
+        rather than given an invented duration. ``params`` is unchanged:
+        identifiers and an argument hash, never the arguments.
+
+        ``arrived`` is this frame's ``perf_counter`` at decode time — the
+        fallback clock; the producers' own ``emitted_at`` stamps are what
+        the duration is normally taken from (see the sibling below).
+        """
+        details = {
+            "session_id": live.chat_id,
+            "tool": frame.get("tool"),
+            "args_hash": hash_args(frame.get("args", {})),
+        }
+        tool_use_id = str(frame.get("tool_use_id") or "")
+        if not tool_use_id:
+            # Explicit None: nothing was measured, and the repository must
+            # not autofill a request age this pump task may have inherited.
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details, duration_ms=None)
+            return
+        live.pending_tool_audits[tool_use_id] = (arrived, _producer_stamp(frame), details)
+
+    def _audit_tool_call_finished(self, live: LiveSession, frame: dict, arrived: float) -> None:
+        """Write the paired ``chat.tool_call`` row for a ``tool_result``,
+        with the measured duration and the result frame's own verdict.
+
+        The duration is the difference between the two frames' ``emitted_at``
+        stamps when both carry one — the producer's own monotonic clock,
+        read where the frames are born, so nothing that happens on the way
+        here counts: this pump is one sequential loop, and a slow sink on
+        the call frame delays even READING the result frame, which no
+        manager-side clock can tell apart from tool time. Without a stamp on
+        both sides (an older producer, or a stamp on only one of them — a
+        stamp is only comparable with one from the same clock) it falls back
+        to the frames' arrival at the pump, taken before each fan-out.
+        """
+        pending = live.pending_tool_audits.pop(str(frame.get("tool_use_id") or ""), None)
+        if pending is None:
+            return  # no call on record for this result (unpaired producer)
+        call_arrived, call_stamp, details = pending
+        result_stamp = _producer_stamp(frame)
+        if call_stamp is not None and result_stamp is not None and result_stamp >= call_stamp:
+            duration_ms = int((result_stamp - call_stamp) * 1000)
+        else:
+            duration_ms = int((arrived - call_arrived) * 1000)
+        write_audit(
+            user_email=live.user_email,
+            action="chat.tool_call",
+            details=details,
+            duration_ms=duration_ms,
+            result="error" if frame.get("is_error") else "success",
+        )
+
+    def _flush_pending_tool_audits(self, live: LiveSession) -> None:
+        """Record every call still awaiting a result — without a duration.
+
+        Runs when a turn ends (``assistant_message`` / ``done``), on a forced
+        kill, and when the pump exits: the attempt stays in the trail even
+        when the sandbox died mid-tool, and a NULL duration says honestly
+        that nobody measured one.
+        """
+        if not live.pending_tool_audits:
+            return
+        for _arrived, _stamp, details in live.pending_tool_audits.values():
+            # ``duration_ms=None`` on purpose (a real NULL, never the
+            # autofill): this task may have been created inside the HTTP
+            # request that spawned the session, and an unfinished call
+            # flushed later must not be stamped with that request's age.
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details, duration_ms=None)
+        live.pending_tool_audits.clear()
 
     # ------------------------------------------------------------------
     # Turn-end artifact harvest (#2268)
@@ -4615,6 +4744,7 @@ class ChatManager:
             # Teardown is best-effort throughout — a failed partial-save must
             # not abort the rest of the kill (sandbox destroy, lease release).
             logger.exception("partial-save failed for %s", live.chat_id)
+        self._flush_pending_tool_audits(live)
         # This path clears `turn_in_flight` outside the pump, so it owes the
         # turn span its end too — an unended span is never exported at all.
         self._close_turn(live, {"type": "done"})

@@ -202,7 +202,7 @@ class ChatSessionPgRepository:
         the DuckDB sibling has to spell out happen here for free — the
         observable contract is identical.
 
-        The two tables migration 0115 added carry no such cascade and are
+        The two tables migration 0117 added carry no such cascade and are
         handled explicitly, in the SAME transaction, because they are not
         the same kind of data: ``chat_message_feedback`` holds a person's
         free-text comment ABOUT this conversation and must not outlive it,
@@ -301,7 +301,7 @@ class ChatSessionPgRepository:
                 or 0
             )
             # ON DELETE CASCADE removes child chat_messages automatically;
-            # migration 0115's tables have no cascade, so they are handled
+            # migration 0117's tables have no cascade, so they are handled
             # here (see `hard_delete_session` for why one is deleted and the
             # other only loses its identity columns).
             conn.execute(

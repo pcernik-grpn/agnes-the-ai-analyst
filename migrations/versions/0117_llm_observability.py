@@ -27,8 +27,8 @@ matching ``_vN_to_v(N+1)`` step; the DuckDB siblings accept the new keyword
 argument and drop it, the same pattern migration ``0092`` established for
 ``chat_messages.cache_read_tokens`` / ``cache_creation_tokens``.
 
-Revision ID: 0115_llm_observability
-Revises: 0114_corpus_chunks_tsv
+Revision ID: 0117_llm_observability
+Revises: 0115_chat_messages_llm_timing
 Create Date: 2026-09-08
 """
 
@@ -40,8 +40,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision: str = "0115_llm_observability"
-down_revision: str | None = "0114_corpus_chunks_tsv"
+revision: str = "0117_llm_observability"
+down_revision: str | None = "0115_chat_messages_llm_timing"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

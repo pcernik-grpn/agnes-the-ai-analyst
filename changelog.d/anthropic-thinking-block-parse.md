@@ -1,0 +1,3 @@
+### Fixed
+
+- Structured LLM output no longer fails intermittently on thinking-capable models. The Anthropic/Vertex extractor read the response's first content block, but a model that thinks adaptively (the Claude 5 family, with no `thinking` parameter requested) returns a `thinking` block first on the turns it chooses to think — which has no `.text`, so the call died with "Failed to parse ... as JSON (AttributeError)" and was re-raised without a retry. It now reads the first text block, and says which block types it got when there is none. Affected every structured-output caller: the skill/agent/plugin/package/MCP/semantic-model builders, store guardrails, ontology, corporate memory, table autodoc and the verification detector.

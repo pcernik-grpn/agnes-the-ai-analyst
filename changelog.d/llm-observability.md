@@ -77,7 +77,7 @@
   resumable on a keyset so a burst wider than the cap is not lost, and held
   back while the conversation itself is still mid-turn), so the corpus's
   quality signal is not frozen at export time. A run that fails mid-walk is audited as
-  failed, never raised into the worker. Migration `0116_export_watermarks`.
+  failed, never raised into the worker. Migration `0118_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and
   `agnes.subject_id`; the `llm_generation` log line gains `workload`, `purpose`
@@ -143,7 +143,7 @@
   `gcp.vertex_ai` everywhere, matching the chat broker.
 - The worker runtime binds `job_id` into the LLM call context so every
   generation inside a background job is attributed without per-handler code.
-- New Alembic migration `0115_llm_observability` (`llm_calls`,
+- New Alembic migration `0117_llm_observability` (`llm_calls`,
   `chat_message_feedback`, `chat_messages.turn_id`,
   `agent_memories.source_turn_id`/`source_message_id`) — Postgres-only, A3
   ratchet; the frozen DuckDB app-state backend keeps answering a typed `501`

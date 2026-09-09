@@ -74,7 +74,7 @@ from app.api.broker_vertex import (
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
 from app.chat.turn_context import TurnRecord, read_turn, started_no_later_than
-from app.chat.turn_usage import add_turn_usage
+from app.chat.turn_usage import add_turn_timing, add_turn_usage
 from src.observability import content_policy as _content_policy
 from src.observability import otel as _otel
 from src.observability.llm_context import LlmCallContext
@@ -1556,6 +1556,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # read), so it measures the provider, not this instance's own gates.
     forward_started = time.monotonic()
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
+    # Completion timing (app/chat/turn_usage.py::add_turn_timing): measured
+    # from HERE — the first attempt's send, after every gate — to the last
+    # upstream byte, so a retried 429 counts as the wait the caller really
+    # sat through and a refused call counts for nothing. Recorded next to
+    # the token usage below; tokens said what a turn cost, never how long
+    # the model took.
+    forward_started = time.perf_counter()
     # Retry loop for upstream rate limiting. A provider 429 (a Vertex
     # per-minute token/request quota is the usual one) means the request was
     # refused WITHOUT being processed, so replaying it is safe and normally
@@ -1704,6 +1711,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                     workload=completion_context.workload if completion_context is not None else None,
                 )
             raise
+    # The response head is the first upstream byte of a buffered reply, and
+    # the fallback first-byte mark for a stream that ends before its first
+    # chunk arrives.
+    upstream_head_at = time.perf_counter()
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
     if vertex_mode and resp.status_code == 401:
@@ -1749,7 +1760,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         turn_session_id = row.get("session_id") if is_completion else None
         collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
-        state = {"overflow": False}
+        state: dict[str, Any] = {"overflow": False, "first_byte_at": None, "exhausted": False}
         # The bounded edges kept for EVERY streamed completion regardless of
         # the full mirror's own overflow state: a 64 KiB append-only head and
         # a 64 KiB rolling tail (whole chunks, so the cap is approximate, not
@@ -1770,6 +1781,8 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             nonlocal tail_bytes
             try:
                 async for chunk in resp.aiter_bytes():
+                    if state["first_byte_at"] is None:
+                        state["first_byte_at"] = time.perf_counter()
                     if mirror_body:
                         if len(head) < _SSE_EDGE_BYTES:
                             head.extend(chunk[: _SSE_EDGE_BYTES - len(head)])
@@ -1783,6 +1796,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                             else:
                                 state["overflow"] = True
                     yield chunk
+                # Reached only when the upstream ran to its natural end AND
+                # the client consumed all of it — a drop on either side
+                # leaves this False and the timing below unrecorded.
+                state["exhausted"] = True
             finally:
                 await resp.aclose()
                 await client.aclose()
@@ -1849,6 +1866,18 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                         summary=summary,
                         response_truncated=state["overflow"],
                     )
+                if turn_session_id and resp.status_code == 200 and state["exhausted"]:
+                    # Independent of the usage parse above (an over-long
+                    # stream still took its time), but NOT of the stream
+                    # finishing: a completion cut short — the upstream
+                    # dropping, the client walking away — is not a
+                    # completion, and its truncated wall time would pull
+                    # every latency average toward whatever aborted it.
+                    # The partial usage above is still recorded: tokens
+                    # were spent either way, time was not fully measured.
+                    _record_completion_timing(
+                        turn_session_id, forward_started, state["first_byte_at"] or upstream_head_at
+                    )
                 if otel_span is not None:
                     _otel.end_completion_span(
                         otel_span,
@@ -1896,6 +1925,8 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # Parsed ONCE for all three consumers below (budget ledger, call record,
     # span) — the same figures, by construction.
     usage = parse_usage(resp.content, ctype) if resp.status_code == 200 else None
+    if turn_session_id and resp.status_code == 200:
+        _record_completion_timing(turn_session_id, forward_started, upstream_head_at)
     if (agent_row is not None or turn_session_id is not None) and resp.status_code == 200:
         try:
             if usage and turn_session_id:
@@ -1975,6 +2006,20 @@ def _anthropic_error_message(resp: httpx.Response) -> str:
         return resp.text[:500]
     except Exception:
         return ""
+
+
+def _record_completion_timing(session_id: str, started: float, first_byte_at: float) -> None:
+    """Hand one 2xx completion's wall time and first-byte latency to the
+    session's turn counters (``app/chat/turn_usage.py``), where ChatManager
+    sums them per turn onto the assistant message. ``started`` /
+    ``first_byte_at`` are ``time.perf_counter()`` marks; "now" is the last
+    upstream byte. Never raises — ``add_turn_timing`` swallows everything."""
+    now = time.perf_counter()
+    add_turn_timing(
+        session_id,
+        duration_ms=int((now - started) * 1000),
+        ttfb_ms=int((first_byte_at - started) * 1000),
+    )
 
 
 def _record_llm_health(app_state: Any, resp: httpx.Response) -> None:

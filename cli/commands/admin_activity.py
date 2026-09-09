@@ -12,7 +12,6 @@ All require admin auth (the server returns 403 otherwise).
 from __future__ import annotations
 
 import json as json_lib
-from typing import Optional
 
 import typer
 
@@ -63,6 +62,47 @@ def _parse_since(value: str) -> int:
     )
 
 
+_CURSOR_PARSE_ERROR = (
+    "Cannot parse --cursor. Pass the next_cursor object from a prior "
+    '--json response verbatim, e.g. --cursor \'{"ts": "...", "id": "..."}\'.'
+)
+
+
+def _parse_cursor(value: str) -> tuple[str, str, str | None]:
+    """Parse a `--cursor` value.
+
+    Takes the exact `next_cursor` object a prior `--json` response prints,
+    e.g. `{"ts": "2026-09-09T10:00:00+00:00", "id": "abc-123", "since_ts":
+    "2026-09-09T09:00:00+00:00"}` — the endpoint's cursor is a (timestamp,
+    id) pair plus an optional pinned floor (app/api/activity.py), so a
+    single opaque value carrying all of it is the CLI-friendly shape
+    without inventing a new encoding for it.
+
+    `ts` and `id` are required and must be non-empty strings — `{"ts": "",
+    "id": ""}` used to pass an `"ts" not in parsed` check and silently
+    restart the timeline from page one instead of failing. `since_ts` is
+    optional (absent from a hand-built cursor, or one printed before this
+    field existed) but if present must also be a non-empty string.
+
+    Raises typer.BadParameter on anything else — a garbled cursor must fail
+    loudly rather than silently restarting the timeline from the top.
+    """
+    try:
+        parsed = json_lib.loads(value)
+    except (json_lib.JSONDecodeError, TypeError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter(_CURSOR_PARSE_ERROR)
+    ts = parsed.get("ts")
+    cid = parsed.get("id")
+    if not isinstance(ts, str) or not ts or not isinstance(cid, str) or not cid:
+        raise typer.BadParameter(_CURSOR_PARSE_ERROR)
+    since_ts = parsed.get("since_ts")
+    if since_ts is not None and (not isinstance(since_ts, str) or not since_ts):
+        raise typer.BadParameter(_CURSOR_PARSE_ERROR)
+    return ts, cid, since_ts
+
+
 def _handle_error(resp, context: str) -> None:
     """Print a clean error and exit non-zero for non-2xx responses."""
     if resp.status_code in (401, 403):
@@ -97,17 +137,21 @@ def timeline(
     ctx: typer.Context,
     since: str = typer.Option("24h", "--since", help="How far back to look (e.g. 1h, 7d, 30m, or raw minutes)"),
     limit: int = typer.Option(50, "--limit", help="Maximum rows to return (1–200)"),
-    action: Optional[str] = typer.Option(None, "--action", help="Filter by action prefix (e.g. sync.)"),
-    user: Optional[str] = typer.Option(None, "--user", help="Filter by user_id (full or prefix)"),
-    resource: Optional[str] = typer.Option(None, "--resource", help="Filter by resource (e.g. table:orders)"),
-    result: Optional[str] = typer.Option(None, "--result", help="Filter by result prefix (e.g. error)"),
-    result_class: Optional[str] = typer.Option(
+    cursor: str | None = typer.Option(
+        None,
+        "--cursor",
+        help="Resume from a prior page — the next_cursor object a --json response "
+        'prints, e.g. --cursor \'{"ts": "...", "id": "..."}\'',
+    ),
+    action: str | None = typer.Option(None, "--action", help="Filter by action prefix (e.g. sync.)"),
+    user: str | None = typer.Option(None, "--user", help="Filter by user_id (full or prefix)"),
+    resource: str | None = typer.Option(None, "--resource", help="Filter by resource (e.g. table:orders)"),
+    result: str | None = typer.Option(None, "--result", help="Filter by result prefix (e.g. error)"),
+    result_class: str | None = typer.Option(
         None, "--result-class", help="Filter by result class (success|error|denied|none|other)"
     ),
-    source: Optional[str] = typer.Option(
-        None, "--source", help="Filter by source (web|cli|scheduler|system|agent|other)"
-    ),
-    trail: Optional[str] = typer.Option(
+    source: str | None = typer.Option(None, "--source", help="Filter by source (web|cli|scheduler|system|agent|other)"),
+    trail: str | None = typer.Option(
         None,
         "--trail",
         help="Narrow to one physical trail (audit|sync|llm|agent_scope). "
@@ -118,7 +162,7 @@ def timeline(
         "--include-self-reads",
         help="Include the Activity Center's own activity.read audit rows (hidden by default)",
     ),
-    search: Optional[str] = typer.Option(None, "--search", help="Full-text search on params JSON"),
+    search: str | None = typer.Option(None, "--search", help="Full-text search on params JSON"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON to stdout"),
 ):
     """Tail the unified activity timeline (default last 24h, up to 50 rows).
@@ -136,7 +180,20 @@ def timeline(
         typer.echo(str(e), err=True)
         raise typer.Exit(2)
 
+    cursor_ts = cursor_id = cursor_since_ts = None
+    if cursor is not None:
+        try:
+            cursor_ts, cursor_id, cursor_since_ts = _parse_cursor(cursor)
+        except typer.BadParameter as e:
+            typer.echo(str(e), err=True)
+            raise typer.Exit(2)
+
     params: dict = {"since_minutes": since_minutes, "limit": limit}
+    if cursor_ts and cursor_id:
+        params["cursor_ts"] = cursor_ts
+        params["cursor_id"] = cursor_id
+        if cursor_since_ts:
+            params["since_ts"] = cursor_since_ts
     if action:
         params["action_prefix"] = action
     if user:
@@ -194,7 +251,10 @@ def timeline(
 
     next_cur = data.get("next_cursor")
     if next_cur:
-        typer.echo("\n  (more rows available — pass --limit higher or use --json to page with cursor)")
+        typer.echo(
+            "\n  (more rows available — re-run with --json to read next_cursor, "
+            "then pass --cursor '<next_cursor JSON>' to continue)"
+        )
 
 
 # ---------------------------------------------------------------------------

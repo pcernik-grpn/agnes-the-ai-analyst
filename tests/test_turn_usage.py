@@ -78,3 +78,50 @@ def test_unavailable_backend_never_raises(monkeypatch):
     monkeypatch.setattr("app.chat.turn_usage.coordination", lambda: _Down())
     add_turn_usage("s1", dict(_USAGE))  # must not raise
     assert drain_turn_usage("s1") is None  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Completion timing rides the same seam as the token counters: the broker
+# records each session-bound completion's wall time and time-to-first-byte,
+# the manager drains them once per turn. A separate drain from the token one
+# so a turn whose usage could not be parsed still keeps its timing, and a
+# timing-only drain can never hydrate a frame with zero tokens.
+# ---------------------------------------------------------------------------
+
+
+def test_timing_accumulates_calls_duration_and_ttfb():
+    from app.chat.turn_usage import add_turn_timing, drain_turn_timing
+
+    add_turn_timing("s1", duration_ms=1200, ttfb_ms=300)
+    add_turn_timing("s1", duration_ms=800, ttfb_ms=250)
+    assert drain_turn_timing("s1") == {"llm_calls": 2, "llm_duration_ms": 2000, "llm_ttfb_ms": 550}
+
+
+def test_timing_drain_is_destructive_and_independent_of_usage():
+    from app.chat.turn_usage import add_turn_timing, drain_turn_timing
+
+    add_turn_timing("s1", duration_ms=10, ttfb_ms=5)
+    assert drain_turn_usage("s1") is None, "timing must not masquerade as token usage"
+    assert drain_turn_timing("s1") == {"llm_calls": 1, "llm_duration_ms": 10, "llm_ttfb_ms": 5}
+    assert drain_turn_timing("s1") is None
+
+
+def test_timing_zero_duration_still_counts_the_call():
+    """A sub-millisecond completion is still a completion; ``llm_calls`` is
+    what makes the per-turn averages honest."""
+    from app.chat.turn_usage import add_turn_timing, drain_turn_timing
+
+    add_turn_timing("s1", duration_ms=0, ttfb_ms=0)
+    assert drain_turn_timing("s1") == {"llm_calls": 1, "llm_duration_ms": 0, "llm_ttfb_ms": 0}
+
+
+def test_timing_unavailable_backend_never_raises(monkeypatch):
+    from app.chat.turn_usage import add_turn_timing, drain_turn_timing
+
+    class _Down:
+        def __getattr__(self, name):
+            raise CoordinationUnavailable("down")
+
+    monkeypatch.setattr("app.chat.turn_usage.coordination", lambda: _Down())
+    add_turn_timing("s1", duration_ms=5, ttfb_ms=1)
+    assert drain_turn_timing("s1") is None

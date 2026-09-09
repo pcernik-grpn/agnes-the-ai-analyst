@@ -44,6 +44,20 @@ _REAL_RESOLVE_SERVER_URL = onb._resolve_server_url
 # --------------------------------------------------------------------------- #
 
 
+@pytest.fixture(autouse=True)
+def _contain_update_check_switch(monkeypatch):
+    """`agnes onboard` sets ``AGNES_NO_UPDATE_CHECK=1`` in its own process on
+    purpose (so its internal `agnes update` is not raced by the root
+    callback's background one). Run in-process by CliRunner, that write
+    outlives the test and every later test on the same xdist worker sees
+    `update_check.check()` short-circuit — `tests/test_cli_update_check.py`
+    failed in CI exactly this way once its cleaner test landed on another
+    worker. Registering the switch's absence with monkeypatch makes its
+    teardown delete whatever the command wrote.
+    """
+    monkeypatch.delenv("AGNES_NO_UPDATE_CHECK", raising=False)
+
+
 def test_classify_empty_dir_is_prepared(tmp_path):
     verdict, detail = onb.classify_workspace_dir(tmp_path)
     assert verdict == onb.DIR_PREPARED

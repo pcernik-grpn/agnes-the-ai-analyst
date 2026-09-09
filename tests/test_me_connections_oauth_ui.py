@@ -18,6 +18,8 @@ import pytest
 
 pytest.importorskip("mcp", reason="mcp SDK not installed")
 
+from datetime import UTC
+
 from cryptography.fernet import Fernet
 
 from app.secrets_vault import _reset_ephemeral_key_for_tests
@@ -67,6 +69,29 @@ def test_admin_detail_has_oauth_connect_and_disconnect_controls():
     assert "myconn-oauth-test-btn" in html
     assert "oauth/authorize" in html
     assert "oauth/connection" in html
+
+
+def test_admin_detail_has_oauth_client_registration_controls():
+    """The register-vs-connect gate: an admin must be able to register an
+    OAuth client (DCR or manual) from this page, not only via the CLI/API."""
+    html = _read("admin_mcp_source_detail.html")
+    assert 'id="oauth-client-card"' in html
+    # The register/manual controls are `ds.button(...)` macro calls (rendered
+    # HTML has `id="…"`, the raw template source these tests read has
+    # `id='…'`) — check the id substring, same convention the sibling test
+    # above uses for the my-connection card's own macro-rendered buttons.
+    assert "oauthclient-register-btn" in html
+    assert "oauthclient-reregister-btn" in html
+    assert "oauthclient-manual-toggle" in html
+    assert 'id="oauthclient-manual-client-id"' in html
+    assert 'id="oauthclient-manual-authz"' in html
+    assert 'id="oauthclient-manual-token"' in html
+    assert "oauthclient-manual-save-btn" in html
+    assert "oauth/register" in html
+    assert "oauth/client" in html
+    # The "Connect your account" control must not be presented as usable
+    # before a client is registered.
+    assert 'id="myconn-oauth-noclient"' in html
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +397,7 @@ def test_me_connections_lapsed_connection_still_offers_disconnect(seeded_app):
     """An expired token with no refresh path is not usable (no green pill),
     but the stored row must still be removable from the page (Devin Review
     on #1130)."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from src.repositories import mcp_user_oauth_tokens_repo
 
@@ -382,7 +407,7 @@ def test_me_connections_lapsed_connection_still_offers_disconnect(seeded_app):
         "analyst1",
         "atok",
         refresh_token=None,
-        expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        expires_at=datetime.now(UTC) - timedelta(hours=1),
     )
     r = seeded_app["client"].get(
         "/me/connections",
@@ -530,3 +555,82 @@ def test_try_again_link_is_withheld_when_the_retry_would_fail_again(seeded_app):
     assert r.status_code == 200
     assert "Connect failed" in r.text
     assert "/api/mcp/sources/src_oauth_retry/oauth/authorize" not in r.text
+
+
+def test_admin_gets_a_fix_link_for_client_registration_missing(seeded_app):
+    """An admin hitting ``client_registration_missing`` sees a clear message
+    AND a link to the fix — not a dead-end "Try again" that would just
+    303-redirect back to the same error (the reported "clicking the link
+    just seemed to do nothing" bug)."""
+    from src.db import get_system_db
+    from src.repositories.mcp_sources import MCPSourceRepository
+
+    conn = get_system_db()
+    MCPSourceRepository(conn).upsert(
+        id="src_oauth_noclient",
+        name="src_oauth_noclient",
+        transport="http",
+        url="https://upstream.example/mcp",
+        auth_method="oauth",
+        scope="per_user",
+    )
+    conn.close()
+
+    r = seeded_app["client"].get(
+        "/me/connections",
+        params={"connect_error": "client_registration_missing", "retry": "src_oauth_noclient"},
+        headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+    )
+    assert r.status_code == 200
+    assert "the OAuth client registration is missing" in r.text
+    assert "/admin/mcp-sources/src_oauth_noclient" in r.text
+    assert "Register the OAuth client" in r.text
+    # Retrying the authorize endpoint would just fail again — withheld from
+    # the error banner specifically (the source card below it still renders
+    # its own "Connect with …" link — that's the normal one-time entry
+    # point, unaffected by this banner's retry gating).
+    banner = r.text.split('class="connx-banner connx-banner--error"')[1].split("</div>")[0]
+    assert "/api/mcp/sources/src_oauth_noclient/oauth/authorize" not in banner
+
+
+def test_analyst_sees_no_admin_fix_link_for_client_registration_missing(seeded_app):
+    """A non-admin has no action of their own to take — no fix link, just
+    the existing fixed 'contact your admin' message."""
+    from src.db import get_system_db
+    from src.repositories.mcp_sources import MCPSourceRepository
+    from src.repositories.tool_registry import PASSTHROUGH, ToolRegistryRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    MCPSourceRepository(conn).upsert(
+        id="src_oauth_noclient2",
+        name="src_oauth_noclient2",
+        transport="http",
+        url="https://upstream.example/mcp",
+        auth_method="oauth",
+        scope="per_user",
+    )
+    tools = ToolRegistryRepository(conn)
+    tools.upsert(
+        tool_id="src_oauth_noclient2.lookup",
+        source_id="src_oauth_noclient2",
+        original_name="lookup",
+        exposed_name="lookup",
+        mode=PASSTHROUGH,
+        description="grant target",
+    )
+    grp = UserGroupsRepository(conn).create(name="grant-src_oauth_noclient2", description=None)
+    tools.add_grant("src_oauth_noclient2.lookup", grp["id"])
+    UserGroupMembersRepository(conn).add_member("analyst1", grp["id"], source="system_seed")
+    conn.close()
+
+    r = seeded_app["client"].get(
+        "/me/connections",
+        params={"connect_error": "client_registration_missing", "retry": "src_oauth_noclient2"},
+        headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+    )
+    assert r.status_code == 200
+    assert "the OAuth client registration is missing" in r.text
+    assert "/admin/mcp-sources/src_oauth_noclient2" not in r.text
+    assert "Register the OAuth client" not in r.text
