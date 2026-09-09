@@ -172,6 +172,27 @@ class ChatSessionPgRepository:
                 {"id": chat_id},
             )
 
+    def last_message_at_for(self, session_ids: list[str]) -> dict:
+        """``{session_id: last_message_at}`` for the ids that have one.
+
+        The conversation-corpus push sink asks this before rebuilding a
+        record the LATE-FEEDBACK sweep selected: that sweep picks sessions
+        by when their feedback changed, which says nothing about whether
+        the conversation itself has settled, and a thumbs verdict on an old
+        answer must not ship a transcript whose newest turn is still being
+        written (design 2026-09-08 §3.12, settle window).
+        """
+        if not session_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT id, last_message_at FROM chat_sessions WHERE id = ANY(:ids) AND last_message_at IS NOT NULL"
+                ),
+                {"ids": list(session_ids)},
+            ).all()
+        return {r[0]: r[1] for r in rows}
+
     def hard_delete_session(self, chat_id: str) -> bool:
         """Permanently delete ONE session; returns whether a row existed.
 

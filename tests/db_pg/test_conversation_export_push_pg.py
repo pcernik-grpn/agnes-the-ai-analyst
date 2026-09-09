@@ -581,6 +581,84 @@ class TestOversizedRecordNeverBlocksTheCorpus:
         assert params["count"] == 0
 
 
+class TestFeedbackSweepHonoursTheSettleWindow:
+    """Review finding: the sweep picks sessions by when their FEEDBACK
+    changed, which says nothing about whether the conversation settled. A
+    thumbs verdict on an old answer must not ship a transcript whose newest
+    turn is still being written, and the held-back row must survive for a
+    later sweep instead of being scanned past."""
+
+    def _feedback(self, pg_engine, session_id: str, turn_id: str = "t1") -> None:
+        from src.repositories import chat_message_feedback_repo
+
+        chat_message_feedback_repo().upsert(
+            session_id=session_id,
+            turn_id=turn_id,
+            user_id="u_1",
+            verdict="down",
+            comment=None,
+            message_id=None,
+        )
+
+    def test_feedback_on_a_session_still_mid_turn_waits_for_the_next_run(self, pg_client, pg_engine):
+        from app.worker import kinds_conversation_export as mod
+        from src.repositories import export_watermarks_repo
+
+        # Settled long ago, then a brand-new user message arrives (mid-turn),
+        # and only THEN does a thumbs land on the older answer.
+        session_id = _seed_session(pg_engine, index=1)
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": datetime.now(UTC), "id": session_id},
+            )
+        self._feedback(pg_engine, session_id)
+
+        posted: list[bytes] = []
+        result = mod.run_conversation_export_once(
+            client=_mock_client(lambda r: (posted.append(r.content), httpx.Response(200))[1]),
+            sleep=lambda *_: None,
+        )
+
+        assert result["refreshed"] == 0, "an unsettled conversation must not be rebuilt"
+        assert posted == []
+        # And its feedback was NOT scanned past: no watermark yet, so the
+        # next run sees the same row again.
+        assert export_watermarks_repo().get(_feedback_watermark_name_for()) is None
+
+    def test_once_the_conversation_settles_the_held_back_feedback_is_delivered(self, pg_client, pg_engine):
+        from app.worker import kinds_conversation_export as mod
+
+        session_id = _seed_session(pg_engine, index=1)
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": datetime.now(UTC), "id": session_id},
+            )
+        self._feedback(pg_engine, session_id)
+
+        first = mod.run_conversation_export_once(
+            client=_mock_client(lambda _r: httpx.Response(200)), sleep=lambda *_: None
+        )
+        assert first["refreshed"] == 0
+
+        # The turn finishes: the conversation's last message is now older
+        # than the settle window.
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": datetime.now(UTC) - mod.SETTLE_WINDOW - timedelta(minutes=1), "id": session_id},
+            )
+
+        posted: list[bytes] = []
+        second = mod.run_conversation_export_once(
+            client=_mock_client(lambda r: (posted.append(r.content), httpx.Response(200))[1]),
+            sleep=lambda *_: None,
+        )
+        assert second["sent"] + second["refreshed"] >= 1, "the settled conversation must reach the destination"
+        assert posted, "nothing was delivered on the second run"
+
+
 class TestHeadersAndAudit:
     def test_headers_come_from_the_env_var_and_never_appear_in_the_audit_row(self, pg_client, pg_engine):
         from app.worker.kinds_conversation_export import run_conversation_export_once

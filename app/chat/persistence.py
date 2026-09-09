@@ -740,6 +740,19 @@ class ChatRepository:
             for r in rows
         ]
 
+    def last_message_at_for(self, session_ids: list[str]) -> dict:
+        """See ``ChatSessionPgRepository.last_message_at_for``. Same shape on
+        the frozen backend, read from the DuckDB table."""
+        if self._sessions_pg is not None:
+            return self._sessions_pg.last_message_at_for(session_ids)
+        if not session_ids:
+            return {}
+        rows = self._conn.execute(
+            "SELECT id, last_message_at FROM chat_sessions WHERE id = ANY(?) AND last_message_at IS NOT NULL",
+            [list(session_ids)],
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     def has_turn(self, session_id: str, turn_id: str) -> bool:
         """See ``ChatMessagePgRepository.has_turn``. ``turn_id`` has no
         DuckDB column (A3 freeze -- ``append_message`` drops it), so the

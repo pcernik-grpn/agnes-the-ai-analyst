@@ -448,6 +448,7 @@ def _sweep_feedback_updates(
     endpoint: str,
     surfaces: tuple[str, ...],
     exclude: set[str],
+    settle_bound: datetime,
     http_client: httpx.Client,
     headers: dict[str, str],
     sleep: Callable[[float], None],
@@ -513,6 +514,27 @@ def _sweep_feedback_updates(
     if not rows:
         watermark_repo.set(name, until, "-")
         return 0, False
+
+    # A session the FEEDBACK picked may be mid-turn: a thumbs verdict on an
+    # old answer says nothing about whether the conversation has settled,
+    # and rebuilding it now would ship a transcript whose newest turn is
+    # still being written -- the very thing SETTLE_WINDOW exists to prevent.
+    # Rows are walked in order and cut at the FIRST unsettled one, so its
+    # feedback is not scanned past: the watermark stops in front of it and
+    # the next run picks it up once the conversation settles.
+    settled_at = bundle.sessions.last_message_at_for([sid for sid, _ in rows])
+    held_back = False
+    for index, (sid, _updated_at) in enumerate(rows):
+        last_message_at = settled_at.get(sid)
+        if last_message_at is None or last_message_at >= settle_bound:
+            rows = rows[:index]
+            has_more = True  # there IS more to do; the watermark must not jump to `until`
+            held_back = True
+            break
+    if not rows:
+        return 0, False
+    if held_back:
+        logger.debug("conversation-export: feedback sweep stopped at an unsettled conversation")
 
     session_ids = [sid for sid, _updated_at in rows if sid not in exclude]
     records = records_for_session_ids(bundle, session_ids) if session_ids else []
@@ -694,6 +716,7 @@ def run_conversation_export_once(
             endpoint=endpoint,
             surfaces=surfaces,
             exclude=delivered_this_run,
+            settle_bound=until,
             http_client=http_client,
             headers=headers,
             sleep=sleep,
