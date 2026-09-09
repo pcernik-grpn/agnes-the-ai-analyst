@@ -39,6 +39,7 @@ from src.models.fact_collection_stats import (
 )
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
 from src.models.facts_llm_cache import FactsLlmCache
+from src.models.issue_reports import IssueComment, IssueReport
 from src.models.jobs import Job
 from src.models.knowledge import (
     KnowledgeContradiction,
@@ -52,7 +53,6 @@ from src.models.knowledge import (
     VerificationEvidence,
 )
 from src.models.knowledge_digests import KnowledgeDigest
-from src.models.memory_detection_runs import MemoryDetectionRun
 from src.models.lookup import (
     BqMetadataCache,
     ColumnMetadata,
@@ -70,6 +70,7 @@ from src.models.mcp import (
     ToolGrant,
     ToolRegistry,
 )
+from src.models.memory_detection_runs import MemoryDetectionRun
 from src.models.misc import (
     NewsTemplate,
     PendingCode,
@@ -164,6 +165,8 @@ __all__ = [
     "IdempotencyKey",
     "IngestRun",
     "InstanceTemplate",
+    "IssueComment",
+    "IssueReport",
     "Job",
     "KnowledgeContradiction",
     "KnowledgeDigest",
@@ -201,11 +204,11 @@ __all__ = [
     "SemanticHealthMute",
     "SemanticModel",
     "SemanticSource",
+    "SessionProcessorState",
+    "SetupToken",
     "ShareRequest",
     "SharepointConnectionState",
     "SharepointCrawlItem",
-    "SessionProcessorState",
-    "SetupToken",
     "SourceConnection",
     "SsoConfig",
     "StoreEntity",

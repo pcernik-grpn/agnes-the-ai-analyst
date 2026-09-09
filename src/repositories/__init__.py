@@ -212,6 +212,8 @@ __all__ = [
     "sharepoint_collection_consolidation_repo",
     # SharePoint split-merge (crawl/facts state union) — Postgres-only
     "sharepoint_connection_merge_repo",
+    # Issue reporting, step 1 (report a problem from every surface) — Postgres-only
+    "issue_reports_repo",
 ]
 
 
@@ -757,6 +759,13 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "sharepoint_connection_merge": {
         PG: ("src.repositories.sharepoint_connection_merge_pg", "SharePointConnectionMergePgRepository"),
     },
+    # Issue reporting, step 1 (report a problem from every surface) —
+    # POSTGRES-ONLY, A3 ratchet: brand-new app-state table pair, no DuckDB
+    # backend. Resolving this key on a DuckDB-backed instance raises
+    # RequiresPostgresBackend, translated to a typed 501 by app/main.py.
+    "issue_reports": {
+        PG: ("src.repositories.issue_reports_pg", "IssueReportsPgRepository"),
+    },
 }
 
 
@@ -1265,3 +1274,10 @@ def sharepoint_collection_consolidation_repo() -> Any:
 
 def sharepoint_connection_merge_repo() -> Any:
     return _build("sharepoint_connection_merge")
+
+
+# Issue reporting, step 1 — POSTGRES-ONLY. Raises RequiresPostgresBackend on
+# a DuckDB-backed instance; let it propagate.
+def issue_reports_repo() -> Any:
+    """Issue reports + comments (PG-only, step 1 of issue reporting)."""
+    return _build("issue_reports")
