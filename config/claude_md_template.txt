@@ -297,7 +297,11 @@ number is unsupported is the admission the reader actually needs.
 
 When you cannot ground an answer or are unsure of a calculation, **offer to
 report it** via `flag_semantic_issue` — don't file it silently without asking,
-but don't wait for the user to remember to raise it either.
+but don't wait for the user to remember to raise it either. For any problem
+that is not about the semantic layer — a tool that fails, a query that
+errors, a missing capability, an answer the user says is wrong — offer
+`report_issue` (or `agnes issue report`) with the context you have;
+`list_my_issues` answers "what have I reported".
 
 ## Charts
 

@@ -256,6 +256,13 @@ STDIO_TOOL_NAMES = frozenset(
         "collection_get",
         "collection_file_read",
         "chat_upload_file",
+        # Issue reports (step 1) — same four any-caller tools as the HTTP
+        # foundation surface; the admin trio (issue_queue_list/issue_reply/
+        # issue_resolve) stays HTTP-only.
+        "report_issue",
+        "list_my_issues",
+        "get_issue",
+        "issue_comment",
         # Data apps: authoring, deploy, and the in-chat preview loop
         "data_apps_list",
         "data_app_get",
@@ -573,11 +580,7 @@ def test_a_shared_tool_takes_the_same_arguments_on_both_servers():
     shared = sorted(set(http) & set(stdio))
     assert shared, "expected the two servers to share tools; the AST scan found none"
 
-    drift = {
-        name: {"http": http[name], "stdio": stdio[name]}
-        for name in shared
-        if set(http[name]) != set(stdio[name])
-    }
+    drift = {name: {"http": http[name], "stdio": stdio[name]} for name in shared if set(http[name]) != set(stdio[name])}
     assert not drift, (
         "these tools take different arguments on the HTTP and stdio MCP servers — "
         f"the contract an agent reads depends on which server it reached: {drift}"

@@ -64,6 +64,7 @@ from cli.commands.mcp import mcp_app
 from cli.commands.docs import docs_app
 from cli.commands.collections import collections_app
 from cli.commands.facts import facts_app
+from cli.commands.issue import issue_app
 from cli.commands.config import config_app
 from cli.commands.connectors import connectors_app
 from cli.commands.data_apps import data_apps_app
@@ -357,6 +358,7 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(docs_app, name="docs")
 app.add_typer(collections_app, name="collections")
 app.add_typer(facts_app, name="facts")
+app.add_typer(issue_app, name="issue")
 app.add_typer(connectors_app, name="tools")
 # Deprecated aliases: `agnes connectors` was the original name, but it
 # collides with "Connector" = data source (Keboola/BigQuery/…) used

@@ -319,6 +319,23 @@ def _data_apps_nav_enabled() -> bool:
         return False
 
 
+def _issue_reporting_available() -> bool:
+    """Whether the "Report a problem" rail/user-menu entry and dialog should
+    render. Issue reports (``issue_reports``/``issue_comments``) are a
+    Postgres-only table pair (A3 PG-first ratchet) — a DuckDB-backed instance
+    shows no button rather than one that 501s. Read live (never cached at
+    import time), same reasoning as ``_data_apps_nav_enabled`` above: an
+    instance's app-state backend does not flip mid-process today, but the
+    live read costs nothing and keeps this in step with the source of truth
+    rather than a snapshot of it."""
+    try:
+        from src.repositories import use_pg
+
+        return bool(use_pg())
+    except Exception:
+        return False
+
+
 def _admin_setup_rail() -> object:
     """The admin's setup chain for the rail, or None.
 
@@ -4682,7 +4699,7 @@ def _definition_is_rich(html: str) -> bool:
     """
     import re as _re
 
-    body = _re.sub(r"</?(?:p|br)\s*/?>", "", html or "", flags=_re.I)
+    body = _re.sub(r"</?(?:p|br)\s*/?>", "", html or "", flags=_re.IGNORECASE)
     return "<" in body
 
 
@@ -7065,6 +7082,10 @@ def _chrome_ctx(request: Request, user: dict | None) -> dict:
         # Publishing external apps — off by default, and its page 404s when it
         # is off, so the row goes with it.
         "can_data_apps": _data_apps_nav_enabled(),
+        # "Report a problem" rail/user-menu entry + dialog — issue reports
+        # are a Postgres-only table pair (A3 PG-first ratchet), so a
+        # DuckDB-backed instance shows no button rather than one that 501s.
+        "can_report_issue": _issue_reporting_available(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).

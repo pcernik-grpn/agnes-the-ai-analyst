@@ -1852,6 +1852,16 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "agnes_data_app_refresh": "mcp.tool_call",
     "agnes_data_app_close": "mcp.tool_call",
     "agnes_data_app_credentials": "exempt:ui_support",
+    # Issue reporting (step 1, docs/superpowers/specs/2026-09-09-issue-
+    # reporting-step1-design.md) -- same actions as the REST routes each
+    # tool self-calls (app/api/issues.py, catalog entries added by Task 2).
+    "report_issue": "issue.report",
+    "list_my_issues": "exempt:ui_support",
+    "get_issue": "exempt:ui_support",
+    "issue_comment": "issue.comment",
+    "issue_queue_list": "exempt:ui_support",
+    "issue_reply": "issue.comment",
+    "issue_resolve": "issue.resolved",
 }
 
 # Slack (`/agnes`, `/agnes-new`, `/agnes-status`) and Telegram (`/start`,

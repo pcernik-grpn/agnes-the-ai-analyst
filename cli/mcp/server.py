@@ -32,9 +32,8 @@ tool sandbox, which blocks outbound HTTP. Credentials are read from
 
 from __future__ import annotations
 
-from typing import Literal
-
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -661,6 +660,84 @@ def pull(skip_materialize: bool = False) -> dict:
         # to `duration_s` to match `PullResult` + `--json` output.
         "duration_s": round(result.duration_s, 1),
     }
+
+
+# ── issue reports ────────────────────────────────────────────────────────────
+#
+# Same four tools as the HTTP foundation surface (app/api/mcp/
+# foundation_tools.py) — a caller connected through the sandboxed stdio
+# `agnes mcp` server can still file and follow a report without leaving
+# chat. The admin-only trio (issue_queue_list/issue_reply/issue_resolve)
+# stays HTTP-only: the admin queue is not something the sandboxed chat
+# agent needs, and #1707 Block 6 already closed this tool set to what
+# genuinely needs a local process. `cli.v2_client.api_post_json`/
+# `api_get_json` carry no `headers=` kwarg (unlike `cli.client.api_get`,
+# used above), so — unlike the HTTP transport — these do NOT send
+# `X-Agnes-Client: mcp`; a report filed this way lands with
+# `source_surface="web"` server-side rather than `"mcp"` until that helper
+# grows one.
+
+
+@tool(read_only=False, idempotent=False)
+def report_issue(
+    title: str,
+    body: str | None = None,
+    kind: str = "bug",
+    page_url: str | None = None,
+    context: dict | None = None,
+) -> dict:
+    """Report a problem to this Agnes instance (bug | wrong_answer | request | question | other).
+
+    Same tool as the server's `report_issue`; the report goes to the same queue.
+    """
+    payload = {
+        k: v
+        for k, v in {"title": title, "body": body, "kind": kind, "page_url": page_url, "context": context}.items()
+        if v is not None
+    }
+    try:
+        return api_post_json("/api/issues", payload)
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error("report_issue", exc)) from exc
+
+
+@tool(read_only=True)
+def list_my_issues(status: str = "open", limit: int = 50) -> dict:
+    """List your own issue reports (status: open | resolved | all).
+
+    Same tool as the server's `list_my_issues`.
+    """
+    try:
+        return api_get_json("/api/issues/mine", status=status, limit=limit)
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error("list_my_issues", exc)) from exc
+
+
+@tool(read_only=True)
+def get_issue(issue_id: str) -> dict:
+    """One issue report and its comments (own report, or any report if admin).
+
+    Args:
+        issue_id: The issue id (``iss_…``), or its number (``42``/``#42``).
+
+    Same tool as the server's `get_issue`.
+    """
+    try:
+        return api_get_json(f"/api/issues/{issue_id}")
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error("get_issue", exc)) from exc
+
+
+@tool(read_only=False)
+def issue_comment(issue_id: str, body: str) -> dict:
+    """Add a comment to an issue report you filed (or, as admin, any report).
+
+    Same tool as the server's `issue_comment`.
+    """
+    try:
+        return api_post_json(f"/api/issues/{issue_id}/comments", {"body": body})
+    except V2ClientError as exc:
+        raise ValueError(_mcp_error("issue_comment", exc)) from exc
 
 
 # ── hosted data apps ─────────────────────────────────────────────────────────

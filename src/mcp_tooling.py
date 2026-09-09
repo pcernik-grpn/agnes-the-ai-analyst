@@ -428,6 +428,13 @@ TITLE_OVERRIDES: dict[str, str] = {
     "fact_claims": "Get Fact Claims",
     "activity": "Get Activity Timeline",
     "effective_access": "Check Table Access Policy",
+    # Issue reporting (step 1) — "report" and "resolve" name the same open/
+    # close pair `flag_semantic_issue`/`semantic_feedback_resolve` already
+    # established above, reused rather than reinvented.
+    "report_issue": "Open Issue Report",
+    "issue_comment": "Add Issue Comment",
+    "issue_reply": "Add Issue Reply",
+    "issue_resolve": "Close Issue Report",
 }
 
 
