@@ -533,7 +533,7 @@ def _onboard_lines(server_url_placeholder: str = "{server_url}") -> list[str]:
         "   and asks before adopting a directory that already holds unrelated files.",
         "   Relay its instructions to the user and follow them — re-run with",
         "   `--accept-dir` only once the user has explicitly agreed to this directory",
-        "   (the install guide suggested ~/{workspace_dir}).",
+        "   (the install guide suggested ~/Desktop/{workspace_dir}).",
         "   Don't pick or create a folder on your own.",
         "",
         "   From there `agnes onboard` converges the rest in one run — workspace init,",

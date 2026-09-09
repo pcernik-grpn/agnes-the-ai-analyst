@@ -438,7 +438,7 @@ def test_brand_and_workspace_dir_substitution():
     assert "Set up the Foundry AI CLI on this machine." in joined
     assert "2) Set up the Foundry AI workspace in the current directory" in joined
     assert '"Foundry AI workspace is ready"' in joined
-    assert "~/FoundryAI" in joined
+    assert "~/Desktop/FoundryAI" in joined
     assert "{instance_brand}" not in joined
     assert "{workspace_dir}" not in joined
 
