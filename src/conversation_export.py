@@ -308,19 +308,31 @@ def _fold_cancelled_marker(totals: dict[str, Any], cancelled: bool) -> dict[str,
     an interruption it is NOT an error -- nothing went wrong.
 
     Which is also why ``has_error`` has to be recomputed rather than left
-    alone: cancelling cuts the stream, so the broker records that call as
-    ``incomplete``, and the session-wide ``has_error`` would then report the
-    cancel itself as a failure. Exactly ONE incomplete row is explained by
-    the cancel; a real ``error`` row, or a SECOND incomplete one from an
-    earlier turn, still counts (#2365 review).
+    alone: cancelling an ANSWER cuts the stream, so the broker records that
+    call as ``incomplete``, and the session-wide ``has_error`` would then
+    report the cancel itself as a failure.
+
+    But a cancel does not always cut a stream. ``ChatManager.cancel`` can
+    land while a TOOL is running, after the completion that asked for the
+    tool already finished cleanly — the transcript gets its cancelled
+    marker and the ledger gets no incomplete row at all. Forgiving one
+    incomplete row regardless would then erase a genuine cut stream from an
+    earlier turn (#2365 review). So the row is forgiven only when the
+    session's NEWEST call really is the incomplete one, which is the row
+    the cancel produced; everything else — an ``error`` row, an earlier
+    incomplete one — still counts.
     """
     if not cancelled:
         return totals
     folded = dict(totals)
+    # Read BEFORE the status is overwritten below: this is the newest call's
+    # own status, and only an `incomplete` one can be the cancel's doing.
+    cancel_cut_the_stream = folded.get("last_run_status") == "incomplete"
     folded["last_run_status"] = "cancelled"
     error_count = int(folded.get("error_count") or 0)
     incomplete_count = int(folded.get("incomplete_count") or 0)
-    folded["has_error"] = error_count > 0 or incomplete_count > 1
+    unexplained_incomplete = incomplete_count - (1 if cancel_cut_the_stream else 0)
+    folded["has_error"] = error_count > 0 or unexplained_incomplete > 0
     if not folded["has_error"]:
         folded["error_types"] = [t for t in (folded.get("error_types") or []) if t != "stream_incomplete"]
     return folded

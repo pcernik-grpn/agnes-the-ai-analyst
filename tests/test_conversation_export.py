@@ -387,6 +387,37 @@ class TestLegacyAndCancelledTranscripts:
         record = build_conversation_record(_session(), messages, statuses, [], [], content_mode="full")
         assert record["has_error"] is True
 
+    def test_a_cancel_during_a_tool_does_not_forgive_an_earlier_cut_stream(self):
+        """`ChatManager.cancel` can land while a TOOL runs, after the
+        completion that asked for it finished cleanly -- the transcript gets
+        its cancelled marker and the ledger gets no incomplete row from it.
+        Forgiving one anyway would erase a genuine cut stream from an
+        earlier turn (#2365 review)."""
+        messages = [
+            _msg(role="user", content="question", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                parts=None,
+                tool_calls=[{"cancelled": True}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+            ),
+        ]
+        statuses = {
+            # The newest call SUCCEEDED (it asked for the tool); the
+            # incomplete row belongs to an earlier turn.
+            "last_run_status": "ok",
+            "has_error": True,
+            "error_types": ["stream_incomplete"],
+            "error_count": 0,
+            "incomplete_count": 1,
+        }
+        record = build_conversation_record(_session(), messages, statuses, [], [], content_mode="full")
+        assert record["has_error"] is True, "an earlier cut stream must survive a tool-time cancel"
+        assert record["error_types"] == ["stream_incomplete"]
+        assert record["last_run_status"] == "cancelled"
+
     def test_an_interrupted_answer_still_wins_over_the_cancel_status(self):
         messages = [
             _msg(

@@ -31,9 +31,10 @@
   still reports its tool calls, read from the legacy column, and its turn
   count, derived from the transcript rather than read as zero. An answer a
   person cancelled is reported as `cancelled` and not complete, distinct
-  from a turn the system lost, and the cut stream a cancel produces is not
-  counted as an error — while a real failure earlier in the same session
-  still is.
+  from a turn the system lost. The cut stream a cancel produces is not
+  counted as an error, but only when the cancel really produced one — a
+  cancel that lands while a tool runs cuts no stream, and a real failure
+  earlier in the same session survives either way.
 - **A real trace per chat turn.** ChatManager mints a `turn_id` per user message,
   opens an `agnes.chat.turn` span with one `agnes.chat.tool <tool>` child per tool
   call, and the broker parents its completion spans under it via a coordination
