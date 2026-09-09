@@ -28,7 +28,12 @@ FROM python:3.13-slim
 # v3: added `python-pptx` / `python-docx` / `openpyxl` to the pip install
 # block below (office-document skills) — an image still reporting "2" or
 # earlier predates them and such a skill silently cannot work.
-LABEL agnes.chat-sandbox.contract="3"
+# v4: pinned `mcp` in the pip install block below to pyproject's range (and
+# copied pyproject's `sqlglot` cap) — an image still reporting "3" or earlier
+# resolved mcp 2.x through claude-agent-sdk's floor-only requirement, so its
+# `agnes mcp` stdio server fails to import and the agent runs without any
+# Agnes foundation or Universal-MCP passthrough tool.
+LABEL agnes.chat-sandbox.contract="4"
 
 # Node.js is required by claude-agent-sdk: it shells out to the
 # `@anthropic-ai/claude-code` CLI for its MCP handshake, and without that
@@ -72,8 +77,19 @@ RUN npm install -g @anthropic-ai/claude-code
 # plugin asks for would let publishing a plugin change what code runs,
 # unreviewed, in every OTHER user's sandbox on their next spawn — a supply-
 # chain lever this image must not hand a plugin author.
+#
+# `mcp` is pinned here although claude-agent-sdk already requires it: the
+# SDK's requirement is a floor only, so left to it pip resolves mcp 2.x, which
+# removed `mcp.server.fastmcp` — the module the `agnes mcp` stdio server
+# (cli/mcp/server.py) is built on. That server is what the runner registers
+# as the sandbox agent's `agnes` MCP server; when it dies at import Claude
+# Code drops it without a word and the agent keeps only its built-in tools —
+# no Agnes foundation tools, no Universal-MCP passthrough tools. Same range as
+# pyproject; `tests/test_chat_answer_provenance_and_charts.py` keeps this pin
+# (and every other pyproject-capped pin below) identical to pyproject's.
 RUN pip install --no-cache-dir \
     "claude-agent-sdk>=0.2.87,<0.3.0" \
+    "mcp>=1.28.1,<2" \
     "duckdb>=1.5.2" \
     "httpx>=0.27.0" \
     "pyyaml>=6.0" \
@@ -84,7 +100,7 @@ RUN pip install --no-cache-dir \
     "pyarrow>=12.0.0" \
     "pandas>=2.0.0" \
     "numpy>=1.24.0" \
-    "sqlglot>=30.0.0" \
+    "sqlglot>=30.17.0,<31.0.0" \
     "matplotlib>=3.8" \
     "python-pptx>=1.0" \
     "python-docx>=1.1" \

@@ -724,6 +724,13 @@ def _make_fake_sdk(monkeypatch, *, with_stream_event: bool):
     class ResultMessage:
         usage: dict | None = None
 
+    @dataclasses.dataclass
+    class SystemMessage:
+        # The real SDK's shape: `init` (MCP server status), `compact_boundary`
+        # and friends all arrive as (subtype, data).
+        subtype: str
+        data: dict
+
     option_fields = [
         ("permission_mode", str, dataclasses.field(default="")),
         ("cwd", str, dataclasses.field(default="")),
@@ -775,6 +782,7 @@ def _make_fake_sdk(monkeypatch, *, with_stream_event: bool):
     mod.AssistantMessage = AssistantMessage
     mod.UserMessage = UserMessage
     mod.ResultMessage = ResultMessage
+    mod.SystemMessage = SystemMessage
     mod.ClaudeAgentOptions = ClaudeAgentOptions
     mod.ClaudeSDKClient = ClaudeSDKClient
 
@@ -1335,3 +1343,74 @@ def test_restore_context_appended_to_system_prompt(monkeypatch, tmp_path):
     assert isinstance(sp2, dict) and sp2.get("preset") == "claude_code"
     assert "```next_actions" in sp2.get("append", "")
     assert "older question" not in sp2.get("append", "")
+
+
+def test_mcp_server_startup_warnings_name_every_server_that_did_not_connect():
+    """Claude Code reports each configured MCP server's status in the `init`
+    system message and otherwise drops a failed server silently — the agent
+    simply runs without its tools. The runner has to say so on stderr (the
+    sandbox log), or a broken `agnes mcp` (the live case: a sandbox image
+    whose unpinned `mcp` resolved 2.x) stays invisible until someone notices
+    the tools are gone."""
+    from app.chat import runner
+
+    data = {
+        "type": "system",
+        "subtype": "init",
+        "mcp_servers": [
+            {"name": "agnes", "status": "failed"},
+            {"name": "agnes-delegation", "status": "connected"},
+            {"name": "crm", "status": "needs-auth"},
+        ],
+    }
+    warnings = runner._mcp_server_startup_warnings(data)
+    assert len(warnings) == 2
+    agnes = next(w for w in warnings if "'agnes'" in w)
+    assert "failed" in agnes
+    # The agnes server is the one whose loss costs every foundation and
+    # passthrough tool; its line names the next diagnostic step.
+    assert "agnes mcp" in agnes
+    crm = next(w for w in warnings if "'crm'" in w)
+    assert "needs-auth" in crm
+    assert not any("agnes-delegation" in w for w in warnings)
+
+
+def test_mcp_server_startup_warnings_quiet_when_all_connected_or_unreported():
+    from app.chat import runner
+
+    assert runner._mcp_server_startup_warnings({"mcp_servers": [{"name": "agnes", "status": "connected"}]}) == []
+    assert runner._mcp_server_startup_warnings({}) == []
+    # A malformed payload must never crash the turn loop it is read from.
+    assert runner._mcp_server_startup_warnings({"mcp_servers": "garbage"}) == []
+    assert runner._mcp_server_startup_warnings({"mcp_servers": [None, {"status": "failed"}]}) == []
+
+
+def test_real_agent_loop_logs_an_mcp_server_that_failed_to_start(monkeypatch, capsys):
+    """Wiring for the helper above: the `init` system message rides the first
+    turn's `receive_response()` stream, and a non-connected server in it has
+    to reach the sandbox log (stderr) without disturbing the turn itself."""
+    mod = _make_fake_sdk(monkeypatch, with_stream_event=True)
+    script = [
+        mod.SystemMessage(
+            subtype="init",
+            data={
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": [
+                    {"name": "agnes", "status": "failed"},
+                    {"name": "agnes-delegation", "status": "connected"},
+                ],
+            },
+        ),
+        mod.AssistantMessage(content=[mod.TextBlock(text="ack")]),
+        mod.ResultMessage(),
+    ]
+    emitted, _client = _run_real_agent_turn(monkeypatch, mod, script, [{"type": "user_msg", "text": "hi"}])
+
+    err = capsys.readouterr().err
+    assert "mcp server 'agnes' did not connect (status='failed')" in err
+    assert "agnes-delegation" not in err
+    # The turn still completes normally — the warning is a log line, not a frame.
+    assert next(f for f in emitted if f["type"] == "assistant_message")["content"] == "ack"
+    assert emitted[-1] == {"type": "done"}
+    assert not any(f.get("type") == "error" for f in emitted)

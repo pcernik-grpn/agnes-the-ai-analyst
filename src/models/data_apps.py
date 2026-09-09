@@ -2,10 +2,13 @@
 
 Mirrors the DuckDB DDL (``src/db.py``'s ``_DATA_APPS_CREATE_SQL`` / shared by
 fresh-install and ``_v95_to_v96``) and the Alembic migration
-``migrations/versions/0043_data_apps_v96.py`` column-for-column. Cross-engine
-behavior parity (not just schema) is covered by
-``tests/db_pg/test_data_apps_contract.py``; the raw-SQL PG repository lives at
-``src/repositories/data_apps_pg.py``.
+``migrations/versions/0043_data_apps_v96.py`` column-for-column — with ONE
+Postgres-only exception, ``data_identity`` (revision ``0113``): the DuckDB
+app-state ladder is frozen (A3), so that column exists on this side alone and
+every reader defaults its absence to ``'owner'``
+(``src.data_apps.identity.data_identity_of``). Cross-engine behavior parity
+(not just schema) is covered by ``tests/db_pg/test_data_apps_contract.py``;
+the raw-SQL PG repository lives at ``src/repositories/data_apps_pg.py``.
 """
 
 from __future__ import annotations
@@ -56,6 +59,9 @@ class DataApp(Base):
     # NULL until the app's first (re)deploy / request — no DuckDB default either.
     last_request_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_deploy_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 0113 (PG-only): 'owner' | 'viewer' — whose grants the app reads data
+    # with. NOT NULL with a server default so existing rows read 'owner'.
+    data_identity: Mapped[str] = mapped_column(String, server_default=text("'owner'"), nullable=False)
     # Neither the DuckDB DDL nor the alembic migration marks these NOT NULL
     # (both rely on the default) — mirror that exactly so autogenerate
     # doesn't see a constraint the applied migration never creates.

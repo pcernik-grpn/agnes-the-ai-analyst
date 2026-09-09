@@ -643,3 +643,278 @@ def test_set_description_reports_failure():
     with patch("cli.commands.data_apps.api_patch", return_value=fake):
         result = runner.invoke(app, ["app", "set-description", "hosted-x", "x"])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# share (owner-scoped sharing, TCRD-291)
+# ---------------------------------------------------------------------------
+
+_SHARE_GROUPS = [
+    {"id": "g1", "name": "Analysts", "is_everyone": False},
+    {"id": "everyone", "name": "Everyone", "is_everyone": True},
+]
+
+
+def test_share_no_flags_shows_state_with_resolved_names():
+    state = _mock_response(
+        200,
+        {
+            "resource_type": "data_app",
+            "resource_id": "kbc-x",
+            "visibility": "shared",
+            "group_ids": ["g1"],
+            "pending_group_ids": [],
+        },
+    )
+    groups = _mock_response(200, _SHARE_GROUPS)
+    with patch("cli.commands.data_apps.api_get", side_effect=[state, groups]) as mock_get:
+        result = runner.invoke(app, ["app", "share", "kbc-x"])
+    assert result.exit_code == 0, result.output
+    assert "shared" in result.stdout
+    assert "Analysts" in result.stdout
+    assert mock_get.call_args_list[0].args[0] == "/api/sharing/data_app/kbc-x"
+    assert mock_get.call_args_list[1].args[0] == "/api/sharing/groups"
+
+
+def test_share_no_flags_unknown_group_id_printed_raw():
+    state = _mock_response(
+        200,
+        {
+            "resource_type": "data_app",
+            "resource_id": "kbc-x",
+            "visibility": "shared",
+            "group_ids": ["ghost-id"],
+            "pending_group_ids": [],
+        },
+    )
+    groups = _mock_response(200, _SHARE_GROUPS)
+    with patch("cli.commands.data_apps.api_get", side_effect=[state, groups]):
+        result = runner.invoke(app, ["app", "share", "kbc-x"])
+    assert result.exit_code == 0, result.output
+    assert "ghost-id" in result.stdout
+
+
+def test_share_no_flags_json():
+    state_body = {
+        "resource_type": "data_app",
+        "resource_id": "kbc-x",
+        "visibility": "private",
+        "group_ids": [],
+        "pending_group_ids": [],
+    }
+    state = _mock_response(200, state_body)
+    with patch("cli.commands.data_apps.api_get", return_value=state) as mock_get:
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--json"])
+    assert result.exit_code == 0, result.output
+    assert '"visibility": "private"' in result.stdout
+    # --json returns the raw state without resolving names, so only ONE GET is made.
+    mock_get.assert_called_once()
+
+
+def test_share_not_found_hints_owner_only():
+    fake = _mock_response(404, {"detail": "resource_not_found"})
+    with patch("cli.commands.data_apps.api_get", return_value=fake):
+        result = runner.invoke(app, ["app", "share", "nope"])
+    assert result.exit_code != 0
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "not found or not yours" in output
+    assert "owner" in output.lower()
+
+
+def test_share_group_resolves_name_to_id_and_puts():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    put_resp = _mock_response(
+        200,
+        {
+            "resource_type": "data_app",
+            "resource_id": "kbc-x",
+            "visibility": "shared",
+            "group_ids": ["g1"],
+            "pending_group_ids": [],
+        },
+    )
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups) as mock_get,
+        patch("cli.commands.data_apps.api_put", return_value=put_resp) as mock_put,
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--group", "analysts"])
+    assert result.exit_code == 0, result.output
+    mock_get.assert_called_once_with("/api/sharing/groups")
+    assert mock_put.call_args.args[0] == "/api/sharing/data_app/kbc-x"
+    assert mock_put.call_args.kwargs.get("json") == {"group_ids": ["g1"]}
+
+
+def test_share_group_accepts_raw_id():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    put_resp = _mock_response(200, {"visibility": "shared", "group_ids": ["g1"], "pending_group_ids": []})
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups),
+        patch("cli.commands.data_apps.api_put", return_value=put_resp) as mock_put,
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--group", "g1"])
+    assert result.exit_code == 0, result.output
+    assert mock_put.call_args.kwargs.get("json") == {"group_ids": ["g1"]}
+
+
+def test_share_everyone_sends_sentinel():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    put_resp = _mock_response(200, {"visibility": "workspace", "group_ids": ["everyone"], "pending_group_ids": []})
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups),
+        patch("cli.commands.data_apps.api_put", return_value=put_resp) as mock_put,
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--everyone"])
+    assert result.exit_code == 0, result.output
+    assert mock_put.call_args.kwargs.get("json") == {"group_ids": ["everyone"]}
+
+
+def test_share_private_sends_empty_list():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    put_resp = _mock_response(200, {"visibility": "private", "group_ids": [], "pending_group_ids": []})
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups),
+        patch("cli.commands.data_apps.api_put", return_value=put_resp) as mock_put,
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--private"])
+    assert result.exit_code == 0, result.output
+    assert mock_put.call_args.kwargs.get("json") == {"group_ids": []}
+
+
+def test_share_private_conflicts_with_group():
+    with (
+        patch("cli.commands.data_apps.api_get") as mock_get,
+        patch("cli.commands.data_apps.api_put") as mock_put,
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--group", "analysts", "--private"])
+    assert result.exit_code != 0
+    mock_get.assert_not_called()
+    mock_put.assert_not_called()
+
+
+def test_share_unknown_group_hints_available_names():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups),
+        patch("cli.commands.data_apps.api_put") as mock_put,
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--group", "NoSuchGroup"])
+    assert result.exit_code != 0
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "NoSuchGroup" in output
+    assert "Analysts" in output
+    mock_put.assert_not_called()
+
+
+def test_share_queued_prints_pending_note():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    put_resp = _mock_response(
+        202, {"visibility": "private", "group_ids": [], "pending_group_ids": ["g1"]}, text="queued"
+    )
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups),
+        patch("cli.commands.data_apps.api_put", return_value=put_resp),
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--group", "analysts"])
+    assert result.exit_code == 0, result.output
+    assert "Pending approval" in result.stdout
+    assert "Analysts" in result.stdout
+    assert "pending" in result.stdout.lower()
+
+
+def test_share_forbidden_group_reports_friendly_message():
+    groups = _mock_response(200, _SHARE_GROUPS)
+    put_resp = _mock_response(403, {"detail": "group_not_shareable"})
+    with (
+        patch("cli.commands.data_apps.api_get", return_value=groups),
+        patch("cli.commands.data_apps.api_put", return_value=put_resp),
+    ):
+        result = runner.invoke(app, ["app", "share", "kbc-x", "--group", "analysts"])
+    assert result.exit_code != 0
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "share with a group you belong to" in output
+
+
+# ---------------------------------------------------------------------------
+# set-identity (TCRD-291)
+# ---------------------------------------------------------------------------
+
+
+def test_set_identity_calls_patch_and_prints_redeploy():
+    fake = _mock_response(
+        200,
+        {"slug": "kbc-x", "data_identity": "viewer", "redeploy": {"triggered": True, "ok": True}},
+    )
+    with patch("cli.commands.data_apps.api_patch", return_value=fake) as mock_patch:
+        result = runner.invoke(app, ["app", "set-identity", "kbc-x", "viewer"])
+    assert result.exit_code == 0, result.output
+    assert "Data identity: viewer" in result.stdout
+    assert "Redeploy: triggered" in result.stdout
+    assert mock_patch.call_args.args[0] == "/api/data-apps/kbc-x"
+    assert mock_patch.call_args.kwargs.get("json") == {"data_identity": "viewer"}
+
+
+def test_set_identity_redeploy_failed_prints_detail():
+    fake = _mock_response(
+        200,
+        {
+            "slug": "kbc-x",
+            "data_identity": "owner",
+            "redeploy": {"triggered": True, "ok": False, "detail": "runner_unavailable"},
+        },
+    )
+    with patch("cli.commands.data_apps.api_patch", return_value=fake):
+        result = runner.invoke(app, ["app", "set-identity", "kbc-x", "owner"])
+    assert result.exit_code == 0, result.output
+    assert "Redeploy: triggered, failed" in result.stdout
+    assert "runner_unavailable" in result.stdout
+
+
+def test_set_identity_not_deployed_prints_no_redeploy():
+    fake = _mock_response(
+        200,
+        {"slug": "kbc-x", "data_identity": "viewer", "redeploy": {"triggered": False}},
+    )
+    with patch("cli.commands.data_apps.api_patch", return_value=fake):
+        result = runner.invoke(app, ["app", "set-identity", "kbc-x", "viewer"])
+    assert result.exit_code == 0, result.output
+    assert "not triggered" in result.stdout.lower()
+
+
+def test_set_identity_rejects_invalid_value():
+    with patch("cli.commands.data_apps.api_patch") as mock_patch:
+        result = runner.invoke(app, ["app", "set-identity", "kbc-x", "bogus"])
+    assert result.exit_code != 0
+    mock_patch.assert_not_called()
+
+
+def test_set_identity_501_friendly_message():
+    fake = _mock_response(
+        501,
+        {
+            "detail": "'data_identity' requires the Postgres app-state backend.",
+            "error": "requires_postgres_backend",
+            "feature": "data_identity",
+        },
+    )
+    with patch("cli.commands.data_apps.api_patch", return_value=fake):
+        result = runner.invoke(app, ["app", "set-identity", "kbc-x", "viewer"])
+    assert result.exit_code != 0
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "Requires the Postgres app-state backend" in output
+
+
+def test_set_identity_not_found():
+    fake = _mock_response(404, {"detail": "data_app_not_found"})
+    with patch("cli.commands.data_apps.api_patch", return_value=fake):
+        result = runner.invoke(app, ["app", "set-identity", "nope", "viewer"])
+    assert result.exit_code != 0
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "not found" in output.lower()
+
+
+def test_set_identity_json():
+    fake = _mock_response(200, {"slug": "kbc-x", "data_identity": "owner", "redeploy": {"triggered": False}})
+    with patch("cli.commands.data_apps.api_patch", return_value=fake):
+        result = runner.invoke(app, ["app", "set-identity", "kbc-x", "owner", "--json"])
+    assert result.exit_code == 0, result.output
+    assert '"data_identity": "owner"' in result.stdout

@@ -10,6 +10,8 @@ import json
 import re
 from urllib.parse import quote
 
+from src.data_apps.identity import data_identity_of
+
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
 
 # Slugs that must never be assignable to a data app: each one is a literal
@@ -84,8 +86,17 @@ def build_config_json(
     clone_url: str,
     clone_token: str,
     service_token: str,
+    viewer_secret: str,
 ) -> dict:
     """The runtime `config.json` the apps-runner writes for a container.
+
+    ``viewer_secret`` is the third credential and is required, not defaulted
+    — the clone/service conflation below is the argument: a keyword that
+    quietly defaults is a keyword a call site quietly forgets. It is the
+    per-app HMAC key the container verifies the proxy's ``X-Agnes-Viewer``
+    identity assertion with (``app/auth/data_app_viewer.py``), exported as
+    ``AGNES_VIEWER_SECRET``; derived from the server signing key and the
+    row's ``service_token_id``, so it rotates with the service token.
 
     ``clone_token`` and ``service_token`` are two different credentials and
     must not be conflated. The clone token is `data-app-git:<slug>`-scoped and
@@ -117,6 +128,7 @@ def build_config_json(
         git = {"repository": app_row["repo_url"], "branch": app_row["repo_branch"] or "main"}
     out_secrets = {f"#{k}": v for k, v in secrets.items()}
     out_secrets["AGNES_TOKEN"] = service_token
+    out_secrets["AGNES_VIEWER_SECRET"] = viewer_secret
     out_secrets["AGNES_URL"] = AGNES_INTERNAL_URL
     return {"dataApp": {"git": git, "secrets": out_secrets}}
 
@@ -128,8 +140,16 @@ def build_container_spec(app_row: dict, *, defaults: dict, data_dir: str) -> dic
     except json.JSONDecodeError as exc:
         raise ValueError(f"data app {slug}: invalid env JSON: {exc}") from exc
     env = {k: str(v) for k, v in env_dict.items()}
+    # Platform-owned variables are written AFTER the user's `env` merge so an
+    # app-authored value can never override them.
     env["AGNES_URL"] = AGNES_INTERNAL_URL
     env["AGNES_APP_ID"] = app_row["id"]
+    # `aud` of the proxy's `X-Agnes-Viewer` assertion is `data-app:<slug>`;
+    # the container needs the slug (not just the id) to check it.
+    env["AGNES_APP_SLUG"] = slug
+    # Which mode the app runs in — `viewer` means the proxy also sends
+    # `X-Agnes-Viewer-Token` and the app should query with it.
+    env["AGNES_DATA_IDENTITY"] = data_identity_of(app_row)
     image = defaults["runtime_image"]
     if app_row.get("runtime_tag"):
         image = image.rsplit(":", 1)[0] + ":" + app_row["runtime_tag"]

@@ -621,6 +621,14 @@ async def agnes_mcp(request: Request, row: Dict[str, Any] = Depends(require_brok
 # Sandboxed data-apps authoring is confined to this prefix — the ticket's
 # `data_apps` scope grants replay access to the data-apps control-plane API
 # only, never the wider `/api/*` surface `agnes-api`/`agnes-mcp` expose.
+#
+# `/api/sharing/*` (owner-scoped Library/data-app sharing, incl. `agnes app
+# share` / `data_app_share*` for the `data_app` resource type — TCRD-291) does
+# NOT need adding here: it is not `require_admin`-gated, so a `main`- or
+# `mcp`-scoped ticket already reaches it through the ordinary `agnes-api`/
+# `agnes-mcp` replay above (`_route_requires_admin` only refuses admin
+# mutations, and `/api/sharing/*` isn't one). Widening THIS prefix would be
+# the wrong fix for a surface that was never narrowed in the first place.
 _DATA_APPS_PATH_PREFIX = "/api/data-apps"
 
 

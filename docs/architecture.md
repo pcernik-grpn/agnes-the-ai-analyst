@@ -606,6 +606,37 @@ client, via an owner-scoped token injected as `AGNES_TOKEN` — never through a
 mounted parquet. See spec §8 for the full rationale and the owner-inherited
 access model this implies for sharing.
 
+**Viewer identity assertion** (always on): every proxied HTTP request and WS
+handshake also carries `X-Agnes-Viewer` — a compact HS256 JWT signed with a
+per-app secret (`AGNES_VIEWER_SECRET`, derived from the server's signing key
+plus the current deploy's service-token id, so it rotates in lockstep with
+`AGNES_TOKEN` without being separately stored), claims `sub`/`email`/`name?`/
+`groups` (capped at 200, `groups_truncated` when capped)/`aud`
+(`data-app:<slug>`)/`iat`/`exp` (5 min)/`via`. Any inbound `X-Agnes-Viewer*`
+header from the browser is stripped first, so the header is trustworthy only
+because the signature verifies — the apps share one docker network, so an
+unsigned header would be forgeable by a sibling app. The baked scaffold's
+`server/agnesViewer.ts` (`getViewer`/`requireViewer`/`viewerTokenFrom`) is
+the sanctioned way to read it; new container env `AGNES_APP_SLUG` carries the
+`aud` value it checks against.
+
+**Opt-in viewer data identity** (`data_identity: viewer`, a Postgres-only
+column per the A3 PG-first ratchet — `501 requires_postgres_backend` on a
+DuckDB-backed instance): when set, the proxy additionally adds
+`X-Agnes-Viewer-Token`, a short-lived (10 min) server-signed bearer token the
+app may forward as `Authorization: Bearer …` in place of `AGNES_TOKEN`.
+Agnes then evaluates RBAC as **owner ∩ viewer**, live per request — never a
+straight swap to the viewer's own grants, and no admin god-mode on either
+side — and binds a table access policy's `$user_email`/`$user_id`/
+`$user_groups` (see [`docs/table-access-policies.md`](table-access-policies.md))
+to the viewer rather than the owner. Default mode (`owner`) is unchanged from
+today's behavior: no such header is ever sent. Switching modes redeploys the
+app (the new
+`AGNES_DATA_IDENTITY` env is baked into the container spec, same as
+`AGNES_TOKEN`) via `PATCH /api/data-apps/{slug}`, `agnes app set-identity`,
+or MCP `data_app_set_data_identity`. Full rationale:
+[`docs/superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md`](superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md).
+
 That token's `data-app:<slug>` scope is enforced fail-closed in
 `app/auth/pat_resolver.py`: it is admitted only on the app data surface —
 `/api/query`, `/api/data`, the `/api/catalog` read routes, `/api/metrics`,
@@ -673,9 +704,10 @@ Python `StaticFiles`/`send_from_directory`/`app.static_folder`); <a
 id="da003"></a>`DA003` an nginx `root`/`alias` serving `/`, `/app`, or a
 bare top-level mount, or `autoindex on`; <a id="da004"></a>`DA004` the whole
 process environment serialized into a response; <a id="da005"></a>`DA005`
-the injected `AGNES_TOKEN` echoed back on a response line (v1 checks that
-name only — arbitrary per-app secret names are noisier to match safely and
-are tracked for a v2); and <a id="da006"></a>`DA006` (informational) debug
+the injected `AGNES_TOKEN`, `AGNES_VIEWER_SECRET`, or the
+`X-Agnes-Viewer-Token` header value echoed back on a response line (beyond
+these three named credentials, arbitrary per-app secret names are noisier to
+match safely and are tracked for a v2); and <a id="da006"></a>`DA006` (informational) debug
 mode left on. `agnes app deploy` prints any findings under the `State:`
 line; `POST .../deploy`'s response carries them as an additive
 `deploy_check` key whenever the scan ran. An externally-hosted repo

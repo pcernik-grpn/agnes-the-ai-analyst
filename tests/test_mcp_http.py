@@ -619,6 +619,14 @@ class TestToolRegistration:
             # on a managed/linked app. Triple-surface with PATCH
             # /api/data-apps/{slug} + `agnes app set-description`.
             "data_app_set_description",
+            # Owner-scoped sharing + data-identity for the `data_app` resource
+            # type (TCRD-291). Triple-surface with GET/PUT
+            # /api/sharing/data_app/{slug} + GET /api/sharing/groups +
+            # PATCH /api/data-apps/{slug} and `agnes app share` /
+            # `agnes app set-identity`.
+            "data_app_share_get",
+            "data_app_share",
+            "data_app_set_data_identity",
             # Wave 3C in-chat preview loop (Task 4/5) — chat-surface-only
             # render directives for the split-pane preview iframe (spec
             # §7/§9): no REST/CLI analogue. `agnes_data_app_preview`'s

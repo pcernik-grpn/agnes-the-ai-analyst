@@ -74,11 +74,30 @@ def _format_attrs(attrs: Optional[dict]) -> str:
     return "; ".join(parts)
 
 
+def _echo_candidates_capped_note() -> None:
+    """`candidates_capped: true` — the server ranked only the best N name
+    matches for QUERY (a bounded candidate set, see `FactsPgRepository.search`),
+    so the page is the best-ranked subset, not every match. Visibility and
+    `--filter` are evaluated AFTER that cap, so a filter cannot reach a match
+    the cap excluded — only a narrower QUERY or a different TYPE can."""
+    typer.echo(
+        "(more names match QUERY than the server ranks per call — this is the best-ranked subset, not every "
+        "match; narrow QUERY to a longer or more specific name, or pick a narrower TYPE. --filter is applied "
+        "after that cap and cannot widen it)",
+        err=True,
+    )
+
+
 @facts_app.command("search")
 def search_facts(
     fact_type: str = typer.Argument(..., metavar="TYPE", help="Subject type to search (e.g. 'person', 'engagement')"),
     q: Optional[str] = typer.Argument(
-        None, metavar="[QUERY]", help="Optional free-text name lookup (e.g. a person or organization name)"
+        None,
+        metavar="[QUERY]",
+        help=(
+            "Optional free-text name lookup (e.g. a person or organization name). Under four characters it "
+            "must start a name token ('llr' finds 'llr-corp' and 'acme-llr', not 'fullrange')."
+        ),
     ),
     filter: List[str] = typer.Option([], "--filter", help="Attribute filter key=value (repeatable)"),
     limit: int = typer.Option(20, "--limit", min=1, max=100, help="Max results (server caps at 100)"),
@@ -87,7 +106,10 @@ def search_facts(
     """Search typed subjects (facts) by type, an optional name, and attribute filters.
 
     QUERY matches subject ALIASES only (never claim text) — an exact or
-    prefix match on the name ranks first. Attributes are projected from YOUR
+    prefix match on the name ranks first. The server ranks a bounded set of
+    name matches per call; when more names match than that, the table is
+    the best-ranked matches and a note asks you to narrow QUERY. Attributes
+    are projected from YOUR
     readable evidence only, per key, latest-`document_date`-wins — a genuine
     tie between two documents shows as `⚠ conflicted (n values)` rather than
     silently picking one. Use `agnes facts claims <id>` on a result to see
@@ -114,11 +136,19 @@ def search_facts(
         return
 
     subjects = data.get("subjects", [])
+    capped = bool(data.get("candidates_capped"))
     if not subjects:
         typer.echo(f"No facts found for type '{fact_type}'{f' matching {q!r}' if q else ''}.")
-        typer.echo(
-            "Try a different QUERY or --filter, or drop them entirely to see everything of this type you can read."
-        )
+        if capped:
+            # An empty page is not "no matches" when the server capped the
+            # name match: the best-ranked candidates all failed visibility or
+            # --filter, and matches may exist beyond the cap. Disclose it
+            # here exactly as the non-empty branch does.
+            _echo_candidates_capped_note()
+        else:
+            typer.echo(
+                "Try a different QUERY or --filter, or drop them entirely to see everything of this type you can read."
+            )
         return
 
     typer.echo(f"{'ID':20s}  {'TYPE':14s}  {'CLAIMS':6s}  {'QUOTES':6s}  ATTRS")
@@ -128,6 +158,8 @@ def search_facts(
             f"{s['id']:20s}  {s['type']:14s}  {s.get('claim_count', 0):<6d}  "
             f"{s.get('quote_count', 0):<6d}  {_format_attrs(s.get('attrs'))}{marker}"
         )
+    if capped:
+        _echo_candidates_capped_note()
     if data.get("limit_applied"):
         typer.echo(
             f"(showing the first {limit} of YOUR visible results — raise --limit for more; "

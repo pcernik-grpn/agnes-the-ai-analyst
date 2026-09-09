@@ -405,6 +405,10 @@ POSTURE: dict[str, str] = {
     # -- app.api.data_apps -----------------------------------------------------
     "DELETE /api/data-apps/{slug}": "data_app.delete",
     "DELETE /api/data-apps/{slug}/drafts/{draft_slug}": "data_app.draft_delete",
+    # Primary/success action. The same route also writes
+    # `data_app.data_identity_changed` when the body flips `data_identity`
+    # (owner|viewer — app/api/data_apps.py::patch_data_app); the handler
+    # always writes its own row(s), so the fallback here is never used.
     "PATCH /api/data-apps/{slug}": "data_app.set_description",
     "POST /api/data-apps": "data_app.create",
     "POST /api/data-apps/reap-idle": "data_app.reap_idle",
@@ -1847,6 +1851,19 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "data_app_git_credential": "data_app.git_credential",
     "data_app_logs": "data_app.logs_read",
     "data_app_set_description": "data_app.set_description",
+    # Owner-scoped sharing for the `data_app` resource type (TCRD-291) — same
+    # posture as the underlying REST routes (`GET/PUT /api/sharing/...` in
+    # HTTP_POSTURE above): the read is UI-support (no content, just group
+    # names/ids), the write reuses `sharing.state_update`, the one audit
+    # action every `/api/sharing/{resource_type}/{resource_id}` PUT writes
+    # regardless of resource type.
+    "data_app_share_get": "exempt:ui_support",
+    "data_app_share": "sharing.state_update",
+    # Which identity a data app's own data calls run as (owner vs the caller
+    # currently viewing it) — an access-shape change, not merely metadata, so
+    # it gets its own cataloged action rather than piggybacking on
+    # `data_app.set_description`.
+    "data_app_set_data_identity": "data_app.data_identity_changed",
     # Placeholder call (empty `url`) makes no server request at all; the
     # live-URL call is the one that mints the preview grant -- named primary.
     "agnes_data_app_preview": "data_app.preview_grant",

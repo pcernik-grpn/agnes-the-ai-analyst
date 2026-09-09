@@ -218,6 +218,25 @@ app, and sharing is their call to publish that view. Admins retain full
 oversight: every grant is visible and revocable in `/admin/access`, and grant
 writes are audited like any other.
 
+**Sharing itself has three surfaces**, all thin wrappers over the same
+owner-scoped `GET/PUT /api/sharing/data_app/<slug>` (+ `GET
+/api/sharing/groups`) this section describes: `agnes app share <slug>`
+(CLI), MCP `data_app_share_get`/`data_app_share` (the authoring agent's path
+— `agnes-data-apps-extras` SKILL.md §3b prompts the user for who should see
+a just-published app rather than deciding on its own), and a Share control
+on `/apps/detail/<slug>`.
+
+**A narrower knob sits below sharing: `data_identity`.** The governance note
+above is unconditional for the *default* mode — a hosted app always
+publishes the owner's view of the data to whoever it's granted to. An owner
+may opt an app into `data_identity: viewer` so each viewer's *own* grants
+additionally bound the app's queries (evaluated as owner ∩ viewer, live, no
+admin god-mode on either side) — this narrows what a grant exposes, it never
+widens it, and it changes nothing about the grant mechanism itself: sharing
+the app still requires the same `resource_grants(data_app, …)` row as
+always. Postgres-backed instances only (A3 ratchet); see
+[`docs/superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md`](superpowers/specs/2026-09-09-data-app-viewer-identity-and-sharing-design.md).
+
 ### Auto-share for admin uploads (opt-in)
 
 Collections are private to their creator by default — without a grant, only
