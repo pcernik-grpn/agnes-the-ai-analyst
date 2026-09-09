@@ -10,7 +10,10 @@
   the figure (`priced_as`). Read it with `GET /api/admin/telemetry/llm-cost`
   (`agnes admin usage llm-cost`, grouped by workload / agent / user / model /
   purpose), `GET /api/admin/telemetry/llm-calls` (`agnes admin usage llm-calls`,
-  the rows of one session / turn / job / user), the new "LLM cost" section on
+  the rows of one session / turn / job / user, paged with a `before` +
+  `before_id` keyset cursor so rows sharing a timestamp are never skipped;
+  buffered rows reach the ledger within 30 s even on an idle instance), the
+  new "LLM cost" section on
   `/admin/telemetry`, and the `agnes_llm_calls` table in the `agnes-usage`
   package. `retention.llm_calls_days` prunes it (default 0 = forever). See
   `docs/observability.md` → *LLM call ledger*.
@@ -22,7 +25,8 @@
   question and its answer pair up — `GET /api/chat/sessions/{id}/messages` rows
   carry it too), `usage_turns.turn_uuid` and `llm_calls.turn_id`.
 - **Thumbs on chat answers.** `POST /api/chat/sessions/{id}/feedback` (`up`/`down`
-  plus an optional comment, one row per turn and user; audited as `chat.feedback`),
+  plus an optional comment, one row per turn and user, accepted only for a turn
+  the session's own messages carry; audited as `chat.feedback`),
   rendered on every completed assistant bubble in the web chat; admins read the
   queue with `GET /api/admin/telemetry/feedback` (`agnes admin usage feedback`).
   Agent memories now record the turn and message that wrote them
@@ -41,7 +45,14 @@
   records or 8 MiB each; three retries with backoff on a 5xx or a connection
   error, never on a 4xx), advancing a Postgres-persisted keyset watermark
   (`last_message_at`, session id) only after a 2xx, under the same
-  content-export policy as the pull. A run that fails mid-walk is audited as
+  content-export policy as the pull. The watermark is keyed by the delivery
+  configuration (`endpoint` + `surfaces`), so repointing the sink re-delivers
+  the corpus from scratch and the destination must upsert by `thread_id`; a
+  conversation is exported once its last message is five minutes old, so a
+  turn in flight is never exported half-finished. The endpoint must be an
+  `https://` URL to a named host (plain `http://` only to loopback) without
+  credentials, and `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`, when set, applies to
+  its host too. A run that fails mid-walk is audited as
   failed, never raised into the worker. Migration `0116_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and
@@ -57,9 +68,12 @@
   record to keep exporting content. A mode without a recorded basis is treated as
   `off` and logged at startup; the effective policy is written to the audit log as
   `observability.content_export`. `pseudonymized` runs every exported text through
-  the instance anonymizer, and the `workloads` allowlist lets an operator open
-  `builder`/`corporate_memory` content for quality work while keeping `chat` at
-  `off`. The embedded engine's OTLP relay obeys the same policy: under `off` it
+  the instance anonymizer (feedback comments included), and the `workloads`
+  allowlist lets an operator open `builder`/`corporate_memory` content for
+  quality work while keeping `chat` at `off` — a `workloads` value with no valid
+  entry (a typo, a mapping) disables content export rather than widening it,
+  and a bare string is read as a one-entry list. The embedded engine's OTLP
+  relay obeys the same policy: under `off` it
   strips `gen_ai.prompt` / `gen_ai.completion` / `gen_ai.input.messages` /
   `gen_ai.output.messages` (flagging `agnes.content_stripped`) and drops log
   bodies, under `pseudonymized` it rewrites them, and an undecodable batch is

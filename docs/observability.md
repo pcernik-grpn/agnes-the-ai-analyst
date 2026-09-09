@@ -219,7 +219,7 @@ agnes admin usage feedback --verdict down            # the thumbs-down queue
   kinds, `cost_usd`, `cached_input_share`, and `priced_models` (which
   model(s) the group's rows were actually priced at, so a figure is never
   taken on trust).
-- `GET /api/admin/telemetry/llm-calls?session_id=|turn_id=|job_id=|user_id=&limit=&before=`
+- `GET /api/admin/telemetry/llm-calls?session_id=|turn_id=|job_id=|user_id=&limit=&before=&before_id=`
   (`agnes admin usage llm-calls`) — the detail rows for one turn, session,
   job or user, newest first, cursor by `created_at`. At least one of the
   four ids is required — this is a drill-down into one unit of work, never
@@ -751,7 +751,11 @@ turn's (or `agent_api` for an agent-bound call), a generation span's is the
 ambient `llm_context`'s, and the engine's telemetry relay (below) is `chat`
 by definition. A workload name the vocabulary does not know is dropped
 from the allowlist and warned about at startup rather than kept, so a typo
-cannot silently expand "only these workloads" into "everything".
+cannot silently expand "only these workloads" into "everything". The
+other direction is closed too: a `workloads` value that names nothing valid
+(a typo-only list, a mapping) disables content export with a warning instead
+of widening it, and a bare string (`workloads: chat`) is read as a one-entry
+list.
 
 ### The embedded engine's own spans
 
