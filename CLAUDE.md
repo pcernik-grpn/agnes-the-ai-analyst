@@ -481,7 +481,15 @@ records all four kinds per message (`chat_messages.cache_read_tokens` /
 measurement rather than a model — see
 [`docs/observability.md`](docs/observability.md) → *Chat cost*. The daily
 spend cap remains deliberately coarser (a two-bucket counter with no model
-attached) and says so.
+attached) and says so. Since the 2026-09-08 LLM observability design every
+call — brokered or server-side — also lands as one priced row in the
+Postgres-only `llm_calls` ledger (`src/observability/llm_record.py` prices
+it with the same table at write time; `GET /api/admin/telemetry/llm-cost`
+groups it by workload/agent/user/model/purpose), carrying the `turn_id`
+that `chat_messages`, `usage_turns` and the exported spans share. Content
+export (spans and the engine's relay) is governed by
+`observability.content_export` in `instance.yaml`, never by an environment
+variable — see `docs/observability.md` → *Content policy*.
 
 ### Config Loading
 1. `config/loader.py` loads `instance.yaml`.
