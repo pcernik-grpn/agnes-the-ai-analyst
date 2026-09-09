@@ -49,6 +49,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from collections import defaultdict
 from datetime import date, datetime
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -299,6 +300,11 @@ class FactsQueryTimeout(RuntimeError):
 
     reason = "facts_search_timeout"
 
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        if reason:
+            self.reason = reason
+
 
 _PG_QUERY_CANCELED_SQLSTATE = "57014"
 
@@ -316,6 +322,51 @@ def _search_timeout_message(timeout_ms: int) -> str:
         "longer, more specific name (a short or common fragment matches too many names), add `type`, "
         "or lower `limit`, then retry."
     )
+
+
+def _read_timeout_message(what: str, timeout_ms: int) -> str:
+    return (
+        f"The fact {what} did not finish within {timeout_ms / 1000:g} s and was cancelled. Narrow the request "
+        "(a smaller `limit`, fewer hops, a `type` or edge-type filter) and retry."
+    )
+
+
+class _ReadBudget:
+    """One wall-clock budget shared by EVERY statement of a multi-statement
+    read. ``statement_timeout`` is per statement, so a read that runs several
+    (``neighbors``' per-node walk, ``collection_facts_summary``'s three legs)
+    would otherwise get ``_STATEMENT_TIMEOUT_MS`` per statement and could hold
+    a pooled connection for a multiple of the guard. ``arm(conn)`` re-issues
+    ``SET LOCAL statement_timeout`` with the time LEFT before each statement
+    and raises ``FactsQueryTimeout`` once the budget is spent — never a zero,
+    which Postgres reads as "no timeout at all"."""
+
+    def __init__(self, total_ms: int, *, reason: str, message: str) -> None:
+        self.total_ms = int(total_ms)
+        self.reason = reason
+        self.message = message
+        self.started = time.monotonic()
+
+    def remaining_ms(self) -> int:
+        return self.total_ms - int((time.monotonic() - self.started) * 1000)
+
+    def arm(self, conn: Connection) -> None:
+        remaining = self.remaining_ms()
+        if remaining <= 0:
+            raise FactsQueryTimeout(self.message, reason=self.reason)
+        conn.execute(sa.text(f"SET LOCAL statement_timeout = {remaining}"))
+
+
+@contextlib.contextmanager
+def _typed_statement_timeout(budget: _ReadBudget) -> Iterator[None]:
+    """Translate Postgres cancelling a statement of a budgeted read into the
+    typed, hinted ``FactsQueryTimeout`` (same contract ``search`` has)."""
+    try:
+        yield
+    except sa.exc.DBAPIError as exc:
+        if _is_statement_timeout(exc):
+            raise FactsQueryTimeout(budget.message, reason=budget.reason) from exc
+        raise
 
 
 def _regex_literal(text: str) -> str:
@@ -2634,8 +2685,13 @@ class FactsPgRepository:
         all_evidence = _visibility_mode() == "all_evidence"
         tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
-        with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+        budget = _ReadBudget(
+            _STATEMENT_TIMEOUT_MS,
+            reason="facts_neighbors_timeout",
+            message=_read_timeout_message("traversal", _STATEMENT_TIMEOUT_MS),
+        )
+        with _typed_statement_timeout(budget), self._engine.begin() as conn:
+            budget.arm(conn)
 
             root_status = self._subject_status(
                 conn,
@@ -2649,6 +2705,8 @@ class FactsPgRepository:
             )
             if not self._is_visible(root_status):
                 raise FactNotFound(subject_id)
+
+            budget.arm(conn)
 
             root_row = (
                 conn.execute(sa.text("SELECT id, type FROM facts WHERE id = :id"), {"id": subject_id})
@@ -2714,6 +2772,7 @@ class FactsPgRepository:
                         params["audience_pairs"] = audience_pairs
                     if edge_types:
                         params["edge_types"] = list(edge_types)
+                    budget.arm(conn)
                     edge_rows = conn.execute(edge_sql, params).mappings().all()
                     if len(edge_rows) > fanout:
                         truncated["fanout"] = True
@@ -2740,6 +2799,7 @@ class FactsPgRepository:
                 )
                 types: Dict[str, str] = {}
                 if candidate_ids:
+                    budget.arm(conn)
                     types = {
                         r["id"]: r["type"]
                         for r in conn.execute(
@@ -2822,6 +2882,7 @@ class FactsPgRepository:
                         check_params["readable"] = list(readable)
                         check_params["tiered_hidden"] = tiered_hidden
                         check_params["audience_pairs"] = audience_pairs
+                    budget.arm(conn)
                     more = conn.execute(check_sql, check_params).first()
                     truncated["depth"] = more is not None
 
@@ -4463,8 +4524,13 @@ class FactsPgRepository:
         cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
         sv_types = list(_single_valued_edge_types())
 
-        with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+        budget = _ReadBudget(
+            _STATEMENT_TIMEOUT_MS,
+            reason="facts_summary_timeout",
+            message=_read_timeout_message("collection summary", _STATEMENT_TIMEOUT_MS),
+        )
+        with _typed_statement_timeout(budget), self._engine.begin() as conn:
+            budget.arm(conn)
 
             # Gap #79: resolved INSIDE this same transaction so the maintained
             # table's own bootstrap-populated check and the combined query
@@ -4555,6 +4621,8 @@ class FactsPgRepository:
             combined_params["offset"] = offset
             combined_params["sv_types"] = sv_types
 
+            budget.arm(conn)
+
             combined_row = conn.execute(combined_sql, combined_params).mappings().first()
             assert combined_row is not None
 
@@ -4598,6 +4666,7 @@ class FactsPgRepository:
                 }
                 if not is_admin:
                     alias_params["readable"] = list(readable)
+                budget.arm(conn)
                 alias_rows = conn.execute(alias_sql, alias_params).mappings().all()
                 display_name: Dict[str, str] = {}
                 for r in alias_rows:
@@ -4622,6 +4691,7 @@ class FactsPgRepository:
                     claims_params["readable"] = list(readable)
                     claims_params["tiered_hidden"] = tiered_hidden
                     claims_params["audience_pairs"] = audience_pairs
+                budget.arm(conn)
                 claim_rows = conn.execute(claims_sql, claims_params).mappings().all()
 
                 claim_count: Dict[str, int] = {}
