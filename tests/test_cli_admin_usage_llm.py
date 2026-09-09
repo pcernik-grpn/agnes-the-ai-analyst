@@ -171,6 +171,57 @@ class TestLlmCalls:
         assert "claude-haiku-4-5" in out
         assert "--before" in out
 
+    def test_before_and_before_id_flags_build_the_request(self, monkeypatch, runner):
+        client = MagicMock()
+        client.get.return_value = _resp(200, {"rows": [], "next_before": None, "next_before_id": None, "notes": []})
+        monkeypatch.setattr(mod, "get_client", lambda timeout=60: client)
+        result = runner.invoke(
+            mod.app,
+            ["llm-calls", "--session-id", "s1", "--before", "2026-09-08T00:00:00+00:00", "--before-id", "c1"],
+        )
+        assert result.exit_code == 0, _clean(result.output)
+        client.get.assert_called_once_with(
+            "/api/admin/telemetry/llm-calls",
+            params={
+                "limit": 50,
+                "session_id": "s1",
+                "before": "2026-09-08T00:00:00+00:00",
+                "before_id": "c1",
+            },
+        )
+
+    def test_paging_hint_carries_next_before_id_when_present(self, monkeypatch, runner):
+        client = MagicMock()
+        client.get.return_value = _resp(
+            200,
+            {
+                "rows": [
+                    {
+                        "id": "c1",
+                        "created_at": "2026-09-08T00:00:00+00:00",
+                        "kind": "completion",
+                        "workload": "chat",
+                        "purpose": "completion",
+                        "model_response": "claude-haiku-4-5",
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "cache_read_tokens": 0,
+                        "cost_usd": 0.001,
+                        "status": "ok",
+                    }
+                ],
+                "next_before": "2026-09-08T00:00:00+00:00",
+                "next_before_id": "c1",
+                "notes": [],
+            },
+        )
+        monkeypatch.setattr(mod, "get_client", lambda timeout=60: client)
+        result = runner.invoke(mod.app, ["llm-calls", "--turn-id", "t1"])
+        assert result.exit_code == 0, _clean(result.output)
+        out = _clean(result.output)
+        assert "--before" in out
+        assert "--before-id c1" in out
+
     def test_501_prints_the_postgres_hint(self, monkeypatch, runner):
         client = MagicMock()
         client.get.return_value = _resp(501, {"error": "requires_postgres_backend"})

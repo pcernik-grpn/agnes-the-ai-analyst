@@ -39893,7 +39893,7 @@
     },
     "/api/admin/telemetry/llm-calls": {
       "get": {
-        "description": "Detail rows for one session/turn/job/user from the ``llm_calls``\nledger, newest first \u2014 the drill-down under ``llm-cost``'s aggregates.\n\nRequires at least one of ``session_id``/``turn_id``/``job_id``/\n``user_id`` so this never becomes an unbounded dump of every call the\ninstance ever made. ``before`` is the pagination cursor: pass the\nprevious page's ``next_before`` to fetch the next older page.",
+        "description": "Detail rows for one session/turn/job/user from the ``llm_calls``\nledger, newest first \u2014 the drill-down under ``llm-cost``'s aggregates.\n\nRequires at least one of ``session_id``/``turn_id``/``job_id``/\n``user_id`` so this never becomes an unbounded dump of every call the\ninstance ever made. ``before``/``before_id`` are the pagination cursor:\npass the previous page's ``next_before``/``next_before_id`` together to\nfetch the next older page via the composite keyset \u2014 rows sharing the\nexact boundary timestamp are never skipped between pages. ``before``\nalone still works (single-column cursor, kept for compatibility).",
         "operationId": "llm_calls_api_admin_telemetry_llm_calls_get",
         "parameters": [
           {
@@ -39988,6 +39988,24 @@
               ],
               "description": "ISO timestamp cursor; fetch rows older than this.",
               "title": "Before"
+            }
+          },
+          {
+            "description": "Row-id tiebreaker for `before`; pass the previous page's `next_before_id`.",
+            "in": "query",
+            "name": "before_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Row-id tiebreaker for `before`; pass the previous page's `next_before_id`.",
+              "title": "Before Id"
             }
           },
           {

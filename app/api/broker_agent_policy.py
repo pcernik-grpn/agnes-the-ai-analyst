@@ -417,6 +417,7 @@ class UsageAccumulator:
         self._rows: List[Dict[str, Any]] = []
         self._call_rows: List[Dict[str, Any]] = []
         self._last_flush = clock()
+        self._pending_timer: Optional[threading.Timer] = None
 
     def add(self, row: Dict[str, Any], *, budget_ttl_s: int = 60) -> None:
         """Buffer one usage row and best-effort bump the agent's cached
@@ -465,6 +466,33 @@ class UsageAccumulator:
             due_by_age = bool(buffered) and (self._clock() - self._last_flush) >= self._flush_interval_s
         if due_by_size or due_by_age:
             self.flush()
+        else:
+            self._arm_timer_if_needed()
+
+    def _arm_timer_if_needed(self) -> None:
+        """Arm a background flush if rows are buffered and no timer is
+        already pending, so a lone buffered row on an otherwise-quiet
+        instance still surfaces within ``flush_interval_s`` instead of
+        waiting for the next append (or shutdown) to notice the age
+        threshold."""
+        timer: Optional[threading.Timer] = None
+        with self._lock:
+            if self._pending_timer is None and (self._rows or self._call_rows):
+                timer = threading.Timer(self._flush_interval_s, self._timer_flush)
+                timer.daemon = True
+                self._pending_timer = timer
+        if timer is not None:
+            timer.start()
+
+    def _timer_flush(self) -> None:
+        """``threading.Timer`` callback — must never raise, since nothing
+        downstream of a background thread would observe the exception."""
+        with self._lock:
+            self._pending_timer = None
+        try:
+            self.flush()
+        except Exception:
+            logger.exception("UsageAccumulator: background flush timer failed")
 
     def flush(self) -> None:
         """Force a flush of whatever is currently buffered. Safe to call
@@ -476,6 +504,9 @@ class UsageAccumulator:
             rows, self._rows = self._rows, []
             call_rows, self._call_rows = self._call_rows, []
             self._last_flush = self._clock()
+            timer, self._pending_timer = self._pending_timer, None
+        if timer is not None:
+            timer.cancel()
         if rows:
             try:
                 llm_usage_repo().insert_batch(rows)

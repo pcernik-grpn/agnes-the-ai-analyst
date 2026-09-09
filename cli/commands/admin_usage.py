@@ -327,6 +327,9 @@ def llm_calls(
     user_id: Optional[str] = typer.Option(None, "--user-id"),
     limit: int = typer.Option(50, "--limit", help="Max rows to show."),
     before: Optional[str] = typer.Option(None, "--before", help="ISO cursor — fetch rows older than this."),
+    before_id: Optional[str] = typer.Option(
+        None, "--before-id", help="Row-id tiebreaker for --before; pass the previous page's next_before_id."
+    ),
     json_out: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
 ):
     """Detail rows for one session/turn/job/user from the LLM call ledger.
@@ -350,6 +353,8 @@ def llm_calls(
         params["user_id"] = user_id
     if before:
         params["before"] = before
+    if before_id:
+        params["before_id"] = before_id
 
     client = get_client(timeout=60)
     try:
@@ -383,7 +388,11 @@ def llm_calls(
                 f"{row.get('cache_read_tokens', 0):>9,} ${row.get('cost_usd', 0):>8.4f}  {row.get('status', '-')}"
             )
         if data.get("next_before"):
-            typer.echo(f"  more available — rerun with --before {data['next_before']}")
+            next_before_id = data.get("next_before_id")
+            cursor_hint = f"--before {data['next_before']}"
+            if next_before_id:
+                cursor_hint += f" --before-id {next_before_id}"
+            typer.echo(f"  more available — rerun with {cursor_hint}")
     for note in data.get("notes") or []:
         typer.echo(f"  note: {note}")
 
