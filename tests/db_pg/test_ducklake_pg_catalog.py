@@ -149,10 +149,17 @@ def test_pg_catalog_exactly_one_connection_per_attach(isolated_ducklake_pg_env):
     """Opening the reader singleton must open exactly one libpq
     connection to the catalog; adding the writer singleton (a second,
     independent ATTACH — Postgres catalogs don't hit the same-process
-    file-catalog restriction) brings the total to exactly two. Matches
-    the wave-2G plan's "one connection per ATTACH" sizing claim.
+    file-catalog restriction) brings the total to exactly two. That is
+    the floor the wave-2G plan's "one connection per ATTACH" sizing claim
+    reduces to; the rest of the sizing rule (module docstring of
+    ``src/ducklake_session.py``, ``docs/DEPLOYMENT.md``) is pinned by the
+    tail of this test: a statement that enumerates catalogs runs a second
+    transaction on the metadata catalog beside DuckLake's own, borrows a
+    second pooled backend for it, and the pool keeps that backend — the
+    reader settles at two, deterministically (6/6 at ``threads=1`` and
+    ``threads=2``), not at "one".
 
-    "Exactly one" is only true because ``_attach_ducklake`` disables the
+    "Exactly one" per attach is only true because ``_attach_ducklake`` disables the
     postgres extension's per-thread connection cache before the ATTACH
     (see :func:`test_pg_catalog_pool_thread_local_cache_is_disabled`).
     With that cache on, the attach opens a second backend whenever
@@ -183,6 +190,17 @@ def test_pg_catalog_exactly_one_connection_per_attach(isolated_ducklake_pg_env):
         w.execute("SELECT 1")
         after_writer = _client_backend_pids(engine)
         assert len(after_writer) == 2, f"expected exactly 2 connections after writer attach too, got {after_writer}"
+
+        r.execute("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake'").fetchall()
+        after_enumeration = _client_backend_pids(engine)
+        assert len(after_enumeration) == 3, (
+            f"expected the reader's catalog enumeration to borrow exactly one more pooled backend "
+            f"(3 in total with the writer), got {after_enumeration}"
+        )
+        r.execute("SELECT 1")
+        assert _client_backend_pids(engine) == after_enumeration, (
+            "a borrowed backend is pooled — it must neither close nor be re-opened on the next statement"
+        )
 
         r.close()
         w.close()
@@ -239,10 +257,14 @@ def test_pg_catalog_close_releases_every_backend(isolated_ducklake_pg_env):
         assert _client_backend_pids(engine) == []
         r = get_ducklake_read()
         r.execute("SELECT 1")
+        # Enumerate once so the reader also holds a *borrowed* pooled
+        # backend (see the tail of the connection-count test above) — the
+        # release has to cover those, not just the one the attach opened.
+        r.execute("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake'").fetchall()
         w = get_ducklake_write()
         w.execute("SELECT 1")
         opened = _client_backend_pids(engine)
-        assert len(opened) == 2, f"expected the two attaches to open two backends, got {opened}"
+        assert len(opened) == 3, f"expected the two attaches plus one borrowed pooled backend, got {opened}"
         r.close()
         w.close()
 

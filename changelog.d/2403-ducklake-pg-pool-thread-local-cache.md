@@ -7,7 +7,8 @@
   nested catalog attach (1 attach in 4 on a loaded 2-CPU host — the source of
   the fleet-wide `test_pg_catalog_exactly_one_connection_per_attach` CI flake,
   #2403), and a closed session's cached connection outlived the DuckDB
-  instance. One attach now holds exactly one backend at rest and
-  `close_ducklake_sessions()` releases it; the sizing note in
-  `docs/DEPLOYMENT.md` now states the per-attach pool cap concurrent
-  statements can grow to.
+  instance. The attach itself now opens exactly one backend and
+  `close_ducklake_sessions()` releases every pooled one; the sizing note in
+  `docs/DEPLOYMENT.md` now describes the pool honestly — a catalog-enumerating
+  statement borrows a second backend that stays, and concurrent statements
+  grow the count up to the extension's per-attach pool cap.

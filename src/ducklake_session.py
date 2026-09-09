@@ -72,16 +72,21 @@ connections in one process — ``Binder Error: ... Unique file handle
 conflict: Cannot attach "__ducklake_metadata_<alias>" - the database file
 "<path>" is already attached`` — regardless of the alias used. A Postgres
 catalog target does **not** hit this: two independent connections each
-get their own libpq connection with no conflict. **Sizing:** one attach
-holds exactly one catalog backend at rest (``_attach_ducklake`` disables
-the postgres extension's per-thread connection cache to make that
-deterministic — issue #2403); statements running *concurrently* on one
-attach — the reader hands a cursor to every request — each borrow a
-pooled connection for their duration, so a busy reader grows to its peak
-concurrency, capped by the extension's ``pg_pool_max_connections``
-(default ``max(8, CPU count)``), and pooled connections stay open once
-opened until the session closes. Budget Postgres ``max_connections`` for
-that cap per api replica, not for one. Since a file catalog is only ever valid
+get their own libpq connection with no conflict. **Sizing:** the attach
+itself opens exactly one catalog backend (``_attach_ducklake`` disables the
+postgres extension's per-thread connection cache so that this is
+deterministic rather than a scheduler race — issue #2403). Every further
+backend is a pooled connection borrowed by a *transaction* on the metadata
+catalog: a statement that enumerates catalogs (``duckdb_tables()``,
+``information_schema`` — routine on the read path) opens a second
+transaction on the metadata catalog beside DuckLake's own and borrows a
+second backend; statements running *concurrently* on one attach — the
+reader hands a cursor to every request — each borrow one for their
+duration. Pooled connections stay open once opened, until the session
+closes, so a reader settles at two and a busy one grows to its peak
+concurrency, capped by ``pg_pool_max_connections`` (default
+``max(8, CPU count)``). Budget Postgres ``max_connections`` for that cap
+per api replica, not for one. Since a file catalog is only ever valid
 in single-process ``all`` mode anyway (multi-process requires an explicit
 Postgres DSN — see ``app.startup_guards.validate_deployment``), the reader
 and writer singletons **share one physical connection** when the
@@ -275,10 +280,12 @@ def _attach_ducklake(conn: duckdb.DuckDBPyConnection, *, catalog_dsn: str, data_
         # attach opened a second backend in roughly 1 attach out of 4,
         # and a closed session's cached connection outlived the DuckDB
         # instance (issue #2403). Disabling the cache returns every
-        # released connection to the shared pool, so one attach holds
-        # exactly one backend at rest and ``close_ducklake_sessions``
-        # closes it. ``GLOBAL``, not session: the pool is created, and
-        # this setting read, on DuckLake's inner connection.
+        # released connection to the shared pool, so the attach itself
+        # opens exactly one backend, a later transaction reuses it unless
+        # one is already borrowed (the module docstring's sizing note),
+        # and ``close_ducklake_sessions`` closes all of them. ``GLOBAL``,
+        # not session: the pool is created, and this setting read, on
+        # DuckLake's inner connection.
         conn.execute("SET GLOBAL pg_pool_enable_thread_local_cache = false")
     Path(data_path).mkdir(parents=True, exist_ok=True)
     target = escape_sql_string_literal(_attach_target(catalog_dsn))

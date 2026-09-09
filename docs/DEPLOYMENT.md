@@ -1058,24 +1058,32 @@ tables land directly in the target database's `public` schema and would
 otherwise mix with app-state tables), created via
 `deploy/postgres/init-ducklake-db.sql` on first boot.
 
-**Postgres catalog sizing.** Every DuckLake ATTACH from a Postgres-catalog
-target holds exactly one libpq connection **at rest** (verified against
-DuckDB 1.5.2; `src/ducklake_session.py::_attach_ducklake` disables the
-postgres extension's per-thread connection cache to make that deterministic
-— with the cache on, an attach opened a second backend whenever DuckDB's
-worker thread ran the nested catalog attach, and a closed session's cached
-connection outlived it). Under load the count is **per attach, not per
-process**: each `api`/`gateway` replica holds one long-lived reader attach
-and hands a cursor to every request, and statements running concurrently on
-that attach each borrow a connection from the extension's pool for their
-duration, so a busy reader grows to its peak concurrency, capped by the
-extension's `pg_pool_max_connections` (default `max(8, CPU count)`); pooled
-connections stay open once opened, until the session closes. Each `worker`
-process holds one writer attach (opened lazily on first rebuild or
-maintenance run), which rebuilds serially. Size the catalog Postgres
-instance's `max_connections` for **N api/gateway replicas × that pool cap +
-M worker processes**, plus normal headroom — not per-request, and not
-per-uvicorn-worker beyond the one attach each role process itself opens.
+**Postgres catalog sizing.** The count is **per attach, not per process**,
+and it is a pool, not a single connection (verified against DuckDB 1.5.2):
+
+- The ATTACH itself opens exactly one libpq connection.
+  `src/ducklake_session.py::_attach_ducklake` disables the postgres
+  extension's per-thread connection cache to make that deterministic — with
+  the cache on, an attach opened a second backend whenever DuckDB's worker
+  thread ran the nested catalog attach, and a closed session's cached
+  connection outlived it.
+- Every further backend is a pooled connection borrowed by a transaction on
+  the metadata catalog. A statement that enumerates catalogs
+  (`duckdb_tables()`, `information_schema` — routine on the read path) runs a
+  second transaction on the metadata catalog beside DuckLake's own and
+  borrows a second backend; statements running concurrently on one attach
+  each borrow one for their duration. Pooled connections stay open once
+  opened, until the session closes.
+- So each `api`/`gateway` replica's long-lived reader attach settles at two
+  and grows with its peak request concurrency, capped by the extension's
+  `pg_pool_max_connections` (default `max(8, CPU count)`). Each `worker`
+  process holds one writer attach (opened lazily on first rebuild or
+  maintenance run), which rebuilds serially.
+
+Size the catalog Postgres instance's `max_connections` for **N api/gateway
+replicas × that pool cap + M worker processes**, plus normal headroom — not
+per-request, and not per-uvicorn-worker beyond the one attach each role
+process itself opens.
 
 **Maintenance job.** A daily `ducklake-maintenance` job (`app/worker/kinds.py`,
 LIGHT lane; see [`jobs-classification.md`](jobs-classification.md)) runs
