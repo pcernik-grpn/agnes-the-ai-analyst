@@ -537,9 +537,23 @@ def _to_response(resp: httpx.Response, extra_headers: Optional[Dict[str, str]] =
     return response
 
 
-def _agent_and_caller_for_ticket(row: Dict[str, Any]) -> "tuple[Optional[Dict[str, Any]], Optional[str]]":
+def _agent_and_caller_for_ticket(
+    row: Dict[str, Any], session: Any = None
+) -> "tuple[Optional[Dict[str, Any]], Optional[str]]":
     """Resolve the ticket's chat session once and return ``(agent_row,
     caller_user_id)``.
+
+    Synchronous throughout, so a caller on a request path must run it in a
+    worker thread (``asyncio.to_thread``) and never on the event loop: the API
+    process is a single uvicorn worker, so a blocking repo read here stalls
+    every OTHER in-flight request too, not just this one.
+
+    ``session`` lets a caller that already holds the row (``anthropic_proxy``
+    resolves it for the ``llm`` ticket scope's session-existence check) hand it
+    in rather than pay a second round-trip for the same row on every
+    completion. Same row by construction — same ``row["session_id"]``, same
+    repo, microseconds earlier in the same request; ``None`` keeps the original
+    self-resolving behaviour.
 
     ``agent_row`` is ``None`` when there is nothing to resolve
     (Slack/legacy sessions with no ``agent_id``, or a session that no
@@ -568,7 +582,8 @@ def _agent_and_caller_for_ticket(row: Dict[str, Any]) -> "tuple[Optional[Dict[st
     session_id = row.get("session_id")
     if not session_id:
         return None, None
-    session = chat_session_repo().get_session(session_id)
+    if session is None:
+        session = chat_session_repo().get_session(session_id)
     if session is None:
         return None, None
     agent_id = getattr(session, "agent_id", None)
@@ -1138,14 +1153,24 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     caller_user_id: str | None = None
     budget_headers: dict[str, str] = {}
     if is_completion:
-        agent_row, caller_user_id = _agent_and_caller_for_ticket(row)
+        # Off the event loop, and reusing `otel_session` when the `llm`-scope
+        # check above already read that row (issue #2246): this is 1-3
+        # synchronous repo round-trips per completion, and on a single-worker
+        # uvicorn every one of them blocks every other in-flight request while
+        # it waits on the DB. That serialisation scales with in-flight LLM
+        # calls and costs no CPU, which is exactly the shape of the
+        # concurrency-ramp latency that made sandbox egress calls miss their
+        # caller's deadline. Same rule the `llm`-scope read above states.
+        agent_row, caller_user_id = await asyncio.to_thread(_agent_and_caller_for_ticket, row, otel_session)
     if agent_row is not None:
         utility_models = getattr(chat_cfg, "agent_api_utility_models", []) or []
         budget_ttl_s = getattr(chat_cfg, "agent_api_budget_cache_ttl_s", 60)
         budget = agent_row.get("token_budget_monthly")
         month_total: Optional[int] = None
         if budget is not None:
-            month_total = cached_month_total(agent_row["id"], budget_ttl_s)
+            # Off the event loop for the same reason: a coordination `kv_get`
+            # plus, on a cache miss, an aggregate over the `llm_usage` ledger.
+            month_total = await asyncio.to_thread(cached_month_total, agent_row["id"], budget_ttl_s)
             budget_headers = {
                 "x-agnes-budget-limit": str(budget),
                 "x-agnes-budget-used": str(month_total),
