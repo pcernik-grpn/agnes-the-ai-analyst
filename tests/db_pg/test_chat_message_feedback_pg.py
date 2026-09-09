@@ -66,6 +66,28 @@ def test_prune_older_than(repo):
     repo.upsert(session_id="s1", turn_id="t1", user_id="u1", verdict="up")
     old = datetime.now(UTC) - timedelta(days=40)
     with repo._engine.begin() as conn:
-        conn.execute(sa.text("UPDATE chat_message_feedback SET created_at = :old"), {"old": old})
+        conn.execute(sa.text("UPDATE chat_message_feedback SET created_at = :old, updated_at = :old"), {"old": old})
     assert repo.prune_older_than(30) == 1
     assert repo.list_feedback() == []
+
+
+def test_a_verdict_revised_today_survives_retention_and_shows_in_the_recent_window(repo):
+    """Review finding: `upsert` keeps the original `created_at` when someone
+    changes their mind, so a clock on `created_at` would delete a comment
+    written today because the FIRST thumb on that turn was old -- and the
+    recent-feedback window would never show the revision."""
+    from datetime import datetime, timedelta
+
+    import sqlalchemy as sa
+
+    repo.upsert(session_id="s1", turn_id="t1", user_id="u1", verdict="up")
+    old = datetime.now(UTC) - timedelta(days=40)
+    with repo._engine.begin() as conn:
+        conn.execute(sa.text("UPDATE chat_message_feedback SET created_at = :old, updated_at = :old"), {"old": old})
+
+    # Same (turn, user): an UPDATE, keeping created_at and refreshing updated_at.
+    repo.upsert(session_id="s1", turn_id="t1", user_id="u1", verdict="down", comment="actually wrong")
+
+    assert repo.prune_older_than(30) == 0, "a comment revised today is not 40 days old"
+    recent = repo.list_feedback(since=datetime.now(UTC) - timedelta(days=1))
+    assert [r["verdict"] for r in recent] == ["down"]

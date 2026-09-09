@@ -392,7 +392,11 @@ class TestContentMode:
         import app.worker.kinds_conversation_export as mod
 
         monkeypatch.setattr(mod, "content_export_mode", lambda workload=None: "pseudonymized")
-        monkeypatch.setattr(mod, "export_text", lambda text: text.replace("hello", "REDACTED") if text else text)
+        monkeypatch.setattr(
+            mod,
+            "make_export_scrubber",
+            lambda: lambda text: text.replace("hello", "REDACTED") if text else text,
+        )
         _seed_session(pg_engine, index=0, content="hello world")
 
         requests: list[httpx.Request] = []

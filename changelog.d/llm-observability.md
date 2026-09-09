@@ -37,7 +37,9 @@
   plus an optional comment, one row per turn and user, accepted only for a turn
   the session's own messages carry; audited as `chat.feedback`),
   rendered on every completed assistant bubble in the web chat; admins read the
-  queue with `GET /api/admin/telemetry/feedback` (`agnes admin usage feedback`).
+  queue with `GET /api/admin/telemetry/feedback` (`agnes admin usage feedback`),
+  which orders and filters by when a verdict last CHANGED, so a rating
+  revised today shows up today and retention counts from the revision.
   Agent memories now record the turn and message that wrote them
   (`agent_memories.source_turn_id`/`source_message_id`).
 - **A queryable corpus of whole conversations, for evaluation.**

@@ -170,7 +170,7 @@ from src.conversation_export import (
     records_for_session_ids,
     serialize_jsonl,
 )
-from src.observability.content_policy import content_export_mode, export_text, load_content_export_policy
+from src.observability.content_policy import content_export_mode, load_content_export_policy, make_export_scrubber
 from src.observability.otel import parse_otlp_headers
 
 logger = logging.getLogger(__name__)
@@ -632,7 +632,7 @@ def run_conversation_export_once(
     # -- left for a later tick rather than exported incomplete.
     until = datetime.now(UTC) - SETTLE_WINDOW
 
-    anonymizer = export_text if mode == "pseudonymized" else None
+    anonymizer = make_export_scrubber() if mode == "pseudonymized" else None
     bundle = ConversationExportRepoBundle(
         sessions=repos["sessions"],
         messages=repos["messages"],

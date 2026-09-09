@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -326,6 +326,54 @@ def export_text(text: str) -> str:
             _warned_pseudonym_failure = True
             logger.warning("content policy: pseudonymisation unavailable, withholding exported content", exc_info=True)
         return WITHHELD
+
+
+def make_export_scrubber() -> Callable[[str], str]:
+    """An :func:`export_text` bound to ONE policy read.
+
+    ``export_text`` resolves the mode, the HMAC key and the anonymizer rules
+    per call, which is right for the span emitters (one call per span, and
+    an operator who completes the policy record is obeyed immediately) and
+    wrong for the conversation-corpus export, which calls it once per text
+    leaf and would repeat that work thousands of times in a single pass.
+    The corpus export resolves its mode once for the whole run anyway — the
+    record it writes carries that one ``content_mode`` — so binding the rest
+    of the resolution alongside it changes nothing observable and does the
+    configuration work once.
+
+    Same fail-closed contract as :func:`export_text`: any failure yields
+    :data:`WITHHELD`, never the raw text.
+    """
+    global _warned_pseudonym_failure
+
+    mode = content_export_mode()
+    if mode == "full":
+        return lambda text: text
+    if mode != "pseudonymized":
+        return lambda _text: ""
+
+    try:
+        key = _pseudonym_key()
+        rules = rules_from_config()
+    except Exception:
+        if not _warned_pseudonym_failure:
+            _warned_pseudonym_failure = True
+            logger.warning("content policy: pseudonymisation unavailable, withholding exported content", exc_info=True)
+        return lambda _text: WITHHELD
+
+    def _scrub(text: str) -> str:
+        global _warned_pseudonym_failure
+        try:
+            return anonymize_markdown(text, key=key, rules=rules).text
+        except Exception:
+            if not _warned_pseudonym_failure:
+                _warned_pseudonym_failure = True
+                logger.warning(
+                    "content policy: pseudonymisation unavailable, withholding exported content", exc_info=True
+                )
+            return WITHHELD
+
+    return _scrub
 
 
 def announce_content_export_policy() -> None:

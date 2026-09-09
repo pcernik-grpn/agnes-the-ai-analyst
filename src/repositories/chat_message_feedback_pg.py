@@ -100,11 +100,17 @@ class ChatMessageFeedbackPgRepository:
         verdict: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """The feedback queue, newest first; ``since``/``verdict`` narrow it."""
+        """The feedback queue, newest first; ``since``/``verdict`` narrow it.
+
+        Newest by ``updated_at``, not ``created_at``: :meth:`upsert` keeps a
+        row's original ``created_at`` when someone changes their mind, so an
+        admin looking at "the last day of feedback" would otherwise miss a
+        verdict revised today on a turn rated last week (review finding).
+        """
         clauses: list[str] = []
         params: dict[str, Any] = {"limit": limit}
         if since is not None:
-            clauses.append("created_at >= :since")
+            clauses.append("updated_at >= :since")
             params["since"] = since
         if verdict is not None:
             clauses.append("verdict = :verdict")
@@ -113,7 +119,7 @@ class ChatMessageFeedbackPgRepository:
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
-                    sa.text(f"SELECT * FROM chat_message_feedback WHERE {where} ORDER BY created_at DESC LIMIT :limit"),
+                    sa.text(f"SELECT * FROM chat_message_feedback WHERE {where} ORDER BY updated_at DESC LIMIT :limit"),
                     params,
                 )
                 .mappings()
@@ -128,11 +134,16 @@ class ChatMessageFeedbackPgRepository:
         trail (``retention.chat_feedback_days``, default 0 = keep forever):
         a thumbs-down comment is a person's free text about an answer, so an
         operator has to be able to put a clock on it.
+
+        The clock runs from ``updated_at``, the row's own change timestamp:
+        :meth:`upsert` keeps the original ``created_at`` when someone revises
+        a verdict, so pruning on ``created_at`` would delete a comment
+        written today because the first thumb on that turn was old.
         """
         cutoff = datetime.now(UTC) - timedelta(days=days)
         with self._engine.begin() as conn:
             result = conn.execute(
-                sa.text("DELETE FROM chat_message_feedback WHERE created_at < :cutoff"), {"cutoff": cutoff}
+                sa.text("DELETE FROM chat_message_feedback WHERE updated_at < :cutoff"), {"cutoff": cutoff}
             )
         return result.rowcount or 0
 

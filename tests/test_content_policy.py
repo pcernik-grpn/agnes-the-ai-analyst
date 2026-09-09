@@ -364,3 +364,58 @@ def test_an_iso_date_or_datetime_is_accepted(dated):
     )
     assert p.mode == "full" and p.approved_at == dated
 
+
+class TestExportScrubber:
+    """`make_export_scrubber` binds one policy read for a whole export pass
+    (review finding: `export_text` reloaded the policy, the HMAC key and the
+    anonymizer rules for every text leaf of every record)."""
+
+    def test_full_mode_returns_the_text_unchanged_without_reading_the_policy_again(self, monkeypatch):
+        reads = []
+
+        def _counting_mode(workload=None):
+            reads.append(workload)
+            return "full"
+
+        monkeypatch.setattr(cp, "content_export_mode", _counting_mode)
+        scrub = cp.make_export_scrubber()
+        assert [scrub(f"text {i}") for i in range(5)] == [f"text {i}" for i in range(5)]
+        assert len(reads) == 1, "the policy must be read once per pass, not once per leaf"
+
+    def test_off_mode_yields_nothing_for_every_leaf(self, monkeypatch):
+        monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "off")
+        scrub = cp.make_export_scrubber()
+        assert scrub("anything") == ""
+
+    def test_pseudonymized_mode_runs_each_leaf_through_the_anonymizer(self, monkeypatch):
+        seen = []
+
+        class _Result:
+            def __init__(self, text):
+                self.text = text.replace("Petr", "PERSON_x")
+
+        monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "pseudonymized")
+        monkeypatch.setattr(cp, "_pseudonym_key", lambda: b"k")
+        monkeypatch.setattr(cp, "rules_from_config", lambda: {})
+        monkeypatch.setattr(cp, "anonymize_markdown", lambda text, key, rules: (seen.append(text), _Result(text))[1])
+
+        scrub = cp.make_export_scrubber()
+        assert scrub("Petr byl tady") == "PERSON_x byl tady"
+        assert seen == ["Petr byl tady"]
+
+    def test_a_failing_anonymizer_withholds_rather_than_leaking(self, monkeypatch):
+        def _boom(**_kw):
+            raise RuntimeError("no key")
+
+        monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "pseudonymized")
+        monkeypatch.setattr(cp, "_pseudonym_key", lambda: b"k")
+        monkeypatch.setattr(cp, "rules_from_config", lambda: {})
+        monkeypatch.setattr(cp, "anonymize_markdown", lambda text, key, rules: _boom())
+
+        assert cp.make_export_scrubber()("Petr byl tady") == cp.WITHHELD
+
+    def test_a_failing_key_resolution_withholds_for_the_whole_pass(self, monkeypatch):
+        monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "pseudonymized")
+        monkeypatch.setattr(cp, "_pseudonym_key", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
+
+        assert cp.make_export_scrubber()("Petr byl tady") == cp.WITHHELD

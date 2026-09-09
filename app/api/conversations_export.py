@@ -22,7 +22,8 @@ grew.
 is off, has no recorded basis, or excludes workload ``chat``. When the mode
 is ``pseudonymized`` every exported text leaf goes through the same
 instance anonymizer the OTel content-export path uses
-(``src.observability.content_policy.export_text`` — fails closed, WITHHELD
+(``src.observability.content_policy.make_export_scrubber`` — one policy read
+for the whole pass, fails closed, WITHHELD
 rather than raw text on an anonymizer failure).
 """
 
@@ -41,7 +42,7 @@ from src.conversation_export import ConversationExportRepoBundle, iter_conversat
 from src.observability.content_policy import (
     NO_BASIS_WARNING,
     content_export_mode,
-    export_text,
+    make_export_scrubber,
     load_content_export_policy,
 )
 
@@ -148,7 +149,7 @@ def export_conversations(
             detail={"error": "content_export_disabled", "reason": _export_denial_reason("chat")},
         )
 
-    anonymizer = export_text if mode == "pseudonymized" else None
+    anonymizer = make_export_scrubber() if mode == "pseudonymized" else None
     bundle = ConversationExportRepoBundle(
         sessions=repos["sessions"],
         messages=repos["messages"],
