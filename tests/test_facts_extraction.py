@@ -117,12 +117,17 @@ class StubExtractor:
         self._delay = delay
         self._lock = threading.Lock()
         self.seen: list[str] = []
+        #: `subject_id` as passed on every `call()` — the seam's own record
+        #: of who called it FOR, so a test can assert the caller threaded
+        #: the document id through without instrumenting `trace_generation`.
+        self.subject_ids_seen: list[str | None] = []
 
-    def call(self, user_message: str) -> str:
+    def call(self, user_message: str, *, subject_id: str | None = None) -> str:
         if self._delay:
             time.sleep(self._delay)
         with self._lock:
             self.seen.append(user_message)
+            self.subject_ids_seen.append(subject_id)
             index = min(len(self.seen) - 1, len(self._replies) - 1)
             self.usage["calls"] += 1
             self.usage["input_tokens"] += 10
@@ -3178,7 +3183,7 @@ def llm_records(monkeypatch):
 
 def test_a_document_extraction_is_recorded_as_extraction_work(llm_records):
     client = FakeClient(_Response("NODES\nEDGES\n"))
-    _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", client=client).call("first")
+    _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", client=client).call("first", subject_id="cf_1")
 
     assert len(llm_records) == 1
     record = llm_records[0]
@@ -3186,6 +3191,21 @@ def test_a_document_extraction_is_recorded_as_extraction_work(llm_records):
     assert record.provider == "anthropic"
     assert record.model_requested == "claude-haiku-4-5"
     assert record.status == "ok"
+    assert record.subject_id == "cf_1", "the row must say which document it was"
+
+
+def test_a_documents_corrective_retry_carries_the_same_subject_id():
+    """`extract_one`'s corrective retry re-calls the SAME extractor for the
+    SAME document — the retry call must still carry the document's id, not
+    go back to unlabelled."""
+    text = "The Northwind rollout began in March."
+    bad = _node("the rollout was cancelled")
+    good = _node("rollout began in March")
+    extractor = StubExtractor([_stream(bad), _stream(good)])
+
+    extract_one(extractor, _work(text, file_id="cf_1"))
+
+    assert extractor.subject_ids_seen == ["cf_1", "cf_1"], "the initial call AND the retry carry the document id"
 
 
 def test_a_vertex_pass_is_recorded_against_vertex(llm_records):

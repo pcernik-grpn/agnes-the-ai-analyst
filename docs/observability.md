@@ -194,13 +194,13 @@ Each row carries the call's **context**
 (`src/observability/llm_context.py`) — `workload` (the coarse kind of work:
 `chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`,
 `knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`,
-`auto_title`, `readiness`, `store_guardrails`, `verification`), `purpose`
-(a finer call-site label, e.g. `entity_builder_turn`, `facts_extraction`,
-`digest`), `session_id`/`turn_id` for a chat call, `user_id`/`agent_id` for
-identity, `job_id` when the call ran inside a worker job, and `subject_id` —
-what the call is *about* (an entity id for a builder, a document id for
-extraction, a session id for auto-title) — plus the four token kinds,
-`cost_usd`, and `priced_as`: the rates the row was priced at
+`auto_title`, `readiness`, `store_guardrails`, `verification`, `admin_ask`),
+`purpose` (a finer call-site label, e.g. `entity_builder_turn`,
+`facts_extraction`, `digest`), `session_id`/`turn_id` for a chat call,
+`user_id`/`agent_id` for identity, `job_id` when the call ran inside a
+worker job, and `subject_id` — what the call is *about* (an entity id for a
+builder, a document id for extraction, a session id for auto-title) — plus
+the four token kinds, `cost_usd`, and `priced_as`: the rates the row was priced at
 (`src/llm_pricing.py`), stored beside the figure so any row can be
 re-derived rather than taken on trust. An unknown model prices at the same
 `DEFAULT_PRICE` every other surface uses, and `priced_as` says so.
@@ -254,6 +254,19 @@ comment). The web chat renders thumbs on every completed assistant bubble
 (the frame carries `turn_id`) and a short optional comment on thumbs-down;
 read the queue with `agnes admin usage feedback` (never prints the comment
 text in its table — use `--json` for that).
+
+### Extraction provenance
+
+"Why did extraction pull the wrong facts" is answered by the `llm_calls`
+rows with `workload=extraction`, `purpose=facts_extraction|facts_retry|
+facts_batch`, `subject_id` (the document's own `corpus_files.id`) and
+`job_id` — the worker job id `app/worker/runtime.py` binds onto the
+context for the whole job, the same id `jobs.id` and `extraction_runs.
+job_id` carry. Join on `extraction_runs`, not `facts_ingest_runs` — the
+latter has no `job_id` column at all (`facts_ingest_runs` is keyed on the
+ingest run's own id, a different unit of work than the worker job that
+drove it). One `llm_calls` row per document call, so a wrong fact traces
+back to the exact call, its model, its cost and, under policy, its prompt.
 
 ### Memory provenance
 

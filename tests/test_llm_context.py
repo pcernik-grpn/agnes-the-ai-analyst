@@ -84,5 +84,6 @@ def test_workload_vocabulary_is_the_spec_list():
             "readiness",
             "store_guardrails",
             "verification",
+            "admin_ask",
         }
     )

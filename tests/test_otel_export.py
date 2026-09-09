@@ -172,6 +172,21 @@ def test_trace_generation_marks_a_failure(otel_exporter):
     assert dict(span.attributes)["error.type"] == "RuntimeError"
 
 
+def test_a_vertex_extractor_generation_is_labelled_gcp_vertex_ai(otel_exporter):
+    """``VertexExtractor`` bills through Google Cloud, not a direct
+    Anthropic call — its generation span carries ``gen_ai.system=
+    gcp.vertex_ai``, the same label every other Vertex call site uses
+    (``src/observability/llm_tracing.py::provider_label``), never the bare
+    ``"vertex"`` setting value the config resolves to."""
+    from connectors.llm.vertex_provider import VertexExtractor
+
+    with trace_generation(provider=VertexExtractor._TRACE_PROVIDER, model="claude-haiku-4-5") as cap:
+        cap.set_input("hello")
+        cap.set_output("world")
+    (span,) = otel_exporter.get_finished_spans()
+    assert dict(span.attributes)["gen_ai.system"] == "gcp.vertex_ai"
+
+
 # ---------------------------------------------------------------------------
 # Call context, cost and cache tokens on the spans; ids and remote parents
 # ---------------------------------------------------------------------------
