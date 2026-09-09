@@ -512,6 +512,37 @@ independently (in a Data-Streams style sink that means mapping the
 `agnes.completion_chars`) are on the span whether capture is on or not.
 Turn it on only where the collector is allowed to hold that data.
 
+#### Per-workload content classes (`workloads` allowlist)
+
+Content export is gated by `observability.content_export`
+(`config/instance.yaml.example`: `mode`, `placement`, `basis`,
+`approved_by`, `approved_at` — a mode without a recorded basis is treated
+as `off`). On top of that base mode, `workloads` narrows *which* kind of
+call's content may leave the instance — an allowlist, empty by default
+meaning every workload once the mode is not `off`. An operator can open
+`builder` and `corporate_memory` content for quality work while keeping
+`chat` at `off`, because the two carry very different content:
+
+| workload | the prompt is | the completion is |
+|---|---|---|
+| `chat` / `agent_api` | the customer's conversation and data | the customer's conversation |
+| `extraction` (facts, OCR, vision, NER) | the customer's document | a derived artifact (facts, proposals) |
+| `builder` | an admin-authored draft plus candidate ids | a config patch |
+| `corporate_memory` / `knowledge` / `semantic_layer` | employee notes, catalog text | derived notes |
+
+Every content producer passes its own workload to the gate
+(`capture_content_enabled(workload=...)` in `src/observability/otel.py`,
+which reads `content_export_mode(workload=...)` in
+`src/observability/content_policy.py`): a completion span's is the chat
+turn's (or `agent_api` for an agent-bound call), a generation span's is the
+ambient `llm_context`'s. The embedded engine's telemetry relay
+(`otlp_proxy`) evaluates the policy for workload `chat` — the sandbox's own
+spans carry one turn's prompt and answer, the same content class as the
+broker's own completion spans. A workload name the vocabulary does not
+know is dropped from the allowlist and warned about at startup rather than
+kept, so a typo cannot silently expand "only these workloads" into
+"everything".
+
 ### The embedded engine's own spans
 
 The broker sees a completion, not the agent loop around it. The embedded

@@ -46,7 +46,10 @@ def content_policy_full(monkeypatch):
     who filled in mode/placement/basis/approver gets."""
     from src.observability import content_policy
 
-    monkeypatch.setattr(content_policy, "content_export_mode", lambda: "full")
+    # ``workload=None`` default: a real ``content_export_mode`` accepts one
+    # too (spec 3.6's per-workload allowlist), and every producer now passes
+    # its own — an unfiltered `full` here means no allowlist is configured.
+    monkeypatch.setattr(content_policy, "content_export_mode", lambda workload=None: "full")
     return content_policy
 
 
@@ -54,8 +57,22 @@ def content_policy_full(monkeypatch):
 def content_policy_pseudonymized(monkeypatch):
     from src.observability import content_policy
 
-    monkeypatch.setattr(content_policy, "content_export_mode", lambda: "pseudonymized")
+    monkeypatch.setattr(content_policy, "content_export_mode", lambda workload=None: "pseudonymized")
     monkeypatch.setattr(content_policy, "_pseudonym_key", lambda: b"unit-test-key")
+    return content_policy
+
+
+@pytest.fixture
+def content_policy_full_for_builder_only(monkeypatch):
+    """``mode: full`` narrowed to the ``builder`` workload only (spec 3.6's
+    ``workloads`` allowlist) — a `chat` completion carries no content while a
+    `builder` generation does, under the very same base mode."""
+    from src.observability import content_policy
+
+    def _mode(workload=None):
+        return "full" if workload in (None, "builder") else "off"
+
+    monkeypatch.setattr(content_policy, "content_export_mode", _mode)
     return content_policy
 
 
@@ -148,9 +165,8 @@ def test_trace_generation_emits_a_span(otel_exporter):
 
 
 def test_trace_generation_marks_a_failure(otel_exporter):
-    with pytest.raises(RuntimeError):
-        with trace_generation(provider="openai_compat", model="m"):
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), trace_generation(provider="openai_compat", model="m"):
+        raise RuntimeError("boom")
     (span,) = otel_exporter.get_finished_spans()
     assert span.status.status_code.name == "ERROR"
     assert dict(span.attributes)["error.type"] == "RuntimeError"
@@ -629,6 +645,35 @@ def test_generation_span_has_no_content_events_by_default(otel_exporter):
     (span,) = otel_exporter.get_finished_spans()
     assert span.events == ()
     assert dict(span.attributes)["agnes.prompt_chars"] == len("patient Nováková")
+
+
+def test_workload_allowlist_narrows_which_producer_gets_content(
+    otel_broker, otel_exporter, content_policy_full_for_builder_only
+):
+    """``mode: full, workloads: [builder]`` (spec 3.6): the broker's completion
+    span is workload `chat` by construction and carries NO content events
+    under that policy, while a `builder`-labelled generation does — same base
+    mode, different producers."""
+    from src.observability.llm_context import llm_context
+
+    tok = ticket_repo().mint("chat_otel_workload_gate", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200, r.text
+    (completion_span,) = otel_exporter.get_finished_spans()
+    assert completion_span.events == ()
+    assert dict(completion_span.attributes)["agnes.prompt_chars"] > 0
+
+    with llm_context(workload="builder"), trace_generation(provider="anthropic", model="claude-x") as cap:
+        cap.set_input("draft")
+        cap.set_output("patch")
+
+    generation_span = otel_exporter.get_finished_spans()[-1]
+    assert {e.name for e in generation_span.events} == {otel.PROMPT_EVENT, otel.COMPLETION_EVENT}
 
 
 def test_broker_aborted_stream_is_marked_incomplete(otel_broker, otel_exporter):

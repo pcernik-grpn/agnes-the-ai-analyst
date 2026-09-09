@@ -13,6 +13,7 @@ only under a decision somebody recorded. That decision lives in
         basis: ""            # contract clause, DPA reference, "internal dev instance"
         approved_by: ""      # a person
         approved_at: ""      # ISO date
+        workloads: []        # allowlist; empty = every workload once mode != off
 
 Two questions, deliberately separate: *what* may be exported (``mode``) and
 *where it lands* (``placement`` — an endpoint the instance's own operator
@@ -20,6 +21,15 @@ runs, or a third party's). The code cannot verify which is which; the record
 makes the operator say it, and the effective policy is logged and audited
 (``observability.content_export``) at startup so the answer is in the trail
 rather than in somebody's memory.
+
+**Content classes differ by workload** (spec 3.6): ``workloads`` narrows
+*which* workload's content is allowed to leave, on top of ``mode`` saying
+*whether any* is. An operator can export ``builder``/``corporate_memory``
+content for quality work while keeping ``chat`` at `off`, because a chat
+prompt is the customer's own conversation and a builder prompt is an
+admin-authored draft. Every producer passes its own workload to
+:func:`content_export_mode`; the engine's telemetry relay is workload
+``chat`` by definition.
 
 **A mode without a basis is `off`.** ``mode: full`` with a blank ``basis``,
 ``approved_by`` or ``placement`` is an unfinished decision, not a decision;
@@ -44,11 +54,12 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from src.anonymization import anonymize_markdown, rules_from_config
 from src.anonymization_key import resolve_or_provision_key
 from src.audit_helpers import log_safe
+from src.observability.llm_context import WORKLOADS
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +96,9 @@ class ContentExportPolicy:
     approved_at: str
     requested_mode: str
     warnings: tuple[str, ...]
+    #: Allowlist of workloads whose content may leave the instance; empty
+    #: means every workload once ``mode`` is on (spec 3.6).
+    workloads: tuple[str, ...] = ()
 
 
 def _text(value: Any) -> str:
@@ -103,7 +117,32 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def load_content_export_policy(config: Optional[Mapping[str, Any]] = None) -> ContentExportPolicy:
+def _workloads(value: Any) -> tuple[tuple[str, ...], list[str]]:
+    """The ``workloads`` allowlist, validated against the spec vocabulary.
+
+    An entry the vocabulary does not know is dropped rather than kept — a
+    typo silently expanding "only these workloads" into "everything" would
+    make the field lie about what it does. The warning rides the SAME
+    ``warnings`` list every other malformed field uses, surfaced once at
+    startup rather than on every read.
+    """
+    if not isinstance(value, (list, tuple)):
+        return (), []
+    out: list[str] = []
+    warnings: list[str] = []
+    for item in value:
+        name = str(item).strip()
+        if not name:
+            continue
+        if name not in WORKLOADS:
+            warnings.append(f"unknown observability.content_export.workloads entry {name!r}; ignored")
+            continue
+        if name not in out:
+            out.append(name)
+    return tuple(out), warnings
+
+
+def load_content_export_policy(config: Mapping[str, Any] | None = None) -> ContentExportPolicy:
     """Read ``observability.content_export`` and decide the effective mode.
 
     ``config`` is a whole instance-config mapping (the tests pass one); when
@@ -121,7 +160,7 @@ def load_content_export_policy(config: Optional[Mapping[str, Any]] = None) -> Co
 
             candidate = get_value("observability", "content_export", default=None)
             block = candidate if isinstance(candidate, Mapping) else {}
-        except Exception:  # noqa: BLE001 - no config package / unreadable overlay
+        except Exception:
             logger.debug("content policy: instance config unreadable, defaulting to off", exc_info=True)
             block = {}
 
@@ -130,7 +169,8 @@ def load_content_export_policy(config: Optional[Mapping[str, Any]] = None) -> Co
     basis = _text(block.get("basis"))
     approved_by = _text(block.get("approved_by"))
     approved_at = _text(block.get("approved_at"))
-    warnings: list[str] = []
+    workloads, workload_warnings = _workloads(block.get("workloads"))
+    warnings: list[str] = list(workload_warnings)
 
     mode = requested
     if mode not in MODES:
@@ -159,18 +199,30 @@ def load_content_export_policy(config: Optional[Mapping[str, Any]] = None) -> Co
         approved_at=approved_at,
         requested_mode=requested if requested in MODES else "off",
         warnings=tuple(warnings),
+        workloads=workloads,
     )
 
 
-def content_export_mode() -> str:
-    """The effective mode, read per call.
+def content_export_mode(workload: str | None = None) -> str:
+    """The effective mode, read per call — for ``workload`` when one is given.
 
     No cache on purpose: the relay asks once per batch and the span emitters
     once per span, so an operator who completes the record is obeyed by the
     next export rather than by the next restart. The read is a dict lookup
     over the already-loaded instance config.
+
+    ``workloads`` is an allowlist (spec 3.6): a non-empty one that does not
+    include ``workload`` makes THIS call `off`, even while the base mode is
+    on — an operator can export ``builder`` content for quality work while
+    keeping ``chat`` at `off`. Called with no ``workload`` (the deprecated
+    env-var check, ``export_text`` once a caller already resolved its own
+    gate, the startup log) the allowlist is not applied and the base mode is
+    returned unfiltered — there is nothing to exclude a workload nobody named.
     """
-    return load_content_export_policy().mode
+    policy = load_content_export_policy()
+    if policy.mode != "off" and workload is not None and policy.workloads and workload not in policy.workloads:
+        return "off"
+    return policy.mode
 
 
 def _pseudonym_key() -> bytes:
@@ -198,7 +250,7 @@ def export_text(text: str) -> str:
         return ""
     try:
         return anonymize_markdown(text, key=_pseudonym_key(), rules=rules_from_config()).text
-    except Exception:  # noqa: BLE001 - fail closed, whatever went wrong
+    except Exception:
         if not _warned_pseudonym_failure:
             _warned_pseudonym_failure = True
             logger.warning("content policy: pseudonymisation unavailable, withholding exported content", exc_info=True)
@@ -219,21 +271,23 @@ def announce_content_export_policy() -> None:
     _announced = True
     try:
         policy = load_content_export_policy()
-    except Exception:  # noqa: BLE001 - instrumentation never fails the process
+    except Exception:
         logger.debug("content policy: could not resolve the policy at startup", exc_info=True)
         return
     for warning in policy.warnings:
         logger.warning("content policy: %s", warning)
     logger.info(
-        "content export policy: mode=%s placement=%s approved_by=%s",
+        "content export policy: mode=%s placement=%s approved_by=%s workloads=%s",
         policy.mode,
         policy.placement or "-",
         policy.approved_by or "-",
+        ", ".join(policy.workloads) or "all",
         extra={
             "event": "content_export_policy",
             "mode": policy.mode,
             "requested_mode": policy.requested_mode,
             "placement": policy.placement,
+            "workloads": list(policy.workloads),
         },
     )
     try:
@@ -250,11 +304,12 @@ def announce_content_export_policy() -> None:
                 # The basis TEXT stays in the config file — the trail records
                 # only that one exists (content never enters `params`).
                 "basis_recorded": bool(policy.basis),
+                "workloads": list(policy.workloads),
             },
             result="success",
             client_kind="system",
         )
-    except Exception:  # noqa: BLE001 - log_safe already swallows; belt and braces
+    except Exception:
         logger.debug("content policy: could not write the policy audit row", exc_info=True)
 
 

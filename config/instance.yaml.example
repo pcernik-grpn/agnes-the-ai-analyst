@@ -421,6 +421,22 @@ auth:
 #     basis: ""             # the contract clause / DPA reference / "internal dev instance" that permits it
 #     approved_by: ""       # a person, never blank unless mode is off
 #     approved_at: ""       # ISO date
+#     workloads: []         # allowlist of workloads whose content may leave;
+#                           # empty = every workload once mode is not off. An
+#                           # operator may open builder/corporate-memory
+#                           # content for quality work while keeping chat at
+#                           # off — content classes differ by workload:
+#                           #   chat / agent_api      — prompt: the customer's own conversation and data;
+#                           #                           completion: the customer's own conversation
+#                           #   extraction (facts,    — prompt: the customer's document;
+#                           #   OCR, vision, NER)       completion: a derived artifact (facts, proposals)
+#                           #   builder               — prompt: an admin-authored draft plus candidate ids;
+#                           #                           completion: a config patch
+#                           #   corporate_memory /    — prompt: employee notes, catalog text;
+#                           #   knowledge /             completion: derived notes
+#                           #   semantic_layer
+#                           # An unknown workload name is dropped and warned
+#                           # about at startup rather than silently kept.
 
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY
