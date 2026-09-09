@@ -540,3 +540,38 @@ def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_ra
     rows = pg_repo.search_candidates([CORPUS_ID], "contract", limit=3)
     assert len(rows) == 3
     assert all("contract" in r["text"] for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# reassign_file_corpus — the single-file move path's chunk re-homing
+# ---------------------------------------------------------------------------
+
+
+def test_reassign_file_corpus_rehomes_only_that_files_chunks(repo):
+    """Moving a file between collections must carry its chunks along:
+    ``corpus_chunks.corpus_id`` is the column body search scopes on, so a
+    chunk left behind keeps answering under the collection the file just
+    left. Only the moved file's rows move; a sibling file's stay put."""
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "relocated body zebra"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "relocated body zebra two"},
+        ]
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": "cf_stays", "ordinal": 0, "text": "staying body zebra"}])
+
+    moved = repo.reassign_file_corpus(FILE_ID, "col_target")
+
+    assert moved == 2
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == ["col_target", "col_target"]
+    assert [r["file_id"] for r in repo.list_for_corpus(CORPUS_ID)] == ["cf_stays"]
+    # Body search follows the move: nothing of the file under the source,
+    # all of it under the target.
+    assert {r["file_id"] for r in repo.search_candidates([CORPUS_ID], "relocated", limit=10)} == set()
+    assert {r["file_id"] for r in repo.search_candidates(["col_target"], "relocated", limit=10)} == {FILE_ID}
+
+
+def test_reassign_file_corpus_unknown_file_is_zero(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "untouched"}])
+    assert repo.reassign_file_corpus("cf_nope", "col_target") == 0
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]

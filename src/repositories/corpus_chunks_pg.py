@@ -107,6 +107,17 @@ class CorpusChunksPgRepository:
                 {"file_id": file_id},
             )
 
+    def reassign_file_corpus(self, file_id: str, target_corpus_id: str) -> int:
+        """Repoint one file's chunks at the collection it now lives in; return
+        the count. See the DuckDB twin for why the column must follow the file.
+        """
+        with self._engine.begin() as conn:
+            res = conn.execute(
+                sa.text("UPDATE corpus_chunks SET corpus_id = :target WHERE file_id = :file_id"),
+                {"target": target_corpus_id, "file_id": file_id},
+            )
+            return int(res.rowcount or 0)
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------

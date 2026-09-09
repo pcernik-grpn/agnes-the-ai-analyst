@@ -131,6 +131,27 @@ class CorpusChunksRepository:
         """Remove all chunks for the given file (idempotent)."""
         self.conn.execute("DELETE FROM corpus_chunks WHERE file_id = ?", [file_id])
 
+    def reassign_file_corpus(self, file_id: str, target_corpus_id: str) -> int:
+        """Repoint one file's chunks at the collection it now lives in; return
+        the count.
+
+        ``corpus_chunks.corpus_id`` is denormalized from ``corpus_files`` and
+        is the column body search scopes candidates on
+        (``search_candidates``), so a chunk left behind after a move keeps
+        answering under the collection the file just left. Called on the
+        single-file move path right after the file row moves — the
+        collection-consolidation path re-homes chunks the same way, in bulk.
+        Unknown file → 0.
+
+        Counted via ``RETURNING`` rather than ``rowcount``: DuckDB's DBAPI
+        ``rowcount`` is ``-1`` for DML.
+        """
+        moved = self.conn.execute(
+            "UPDATE corpus_chunks SET corpus_id = ? WHERE file_id = ? RETURNING id",
+            [target_corpus_id, file_id],
+        ).fetchall()
+        return len(moved)
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------

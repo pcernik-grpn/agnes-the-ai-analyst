@@ -981,6 +981,64 @@ def test_delete_file_removes_its_chunks(seeded_app):
     assert corpus_chunks_repo().list_for_file(fid) == []
 
 
+def test_move_file_rehomes_its_chunks_for_search(seeded_app):
+    """Moving a file must carry its body chunks to the target collection.
+
+    Body search scopes candidates on ``corpus_chunks.corpus_id``, not on the
+    file row's current collection — so a moved file whose chunks stayed
+    behind kept answering under the SOURCE collection: readable to a reader
+    granted only the collection the file just left, and invisible under the
+    target. Asserted from both sides, and the leak side as a non-admin
+    reader who was granted the source only.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Move Src Chunks"}, headers=admin).json()["id"]
+    dst_id = c.post("/api/collections", json={"name": "Move Dst Chunks"}, headers=admin).json()["id"]
+    _seed_collection_grant(src_id, "analyst1")  # the analyst can read the SOURCE only
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="moved.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many(
+        [{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "the quokka sentence lives here"}]
+    )
+    # A second file keeps the source alive after the move (a single-file
+    # source is soft-deleted, which would take it out of the searchable set
+    # and make the source-side assertions below vacuous).
+    _seed_files_direct(src_id, ["stays.txt"])
+
+    r = c.post(
+        f"/api/collections/{src_id}/files/{fid}/move",
+        json={"target_collection_id": dst_id},
+        headers=admin,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["source_emptied"] is False
+
+    def _hits(token: str, corpus_id: str | None = None) -> list[str]:
+        params = {"q": "quokka sentence"}
+        if corpus_id:
+            params["corpus_id"] = corpus_id
+        resp = c.get("/api/collections/search", params=params, headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        return [res["file_id"] for res in resp.json()["results"]]
+
+    # Under the target: found. Under the source: gone — for the admin
+    # narrowing to it, and for the reader who holds the source grant only.
+    assert fid in _hits(seeded_app["admin_token"], dst_id)
+    assert fid not in _hits(seeded_app["admin_token"], src_id)
+    assert _hits(seeded_app["analyst_token"]) == []
+    # And the chunk rows themselves now point at the target.
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
+
+
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
     """A name with no alphanumerics must not yield an empty slug."""
     c = seeded_app["client"]
