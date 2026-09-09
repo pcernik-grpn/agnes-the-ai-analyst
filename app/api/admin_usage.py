@@ -225,6 +225,8 @@ def ask_usage(
         )
 
     dialect = "postgresql" if use_pg() else "duckdb"
+    from src.observability.llm_context import llm_context
+
     try:
         # Constructed inside the error boundary: the SDK import is deferred
         # to first use, so client construction is a failure point too — an
@@ -237,13 +239,14 @@ def ask_usage(
         else:
             extractor = AnthropicExtractor(api_key=api_key, model=_ASK_MODEL)
         t0 = time.monotonic()
-        llm_out = extractor.extract_json(
-            prompt=build_prompt(question),
-            max_tokens=1024,
-            json_schema=RESPONSE_SCHEMA,
-            schema_name="usage_ask_response",
-            system=system_prompt(dialect),
-        )
+        with llm_context(workload="admin_ask", purpose="telemetry_ask", user_id=user.get("id")):
+            llm_out = extractor.extract_json(
+                prompt=build_prompt(question),
+                max_tokens=1024,
+                json_schema=RESPONSE_SCHEMA,
+                schema_name="usage_ask_response",
+                system=system_prompt(dialect),
+            )
     except LLMAuthError:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is invalid")
     except LLMRateLimitError:

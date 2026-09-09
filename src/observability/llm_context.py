@@ -41,6 +41,7 @@ WORKLOADS: frozenset[str] = frozenset(
         "readiness",
         "store_guardrails",
         "verification",
+        "admin_ask",
     }
 )
 

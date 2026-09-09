@@ -2457,14 +2457,19 @@ class _Extractor:
                 )
             return self._client, (self._call_model or self.model)
 
-    def _create(self, user_message: str) -> Any:
+    def _create(self, user_message: str, *, subject_id: str | None = None) -> Any:
         from src.observability import llm_context, trace_generation
         from src.observability.llm_tracing import provider_label
 
         client, model = self._ensure_client()
         with (
             llm_context(workload="extraction"),
-            trace_generation(provider=provider_label(self.provider), model=model, purpose="facts_extraction") as cap,
+            trace_generation(
+                provider=provider_label(self.provider),
+                model=model,
+                purpose="facts_extraction",
+                subject_id=subject_id,
+            ) as cap,
         ):
             cap.set_input(user_message)
             response = client.messages.create(
@@ -2509,8 +2514,14 @@ class _Extractor:
         with self._usage_lock:
             return dict(self.usage)
 
-    def call(self, user_message: str) -> str:
+    def call(self, user_message: str, *, subject_id: str | None = None) -> str:
         """One bounded-retry call.
+
+        ``subject_id`` is the document's own id (``_Work.file_id``, the
+        caller's join key) — passed straight through to :meth:`_create` so
+        the ``llm_calls`` row this call produces says which document it
+        was, the same way the batch transport's own generation record
+        already does.
 
         Raises :class:`ProviderLimitHit` IMMEDIATELY (no retry, no backoff
         sleep) for an error :func:`classify_provider_limit_error` recognizes
@@ -2541,7 +2552,7 @@ class _Extractor:
         for attempt in range(1, self.max_attempts + 1):
             attempts_made = attempt
             try:
-                response = self._create(user_message)
+                response = self._create(user_message, subject_id=subject_id)
             except FactsExtractionUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001 — classified below
@@ -3571,7 +3582,7 @@ def extract_one(
     if reply is not None:
         cache_hits += 1
     else:
-        reply = extractor.call(work.user_message)
+        reply = extractor.call(work.user_message, subject_id=work.file_id)
         _cache_store(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="", reply=reply)
     nodes, edges, parse_errors = parse_streams(reply)
     # See `_normalize_evidence_doc_ids`'s docstring: a cache hit replays a
@@ -3637,7 +3648,7 @@ def extract_one(
         if retry_reply is not None:
             cache_hits += 1
         else:
-            retry_reply = extractor.call(_retry_message(work.user_message, bounded_failures))
+            retry_reply = extractor.call(_retry_message(work.user_message, bounded_failures), subject_id=work.file_id)
             _cache_store(
                 cache,
                 sha256=work.sha256,
@@ -4872,14 +4883,19 @@ def _run_batch_pass(
         docs_done += 1
         _report_progress()
 
-    def _sync_retry(message: str) -> str:
+    def _sync_retry(message: str, *, subject_id: str | None = None) -> str:
         from src.anonymization_ner import _reply_text
         from src.observability import llm_context, trace_generation
         from src.observability.llm_tracing import provider_label
 
         with (
             llm_context(workload="extraction"),
-            trace_generation(provider=provider_label(provider), model=resolved_model, purpose="facts_retry") as cap,
+            trace_generation(
+                provider=provider_label(provider),
+                model=resolved_model,
+                purpose="facts_retry",
+                subject_id=subject_id,
+            ) as cap,
         ):
             cap.set_input(message)
             response = client.messages.create(
@@ -4936,7 +4952,7 @@ def _run_batch_pass(
                 - len(work.user_message),
             )
             bounded_failures, _overflow = _bound_failures_for_retry(failures, char_budget=retry_char_budget)
-            retry_reply = _sync_retry(_retry_message(work.user_message, bounded_failures))
+            retry_reply = _sync_retry(_retry_message(work.user_message, bounded_failures), subject_id=work.file_id)
             final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
                 work=work,
                 nodes=nodes,

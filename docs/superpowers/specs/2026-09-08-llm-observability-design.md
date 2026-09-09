@@ -132,7 +132,7 @@ immutable `LlmCallContext`:
 
 | field | meaning | set by |
 |---|---|---|
-| `workload` | coarse kind of work: `chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`, `knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`, `auto_title`, `readiness`, `store_guardrails`, `verification` | the call site |
+| `workload` | coarse kind of work: `chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`, `knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`, `auto_title`, `readiness`, `store_guardrails`, `verification`, `admin_ask` | the call site |
 | `purpose` | fine-grained call site label, e.g. `entity_builder_turn`, `facts_extraction`, `facts_retry`, `digest`, `tagger`, `contradiction`, `completion` | the call site |
 | `session_id`, `turn_id` | chat session and turn (see 3.2) | ChatManager / broker |
 | `user_id`, `agent_id` | identity — the user id, never the email | the call site |
@@ -317,9 +317,12 @@ audit row carries `turn_id`. The DuckDB sibling accepts and drops them
 **Extraction provenance.** "Why did extraction pull the wrong facts" is
 answered by the `llm_calls` rows with `workload=extraction`,
 `purpose=facts_extraction|facts_retry|facts_batch`, `subject_id=<document
-id>` and `job_id=<ingest run>`, joined to `facts_ingest_runs` — one row per
-document call, so a wrong fact traces to the call, its model, its cost and,
-under policy, its prompt.
+id>` (the document's own `corpus_files.id`) and `job_id=<the worker job
+id>` (bound by `app/worker/runtime.py`, the SAME id `jobs.id` and
+`extraction_runs.job_id` carry — never `facts_ingest_runs`, which has no
+`job_id` column), joined to `extraction_runs` — one row per document call,
+so a wrong fact traces to the call, its model, its cost and, under policy,
+its prompt.
 
 **Builder provenance.** The five builder turns set the context (3.3), so
 their `llm_calls` rows say which builder, for which subject, by whom. The
