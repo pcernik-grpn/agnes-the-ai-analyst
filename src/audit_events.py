@@ -1513,6 +1513,17 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a table's schema + sample values for the no-SQL policy builder.",
     ),
+    # -- 2026-09-08 LLM observability design §3.6 — the effective content-export
+    # policy is written once at startup so the decision is in the trail.
+    # Written by src/observability/content_policy.py with no actor: nobody
+    # asks for it per request; the process announces what it will export.
+    # The basis TEXT stays in instance.yaml — the row records only that one
+    # was recorded.
+    "observability.content_export": AuditEvent(
+        "observability.content_export",
+        "system",
+        "The instance's effective content-export policy (mode, placement, approver) at startup.",
+    ),
 }
 
 

@@ -72,9 +72,11 @@ from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_sessi
 from app.auth.jwt import create_access_token
 from app.chat.turn_context import TurnRecord, read_turn
 from app.chat.turn_usage import add_turn_usage
+from src.observability import content_policy as _content_policy
 from src.observability import otel as _otel
 from src.observability.llm_context import LlmCallContext
 from src.observability.llm_record import LlmCallRecord, build_record
+from src.observability.otlp_scrub import OtlpBatchUndecodable, empty_logs_response, scrub_logs, scrub_traces
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
     access_token_repo,
@@ -1031,7 +1033,9 @@ _OTLP_MAX_BODY_BYTES = 8 * 1024 * 1024
 _OTLP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 #: Inbound headers worth forwarding: the wire format and its compression. The
 #: relay already dropped the credential/hop-by-hop sets; everything else is
-#: the sandbox's business, not the collector's.
+#: the sandbox's business, not the collector's. ``content-encoding`` survives
+#: only when the batch is forwarded as received — a batch the content policy
+#: decoded and re-serialised leaves here uncompressed, and says so.
 _OTLP_FORWARDED_REQUEST_HEADERS = frozenset({"content-type", "content-encoding"})
 
 
@@ -1057,10 +1061,30 @@ async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depend
     batch instead of silently swallowing telemetry — the turn itself is
     unaffected, the SDK's exporter just logs the refusal.
 
-    The body is the SDK's protobuf batch, forwarded byte-for-byte with its
-    wire-format and compression headers; the collector's 2xx body comes back
-    as-is (the OTLP success response), its error text never does — the status
-    (and ``Retry-After``, which the exporter's retry honours) is enough.
+    The body is the SDK's protobuf batch. It is forwarded under the
+    instance's content-export policy (``observability.content_export`` —
+    :mod:`src.observability.content_policy`), the same record the broker's
+    own completion spans obey, because the sandbox's spans carry the prompt
+    and the answer in their attributes:
+
+    - ``full`` — forwarded byte-for-byte with its compression header.
+    - ``pseudonymized`` — traces and log bodies rewritten through the
+      instance anonymizer; the batch is re-serialised uncompressed.
+    - ``off`` (the default) — the content attributes are stripped from
+      traces (the structural turn/step/tool spans still flow) and a logs
+      batch is accepted and dropped, so the exporter sees a 2xx rather than
+      retrying a decision the operator made.
+
+    Metrics carry counts, never content, and are always forwarded as sent.
+
+    **The relay fails closed on content:** under ``off`` / ``pseudonymized``
+    a batch it cannot decode is refused with ``400 otlp_batch_undecodable``,
+    never forwarded unstripped — a relay that cannot read a batch cannot
+    claim the batch is free of content.
+
+    The collector's 2xx body comes back as-is (the OTLP success response),
+    its error text never does — the status (and ``Retry-After``, which the
+    exporter's retry honours) is enough.
     """
     _require_scope(row, "kai_otlp")
     if signal not in _OTLP_SIGNALS:
@@ -1077,8 +1101,28 @@ async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depend
     body = await request.body()
     if len(body) > _OTLP_MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
+
+    mode = _content_policy.content_export_mode()
+    encoding: Optional[str] = request.headers.get("content-encoding")
+    try:
+        if signal == "traces" and mode != "full":
+            body = scrub_traces(body, mode=mode, content_encoding=encoding)
+            encoding = None
+        elif signal == "logs" and mode != "full":
+            if mode == "off":
+                return Response(content=empty_logs_response(), status_code=200, media_type="application/x-protobuf")
+            body = scrub_logs(body, mode=mode, content_encoding=encoding) or b""
+            encoding = None
+    except OtlpBatchUndecodable as exc:
+        logger.warning("broker: refused an undecodable %s batch under content mode %s", signal, mode)
+        raise HTTPException(status_code=400, detail={"code": "otlp_batch_undecodable"}) from exc
+
     headers = {k: v for k, v in request.headers.items() if k.lower() in _OTLP_FORWARDED_REQUEST_HEADERS}
     headers.setdefault("content-type", "application/x-protobuf")
+    if encoding is None:
+        # The batch was decoded and re-serialised — whatever the sandbox
+        # compressed, what leaves here is plain protobuf.
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-encoding"}
     headers.update(operator_headers)
     try:
         async with httpx.AsyncClient(timeout=_OTLP_TIMEOUT) as client:

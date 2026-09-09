@@ -973,6 +973,10 @@ async def lifespan(app):
 
     configure_otel(role=os.environ.get("AGNES_ROLE") or "app")
 
+    from src.observability.content_policy import announce_content_export_policy
+
+    announce_content_export_policy()
+
     # Surface an unsafe/no-op data-apps posture at startup: enabled, but
     # same-origin serving off and no isolated origin configured, so no hosted
     # app can actually be served (see data_apps_proxy._same_origin_serving_refused).

@@ -40,6 +40,25 @@ def otel_exporter(monkeypatch):
     otel.shutdown_otel()
 
 
+@pytest.fixture
+def content_policy_full(monkeypatch):
+    """Content export ON under a complete policy record — what an operator
+    who filled in mode/placement/basis/approver gets."""
+    from src.observability import content_policy
+
+    monkeypatch.setattr(content_policy, "content_export_mode", lambda: "full")
+    return content_policy
+
+
+@pytest.fixture
+def content_policy_pseudonymized(monkeypatch):
+    from src.observability import content_policy
+
+    monkeypatch.setattr(content_policy, "content_export_mode", lambda: "pseudonymized")
+    monkeypatch.setattr(content_policy, "_pseudonym_key", lambda: b"unit-test-key")
+    return content_policy
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle and resource
 # ---------------------------------------------------------------------------
@@ -473,10 +492,11 @@ def test_broker_completion_emits_one_span(otel_broker, otel_exporter):
     assert "secret answer" not in json.dumps(attrs)
 
 
-def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_exporter, monkeypatch):
+def test_broker_streamed_completion_with_content_and_identity(
+    otel_broker, otel_exporter, content_policy_full, monkeypatch
+):
     from app.chat.types import Surface
 
-    monkeypatch.setenv(otel.CAPTURE_CONTENT_VAR, "1")
     session = chat_session_repo().create_session(user_email="otel-user@test.com", surface=Surface.WEB)
     tok = ticket_repo().mint(session.id, "llm", ttl_seconds=60)  # the engine's egress scope
     _FakeUpstream.content_type = "text/event-stream"
@@ -555,6 +575,60 @@ def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_
     assert attrs["agnes.prompt_chars"] == len(events[otel.PROMPT_EVENT]["gen_ai.prompt"])
     assert attrs["agnes.completion_chars"] == len(events[otel.COMPLETION_EVENT]["gen_ai.completion"])
     assert "agnes.content_truncated" not in attrs
+
+
+def test_the_env_var_alone_exports_no_content(otel_broker, otel_exporter, monkeypatch):
+    """``AGNES_OTEL_CAPTURE_CONTENT`` used to be the whole switch. It is now a
+    deprecated alias: without a recorded policy it enables nothing, so the
+    span carries sizes and no events."""
+    monkeypatch.setenv(otel.CAPTURE_CONTENT_VAR, "1")
+    tok = ticket_repo().mint("chat_otel_envvar", "main", ttl_seconds=60)
+
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-x", "messages": [{"role": "user", "content": "patient Nováková"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    (span,) = otel_exporter.get_finished_spans()
+    assert span.events == ()
+    assert dict(span.attributes)["agnes.prompt_chars"] > 0
+    assert "Nováková" not in json.dumps(dict(span.attributes))
+
+
+def test_generation_span_carries_content_events_under_policy(otel_exporter, content_policy_pseudonymized):
+    """A server-side generation (a builder turn, an extraction) exports the
+    same two content events a completion does — pseudonymised, sizes intact."""
+    with trace_generation(provider="anthropic", model="claude-x", purpose="agent_builder") as cap:
+        cap.set_input("Hello jane@example.com")
+        cap.set_output("fine")
+
+    (span,) = otel_exporter.get_finished_spans()
+    events = {e.name: dict(e.attributes) for e in span.events}
+    assert set(events) == {otel.PROMPT_EVENT, otel.COMPLETION_EVENT}
+    prompt = json.loads(events[otel.PROMPT_EVENT]["gen_ai.prompt"])
+    assert prompt[0]["role"] == "user"
+    text = prompt[0]["parts"][0]["content"]
+    assert "jane@example.com" not in text and "EMAIL_" in text
+    completion = json.loads(events[otel.COMPLETION_EVENT]["gen_ai.completion"])
+    assert completion == [{"role": "assistant", "parts": [{"type": "text", "content": "fine"}]}]
+    attrs = dict(span.attributes)
+    # Sizes measure what the model saw, not what the collector got.
+    assert attrs["agnes.prompt_chars"] == len("Hello jane@example.com")
+    assert attrs["agnes.completion_chars"] == len("fine")
+    assert "agnes.content_truncated" not in attrs
+
+
+def test_generation_span_has_no_content_events_by_default(otel_exporter):
+    with trace_generation(provider="anthropic", model="claude-x") as cap:
+        cap.set_input("patient Nováková")
+        cap.set_output("the answer")
+
+    (span,) = otel_exporter.get_finished_spans()
+    assert span.events == ()
+    assert dict(span.attributes)["agnes.prompt_chars"] == len("patient Nováková")
 
 
 def test_broker_aborted_stream_is_marked_incomplete(otel_broker, otel_exporter):
