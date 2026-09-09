@@ -29,6 +29,7 @@ from src.models.config import GlossaryTerm, InstanceTemplate, MetricDefinition, 
 from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
+from src.models.export_watermarks import ExportWatermark
 from src.models.extraction import ExtractionRun
 from src.models.extraction_conditions import ExtractionCondition
 from src.models.fact_collection_stats import (
@@ -152,6 +153,7 @@ __all__ = [
     "DataPackageTool",
     "Edge",
     "EdgeCollectionMembership",
+    "ExportWatermark",
     "ExtractionCondition",
     "ExtractionRun",
     "Fact",

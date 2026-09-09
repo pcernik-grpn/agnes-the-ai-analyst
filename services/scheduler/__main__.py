@@ -410,6 +410,32 @@ def _acl_sync_schedule() -> str:
     return schedule if is_valid_schedule(schedule) else "every 4h"
 
 
+def _conversation_export_schedule() -> Optional[str]:
+    """``every Nm``/``every Nh`` row for the ``conversation-export`` push-sink
+    job (design 2026-09-08 §3.12, Task 11), or ``None`` when
+    ``observability.conversation_export.endpoint`` is unset — the row is
+    then omitted from :func:`build_jobs` entirely, mirroring
+    :func:`_extraction_schedule`'s off-by-default registration discipline
+    above: this is an opt-in feature, so absent config means no scheduler
+    row at all, not a guessed default cadence.
+
+    The handler itself (``app/worker/kinds_conversation_export.py``) ALSO
+    re-checks the same config before doing any work — belt-and-braces
+    against a stray/stale manual enqueue, same posture as
+    ``_run_ducklake_maintenance``'s own backend re-check.
+    """
+    try:
+        from app.instance_config import get_conversation_export_config
+
+        config = get_conversation_export_config()
+    except Exception:
+        logger.exception("scheduler: failed to read observability.conversation_export config")
+        return None
+    if config is None:
+        return None
+    return _seconds_to_schedule(config["interval_minutes"] * 60)
+
+
 #: Daily, off-peak. See :func:`_subscription_renewal_schedule` for why this
 #: sweep has a default cadence where the extraction sweep above has none.
 _SUBSCRIPTION_RENEWAL_SCHEDULE_DEFAULT = "daily 04:30"
@@ -610,6 +636,19 @@ _ENQUEUE_BODIES: dict[str, dict[str, str]] = {
     "sharepoint-subtree-sweep": {
         "kind": "sharepoint-subtree-sweep",
         "idempotency_key": "sharepoint-subtree-sweep",
+    },
+    # design 2026-09-08 §3.12, Task 11: conversation-corpus export push
+    # sink. The handler (app/worker/kinds_conversation_export.py) no-ops
+    # when observability.conversation_export.endpoint is unset, when the
+    # content-export policy excludes workload chat, or on a DuckDB-backed
+    # instance — same harmless-unconditional-enqueue posture as
+    # ducklake-maintenance above. This row itself is registered only when
+    # an endpoint IS configured (see _conversation_export_schedule below),
+    # unlike ducklake-maintenance/sharepoint-acl, which enqueue
+    # unconditionally and rely solely on the handler's own no-op.
+    "conversation-export": {
+        "kind": "conversation-export",
+        "idempotency_key": "conversation-export",
     },
 }
 
@@ -1003,6 +1042,28 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
                 "/api/admin/sharepoint/subscriptions/run-due",
                 "POST",
                 900,
+            )
+        )
+
+    # design 2026-09-08 §3.12, Task 11: conversation-corpus export push
+    # sink. `_conversation_export_schedule()` -> None omits this row
+    # entirely (off by default — an operator must set
+    # `observability.conversation_export.endpoint` to turn it on), same
+    # registration discipline as `extraction-run-due`/
+    # `sharepoint-subscriptions-renew` above. Enqueues via `/api/jobs`
+    # (see `_ENQUEUE_BODIES`) rather than running inline — the handler can
+    # legitimately walk the whole conversation history on a cold-start
+    # backfill.
+    conversation_export_sched = _conversation_export_schedule()
+    if conversation_export_sched is not None:
+        jobs.append(
+            (
+                "conversation-export",
+                conversation_export_sched,
+                "/api/jobs",
+                "POST",
+                _ENQUEUE_TIMEOUT_SEC,
+                _ENQUEUE_BODIES["conversation-export"],
             )
         )
 
