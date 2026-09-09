@@ -963,19 +963,27 @@ was already delivered would otherwise sit in `chat_message_feedback`
 forever with nothing that ever revisits it — the delivered record's
 `feedback_json` would stay empty for good. After the main walk, the same
 run additionally sweeps for the session ids whose feedback changed since
-the last sweep and re-delivers just those records through the identical
+the last sweep — narrowed by the same `surfaces` allowlist as the main walk,
+pushed into the sweep's own query (a join against `chat_sessions`) rather
+than filtered on the ids afterwards, so an excluded surface's feedback
+neither ships nor consumes a slot in the capped page ahead of an included
+surface's update — and re-delivers just those records through the identical
 builder/batching/retry path (`refreshed` in the audit row, separate from
 `count`) — the destination already upserts by `thread_id`, so a
 re-delivered record simply replaces the stale one. This aux sweep tracks
 its own, coarser watermark (same `export_watermarks` table, one row per
-delivery configuration, suffixed `:feedback`) and is capped at 500 session
-ids per run rather than paginated, so a burst of feedback wider than that
-in one window leaves stragglers for the window after. A session the main
-walk already delivered in the same run is never swept twice — its feedback
-at query time already rode along in that record. Memory-status changes
-(`agent_memories`) are NOT covered by this sweep: that table has no single
-"last changed" timestamp column to sweep on, only separate
-`created_at`/`activated_at`/`archived_at` markers for each lifecycle step.
+delivery configuration, suffixed `:feedback`) as a `(timestamp, session_id)`
+keyset position exactly like the main watermark, and is capped at 500
+session ids per run: when a page comes back full the watermark advances
+only to the last id it actually scanned, so the NEXT run resumes the same
+burst instead of jumping ahead and dropping everything past the cap; a page
+that comes back short (the window is exhausted) advances all the way to the
+run's own upper bound. A session the main walk already delivered in the
+same run is never swept twice — its feedback at query time already rode
+along in that record. Memory-status changes (`agent_memories`) are NOT
+covered by this sweep: that table has no single "last changed" timestamp
+column to sweep on, only separate `created_at`/`activated_at`/`archived_at`
+markers for each lifecycle step.
 
 ## No telemetry vendor
 

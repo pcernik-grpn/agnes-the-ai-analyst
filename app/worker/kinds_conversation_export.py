@@ -41,25 +41,37 @@ batching and retry path -- the destination already upserts by
 and only then advances a SECOND watermark row
 (:func:`feedback_watermark_name` -- the same ``export_watermarks`` table,
 one row per delivery configuration, suffixed ``:feedback`` so it never
-collides with the main one) to this run's feedback-sweep upper bound. A
-session the main walk already delivered in the SAME run is skipped here --
-its feedback (whatever existed at query time) was already read into that
-record by the same bulk ``feedback.list_for_sessions`` call every record
-build uses. The sweep is capped (:data:`FEEDBACK_SWEEP_LIMIT` ids per run)
-rather than paginated: a burst of feedback wider than the cap in one window
-leaves stragglers for the window after, a deliberate simplification over a
-second full resumable walk. Memory-status changes (``agent_memories``) are
-NOT covered by this sweep: that table has no single ``updated_at`` column
--- only ``created_at``/``activated_at``/``archived_at`` -- so there is no
-one timestamp to sweep on without a migration, out of scope for this fix.
+collides with the main one). A session the main walk already delivered in
+the SAME run is skipped here -- its feedback (whatever existed at query
+time) was already read into that record by the same bulk
+``feedback.list_for_sessions`` call every record build uses. Memory-status
+changes (``agent_memories``) are NOT covered by this sweep: that table has
+no single ``updated_at`` column -- only
+``created_at``/``activated_at``/``archived_at`` -- so there is no one
+timestamp to sweep on without a migration, out of scope for this fix.
 
-**``surfaces`` is pushed into the query, not filtered after the fact.**
-``observability.conversation_export.surfaces`` reaches
-``list_completed_between``'s own ``surface = ANY(...)`` clause via
-``iter_conversations``, so a row this instance will never deliver is never
-fetched at all — the walk's keyset only ever advances across rows that
-were actually sent, and an excluded surface never causes the same filtered
-tail to be re-fetched and re-discarded on every tick.
+**The aux sweep's watermark is a keyset position too, capped but
+resumable.** :func:`session_ids_updated_between` is capped at
+:data:`FEEDBACK_SWEEP_LIMIT` ids per call, but the sweep's own watermark is
+a ``(timestamp, session_id)`` pair advanced only to the last id it actually
+SCANNED -- exactly the main watermark's shape, not a bare timestamp. A page
+that comes back full advances the watermark to that last scanned id rather
+than jumping to this run's ``until``, so the NEXT run resumes the same
+burst with ``after=(that timestamp, that id)`` instead of silently
+dropping every id past the cap; a page that comes back short (the window
+is exhausted) advances all the way to ``until``. A feedback burst wider
+than the cap in one window therefore spreads over as many runs as it takes
+to drain, never loses a straggler.
+
+**``surfaces`` is pushed into the query, not filtered after the fact --
+for BOTH watermarks.** ``observability.conversation_export.surfaces``
+reaches ``list_completed_between``'s own ``surface = ANY(...)`` clause via
+``iter_conversations`` for the main walk, and
+``session_ids_updated_between``'s own join+filter for the aux sweep, so a
+row this instance will never deliver is never fetched at all by either --
+an excluded surface never causes a filtered tail to be re-fetched and
+re-discarded on every tick, and never consumes a slot in the aux sweep's
+capped page ahead of an included surface's feedback update.
 
 **The watermark identity tracks the delivery configuration, not a fixed
 name.** :func:`watermark_name` derives the ``export_watermarks.name`` row
@@ -450,11 +462,30 @@ def _sweep_feedback_updates(
     it in one transaction, never half-written — so this sweeps all the way
     up to a fresh ``now``, not the main walk's lagged ``until``.
 
+    ``surfaces`` is pushed into :meth:`session_ids_updated_between`'s own
+    query exactly like the main walk pushes it into
+    ``list_completed_between`` — an excluded surface's feedback is never
+    fetched at all, so it can neither be delivered nor consume a slot in
+    the capped page ahead of an included surface's update.
+
     ``exclude`` is the set of session ids the main walk already delivered
     in THIS run: their feedback (whatever existed at query time) already
     rode along in that record via the same bulk ``feedback.list_for_sessions``
     read every record build uses, so re-sending them here would just be a
-    wasted duplicate POST for the same ``thread_id``.
+    wasted duplicate POST for the same ``thread_id``. Excluded AFTER the
+    capped page is fetched, never as part of the query, so an excluded id
+    still counts as scanned for the purpose of advancing the watermark past
+    it.
+
+    The watermark this sweep persists is a ``(timestamp, session_id)``
+    keyset position, exactly like the main watermark — not a bare
+    timestamp — so a feedback burst wider than :data:`FEEDBACK_SWEEP_LIMIT`
+    resumes on the NEXT run from the last id actually scanned rather than
+    jumping straight to this run's ``until`` and silently dropping
+    everything past the cap. A page that comes back full (more rows exist
+    past the cap) advances the watermark only to the last scanned row's own
+    key; a page that comes back short (the window is exhausted) advances it
+    all the way to ``until``, exactly like the main walk's own resume logic.
 
     Returns ``(refreshed, failed)`` — the count of records actually
     delivered (for the audit params' ``refreshed`` figure), and whether any
@@ -463,21 +494,28 @@ def _sweep_feedback_updates(
     """
     name = feedback_watermark_name(endpoint, surfaces)
     watermark = watermark_repo.get(name)
-    since = watermark[0] if watermark is not None else _EPOCH
+    if watermark is None:
+        since = _EPOCH
+        after: tuple[datetime, str] | None = None
+    else:
+        watermark_ts, watermark_cursor_id = watermark
+        since = watermark_ts
+        after = None if watermark_cursor_id == "-" else (watermark_ts, watermark_cursor_id)
     until = datetime.now(UTC)
     if not since < until:
         return 0, False
 
-    session_ids = [
-        sid
-        for sid in feedback_repo.session_ids_updated_between(since, until, limit=FEEDBACK_SWEEP_LIMIT)
-        if sid not in exclude
-    ]
-    if not session_ids:
+    rows = feedback_repo.session_ids_updated_between(
+        since, until, limit=FEEDBACK_SWEEP_LIMIT + 1, surfaces=surfaces or None, after=after
+    )
+    has_more = len(rows) > FEEDBACK_SWEEP_LIMIT
+    rows = rows[:FEEDBACK_SWEEP_LIMIT]
+    if not rows:
         watermark_repo.set(name, until, "-")
         return 0, False
 
-    records = records_for_session_ids(bundle, session_ids)
+    session_ids = [sid for sid, _updated_at in rows if sid not in exclude]
+    records = records_for_session_ids(bundle, session_ids) if session_ids else []
     refreshed = 0
     for batch in _batches((record, None) for record in records):
         body = b"".join(serialize_jsonl(record for record, _key in batch))
@@ -490,7 +528,12 @@ def _sweep_feedback_updates(
             )
             return refreshed, True
         refreshed += len(batch)
-    watermark_repo.set(name, until, "-")
+
+    last_id, last_updated_at = rows[-1][0], rows[-1][1]
+    if has_more:
+        watermark_repo.set(name, last_updated_at, last_id)
+    else:
+        watermark_repo.set(name, until, "-")
     return refreshed, False
 
 

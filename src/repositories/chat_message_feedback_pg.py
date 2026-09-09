@@ -160,15 +160,24 @@ class ChatMessageFeedbackPgRepository:
             out.setdefault(r["session_id"], []).append(dict(r))
         return out
 
-    def session_ids_updated_between(self, since: datetime, until: datetime, *, limit: int = 500) -> list[str]:
-        """Distinct ``session_id``s whose feedback changed in ``[since, until)``
-        -- the conversation-corpus push sink's "late feedback" aux sweep
-        (design 2026-09-08 §3.12, push-sink defect fix): a thumbs-up/down
-        landing after its conversation already settled and was delivered
-        never moves the sink's MAIN watermark (that one tracks
-        ``chat_sessions.last_message_at``, which a feedback write never
-        touches), so this read is what lets a SECOND watermark catch it and
-        re-deliver the record with the feedback included.
+    def session_ids_updated_between(
+        self,
+        since: datetime,
+        until: datetime,
+        *,
+        limit: int = 500,
+        surfaces: tuple[str, ...] | None = None,
+        after: tuple[datetime, str] | None = None,
+    ) -> list[tuple[str, datetime]]:
+        """``(session_id, latest_updated_at)`` pairs whose feedback changed
+        in ``[since, until)`` -- the conversation-corpus push sink's "late
+        feedback" aux sweep (design 2026-09-08 §3.12, push-sink defect
+        fix): a thumbs-up/down landing after its conversation already
+        settled and was delivered never moves the sink's MAIN watermark
+        (that one tracks ``chat_sessions.last_message_at``, which a
+        feedback write never touches), so this read is what lets a SECOND
+        watermark catch it and re-deliver the record with the feedback
+        included.
 
         ``updated_at``, not ``created_at``, is the change signal:
         :meth:`upsert` refreshes ``updated_at`` on BOTH a first submit and a
@@ -176,26 +185,46 @@ class ChatMessageFeedbackPgRepository:
         reflects the FIRST submit -- a verdict flip after the fact would
         never surface here on ``created_at`` alone.
 
+        ``surfaces``, when given, joins ``chat_sessions`` and filters
+        ``surface = ANY(:surfaces)`` IN THE QUERY -- the same push-down
+        shape ``ChatSessionsPgRepository.list_completed_between`` uses for
+        the main walk. An excluded surface's feedback must never consume a
+        slot in the capped page any more than an excluded surface's
+        conversation is fetched by the main walk; filtering client-side
+        after this read would let it do exactly that.
+
+        ``after``, when given, is a ``(timestamp, session_id)`` keyset
+        position -- the same shape :meth:`ExportWatermarksPgRepository.get`
+        returns -- and only rows strictly past it (``HAVING (MAX(updated_at),
+        session_id) > (:after_ts, :after_id)``) are returned, making a
+        feedback burst wider than ``limit`` resumable across runs instead of
+        losing everything past the first page: the caller persists the last
+        returned pair and passes it back in as ``after`` on the next call.
+
         Grouped (not a raw row scan) so one session with several feedback
-        writes in the window still yields ONE id; ordered by each session's
-        latest write ascending so a capped page is deterministic. Capped at
-        ``limit``, not paginated -- the caller advances its own watermark to
-        the window's ``until`` regardless of whether the cap was hit, which
-        is a deliberate simplification (see the caller's docstring) rather
-        than a full resumable walk: this is a bounded aux sweep riding beside
-        the main keyset walk, not a second one.
+        writes in the window still yields ONE row; ordered by each session's
+        latest write ascending, tiebroken by ``session_id``, so a capped
+        page is deterministic and the keyset above is well-defined.
         """
+        clauses = ["f.updated_at >= :since", "f.updated_at < :until"]
+        params: dict[str, Any] = {"since": since, "until": until, "limit": limit}
+        join_sql = ""
+        if surfaces:
+            join_sql = " JOIN chat_sessions cs ON cs.id = f.session_id"
+            clauses.append("cs.surface = ANY(:surfaces)")
+            params["surfaces"] = list(surfaces)
+        having_sql = ""
+        if after is not None:
+            after_ts, after_id = after
+            having_sql = " HAVING (MAX(f.updated_at), f.session_id) > (:after_ts, :after_id)"
+            params["after_ts"] = after_ts
+            params["after_id"] = after_id
+        query = (
+            "SELECT f.session_id AS session_id, MAX(f.updated_at) AS latest "
+            "FROM chat_message_feedback f" + join_sql + " WHERE " + " AND ".join(clauses) + " "
+            "GROUP BY f.session_id" + having_sql + " "
+            "ORDER BY latest ASC, session_id ASC LIMIT :limit"
+        )
         with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    sa.text(
-                        "SELECT session_id, MAX(updated_at) AS latest FROM chat_message_feedback "
-                        "WHERE updated_at >= :since AND updated_at < :until "
-                        "GROUP BY session_id ORDER BY latest ASC, session_id ASC LIMIT :limit"
-                    ),
-                    {"since": since, "until": until, "limit": limit},
-                )
-                .mappings()
-                .all()
-            )
-        return [r["session_id"] for r in rows]
+            rows = conn.execute(sa.text(query), params).mappings().all()
+        return [(r["session_id"], r["latest"]) for r in rows]

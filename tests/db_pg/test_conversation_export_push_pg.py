@@ -981,3 +981,109 @@ class TestLateFeedbackAuxSweep:
         assert delivered["thread_id"] == session_id
         (feedback_entry,) = delivered["feedback_json"]
         assert feedback_entry["verdict"] == "up"
+
+    def test_a_filtered_out_surface_does_not_consume_the_sweep_cap(self, pg_client, pg_engine, monkeypatch):
+        """Review finding (bug): the aux sweep selected purely on feedback
+        timestamps, ignoring `observability.conversation_export.surfaces` --
+        a thumbs verdict on an excluded surface both shipped a conversation
+        the operator deliberately excluded AND consumed a slot in the
+        capped page ahead of an included surface's own update. The filter
+        must live in the query (`session_ids_updated_between`'s own join),
+        not be applied to the ids after the fact."""
+        import app.instance_config as ic
+        import app.worker.kinds_conversation_export as mod
+        from app.chat.types import Surface
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import chat_message_feedback_repo, chat_message_repo, chat_session_repo
+
+        monkeypatch.setattr(ic, "get_conversation_export_config", lambda: _default_config(surfaces=("web",)))
+        monkeypatch.setattr(mod, "FEEDBACK_SWEEP_LIMIT", 1)
+
+        web_id = _seed_session(pg_engine, index=0, surface="web")
+        slack_session = chat_session_repo().create_session(user_email="analyst@test.com", surface=Surface.SLACK_DM)
+        chat_message_repo().append_message(session_id=slack_session.id, role="user", content="hi slack", turn_id="s0")
+        slack_ts = _BASE + timedelta(minutes=1)  # newer than the web session
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": slack_ts, "id": slack_session.id},
+            )
+            conn.execute(
+                sa.text("UPDATE chat_messages SET created_at = :ts WHERE session_id = :id"),
+                {"ts": slack_ts, "id": slack_session.id},
+            )
+
+        def ok_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(ok_handler), sleep=lambda *_: None)
+        assert first["sent"] == 1  # only the web session -- slack excluded by the main walk already
+
+        # Feedback on the excluded slack session lands FIRST (chronologically
+        # older), the included web session's feedback SECOND -- with a
+        # client-side filter and cap=1, the slack row alone would fill the
+        # page and the web feedback would never even be fetched this run.
+        chat_message_feedback_repo().upsert(
+            session_id=slack_session.id, turn_id="s0", user_id="analyst-1", verdict="up"
+        )
+        chat_message_feedback_repo().upsert(session_id=web_id, turn_id="t0", user_id="analyst-1", verdict="down")
+
+        requests: list[httpx.Request] = []
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        second = run_conversation_export_once(client=_mock_client(capture), sleep=lambda *_: None)
+
+        assert second["sent"] == 0
+        assert second["refreshed"] == 1
+        assert len(requests) == 1
+        (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
+        assert delivered["thread_id"] == web_id
+
+    def test_a_feedback_burst_larger_than_the_cap_is_delivered_across_two_runs(self, pg_client, pg_engine, monkeypatch):
+        """Review finding (bug): the sweep capped at `FEEDBACK_SWEEP_LIMIT`
+        session ids but advanced its watermark straight to `until`
+        regardless -- any session past the cap fell behind the cursor and
+        was never delivered. The watermark must instead advance only to the
+        last id actually scanned, so a second run picks up the remainder."""
+        import app.worker.kinds_conversation_export as mod
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import chat_message_feedback_repo
+
+        session_ids = [_seed_session(pg_engine, index=i) for i in range(3)]
+
+        def ok_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        first = run_conversation_export_once(client=_mock_client(ok_handler), sleep=lambda *_: None)
+        assert first["sent"] == 3  # all three delivered by the main walk, none has feedback yet
+
+        for i, session_id in enumerate(session_ids):
+            chat_message_feedback_repo().upsert(
+                session_id=session_id, turn_id=f"t{i}", user_id="analyst-1", verdict="up"
+            )
+
+        monkeypatch.setattr(mod, "FEEDBACK_SWEEP_LIMIT", 2)
+
+        delivered_ids: list[str] = []
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            for line in request.content.decode("utf-8").splitlines():
+                delivered_ids.append(json.loads(line)["thread_id"])
+            return httpx.Response(200)
+
+        second = run_conversation_export_once(client=_mock_client(capture), sleep=lambda *_: None)
+        assert second["sent"] == 0
+        assert second["refreshed"] == 2
+
+        third = run_conversation_export_once(client=_mock_client(capture), sleep=lambda *_: None)
+        assert third["sent"] == 0
+        assert third["refreshed"] == 1
+
+        assert sorted(delivered_ids) == sorted(session_ids)  # every session exactly once across the two runs
+
+        fourth = run_conversation_export_once(client=_mock_client(capture), sleep=lambda *_: None)
+        assert fourth["refreshed"] == 0  # nothing left to sweep
+        assert len(delivered_ids) == 3  # the fourth run added nothing more
