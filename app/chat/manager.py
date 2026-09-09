@@ -3384,13 +3384,21 @@ class ChatManager:
         once ``produce_inbound_user_message`` published it on the entry
         (#2365 review); an entry from an older replica carries neither key
         and this stays ``None``, same as before.
+
+        The turn context (id, span, published record) is established BEFORE
+        the stdin write, not after (review finding on #2365): a fast runner
+        can call the broker inside the gap between the write and this
+        method's bookkeeping, and that first completion must find the turn
+        record already published and the span already open, not a race
+        against them. ``turn_in_flight``/``turn_buffer`` stay set only once
+        the drain actually succeeds, same as before — nothing outside this
+        method may see a turn "in flight" that was never handed to the
+        runner. A write/drain failure ends the turn span this call just
+        opened (so it is never left dangling and unexported) and re-raises;
+        it does not resurrect the previous turn, whose span this call
+        already closed as part of establishing the new one.
         """
         payload = json.dumps({"type": "user_msg", "text": text}) + "\n"
-        async with live._stdin_lock:
-            live.handle.stdin.write(payload.encode("utf-8"))
-            await live.handle.stdin.drain()
-        live.turn_buffer.clear()
-        live.turn_in_flight = True
         # A previous turn still open here (a co-driver's message landing
         # mid-turn) would otherwise have its span orphaned — an unended span
         # is never exported at all. Closing it first is a no-op in the
@@ -3400,7 +3408,27 @@ class ChatManager:
         live.turn_tool_calls = 0
         live.turn_tool_spans = {}
         live.turn_error_kind = None
+        # Open the span and publish the turn record BEFORE the runner can
+        # see the message (#2365 review) — a completion racing the drain
+        # below must find a turn to join, not an empty key.
         self._open_turn(live, message_id=message_id)
+        try:
+            async with live._stdin_lock:
+                live.handle.stdin.write(payload.encode("utf-8"))
+                await live.handle.stdin.drain()
+        except Exception:
+            # The message never reached the runner. `turn_in_flight` and
+            # `turn_buffer` were never touched (they are only set below,
+            # after a successful drain), so the only thing this call leaves
+            # behind is the span/record just opened above -- close it the
+            # same way an ordinary answer-less turn end does (a "done" with
+            # no assistant frame) so it is never left dangling and
+            # unexported, then let the caller see the original failure.
+            live.turn_error_kind = "delivery_failed"
+            self._close_turn(live, {"type": "done"})
+            raise
+        live.turn_buffer.clear()
+        live.turn_in_flight = True
         live.last_activity = datetime.now(UTC)
         live.state = SessionState.ACTIVE
         # Track C7: a fresh turn gets its own one-delegation budget.

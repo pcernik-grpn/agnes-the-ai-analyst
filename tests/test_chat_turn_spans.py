@@ -486,3 +486,109 @@ def test_a_killed_turn_still_closes_its_span(manager: ChatManager, otel_exporter
         assert [sp.name for sp in otel_exporter.get_finished_spans()] == ["agnes.chat.turn"]
 
     asyncio.run(_run())
+
+
+class _ProbeStdin:
+    """A stdin stub that lets a test see exactly what state is visible the
+    instant the "runner" observes the write -- the same moment a fast
+    runner could turn around and call the broker."""
+
+    def __init__(self, on_write) -> None:
+        self._on_write = on_write
+
+    def write(self, b: bytes) -> None:
+        self._on_write()
+
+    async def drain(self) -> None:
+        return None
+
+
+class _FailingStdin:
+    """A stdin stub whose write raises -- the message never reaches the
+    runner."""
+
+    def write(self, b: bytes) -> None:
+        raise ConnectionResetError("broken pipe")
+
+    async def drain(self) -> None:
+        return None
+
+
+class _ProbeHandle:
+    """Bare handle carrying only what ``_deliver_local_user_message``
+    touches -- swapped in over the fixture's ``FakeHandle`` so the stdin
+    write itself can be observed or made to fail."""
+
+    def __init__(self, stdin) -> None:
+        self.stdin = stdin
+
+
+def test_turn_context_is_published_before_the_write_reaches_the_runner(manager: ChatManager, otel_exporter):  # noqa: F811
+    """Review finding on #2365: the turn id, the open span and the
+    published ``TurnRecord`` must all be in place BEFORE the message is
+    written to the runner's stdin -- a fast runner can call the broker
+    inside the gap between the write and this method's own bookkeeping, and
+    that first completion must find the turn it belongs to, not a race
+    against it becoming visible."""
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+
+        seen: dict[str, object] = {}
+
+        def _on_write() -> None:
+            # The exact instant the message becomes visible to the runner.
+            seen["turn_id"] = live.turn_id
+            seen["record"] = read_turn(live.chat_id)
+            seen["span_open"] = live.turn_span is not None
+
+        live.handle = _ProbeHandle(_ProbeStdin(_on_write))
+
+        await manager._deliver_local_user_message(live, "hello", message_id="msg_1")
+
+        assert seen["turn_id"] is not None
+        rec = seen["record"]
+        assert rec is not None, "the turn record must already be published when the runner sees the write"
+        assert rec.turn_id == seen["turn_id"] == live.turn_id
+        assert rec.message_id == "msg_1"
+        assert seen["span_open"] is True, "the turn span must already be open when the runner sees the write"
+
+    asyncio.run(_run())
+
+
+def test_a_failed_write_closes_the_turn_it_just_opened(manager: ChatManager, otel_exporter):  # noqa: F811
+    """Review finding on #2365: a stdin write/drain failure must not leave
+    the turn it just opened dangling forever un-exported. This test asserts
+    the fixed code's actual guarantee -- the turn is explicitly CLOSED
+    (``ended_at`` set), not left with no record at all: ``_close_turn``'s
+    own contract never deletes a published record, so "closed" (not
+    "absent") is the honest post-failure state. It also asserts the
+    in-flight bookkeeping (``turn_in_flight``/``turn_buffer``), which only
+    ever follows a SUCCESSFUL drain, was never touched by the failed
+    attempt."""
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        live.handle = _ProbeHandle(_FailingStdin())
+
+        with pytest.raises(ConnectionResetError):
+            await manager._deliver_local_user_message(live, "hello")
+
+        failed_turn_id = live.turn_id
+        assert failed_turn_id is not None
+
+        rec = read_turn(live.chat_id)
+        assert rec is not None and rec.turn_id == failed_turn_id
+        assert rec.ended_at is not None, "a turn that never reached the runner must not dangle open forever"
+        assert rec.is_open() is False
+
+        assert live.turn_span is None
+        assert live.turn_in_flight is False
+        assert live.turn_buffer == []
+
+        (turn_span,) = [sp for sp in otel_exporter.get_finished_spans() if sp.name == "agnes.chat.turn"]
+        assert turn_span.status.status_code.name == "ERROR"
+
+    asyncio.run(_run())
