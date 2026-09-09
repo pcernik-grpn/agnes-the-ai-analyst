@@ -181,3 +181,30 @@ def test_pg_stores_turn_provenance(repo):
         source_message_id="msg_1",
     )
     assert repo.get("m2")["source_turn_id"] == "t1"
+
+
+def test_list_for_sessions_groups_by_session_oldest_first(repo):
+    """The conversation-corpus export's bulk read (design 2026-09-08
+    §3.12): one query for a whole page of sessions rather than one lookup
+    per memory."""
+    repo.create(id="m1", agent_id="a1", owner_user_id="u1", content="first", source_session_id="c1")
+    repo.create(id="m2", agent_id="a1", owner_user_id="u1", content="second", source_session_id="c1")
+    repo.create(id="m3", agent_id="a1", owner_user_id="u1", content="other-session", source_session_id="c2")
+    repo.create(id="m4", agent_id="a1", owner_user_id="u1", content="unrequested", source_session_id="c3")
+
+    by_session = repo.list_for_sessions(["c1", "c2"])
+
+    assert set(by_session.keys()) == {"c1", "c2"}
+    assert [m["id"] for m in by_session["c1"]] == ["m1", "m2"]  # oldest first
+    assert [m["id"] for m in by_session["c2"]] == ["m3"]
+
+
+def test_list_for_sessions_omits_sessions_with_no_memories(repo):
+    repo.create(id="m1", agent_id="a1", owner_user_id="u1", content="x", source_session_id="c1")
+    by_session = repo.list_for_sessions(["c1", "no-such-session"])
+    assert set(by_session.keys()) == {"c1"}
+
+
+def test_list_for_sessions_empty_input_returns_empty_dict(repo):
+    repo.create(id="m1", agent_id="a1", owner_user_id="u1", content="x", source_session_id="c1")
+    assert repo.list_for_sessions([]) == {}

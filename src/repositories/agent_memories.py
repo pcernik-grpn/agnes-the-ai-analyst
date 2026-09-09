@@ -125,3 +125,22 @@ class AgentMemoriesRepository:
             [agent_id],
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def list_for_sessions(self, session_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Every memory write attributed to ``session_ids`` (``source_session_id``),
+        grouped by session and ordered oldest-first -- the conversation-corpus
+        export's bulk read (design 2026-09-08 §3.12), one query for a whole
+        page of sessions rather than one lookup per memory. Mirrors
+        ``AgentMemoriesPgRepository.list_for_sessions``.
+        """
+        if not session_ids:
+            return {}
+        rows = self.conn.execute(
+            "SELECT * FROM agent_memories WHERE source_session_id = ANY(?) "
+            "ORDER BY source_session_id ASC, created_at ASC",
+            [list(session_ids)],
+        ).fetchall()
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for d in self._rows_to_dicts(rows):
+            out.setdefault(d["source_session_id"], []).append(d)
+        return out
