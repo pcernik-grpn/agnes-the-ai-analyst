@@ -979,8 +979,12 @@ document.getElementById("oauthclient-manual-save-btn").addEventListener("click",
     authorization_endpoint: authzEndpoint,
     token_endpoint: tokenEndpoint,
   };
-  const secret = document.getElementById("oauthclient-manual-client-secret").value;
-  if (secret) payload.client_secret = secret;
+  // Always send the secret field, even blank: the backend treats an omitted
+  // (`None`) client_secret as "leave the stored one alone" but an explicit ""
+  // as "clear it — this is now a public PKCE-only client" (see
+  // set_oauth_client_config). Omitting it here for a blank input would make
+  // it impossible to ever demote a confidential client to public via this form.
+  payload.client_secret = document.getElementById("oauthclient-manual-client-secret").value;
   const issuer = document.getElementById("oauthclient-manual-issuer").value.trim();
   if (issuer) payload.issuer = issuer;
   const scopes = document.getElementById("oauthclient-manual-scopes").value.trim();
