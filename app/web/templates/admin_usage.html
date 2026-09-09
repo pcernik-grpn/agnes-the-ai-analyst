@@ -77,6 +77,9 @@
 .obs-source-pill.is-builtin { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
 .obs-bar-fill { display: inline-block; height: 8px; background: var(--ds-primary); border-radius: 2px;
   vertical-align: middle; margin-left: 6px; min-width: 2px; }
+.obs-section-head { padding: 12px 14px; border-bottom: 1px solid var(--border, #e5e7eb);
+  background: var(--border-light, #f3f4f6); display: flex;
+  justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 </style>
 {% endblock %}
 
@@ -221,9 +224,7 @@
   {# Query telemetry (#410): top tables / scan bytes / remote-vs-local split,
      aggregated on-demand from the query.* audit rows via /summary. #}
   <section class="obs-table-wrap" id="qt-section" style="margin-top:20px;" aria-label="Query telemetry">
-    <div style="padding:12px 14px; border-bottom:1px solid var(--border, #e5e7eb);
-                background:var(--border-light, #f3f4f6); display:flex;
-                justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap;">
+    <div class="obs-section-head">
       <strong>Query telemetry — top tables</strong>
       <span id="qt-totals" class="obs-row-count">—</span>
     </div>
@@ -242,6 +243,34 @@
         <tr><td colspan="5" class="obs-empty">Loading…</td></tr>
       </tbody>
     </table>
+  </section>
+
+  {# LLM cost (LLM observability design 2026-09-08 §3.4): every workload's
+     spend from the llm_calls ledger — priced at write time, so this and the
+     exported spans carry one figure. Postgres-backed instances only. #}
+  <section class="obs-table-wrap" id="llmcost-section" style="margin-top:20px;" aria-label="LLM cost">
+    <div class="obs-section-head">
+      <strong>LLM cost — by workload</strong>
+      <label class="obs-window">
+        <span class="obs-label">Window</span>
+        <select id="llmcost-window" class="obs-select ds-dropdown-native">
+          <option value="1d">Last 24h</option>
+          <option value="7d" selected>Last 7d</option>
+          <option value="30d">Last 30d</option>
+          <option value="all">All time</option>
+        </select>
+      </label>
+      <span id="llmcost-totals" class="obs-row-count">—</span>
+    </div>
+    <table class="obs-table">
+      <thead><tr>
+        <th>Workload</th><th class="obs-num">Calls</th><th class="obs-num">Input</th><th class="obs-num">Output</th>
+        <th class="obs-num">Cache read</th><th class="obs-num">Cache write</th><th class="obs-num">Cached %</th>
+        <th class="obs-num">Cost (USD)</th><th>Priced as</th>
+      </tr></thead>
+      <tbody id="llmcost-rows"><tr><td colspan="9" class="obs-empty">Loading…</td></tr></tbody>
+    </table>
+    <p class="obs-subtitle" id="llmcost-note" style="padding:8px 14px 12px; margin:0;">Also: <code>agnes admin usage llm-cost</code>, and the <code>agnes_llm_calls</code> table in the <code>agnes-usage</code> package.</p>
   </section>
 
 </div>
@@ -673,6 +702,38 @@
   function refreshOnFilter() { loadKpis().catch(()=>{}); loadTable().catch(()=>{}); }
   function refreshAll()      { loadKpis().catch(()=>{}); loadFacets().catch(()=>{}); loadTable().catch(()=>{}); loadQueryTelemetry().catch(()=>{}); }
   refreshAll();
+
+  // --- LLM cost (design 2026-09-08 §3.4) -----------------------------------
+  async function loadLlmCost() {
+    const win = document.getElementById('llmcost-window').value;
+    const rows = document.getElementById('llmcost-rows');
+    const totals = document.getElementById('llmcost-totals');
+    let r;
+    try {
+      r = await fetch(`/api/admin/telemetry/llm-cost?window=${encodeURIComponent(win)}&by=workload`, { credentials: 'same-origin' });
+    } catch (e) {
+      rows.innerHTML = '<tr><td colspan="9" class="obs-empty">Could not load.</td></tr>';
+      return;
+    }
+    if (r.status === 501) {
+      rows.innerHTML = '<tr><td colspan="9" class="obs-empty">LLM cost needs the Postgres app-state backend.</td></tr>';
+      totals.textContent = '—';
+      return;
+    }
+    if (!r.ok) { rows.innerHTML = `<tr><td colspan="9" class="obs-empty">Could not load (${r.status}).</td></tr>`; return; }
+    const data = await r.json();
+    const t = data.totals || {};
+    totals.textContent = `$${(t.cost_usd || 0).toFixed(4)} over ${t.calls || 0} calls`;
+    if (!(data.groups || []).length) { rows.innerHTML = '<tr><td colspan="9" class="obs-empty">No LLM calls in this window.</td></tr>'; return; }
+    rows.innerHTML = data.groups.map(g => `<tr>
+      <td>${escapeHtml(g.key || '—')}</td><td class="obs-num">${g.calls}</td>
+      <td class="obs-num">${(g.input_tokens||0).toLocaleString()}</td><td class="obs-num">${(g.output_tokens||0).toLocaleString()}</td>
+      <td class="obs-num">${(g.cache_read_tokens||0).toLocaleString()}</td><td class="obs-num">${(g.cache_creation_tokens||0).toLocaleString()}</td>
+      <td class="obs-num">${g.cached_input_share == null ? 'n/a' : (g.cached_input_share*100).toFixed(1)+'%'}</td>
+      <td class="obs-num">$${(g.cost_usd||0).toFixed(4)}</td><td>${escapeHtml((g.priced_models||[]).join(', '))}</td></tr>`).join('');
+  }
+  document.getElementById('llmcost-window').addEventListener('change', loadLlmCost);
+  loadLlmCost();
 })();
 </script>
 {% endblock %}

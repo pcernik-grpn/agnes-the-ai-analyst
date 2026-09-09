@@ -3204,6 +3204,16 @@ KNOWN_UNTESTED = {
     # actually ran, cached reads priced as cached, unrecorded cache reported
     # as unavailable rather than as zero.
     "GET /api/admin/telemetry/chat-cost",
+    # LLM observability read surfaces (design 2026-09-08 §3.4/§3.5) — all
+    # three are admin-gated and resolve a Postgres-only repo (llm_calls /
+    # chat_message_feedback, A3 ratchet) as a FastAPI dependency, so this
+    # sweep's DuckDB-backed instance would only ever exercise the typed 501,
+    # not the actual grouping/paging/filtering. Behaviourally covered in
+    # tests/db_pg/test_admin_llm_cost_pg.py (grouping, paging, 400s) and
+    # tests/test_admin_llm_cost_api.py (admin gate, typed 501).
+    "GET /api/admin/telemetry/llm-cost",
+    "GET /api/admin/telemetry/llm-calls",
+    "GET /api/admin/telemetry/feedback",
     "GET /api/admin/telemetry/export",
     "GET /api/admin/telemetry/facets",
     "GET /api/admin/telemetry/kpis",

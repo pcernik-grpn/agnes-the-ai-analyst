@@ -979,6 +979,12 @@ READ_POSTURE: dict[str, str] = {
     # action rather than exempt:ui_support per the read-posture policy.
     "GET /api/admin/telemetry/chat-cost": "usage.chat_cost",
     "GET /api/admin/telemetry/export": "usage.export",
+    # Cross-workload cost/detail/feedback reads (LLM observability design
+    # 2026-09-08 §3.4/§3.5) — same cross-user disclosure class as chat-cost
+    # right above, so cataloged rather than exempt.
+    "GET /api/admin/telemetry/llm-cost": "usage.llm_cost",
+    "GET /api/admin/telemetry/llm-calls": "usage.llm_calls",
+    "GET /api/admin/telemetry/feedback": "usage.feedback_list",
     # -- app.api.admin_usage_summary --
     "GET /api/admin/telemetry/facets": "exempt:ui_support",
     "GET /api/admin/telemetry/kpis": "exempt:ui_support",

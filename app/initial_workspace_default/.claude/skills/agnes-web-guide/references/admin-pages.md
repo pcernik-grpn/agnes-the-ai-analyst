@@ -115,7 +115,7 @@ anyone to one without checking `/admin/server-config` first. Each is one flag
 
 - `/admin/activity` — the audit log; also the cross-source "what failed
   today?" view.
-- `/admin/telemetry` — usage telemetry.
+- `/admin/telemetry` — usage telemetry, query telemetry and the LLM cost table (every workload, priced at write time).
 - `/admin/sessions` — analyst (CLI) session transcripts.
 - `/admin/chat` — web-chat session transcripts.
 - `/admin/adoption` — adoption overview per user.
