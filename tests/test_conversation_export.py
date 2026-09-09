@@ -177,6 +177,96 @@ class TestToolCallsFlattening:
         assert record["tool_call_count"] == 1
         assert record["tool_calls_sequence"] == ["Bash"]
 
+    def test_tool_calls_fall_back_to_legacy_column_when_parts_absent(self):
+        """A message written before ``parts`` existed (schema v123) keeps
+        its calls only in the legacy positionless ``tool_calls`` column
+        (``app/chat/message_parts.py::parts_to_tool_calls``'s shape:
+        ``[{"tool": ..., "args": ...}]``, no result/error ever recorded).
+        Without a fallback a historical conversation exports as if the
+        model used no tools at all (#2365 review)."""
+        messages = [
+            _msg(
+                role="assistant",
+                content="checking",
+                parts=None,
+                tool_calls=[{"tool": "Bash", "args": {"cmd": "ls"}}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:00"),
+            )
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["tool_calls_json"] == [
+            {
+                "turn_id": "t1",
+                "tool_name": "Bash",
+                "input": {"cmd": "ls"},
+                # Never recorded for a pre-parts row -- left honestly
+                # unknown rather than invented.
+                "output": None,
+                "is_error": False,
+                "started_at": "2026-01-01T10:00:00+00:00",
+            }
+        ]
+        assert record["tool_call_count"] == 1
+        assert record["tool_calls_sequence"] == ["Bash"]
+
+    def test_tool_calls_from_parts_win_over_legacy_column_when_both_present(self):
+        """A row with `parts` never doubles up on its own legacy
+        `tool_calls` projection (`parts_to_tool_calls` derives one FROM the
+        other on write) -- the legacy column is a fallback for ABSENT
+        parts only."""
+        parts = [{"type": "tool", "tool": "Bash", "args": {"cmd": "ls"}, "result": "a.txt", "is_error": False}]
+        messages = [
+            _msg(
+                role="assistant",
+                content="checking",
+                parts=parts,
+                tool_calls=[{"tool": "Grep", "args": {"pattern": "x"}}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:00"),
+            )
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["tool_calls_sequence"] == ["Bash"]
+
+    def test_legacy_interrupted_marker_is_not_read_as_a_tool_call(self):
+        """The interrupted/cancelled marker (`_partial_save`'s
+        `tool_calls=[{"interrupted": True, ...}]`) has no `tool` key and
+        must not surface as a bogus tool call once the legacy column
+        becomes a real fallback source."""
+        messages = [
+            _msg(
+                role="assistant",
+                content="",
+                parts=None,
+                tool_calls=[{"interrupted": True, "reason": "killed"}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:00"),
+            )
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["tool_calls_json"] == []
+        assert record["tool_call_count"] == 0
+
+    def test_legacy_tool_calls_fallback_is_pseudonymized(self):
+        def fake_anonymizer(text: str) -> str:
+            return f"REDACTED({text})"
+
+        messages = [
+            _msg(
+                role="assistant",
+                content="checking",
+                parts=None,
+                tool_calls=[{"tool": "Bash", "args": {"cmd": "echo bob@example.com"}}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:00"),
+            )
+        ]
+        record = build_conversation_record(
+            _session(), messages, None, [], [], content_mode="pseudonymized", anonymizer=fake_anonymizer
+        )
+        assert record["tool_calls_json"][0]["input"] == {"cmd": "REDACTED(echo bob@example.com)"}
+
 
 class TestFeedbackAndMemoryJoins:
     def test_feedback_rows_map_to_the_spec_shape(self):
