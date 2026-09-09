@@ -51,6 +51,16 @@ _SELECT_CC_NO_EMBED = ", ".join(f"cc.{c}" for c in _COLS_NO_EMBED)
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 # Bounds the OR'd ILIKE clause below — a pathologically long query must not
 # turn into a pathologically long WHERE clause.
+#
+# Higher than the PG sibling's ``_MAX_FTS_TERMS`` (8) on purpose, and the
+# two are not meant to converge: a term costs one more OR'd predicate in a
+# single scan here, and one whole additional index scan there. So a query
+# long enough to pass 8 terms gets per-term windows for more of them on this
+# backend. The backends were never bit-identical anyway — this one does no
+# ranking at all while PG ranks with ``ts_rank_cd`` over a stored tsvector —
+# and what the cross-engine contract tests pin is the observable properties
+# (multi-word selection, per-term fairness, window filling, scoping), not an
+# identical row order. (Devin Review on #2420.)
 _MAX_ILIKE_TERMS = 16
 
 
@@ -357,6 +367,27 @@ class CorpusChunksRepository:
         the candidate set is not meaningful either way — ``rank_chunks``
         re-sorts it — so only WHICH rows survive the cap changes.
 
+        The reserved rows are INTERLEAVED, not concatenated per term:
+        appending each term's whole block in query order meant the final
+        ``[:limit]`` slice charged all the overflow to the LAST terms, and
+        it is exactly the DISTINCTIVE term that tends to sit late in a
+        natural-language question. One row per term per round spreads the
+        loss across rounds instead. (Devin Review on #2420.)
+
+        What that does NOT fix, stated plainly: when ``limit`` is smaller
+        than the term count there is only ONE round, so the slice still
+        keeps the first ``limit`` terms and drops the rest. No ordering can
+        fix that — the window cannot represent 8 terms in 5 slots — and
+        choosing WHICH terms deserve the slots needs a rarity signal this
+        layer deliberately does not have (see the PG sibling's
+        ``_MAX_FTS_TERMS`` note on why no stopword list is copied here).
+        It is also unreachable in any sane configuration: ``limit`` is the
+        retrieval cap, ``min(knowledge.retrieval.max_candidate_chunks,
+        collections.search_max_chunks)``, default 5000 against at most 16
+        terms — so each term's share is 313 rows and the reservation does
+        not truncate at all. Reaching the biased branch takes a cap set
+        below the number of words in the query.
+
         The single-term case is unchanged by construction: one term's share
         IS the whole window, so it runs exactly the query it always did.
 
@@ -372,8 +403,17 @@ class CorpusChunksRepository:
         seen: set[str] = set()
         if len(terms) > 1:
             share = -(-limit // len(terms))  # ceil, so every term gets >= 1
-            for term in terms:
-                for row in self._ilike_candidates(corpus_ids, [term], limit=share, path_prefix=path_prefix):
+            per_term = [
+                self._ilike_candidates(corpus_ids, [term], limit=share, path_prefix=path_prefix) for term in terms
+            ]
+            # Round-robin: one row per term per round, so the `[:limit]`
+            # slice below cannot charge the whole overflow to the terms that
+            # happen to come last (see the docstring).
+            for depth in range(share):
+                for term_rows in per_term:
+                    if depth >= len(term_rows):
+                        continue
+                    row = term_rows[depth]
                     if row[0] not in seen:
                         seen.add(row[0])
                         rows.append(row)

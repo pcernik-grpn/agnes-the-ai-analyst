@@ -500,3 +500,61 @@ class TestTheResponseCarriesTheTruncationSourceAsAField:
 
         assert body.get("truncated") is None
         assert "truncated_source" not in body
+
+
+class TestFolderScopingForANonAdminCaller:
+    """`path_prefix` has to compose with grant resolution, not bypass it.
+
+    Every other folder-scoping test here authenticates as an admin, and
+    admin is a god-mode short-circuit on every authorization check — so
+    those tests never exercise `accessible_collection_ids` at all. These
+    drive the same filter through a non-admin caller, where the granted set
+    is really computed. (Devin Review on #2420.)
+    """
+
+    def test_a_non_admin_owner_can_scope_to_a_folder(self, seeded_app):
+        tok = seeded_app["analyst_token"]
+        _make_collection_with_paths(
+            seeded_app,
+            tok,
+            "Analyst Customers",
+            [
+                ("acme-sow.md", "00_Customers/Acme/acme-sow.md", "statement of work and fees"),
+                ("globex-sow.md", "00_Customers/Globex/globex-sow.md", "statement of work and fees"),
+            ],
+        )
+
+        scoped = _search(seeded_app, tok, "statement of work", path_prefix="00_Customers/Acme/")
+
+        assert [r["filename"] for r in scoped["results"]] == ["acme-sow.md"]
+
+    def test_a_prefix_never_reaches_a_collection_the_caller_has_no_grant_on(self, seeded_app):
+        """The strong direction: naming the folder of someone else's
+        collection must not surface it. `path_prefix` narrows INSIDE the
+        caller's resolved set, so it cannot be used to probe outside it."""
+        admin = seeded_app["admin_token"]
+        analyst = seeded_app["analyst_token"]
+
+        # Owned by the admin, never granted to the analyst.
+        _make_collection_with_paths(
+            seeded_app,
+            admin,
+            "Admin Only Deal Files",
+            [("secret-sow.md", "90_Confidential/secret-sow.md", "statement of work and fees")],
+        )
+        # The analyst owns an unrelated one, so their granted set is non-empty
+        # and an empty result cannot be explained away as "no access at all".
+        _make_collection_with_paths(
+            seeded_app,
+            analyst,
+            "Analyst Own",
+            [("mine.md", "00_Mine/mine.md", "unrelated notes")],
+        )
+
+        body = _search(seeded_app, analyst, "statement of work", path_prefix="90_Confidential/")
+
+        assert body["results"] == []
+        # ...and the admin, who does own it, finds it — so the assertion
+        # above is about the grant, not a mis-seeded fixture.
+        as_admin = _search(seeded_app, admin, "statement of work", path_prefix="90_Confidential/")
+        assert [r["filename"] for r in as_admin["results"]] == ["secret-sow.md"]
