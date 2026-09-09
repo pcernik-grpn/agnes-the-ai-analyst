@@ -316,7 +316,10 @@ async def check_branding(app) -> dict:
     # despite the second one technically being a "customized" instance.name.
     # "Acme Agnes Portal" leaves "Acme", which is exactly the identity this
     # check exists to require, so it passes.
-    remainder = [w for w in re.findall(r"[A-Za-z0-9]+", title) if w.lower() not in _BRANDING_FILLER_WORDS]
+    # \w+ (Unicode by default) rather than [A-Za-z0-9]+ — a non-Latin operator
+    # name (e.g. "Login - 日本語データ分析") must not have every identifying
+    # character discarded before the filler-word check runs.
+    remainder = [w for w in re.findall(r"\w+", title) if w.lower() not in _BRANDING_FILLER_WORDS]
     if not remainder:
         leaked.append("Agnes")
     if leaked or not title:

@@ -325,6 +325,18 @@ class TestBranding:
         assert check["status"] == "error"
         assert "operator identity" in check["detail"]
 
+    def test_non_latin_operator_name_is_ok(self, seeded_app, monkeypatch):
+        """A non-Latin custom name must not have every identifying character
+        stripped before the filler-word check runs — `[A-Za-z0-9]+` would
+        leave nothing for a name like this, incorrectly reporting it as
+        unattributed."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "日本語データ分析")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "ok"
+
     def test_product_word_plus_generic_filler_is_still_an_error(self, seeded_app, monkeypatch):
         """ "Agnes Portal" is no more attributed than bare "Agnes" — "Portal"
         is generic filler any deployment could carry, so it supplies no
