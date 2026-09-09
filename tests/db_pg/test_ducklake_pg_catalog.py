@@ -168,7 +168,7 @@ def test_pg_catalog_exactly_one_connection_per_attach(isolated_ducklake_pg_env):
     the catalog constructor opened is parked in *that* thread's cache,
     the first metadata query binds on the other thread, misses, and opens
     a fresh one. Reproduced at 3/25 attaches on a loaded 14-core laptop
-    and 10+/40 in a 2-CPU Linux container; it flaked fleet-wide on the
+    and 12/40 in a 2-CPU Linux container; it flaked fleet-wide on the
     2-CPU CI runners (issue #2403).
 
     Runs against a dedicated, single-test pgserver (``isolated_ducklake_pg_env``)
