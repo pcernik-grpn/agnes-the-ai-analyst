@@ -72,11 +72,17 @@ boundary. Ask which shape the customer has.
 
 ## Operator side
 
-1. **Store both values** where the deployment reads them —
-   `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`. The bundled Terraform module
-   reads them from Secret Manager under `google-oauth-client-id` /
-   `google-oauth-client-secret`, or the per-VM names expanded from
-   `oauth_secret_name_template`.
+1. **Store both values, and grant the VM read access — they are two
+   different steps.** The bundled Terraform module's startup script fetches
+   `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` from Secret Manager under the
+   fixed names `google-oauth-client-id` and `google-oauth-client-secret`, but
+   reading them needs a `secretAccessor` binding the module does not create
+   for those names on its own: add both to `runtime_secrets`, whose default
+   (`["keboola-storage-token"]`) names neither. Setting
+   `oauth_secret_name_template` instead moves the deployment to per-VM secret
+   names and the module grants `secretAccessor` on those itself — do not do
+   both for one name, since two identical bindings fail the apply with
+   "already exists". Either way the secrets must exist before the apply.
 2. **`auth.allowed_domain`** = the customer's domains as a comma-separated
    **string** (a YAML list raises inside the callback and is swallowed as
    `error=oauth_failed`). Leave the operator's own domain out — it reaches the
@@ -93,8 +99,14 @@ boundary. Ask which shape the customer has.
 ## Verify
 
 ```bash
-docker compose exec app env | grep -c GOOGLE_CLIENT   # expect 2
+docker compose exec app sh -c 'test -n "$GOOGLE_CLIENT_ID" && test -n "$GOOGLE_CLIENT_SECRET" && echo both set'
 ```
+
+Test the values, not the variable names. A fetch the VM is not allowed to
+make — the missing binding from step 1 — falls back to an empty string rather
+than failing the boot, so both names are present in the environment either
+way; counting them passes while `is_available()` is false and the login page
+quietly offers password only.
 
 Then walk all three refusals, because they fail in different places:
 
