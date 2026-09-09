@@ -128,6 +128,11 @@ CATALOG: dict[str, AuditEvent] = {
         "usage.chat_cost", "read", "Measured chat token/cost breakdown was read across users."
     ),
     "usage.export": AuditEvent("usage.export", "read", "Usage data was exported."),
+    "usage.feedback_list": AuditEvent("usage.feedback_list", "read", "An admin read chat feedback rows."),
+    "usage.llm_calls": AuditEvent(
+        "usage.llm_calls", "read", "An admin read LLM call ledger rows for a session, turn or job."
+    ),
+    "usage.llm_cost": AuditEvent("usage.llm_cost", "read", "An admin read the cross-workload LLM cost summary."),
     "usage.summary": AuditEvent("usage.summary", "read", "A usage summary was read."),
     # -- system: scheduler ticks, startup, broker guardrails, review internals
     "admin_elevation_paused": AuditEvent(
@@ -846,6 +851,7 @@ CATALOG: dict[str, AuditEvent] = {
     "chat.session.title_update": AuditEvent(
         "chat.session.title_update", "mutation", "A chat session's title was changed."
     ),
+    "chat.feedback": AuditEvent("chat.feedback", "mutation", "A user rated one chat turn (thumbs up/down)."),
     "chat.copresence.fork": AuditEvent(
         "chat.copresence.fork", "mutation", "A shared chat session was forked into the caller's own copy."
     ),
@@ -1536,6 +1542,28 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "issue.comment": AuditEvent("issue.comment", "mutation", "A reporter or admin commented on an issue"),
     "issue.resolved": AuditEvent("issue.resolved", "mutation", "An admin resolved an issue"),
+    # -- 2026-09-08 LLM observability design §3.6 — the effective content-export
+    # policy is written once at startup so the decision is in the trail.
+    # Written by src/observability/content_policy.py with no actor: nobody
+    # asks for it per request; the process announces what it will export.
+    # The basis TEXT stays in instance.yaml — the row records only that one
+    # was recorded.
+    "observability.content_export": AuditEvent(
+        "observability.content_export",
+        "system",
+        "The instance's effective content-export policy (mode, placement, approver) at startup.",
+    ),
+    # -- 2026-09-08 LLM observability design §3.12 -- the evaluation-corpus
+    # export, both deliveries (pull and the scheduled push sink). One row
+    # per pull request or push batch: window, count, content_mode,
+    # placement and delivery ("pull"/"push") -- never the exported content
+    # itself.
+    "conversations.export": AuditEvent(
+        "conversations.export",
+        "read",
+        "A conversation-corpus export was delivered -- an admin's pull request or a "
+        "scheduled push-sink batch -- under the content-export policy.",
+    ),
 }
 
 

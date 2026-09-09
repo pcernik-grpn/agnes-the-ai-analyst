@@ -338,8 +338,9 @@ def test_cli_subcommands_registered():
     (``admin semantic coverage tables``). Hidden registrations count — a
     deprecated alias is still a reachable surface.
     """
-    from cli.main import app
     from typer.models import DefaultPlaceholder
+
+    from cli.main import app
 
     def invoke_without_command(group_info) -> bool:
         """Is this GROUP runnable on its own, per Typer's own resolution order?
@@ -1271,6 +1272,23 @@ _EXEMPT: dict[str, str] = {
         "surface over their own data, and an agent has no business reading "
         "every user's spend."
     ),
+    "/api/admin/telemetry/llm-cost": (
+        "admin-only cross-workload cost telemetry read (LLM observability "
+        "design 2026-09-08), same shape as its sibling `/api/admin/"
+        "telemetry/chat-cost` right above. CLI surface `agnes admin usage "
+        "llm-cost`. No MCP tool: an agent has no business reading every "
+        "user's spend."
+    ),
+    "/api/admin/telemetry/llm-calls": (
+        "admin-only LLM call ledger detail read, same reasoning as "
+        "llm-cost above. CLI surface `agnes admin usage llm-calls`. No MCP "
+        "tool."
+    ),
+    "/api/admin/telemetry/feedback": (
+        "admin-only chat feedback queue read, same reasoning as llm-cost "
+        "above. CLI surface `agnes admin usage feedback`. No MCP tool: an "
+        "agent has no business reading every user's feedback."
+    ),
     "/api/admin/prompts/{kind}": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/source": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/bind-git": _PROMPTS_REASON,
@@ -1911,6 +1929,19 @@ _EXEMPT: dict[str, str] = {
         "conversations, the same column the Haiku auto-title writes; no "
         "analyst CLI/MCP analogue"
     ),
+    # Thumbs on a completed assistant bubble (LLM observability design §3.5) —
+    # a web-chat UI affordance keyed on the live turn id the client learns
+    # from the WS frames. The admin read side is GET
+    # /api/admin/telemetry/feedback with `agnes admin usage feedback`; no
+    # analyst CLI/MCP analogue — an agent rating its own answers is not a
+    # signal.
+    "/api/chat/sessions/{chat_id}/feedback": (
+        "web-chat UI affordance keyed on the live turn id the client learns "
+        "from the WS frames; the admin read side is GET "
+        "/api/admin/telemetry/feedback with `agnes admin usage feedback`; no "
+        "analyst CLI/MCP analogue — an agent rating its own answers is not a "
+        "signal"
+    ),
     # Chats page (/chats) archive lifecycle. Same class as pin/title: these
     # manage how the WEB inventory presents the caller's own conversations.
     # Archived is the name the plain DELETE's long-standing soft-archive state
@@ -2079,6 +2110,20 @@ _EXEMPT: dict[str, str] = {
         "CLI subcommand or MCP analogue"
     ),
     "/api/issues/{issue_id}/screenshot": _ISSUE_SCREENSHOT_REASON,
+    # Conversation corpus export (design 2026-09-08 §3.12) — CLI-covered
+    # (`agnes admin conversations export`), MCP-exempt by design: it is a
+    # bulk, admin-only pull of OTHER users' full conversation content (every
+    # message, every tool call, feedback, memory writes) meant to leave the
+    # instance via a deliberate admin action under the content-export
+    # policy, not a tool a live chat/agent-api turn could reach for on its
+    # own — a different risk than an admin's own scoped queries.
+    "/api/admin/conversations/corpus": (
+        "the evaluation-corpus pull (design 2026-09-08 §3.12) — CLI-covered "
+        "(`agnes admin conversations export`); no MCP tool by design — handing "
+        "a live agent a tool that reads back the whole corpus (other users' "
+        "conversations, tool call bodies) under the content-export policy is a "
+        "bulk admin export, not an agent-facing query"
+    ),
 }
 
 

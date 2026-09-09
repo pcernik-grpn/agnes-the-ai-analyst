@@ -609,23 +609,27 @@ def _stub_turn(message: str, draft: Dict[str, Any], tables: List[Dict[str, Any]]
     }
 
 
-def _llm_turn(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+def _llm_turn(
+    prompt: str, schema: Dict[str, Any], *, user_id: str | None = None, subject_id: str | None = None
+) -> Dict[str, Any]:
     """One structured call. Raises ``ValueError`` when nothing is configured."""
     from app.instance_config import load_instance_config
     from connectors.llm import create_extractor_from_env_or_config
+    from src.observability.llm_context import llm_context
 
     try:
         instance_config = load_instance_config()
     except (ValueError, FileNotFoundError):
         instance_config = {}
     extractor = create_extractor_from_env_or_config((instance_config or {}).get("ai"))
-    return extractor.extract_json(
-        prompt=prompt,
-        max_tokens=3000,
-        json_schema=schema,
-        schema_name="semantic_model_builder_turn",
-        system=SYSTEM,
-    )
+    with llm_context(workload="builder", purpose="semantic_model_builder_turn", user_id=user_id, subject_id=subject_id):
+        return extractor.extract_json(
+            prompt=prompt,
+            max_tokens=3000,
+            json_schema=schema,
+            schema_name="semantic_model_builder_turn",
+            system=SYSTEM,
+        )
 
 
 @router.post("/builder/turn")
@@ -665,7 +669,10 @@ async def semantic_model_builder_turn(
         )
         schema = _schema(sorted(candidate_ids))
         try:
-            result = await asyncio.to_thread(_llm_turn, prompt, schema)
+            # No subject_id: a semantic-model draft has no row until Save
+            # (POST /api/semantic-models/apply) — there is nothing yet to
+            # attribute this turn's calls to.
+            result = await asyncio.to_thread(_llm_turn, prompt, schema, user_id=user["id"])
         except ValueError as e:
             logger.warning("semantic model builder: no LLM configured: %s", e)
             raise HTTPException(

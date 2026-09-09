@@ -37,12 +37,15 @@ logger = logging.getLogger(__name__)
 #: ``facts_ingest_runs`` (Alembic ``0078_facts_ingest_runs``) are the same
 #: story — both are PG-only app-state tables added after the freeze.
 #: ``agnes_issues`` / ``agnes_issue_comments`` (issue reporting, step 1;
-#: Alembic ``0116_issue_reports``) are the same story too.
+#: Alembic ``0119_issue_reports``) and ``agnes_llm_calls`` (Alembic
+#: ``0117_llm_observability``, design 2026-09-08 — the LLM observability
+#: ledger) are the same story too.
 PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset(
     {
         "agnes_turns",
         "agnes_extraction_runs",
         "agnes_facts_ingest_runs",
+        "agnes_llm_calls",
         "agnes_issues",
         "agnes_issue_comments",
     }
@@ -67,14 +70,17 @@ USAGE_PACKAGE_DESCRIPTION = (
 # these tables never enter `agnes pull` manifests.
 USAGE_PACKAGE_LONG_DESCRIPTION = (
     "Self-service usage analytics over your own Agnes activity, plus (admins "
-    "only) the extraction pipelines' own operational history. Eight tables: "
+    "only) the extraction pipelines' own operational history. Nine tables: "
     "`agnes_sessions` (one row per Claude Code or chat session — activity "
     "counters plus summed input/output/cache tokens), `agnes_turns` (one row "
     "per assistant turn with exact token usage incl. prompt cache; "
     "Postgres-backed instances only), `agnes_telemetry` (one row per "
     "tool/skill/sub-agent/MCP event), `agnes_audit` (server-side audit "
-    "trail of your actions), `agnes_issues` (one row per problem, wrong "
-    "answer, missing thing or question you reported through 'Report a "
+    "trail of your actions), `agnes_llm_calls` (one row per LLM call across "
+    "every workload — chat, agent API, builders, extraction, corporate "
+    "memory — with token counts and the USD cost as priced at write time; "
+    "Postgres-backed instances only), `agnes_issues` (one row per problem, "
+    "wrong answer, missing thing or question you reported through 'Report a "
     "problem', `agnes issue report` or the report_issue tool; Postgres-"
     "backed instances only), `agnes_issue_comments` (public replies on your "
     "issue reports, from you or an admin; Postgres-backed instances only), "
@@ -82,11 +88,11 @@ USAGE_PACKAGE_LONG_DESCRIPTION = (
     "status, progress, LLM token usage; Postgres-backed instances only) and "
     "`agnes_facts_ingest_runs` (one row per fact-graph ingest batch, "
     "including the real LLM spend ledger; Postgres-backed instances only). "
-    "The first six are filtered to YOUR rows — admins see everyone. The "
+    "The first seven are filtered to YOUR rows — admins see everyone. The "
     "last two are admin/operator data, not a per-user table: they carry no "
     "row for anyone (not even an admin's own activity) unless the caller is "
     "an admin, because a run belongs to a connection or a set of "
-    "collections, never to a person. All eight tables are server-side only: "
+    "collections, never to a person. All nine tables are server-side only: "
     'query them with `agnes query "SELECT …"` (auto-routes to the server); '
     "they never appear in `agnes pull` and have no local parquet. New "
     "activity is visible within seconds of a session upload, chat turn or "
@@ -97,6 +103,7 @@ USAGE_PACKAGE_WHEN_TO_USE = [
     "Understanding prompt-cache efficiency (cache_read vs fresh input tokens)",
     "Auditing which tools, skills and MCP servers you actually use, and which fail",
     "Reviewing your own action history on this instance (agnes_audit)",
+    "Tracing which LLM call produced a given answer, and what it cost (agnes_llm_calls)",
     "Admins: auditing an extraction run's or a fact-ingest batch's true LLM cost (agnes_extraction_runs.usage, agnes_facts_ingest_runs.llm_usage) instead of trusting one dashboard's arithmetic",
 ]
 USAGE_PACKAGE_WHEN_NOT_TO_USE = [

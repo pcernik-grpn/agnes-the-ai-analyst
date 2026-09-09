@@ -403,6 +403,41 @@ def test_temperature_is_dropped_when_the_model_rejects_it():
     assert "temperature" not in client.calls[2]
 
 
+def test_a_detection_is_recorded_as_anonymization_work(monkeypatch):
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    detector, _client = _detector([_Response("[]")])
+
+    detector("Petr Novák byl tady.")
+
+    assert len(records) == 1
+    assert (records[0].workload, records[0].purpose) == ("anonymization", "ner_detect")
+    assert records[0].provider == "anthropic"
+
+
+def test_the_no_temperature_retry_is_priced_once_but_the_rejection_is_still_recorded(monkeypatch):
+    """The retry re-sends the SAME logical detection with one keyword
+    dropped, so only ONE row carries the cost. The rejected attempt still
+    gets a zero-cost error row (review finding): the provider refused the
+    request outright, so there are no tokens to double-count, and a
+    rejection visible in no call count is what the ledger exists to
+    prevent."""
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    rejection = _ApiError(400, "temperature: unsupported parameter for this model")
+    detector, client = _detector([rejection, _Response("[]")])
+
+    detector("Petr Novák byl tady.")
+
+    assert len(client.calls) == 2, "the retry must still happen"
+    assert len(records) == 2, "the rejection and the retry each get a row"
+    by_status = {r.status: r for r in records}
+    assert set(by_status) == {"ok", "error"}
+    assert by_status["error"].error_type == "temperature_rejected"
+    assert not by_status["error"].cost_usd, "a refused request spent nothing — it must not be priced"
+    assert by_status["ok"].purpose == "ner_detect"
+
+
 # ---------------------------------------------------------------------------
 # Usage accounting
 # ---------------------------------------------------------------------------

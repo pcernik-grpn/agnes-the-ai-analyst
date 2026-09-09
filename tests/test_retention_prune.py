@@ -2,7 +2,8 @@
 
 Generalizes the B8 ``audit_log`` retention pattern (``tests/test_audit_retention.py``)
 to the other unbounded audit/activity trails: ``sync_history``, ``llm_usage``,
-and ``agent_scope_snapshots``. Covers:
+``agent_scope_snapshots``, and (design 2026-09-08) ``llm_calls`` — the LLM
+observability ledger, Postgres-only. Covers:
 
   1. ``src/audit_retention.py::prune_trail`` / ``run_retention_sweep`` — the
      generalized dispatcher.
@@ -97,6 +98,55 @@ class TestPruneTrail:
         result = prune_trail("agent_scope_snapshots", retention_days=10, repo=_FakeRepo())
         assert result == {"pruned": 2, "skipped": False}
 
+    def test_dispatches_llm_calls_to_prune_older_than(self):
+        from src.audit_retention import prune_trail
+
+        class _FakeRepo:
+            def prune_older_than(self, days):
+                return 6
+
+        result = prune_trail("llm_calls", retention_days=10, repo=_FakeRepo())
+        assert result == {"pruned": 6, "skipped": False}
+
+    def test_dispatches_chat_feedback_to_prune_older_than(self):
+        """Review finding: the feedback table had a pruner nobody called, so
+        a person's free-text comment about an answer was kept forever with
+        no way for an operator to put a clock on it."""
+        from src.audit_retention import prune_trail
+
+        class _FakeRepo:
+            def prune_older_than(self, days):
+                return 4
+
+        result = prune_trail("chat_feedback", retention_days=10, repo=_FakeRepo())
+        assert result == {"pruned": 4, "skipped": False}
+
+    def test_chat_feedback_swallows_requires_postgres_backend(self, monkeypatch):
+        from src.audit_retention import prune_trail
+        from src.repositories import RequiresPostgresBackend
+
+        def _raise():
+            raise RequiresPostgresBackend("chat_message_feedback")
+
+        monkeypatch.setattr("src.repositories.chat_message_feedback_repo", _raise)
+        result = prune_trail("chat_feedback", retention_days=10)
+        assert result == {"pruned": 0, "skipped": False}
+
+    def test_llm_calls_swallows_requires_postgres_backend(self, monkeypatch):
+        """The DuckDB backend answer: nothing pruned, never an unhandled
+        raise — the ledger simply does not exist there. The pruner resolves
+        ``llm_calls_repo()`` itself (no injected repo, so the factory call
+        inside ``_prune_llm_calls`` actually runs)."""
+        from src.audit_retention import prune_trail
+        from src.repositories import RequiresPostgresBackend
+
+        def _raise():
+            raise RequiresPostgresBackend("llm_calls")
+
+        monkeypatch.setattr("src.repositories.llm_calls_repo", _raise)
+        result = prune_trail("llm_calls", retention_days=10)
+        assert result == {"pruned": 0, "skipped": False}
+
     def test_uses_repo_factory_by_default(self, monkeypatch):
         from src.audit_retention import prune_trail
 
@@ -132,12 +182,14 @@ class TestRunRetentionSweep:
             "sync_history": {"pruned": 0, "skipped": True},
             "llm_usage": {"pruned": 0, "skipped": True},
             "agent_scope_snapshots": {"pruned": 0, "skipped": True},
+            "llm_calls": {"pruned": 0, "skipped": True},
+            "chat_feedback": {"pruned": 0, "skipped": True},
         }
 
     def test_zero_windows_prunes_nothing(self):
         from src.audit_retention import run_retention_sweep
 
-        result = run_retention_sweep({"sync_history": 0, "llm_usage": 0, "agent_scope_snapshots": 0})
+        result = run_retention_sweep({"sync_history": 0, "llm_usage": 0, "agent_scope_snapshots": 0, "llm_calls": 0})
         assert all(v["skipped"] for v in result.values())
         assert all(v["pruned"] == 0 for v in result.values())
 
@@ -171,7 +223,7 @@ class TestRunRetentionSweep:
 
         result = run_retention_sweep({"chat_messages": 30, "sync_history": 0})
         assert "chat_messages" not in result
-        assert set(result) == {"sync_history", "llm_usage", "agent_scope_snapshots"}
+        assert set(result) == {"sync_history", "llm_usage", "agent_scope_snapshots", "llm_calls", "chat_feedback"}
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +238,8 @@ class TestRetentionDaysConfig:
             ("get_sync_history_retention_days", "sync_history_days"),
             ("get_llm_usage_retention_days", "llm_usage_days"),
             ("get_agent_scope_snapshots_retention_days", "agent_scope_snapshots_days"),
+            ("get_llm_calls_retention_days", "llm_calls_days"),
+            ("get_chat_feedback_retention_days", "chat_feedback_days"),
         ],
     )
     def test_default_is_zero(self, monkeypatch, getter_name, config_key):
@@ -200,6 +254,8 @@ class TestRetentionDaysConfig:
             ("get_sync_history_retention_days", "sync_history_days"),
             ("get_llm_usage_retention_days", "llm_usage_days"),
             ("get_agent_scope_snapshots_retention_days", "agent_scope_snapshots_days"),
+            ("get_llm_calls_retention_days", "llm_calls_days"),
+            ("get_chat_feedback_retention_days", "chat_feedback_days"),
         ],
     )
     def test_reads_configured_value(self, monkeypatch, getter_name, config_key):
@@ -217,6 +273,7 @@ class TestRetentionDaysConfig:
             "get_sync_history_retention_days",
             "get_llm_usage_retention_days",
             "get_agent_scope_snapshots_retention_days",
+            "get_llm_calls_retention_days",
         ],
     )
     def test_negative_value_clamped_to_zero(self, monkeypatch, getter_name):
@@ -231,6 +288,7 @@ class TestRetentionDaysConfig:
             "get_sync_history_retention_days",
             "get_llm_usage_retention_days",
             "get_agent_scope_snapshots_retention_days",
+            "get_llm_calls_retention_days",
         ],
     )
     def test_invalid_value_falls_back_to_zero(self, monkeypatch, getter_name):

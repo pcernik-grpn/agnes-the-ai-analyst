@@ -284,3 +284,23 @@ def test_a_stored_override_with_the_retired_token_placeholder_is_ignored(conn, c
     assert any("retired" in r.message.lower() or "retired" in str(r.msg).lower() for r in caplog.records), (
         "the operator gets no log line explaining why their override was ignored"
     )
+
+
+def test_a_stored_override_with_a_bare_server_url_placeholder_still_resolves(conn):
+    """The save-time guard (`_reject_bare_server_url_placeholder`) only
+    inspects NEW writes — an override saved before that guard shipped, or
+    authored by hand, can still carry the single-brace `{server_url}` the
+    live default substitutes outside Jinja. Jinja2 only processes `{{ }}`,
+    so left alone the reader would get the literal placeholder instead of a
+    URL. Unlike the retired `{token}` placeholder this isn't unsafe to serve
+    — it's just wrong — so the fix is to substitute it, not fall back to the
+    default and discard the admin's content."""
+    WelcomeTemplateRepository(conn).set(
+        "Server: {server_url}\n",
+        updated_by="admin@example.com",
+    )
+
+    out = render_agent_prompt_banner(conn, user=_user(), server_url="https://example.com")
+
+    assert "{server_url}" not in out
+    assert "Server: https://example.com" in out

@@ -193,7 +193,7 @@ class TestDegradingWithoutAModel:
         broken page — the message has to say which of the two it is."""
         monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
 
-        def _no_key(_prompt):
+        def _no_key(_prompt, **_kwargs):
             raise ValueError("no AI credential configured")
 
         monkeypatch.setattr("app.api.agent_builder._llm_turn", _no_key)
@@ -204,7 +204,7 @@ class TestDegradingWithoutAModel:
     def test_a_provider_error_is_not_a_500(self, builder, monkeypatch):
         monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
 
-        def _boom(_prompt):
+        def _boom(_prompt, **_kwargs):
             raise RuntimeError("upstream exploded")
 
         monkeypatch.setattr("app.api.agent_builder._llm_turn", _boom)
@@ -217,7 +217,7 @@ class TestDegradingWithoutAModel:
         monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
         monkeypatch.setattr(
             "app.api.agent_builder._llm_turn",
-            lambda _p: {"reply": "Which team is this for?"},
+            lambda _p, **_kw: {"reply": "Which team is this for?"},
         )
         r = _turn(builder, "an agent")
         assert r.status_code == 200
@@ -370,7 +370,7 @@ class TestAPartialSurfacesPatchDoesNotSwitchTheOthersOff:
         monkeypatch.setattr(
             ab,
             "_llm_turn",
-            lambda prompt: {"reply": "Turned MCP on.", "patch": {"surfaces": {"mcp": True}}},
+            lambda prompt, **_kw: {"reply": "Turned MCP on.", "patch": {"surfaces": {"mcp": True}}},
         )
         r = _turn(builder, "expose it over MCP too")
         assert r.status_code == 200, r.text

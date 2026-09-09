@@ -3275,6 +3275,12 @@ a.slack-badge:hover {
     margin-bottom: var(--space-3);
 }
 
+.features-operator {
+    font-size: var(--text-sm);
+    opacity: 0.75;
+    margin: 0 0 var(--space-3);
+}
+
 .features-subtitle {
     font-size: var(--text-md);
     line-height: 1.6;

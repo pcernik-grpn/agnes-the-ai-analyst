@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from connectors.llm.anthropic_provider import AnthropicExtractor
 from connectors.llm.exceptions import LLMError
 from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
+from src.observability import llm_context
 
 from .lint_corpus import CorpusDoc
 from .prompts import (
@@ -105,13 +106,14 @@ def _craft_review_or_raise(
             extractor = create_vertex_extractor(model)
         else:
             extractor = AnthropicExtractor(api_key=api_key, model=model)
-        result = extractor.extract_json(
-            prompt=prompt,
-            system=CRAFT_REVIEW_PROMPT,
-            max_tokens=MAX_RESPONSE_TOKENS,
-            json_schema=CRAFT_REVIEW_JSON_SCHEMA,
-            schema_name="store_guardrails_craft_review",
-        )
+        with llm_context(workload="store_guardrails", purpose="craft_review"):
+            result = extractor.extract_json(
+                prompt=prompt,
+                system=CRAFT_REVIEW_PROMPT,
+                max_tokens=MAX_RESPONSE_TOKENS,
+                json_schema=CRAFT_REVIEW_JSON_SCHEMA,
+                schema_name="store_guardrails_craft_review",
+            )
     except LLMError as e:
         logger.warning("SL010 craft review LLM call failed: %s", type(e).__name__)
         raise CraftUnavailable(str(e)) from e

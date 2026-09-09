@@ -460,3 +460,35 @@ class TestConvertPySourcePathThreading:
 
         assert result.engine == "ocr"
         assert "page text" in result.markdown
+
+
+# ------------------------------------------------- call labelling (triage)
+
+
+@pytest.fixture
+def llm_records(monkeypatch):
+    """Collect the ``LlmCallRecord`` every traced generation emits."""
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+    return records
+
+
+def test_the_classify_call_is_recorded_apart_from_the_pages_it_gates(tmp_path, monkeypatch, llm_records):
+    """A triage pass buys its saving with one extra call — it has to be
+    visible as its own purpose, or the saving cannot be checked."""
+    client = _FakeClient(
+        "page one",
+        {
+            "doc_type": "lease",
+            "language": "en",
+            "scan_quality": "good",
+            "continue": False,
+            "reason": "boilerplate",
+        },
+    )
+    settings = _enable(monkeypatch, client, triage_enabled=True, preview_pages=1)
+
+    ScanTranscriber(settings, client=client, source_path="Leases/example.pdf").transcribe(_scan_pdf(tmp_path, pages=3))
+
+    purposes = [(r.workload, r.purpose) for r in llm_records]
+    assert purposes == [("ocr", "scan_ocr"), ("ocr", "scan_ocr_retry")]

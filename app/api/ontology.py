@@ -397,15 +397,19 @@ async def ontology_dry_run(body: OntologyDryRunRequest, user: dict = Depends(req
         raise HTTPException(status_code=501, detail={"error": "llm_not_configured", "message": str(exc)}) from exc
 
     from connectors.llm.exceptions import LLMError
+    from src.observability.llm_context import llm_context
 
     try:
-        result = extractor.extract_json(
-            prompt,
-            max_tokens=_DRY_RUN_MAX_TOKENS,
-            json_schema=_DRY_RUN_JSON_SCHEMA,
-            schema_name="ontology_dry_run",
-            system=system_prompt,
-        )
+        with llm_context(
+            workload="semantic_layer", purpose="ontology_draft", user_id=user["id"], subject_id=body.file_id
+        ):
+            result = extractor.extract_json(
+                prompt,
+                max_tokens=_DRY_RUN_MAX_TOKENS,
+                json_schema=_DRY_RUN_JSON_SCHEMA,
+                schema_name="ontology_dry_run",
+                system=system_prompt,
+            )
     except LLMError as exc:
         raise HTTPException(status_code=502, detail={"error": "llm_extraction_failed", "message": str(exc)}) from exc
 

@@ -449,6 +449,7 @@ def _purge_user_chat_data(
     user_email: str,
     *,
     actor_id: str,
+    target_user_id: str | None = None,
 ) -> None:
     """GDPR hard-delete: remove all chat sessions + per-user workdir files.
 
@@ -467,6 +468,20 @@ def _purge_user_chat_data(
         sessions_purged = chat_repo.hard_delete_user_sessions(user_email)
     except Exception:
         logger.exception("GDPR purge: chat_repo.hard_delete_user_sessions failed for %s", user_email)
+
+    # 1b. The LLM call ledger keeps the spend but must not keep the person:
+    # deleting the sessions above scrubbed the rows that belong to one, and
+    # this reaches the rest — a builder turn or an extraction run carries a
+    # user id and no session id at all.
+    try:
+        from src.repositories import RequiresPostgresBackend, llm_calls_repo
+
+        if target_user_id:
+            llm_calls_repo().scrub_user_identity(target_user_id)
+    except RequiresPostgresBackend:
+        pass  # the ledger is Postgres-only; nothing to scrub on DuckDB
+    except Exception:
+        logger.exception("GDPR purge: llm_calls scrub failed for %s", user_email)
 
     # 2. Purge per-user workdir from disk (chat workspace + session dirs).
     try:
@@ -552,7 +567,7 @@ async def delete_user(
     if hard:
         # GDPR hard-delete: purge all chat sessions and per-user workdir
         # files in addition to removing the user row.
-        _purge_user_chat_data(conn, request, target_email, actor_id=user["id"])
+        _purge_user_chat_data(conn, request, target_email, actor_id=user["id"], target_user_id=target["id"])
 
 
 @router.post("/{user_id}/reset-password")

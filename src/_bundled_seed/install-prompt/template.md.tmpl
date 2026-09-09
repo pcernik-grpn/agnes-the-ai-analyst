@@ -1,9 +1,12 @@
 Set up the {{ instance.name }} CLI on this machine.
 
-Server: {server_url}
+Server: {{ server.url }}
+
+Requirements: `uv` (https://docs.astral.sh/uv/) and `curl`, plus network
+access to the server above.
 
 Your login token is already saved on this machine at ~/.agnes/token
-(written by step 4 of the install guide at {server_url}). The steps below
+(written by step 4 of the install guide at {{ server.url }}). The steps below
 use that file path, so there is no need to display its contents.
 
 Every step below is idempotent and safe to re-run: a machine that already
@@ -16,17 +19,17 @@ verification.
 Before you start, confirm the login token file is in place:
    test -s ~/.agnes/token && echo "token present" || echo "token missing"
 
-   Missing: an earlier run may have consumed it, but that needs BOTH a
-   saved credential and a matching server — token.json records no server,
-   and the installer writes server: before anyone has signed in:
+   Present: continue. Missing: an earlier run may have consumed it, but that
+   needs BOTH a saved credential and a matching server — token.json records
+   no server, and the installer writes server: before anyone has signed in:
       test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml
-   Prints {server_url} → continue. Anything else, including no output →
-   not signed in to {server_url}: stop, send the user to
-   {server_url}/home step 4 — the step that saves it.
+   Prints {{ server.url }} → continue. Anything else, including no output →
+   not signed in to {{ server.url }}: stop, send the user to {{ server.url }}/how-it-works#connect.
 
 1) Install the CLI:
+   If someone else runs this, copy the commands below into the reply in full — not a reference to "step 1".
    TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)
-   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {server_url}/cli/download)
+   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {{ server.url }}/cli/download)
    WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)
    [ -n "$WHEEL" ] || { echo "error: wheel download failed (no .whl in $TMPDIR_WHEEL)" >&2; exit 1; }
    uv tool install --force "$WHEEL"
@@ -44,7 +47,10 @@ Before you start, confirm the login token file is in place:
 
 2) Set up the {{ instance.name }} workspace in the current directory:
 
-   agnes onboard --server-url "{server_url}" --workspace .
+   If someone else runs this, copy the exact command (with the agreed folder) into
+   the reply in full — not a reference to "step 2".
+
+   agnes onboard --server-url "{{ server.url }}" --workspace .
 
    The CLI checks the directory first: it declines home and system directories,
    and asks before adopting a directory that already holds unrelated files.
@@ -67,3 +73,7 @@ Before you start, confirm the login token file is in place:
    - the diagnose status it finished on
    - which connectors are available to set up later — nothing to do now,
      just ask when you want one (e.g. "set up Jira")
+
+   A good first question from here: "What data can I access through
+   {{ instance.name }}? Give me a brief overview and suggest three useful
+   questions you can answer."

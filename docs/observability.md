@@ -2,12 +2,14 @@
 
 ## Audit & activity trails (retention status)
 
-Agnes keeps seven distinct records of "who did what": `audit_log` (admin/API
+Agnes keeps eight distinct records of "who did what": `audit_log` (admin/API
 actions), chat transcripts (`chat_messages` — flag-controlled, see below),
 CLI session JSONLs (viewer: `/admin/sessions`), usage rollups
 (`usage_events`, viewer: `/admin/telemetry`), `sync_history`, `llm_usage`
-(per-call agent token accounting), and agent-runtime forensics
-(`agent_scope_snapshots`).
+(per-call agent token accounting), agent-runtime forensics
+(`agent_scope_snapshots`), and `llm_calls` (the LLM observability ledger —
+one priced row per LLM call across every workload, see *LLM call ledger*
+below).
 
 Chat transcripts used to have no admin viewer at all (a deliberate privacy
 decision). Since the audit-full-coverage plan's F4 bridge, a chat session is
@@ -49,6 +51,7 @@ Retention, per trail:
 | `audit_log` | `audit.retention_days` | 365 days | daily `audit-prune` |
 | `sync_history` | `retention.sync_history_days` | 0 = forever | daily `retention-prune` |
 | `llm_usage` | `retention.llm_usage_days` | 0 = forever | daily `retention-prune` |
+| `llm_calls` | `retention.llm_calls_days` | 0 = forever | daily `retention-prune` |
 | `agent_scope_snapshots` | `retention.agent_scope_snapshots_days` | 0 = forever | daily `retention-prune` |
 | `usage_events` | `retention.usage_events_days` (or `USAGE_EVENTS_RETENTION_DAYS` env, which wins when set) | 0 = forever | own job, `POST /api/admin/usage/prune` (`agnes admin usage prune`) |
 | `chat_messages` | — | no policy | — (privacy decision, deliberately out of scope) |
@@ -74,20 +77,23 @@ their own usage with `agnes query` instead of an admin page:
 | `agnes_telemetry` | `usage_events` | own rows (non-admin) / all (admin) |
 | `agnes_audit` | `audit_log` | own rows (non-admin) / all (admin) |
 | `agnes_turns` | `usage_turns` | own rows (non-admin) / all (admin) |
+| `agnes_llm_calls` | `llm_calls` | own rows (non-admin) / all (admin) |
 | `agnes_extraction_runs` | `extraction_runs` | **admin-only** — zero rows for any non-admin |
 | `agnes_facts_ingest_runs` | `facts_ingest_runs` | **admin-only** — zero rows for any non-admin |
 
 `agnes_turns` (token usage per assistant turn, including prompt-cache reads
-and writes, across Claude Code and every chat surface), `agnes_extraction_runs`
-(one row per built-in extraction/crawl run) and `agnes_facts_ingest_runs`
-(one row per fact-graph ingest batch) exist **only on Postgres-backed
-instances** — their source tables have no DuckDB counterpart. On a
-DuckDB-backed instance none of the three ids is registered at all: they never
-appear in `agnes catalog`, and a `SELECT` against any of them says the table
-is unavailable here rather than pointing at a package grant that could not
-surface it.
+and writes, across Claude Code and every chat surface), `agnes_llm_calls`
+(one row per LLM call across every workload — chat, agent API, builders,
+extraction, corporate memory and the rest — priced at write time, see *LLM
+call ledger* below), `agnes_extraction_runs` (one row per built-in
+extraction/crawl run) and `agnes_facts_ingest_runs` (one row per
+fact-graph ingest batch) exist **only on Postgres-backed instances** — their
+source tables have no DuckDB counterpart. On a DuckDB-backed instance none of
+the four ids is registered at all: they never appear in `agnes catalog`, and
+a `SELECT` against any of them says the table is unavailable here rather
+than pointing at a package grant that could not surface it.
 
-The first four tables are filtered to the caller's own rows (admins see
+The first five tables are filtered to the caller's own rows (admins see
 everyone). `agnes_extraction_runs` and `agnes_facts_ingest_runs` are
 **admin/operator data, not per-user data**: a crawl run belongs to a
 data-source connection and an ingest batch belongs to a set of collections —
@@ -106,11 +112,11 @@ They are server-side only — `agnes pull` never downloads them — and they are
 **members of a seeded data package with the slug `agnes-usage`**, so who may
 query usage data at all is an admin decision like any other table grant.
 Grant the package to a group (`/admin/access`, or `agnes admin grant create
-<group> data_package <pkg-id>`) and its members can read the four own-rows
+<group> data_package <pkg-id>`) and its members can read the five own-rows
 tables, still filtered to their own rows; without the grant every table in
 the package is absent from `agnes catalog` and a `SELECT` against any of them
 returns 403 naming the package. Admins are unaffected (god-mode) and keep the
-unscoped view on all six tables. Agents and co-sessions also keep access
+unscoped view on all seven tables. Agents and co-sessions also keep access
 without the grant — their authority is already owner grants ∩ scope. Full
 model: [`RBAC.md`](RBAC.md#internal-usage-tables-the-agnes-usage-package).
 
@@ -175,6 +181,141 @@ expensive general-purpose tier because it reads a two-bucket counter with no
 model attached — a guardrail that must guess should guess in the direction
 that stops sooner. It is a soft guardrail, not a billing ledger; this
 endpoint is the ledger.
+
+This endpoint stays the per-session chat view. For the cross-workload one —
+chat AND every server-side generation, priced the same way — see `llm-cost`
+in *LLM call ledger* below.
+
+## LLM call ledger — every call, priced once
+
+`llm_calls` (Postgres-only, migration `0117_llm_observability`, A3 ratchet —
+see *Dual-backend discipline* in `CLAUDE.md`) is the single place "an LLM
+call happened" is recorded. The chat broker writes one row per forwarded
+completion, and `trace_generation` (`src/observability/llm_tracing.py`)
+writes one per server-side generation — the same call sites the OTel spans
+above come from, wrapped at every one of: the five builder endpoints
+(`entity_builder`, `agent_builder`, `mcp_builder`, `package_builder`,
+`semantic_model_builder`), document fact extraction (including one row per
+document result fetched back from a batch job), OCR, vision captioning, the
+NER anonymizer, auto-title, chat readiness probes, corporate memory,
+knowledge digests, table autodoc, ontology, the memory-curator profile,
+session verification and the store guardrails — not only the two
+`connectors/llm/` providers the older `llm_usage` ledger saw.
+
+Each row carries the call's **context**
+(`src/observability/llm_context.py`) — `workload` (the coarse kind of work:
+`chat`, `agent_api`, `builder`, `extraction`, `corporate_memory`,
+`knowledge`, `semantic_layer`, `anonymization`, `ocr`, `vision`,
+`auto_title`, `readiness`, `store_guardrails`, `verification`, `admin_ask`),
+`purpose` (a finer call-site label, e.g. `entity_builder_turn`,
+`facts_extraction`, `digest`), `session_id`/`turn_id` for a chat call,
+`user_id`/`agent_id` for identity, `job_id` when the call ran inside a
+worker job, and `subject_id` — what the call is *about* (an entity id for a
+builder, a document id for extraction, a session id for auto-title) — plus
+the four token kinds, `cost_usd`, and `priced_as`: the rates the row was priced at
+(`src/llm_pricing.py`), stored beside the figure so any row can be
+re-derived rather than taken on trust. An unknown model prices at the same
+`DEFAULT_PRICE` every other surface uses, and `priced_as` says so.
+
+### Reading it
+
+```bash
+agnes admin usage llm-cost                          # last 7 days, by workload
+agnes admin usage llm-cost --by model --window 30d --json
+agnes admin usage llm-calls --turn-id <turn-id>      # every call one turn made
+agnes admin usage feedback --verdict down            # the thumbs-down queue
+```
+
+- `GET /api/admin/telemetry/llm-cost?window=1d|7d|30d|all&by=workload|agent|user|model|purpose`
+  (`agnes admin usage llm-cost`) — grouped totals: calls, the four token
+  kinds, `cost_usd`, `cached_input_share`, and `priced_models` (which
+  model(s) the group's rows were actually priced at, so a figure is never
+  taken on trust).
+- `GET /api/admin/telemetry/llm-calls?session_id=|turn_id=|job_id=|user_id=&limit=&before=&before_id=`
+  (`agnes admin usage llm-calls`) — the detail rows for one turn, session,
+  job or user, newest first, cursor by `created_at`. At least one of the
+  four ids is required — this is a drill-down into one unit of work, never
+  an unbounded dump of every call the instance ever made.
+- `GET /api/admin/telemetry/feedback?window=&verdict=up|down` (`agnes admin
+  usage feedback`) — the chat-turn thumbs queue, see *Feedback* below.
+- `/admin/telemetry` has an "LLM cost" section reading `llm-cost` by
+  workload with a window selector, and the `agnes_llm_calls` table in the
+  `agnes-usage` data package (own rows for a non-admin grantee, everything
+  for an admin) reads the same ledger as an ordinary `agnes query` table.
+
+All three read routes are admin-gated and resolve the ledger repository as a
+FastAPI dependency, so a DuckDB-backed instance answers the typed `501
+requires_postgres_backend` before any query parameter is even validated.
+
+### One turn id, three tables
+
+`chat_messages.turn_id`, `usage_turns.turn_uuid` and `llm_calls.turn_id`
+carry the SAME id — the one ChatManager mints per delivered user message
+(see *OpenTelemetry export* → *What is exported* below) — so the transcript,
+the per-turn token table and the call ledger always agree on what one turn
+was.
+
+### Feedback
+
+`POST /api/chat/sessions/{chat_id}/feedback` (`{turn_id, verdict: "up"|
+"down", comment?}`, gated like the session's other routes — owner or a live
+participant — and only for a turn the session's own messages carry, so a
+caller cannot key feedback on another session's turn) writes one
+`chat_message_feedback` row per `(turn_id,
+user_id)` — a second submit updates it rather than piling up a second
+opinion. Audited as `chat.feedback` (session, turn, verdict — never the
+comment). The web chat renders thumbs on every completed assistant bubble
+(the frame carries `turn_id`) and a short optional comment on thumbs-down;
+read the queue with `agnes admin usage feedback` (never prints the comment
+text in its table — use `--json` for that).
+
+### Extraction provenance
+
+"Why did extraction pull the wrong facts" is answered by the `llm_calls`
+rows with `workload=extraction`, `purpose=facts_extraction|facts_retry|
+facts_batch`, `subject_id` (the document's own `corpus_files.id`) and
+`job_id` — the worker job id `app/worker/runtime.py` binds onto the
+context for the whole job, the same id `jobs.id` and `extraction_runs.
+job_id` carry. Join on `extraction_runs`, not `facts_ingest_runs` — the
+latter has no `job_id` column at all (`facts_ingest_runs` is keyed on the
+ingest run's own id, a different unit of work than the worker job that
+drove it). One `llm_calls` row per document call, so a wrong fact traces
+back to the exact call, its model, its cost and, under policy, its prompt.
+
+### Memory provenance
+
+`agent_memories` gains `source_turn_id`/`source_message_id` (Postgres-only;
+the DuckDB sibling accepts and drops them, the same pattern the
+`chat_messages` cache-token columns already established) — `remember` fills
+them from the live turn record at write time, so "why did this memory get
+written" traces back to the exact turn and message that caused it.
+
+The turn record `chat:turn:{session_id}` is never deleted at turn end, only
+re-published with `ended_at` set, so it always answers with the session's
+LAST turn — open or closed, however old. A write that happens outside any
+live turn (an owner note through the API, a curator job) must not borrow
+that last turn's identity just because one is still there to read:
+`remember` stamps provenance only from a record that is BOTH still open
+(`ended_at is None`) AND not newer than the write itself (the same
+`started_at` freshness rule the broker applies to a late completion — see
+*What is exported* below). A closed turn, a turn that started after the
+write began, or a legacy record published before `ended_at` existed (no
+such key at all, read as "unknown", never as "open") all get no provenance
+rather than a wrong one.
+
+### DuckDB-backed instances
+
+`llm_calls` and `chat_message_feedback` are Postgres-only by construction
+(A3 ratchet): on the frozen DuckDB app-state backend the three read routes
+above and the feedback endpoint answer a typed `501
+requires_postgres_backend`, spans are unaffected, and the ledger WRITES from
+the broker and `trace_generation` are silent no-ops rather than a crash — a
+measurement must never cost the call it observes.
+
+### Retention
+
+`retention.llm_calls_days` (default `0` = forever), pruned by the same
+daily `retention-prune` job as the other trails above.
 
 ## Knowledge packaging — worker job, single-run, checkpointed
 
@@ -451,16 +592,21 @@ the exporter is installed):
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=https://<collector>/<base-path>   # the SDK appends /v1/traces
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<token>    # whatever the collector wants
-AGNES_OTEL_CAPTURE_CONTENT=1                                 # optional — see below
+# Prompt/completion TEXT export is a separate decision — see *Content policy*
+# below. It is governed by `observability.content_export` in instance.yaml,
+# never by an environment variable; AGNES_OTEL_CAPTURE_CONTENT is a
+# deprecated alias that no longer enables anything on its own.
 ```
 
-On a VM built by the `customer-instance` Terraform module the three
-variables come from the per-instance `otlp_endpoint`, `otlp_headers_secret`
-(a Secret Manager secret name — the value is fetched at boot, never stored
-in state) and `otlp_capture_content` fields; the module also writes
-`AGNES_DEPLOYMENT_ENV` for every VM (the VM's name unless `deployment_env`
-says otherwise). Like everything the startup script renders, they reach a
-running VM only through a recreate.
+On a VM built by the `customer-instance` Terraform module the endpoint and
+headers come from the per-instance `otlp_endpoint` and `otlp_headers_secret`
+fields (a Secret Manager secret name — the value is fetched at boot, never
+stored in state); the module also writes `AGNES_DEPLOYMENT_ENV` for every VM
+(the VM's name unless `deployment_env` says otherwise). The module's
+`otlp_capture_content` boolean no longer enables content export on its own —
+carrying the `observability.content_export` policy record instead is a
+separate module change, out of scope here. Like everything the startup
+script renders, these reach a running VM only through a recreate.
 
 An unset endpoint leaves the OpenTelemetry API's no-op tracer in place: no
 exporter, no background thread, a dictionary lookup per call. The log line
@@ -475,20 +621,61 @@ that refuses the batches shows up as the SDK's own
   a session's LLM traffic goes through that one route. Named `chat <model>`,
   kind `CLIENT`, with the duration of the upstream call.
 - **One span per server-side generation** wrapped in `trace_generation`
-  (`src/observability/llm_tracing.py`: summaries, extraction, the semantic
-  layer) — the same tracer, the same table.
+  (`src/observability/llm_tracing.py`) — every call site in *LLM call
+  ledger* above (builders, extraction, OCR, vision, anonymization,
+  auto-title, readiness, corporate memory, digests, autodoc, ontology,
+  verification, store guardrails) — the same tracer, the same table.
+- **One `agnes.chat.turn` span per delivered user message** (kind
+  `INTERNAL`, opened by ChatManager) — `agnes.session_id`, `agnes.turn_id`,
+  `agnes.user_id`, `agnes.agent_id`, `agnes.surface`, `agnes.workload`
+  (`chat` or `agent_api`) — no message text. Closed with `agnes.tool_calls`
+  and the turn's drained token totals and `agnes.cost_usd`. One
+  `agnes.chat.tool <tool>` child span per tool call under it (`agnes.tool`,
+  `agnes.args_hash` — the same digest the `chat.tool_call` audit row
+  carries, `agnes.is_error`), ended by the matching `tool_result` — never
+  the arguments or the result.
+- **Completion spans open as children of the turn.** The broker reads
+  `chat:turn:{session_id}` — a coordination record with a 24 h TTL that is
+  never deleted at turn end, only re-published (with `ended_at` set) when
+  the turn closes and overwritten outright by the next turn — and opens its
+  completion span as a child of the stored context, even when the turn and
+  the completion run in different replicas (the collector stitches the two
+  on `trace_id`). A record whose own `started_at` is AFTER this completion
+  began is refused rather than attributed — a co-driver's message can start
+  turn N+1 before turn N's completion returns, and the session's last turn
+  is not necessarily the turn that made this call. With the coordination
+  backend unavailable, or with no usable record, the completion span is a
+  root span instead, `turn_id` is null on it, and everything else records
+  as usual — degrade, never fail.
+- **One `agnes.chat.feedback` span per thumbs submission**, carrying one
+  event `agnes.feedback` (`agnes.verdict`, `agnes.has_comment`), parented
+  under the turn's own span context when it is still the turn the feedback
+  is about.
 
 | attribute | on | carries |
 |---|---|---|
 | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model` | both | provider (`anthropic`, `gcp.vertex_ai`) and models |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | both | uncached input and output |
-| `gen_ai.usage.cache_read_input_tokens`, `gen_ai.usage.cache_creation_input_tokens` | broker | prompt-cache reads and writes, **separately** — folding them into `input_tokens` undercounts an agentic run by orders of magnitude (see *Chat cost*) |
+| `gen_ai.usage.cache_read_input_tokens`, `gen_ai.usage.cache_creation_input_tokens` | both | prompt-cache reads and writes, **separately** — folding them into `input_tokens` undercounts an agentic run by orders of magnitude (see *Chat cost*); generation spans carry these now too, not only the broker's |
 | `gen_ai.response.finish_reasons` | broker | the stop reason |
-| `agnes.session_id`, `agnes.user_email`, `agnes.user_id`, `agnes.agent_id`, `agnes.ticket_scope` | broker | which session, who ran it, under which agent; `llm` is the embedded turn engine, `main` the native sandbox |
+| `agnes.session_id`, `agnes.user_id`, `agnes.agent_id`, `agnes.ticket_scope` | broker | which session, who ran it, under which agent; `llm` is the embedded turn engine, `main` the native sandbox |
+| `agnes.workload`, `agnes.purpose` | both | the call's context (`src/observability/llm_context.py`) — coarse kind of work and a finer call-site label, so a builder turn, a corporate-memory extraction and an auto-title stop looking identical |
+| `agnes.turn_id`, `agnes.job_id`, `agnes.subject_id` | both | the chat turn, the worker job, and what the call is *about*, when the context carries them |
 | `agnes.upstream`, `agnes.stream`, `http.response.status_code`, `error.type` | broker | where the call went and how it ended |
 | `agnes.response_bytes`, `agnes.stream_complete` | broker | how much of the response came back, and for a stream whether the model reached its stop reason — a client that walks away mid-turn leaves a span with no answer and no final usage, and this is what tells it apart from a lost export |
+| `agnes.response_truncated` | broker | the usage was recovered from the stream's head/tail edges because the full mirror overflowed — tokens, cost and stop reason are still exact; only the content SUMMARY (never exported unless the policy allows it) was cut |
 | `agnes.prompt_chars`, `agnes.completion_chars` | both | sizes of the exchange, never text |
-| `agnes.kind` | both | `completion` (the broker) or `generation` (a server-side call) |
+| `agnes.cost_usd` | both | the price `src/llm_pricing.py` computed for the call, at the same rates the matching `llm_calls` row was priced at — a collector never has to re-implement the price table |
+| `agnes.kind` | both | `completion` (the broker), `generation` (a server-side call), `turn`, `tool`, or `feedback` |
+| `agnes.tool_calls` | turn | how many tool calls the turn made, set when the turn span closes |
+
+**Identity minimisation.** `agnes.user_email` is not exported on any span —
+only `agnes.user_id` rides the span, which has a stable join value
+off-instance the email never had. Fetching the email used to be the only
+reason the broker read the session row for the native sandbox's `main`
+scope on the span path, and it no longer does. A collector-side query that
+already references the attribute is unaffected: a missing-key read comes
+back `NULL` rather than an error, so the column simply empties.
 
 The resource on every span is `service.name=agnes`, `service.version`,
 `deployment.environment` and `service.instance.id` (`hostname:pid`) —
@@ -497,13 +684,63 @@ The resource on every span is `service.name=agnes`, `service.version`,
 both signals. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override
 any of them.
 
-### Content
+### Content policy — placement and consent
 
-Prompt and completion text is **not** exported by default, for the same
-reason the logs never carry it: in this product it routinely holds customer
-data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds two **span events** — never span
-attributes — in the OpenTelemetry GenAI message shape (`[{role, parts}]`
-as JSON):
+Prompt and completion TEXT leaves the instance only under a policy somebody
+recorded — the same reasoning the logs follow (never carry it), extended
+with WHO agreed and WHERE it goes. Three placement tiers, named in the
+policy and in this doc:
+
+- **T0, on-instance.** `chat_messages`, session JSONL, `llm_calls`. Always,
+  under the customer's own contract.
+- **T1, operator-controlled collector.** An OTLP endpoint the instance's own
+  owner runs.
+- **T2, third-party collector.** An endpoint someone else runs (the vendor,
+  a SaaS). The code cannot verify which tier an endpoint actually is — the
+  policy record makes the operator say it.
+
+`config/instance.yaml`:
+
+```yaml
+observability:
+  content_export:
+    mode: off            # off | pseudonymized | full
+    placement: operator  # operator | third_party
+    basis: ""            # free text: contract clause, DPA reference, "internal dev instance"
+    approved_by: ""      # a person, never blank unless off
+    approved_at: ""      # ISO date — required; an undated approval is `off`
+    workloads: []        # allowlist; empty = every workload once mode != off
+```
+
+Rules, enforced in `src/observability/otel.py` and
+`src/observability/content_policy.py`:
+
+- **A mode without a basis is `off`.** `capture_content_enabled()` (and the
+  relay's `content_export_mode()`) return true only when `mode != off` AND
+  `basis`, `approved_by`, `placement` are ALL non-empty; an unfinished
+  record is logged at WARNING at startup ("content export requested
+  without a recorded basis; exporting sizes only") and treated as `off`.
+- **`AGNES_OTEL_CAPTURE_CONTENT` is a deprecated alias.** It used to be the
+  whole switch. Set while no policy exists, it is now ignored with the
+  same warning. **BREAKING**: a deployment that relied on the variable
+  alone must add the policy record above to keep exporting content.
+- **The effective policy is logged once at startup** (mode, placement,
+  approved_by, workloads) and written to the audit log as
+  `observability.content_export` (a system action, content-free — the
+  basis TEXT stays in the config file, only `basis_recorded: true/false`
+  enters `params`), so the decision is in the trail rather than in
+  somebody's memory.
+- **`pseudonymized` runs every exported text through the instance
+  anonymizer** (`src.anonymization.anonymize_markdown`, this instance's own
+  pseudonym key and `rules_from_config()`) before it is exported — stable
+  `EMAIL_<hmac>`/`PERSON_<hmac>`… tokens, so a collector can still tell two
+  mentions apart without ever holding the value. `full` exports as today,
+  unchanged. A pseudonymisation that cannot run (a missing key, an
+  anonymizer failure) withholds the text — `export_text` fails **closed**,
+  never falls back to the raw exchange.
+
+Text rides two span **events** — never span attributes — in the
+OpenTelemetry GenAI message shape (`[{role, parts}]` as JSON):
 
 | event | attribute | carries |
 |---|---|---|
@@ -522,7 +759,33 @@ independently (in a Data-Streams style sink that means mapping the
 (`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged on the span as
 `agnes.content_truncated`; the sizes (`agnes.prompt_chars` /
 `agnes.completion_chars`) are on the span whether capture is on or not.
-Turn it on only where the collector is allowed to hold that data.
+
+**Content classes differ by workload**, and `workloads` (empty by default,
+meaning every workload once `mode` is not `off`) lets the policy say so: an
+operator can open `builder`/`corporate_memory` content for quality work
+while keeping `chat` at `off`, because the two carry very different
+content:
+
+| workload | the prompt is | the completion is |
+|---|---|---|
+| `chat` / `agent_api` | the customer's conversation and data | the customer's conversation |
+| `extraction` (facts, OCR, vision, NER) | the customer's document | a derived artifact (facts, proposals) |
+| `builder` | an admin-authored draft plus candidate ids | a config patch |
+| `corporate_memory` / `knowledge` / `semantic_layer` | employee notes, catalog text | derived notes |
+
+Every content producer passes its own workload to the gate
+(`capture_content_enabled(workload=...)` in `src/observability/otel.py`,
+which reads `content_export_mode(workload=...)` in
+`src/observability/content_policy.py`): a completion span's is the chat
+turn's (or `agent_api` for an agent-bound call), a generation span's is the
+ambient `llm_context`'s, and the engine's telemetry relay (below) is `chat`
+by definition. A workload name the vocabulary does not know is dropped
+from the allowlist and warned about at startup rather than kept, so a typo
+cannot silently expand "only these workloads" into "everything". The
+other direction is closed too: a `workloads` value that names nothing valid
+(a typo-only list, a mapping) disables content export with a warning instead
+of widening it, and a bare string (`workloads: chat`) is read as a one-entry
+list.
 
 ### The embedded engine's own spans
 
@@ -544,6 +807,199 @@ mint one and every turn fails before the prompt is sent. Rolling back is
 the reverse: clear the URL, then the app.
 
 Not exported by anything: HTTP request spans and database calls.
+
+#### The relay under the same policy
+
+The sandbox's own spans carry the same content classes the broker's
+completion spans do — the prompt, the tool calls, the answer — so
+`otlp_proxy` (`app/api/broker.py`) decodes the protobuf batch it is about
+to forward and applies the SAME `observability.content_export` policy, at
+workload `chat` by definition (the relay carries one turn's own prompt and
+answer):
+
+- **`off`** (the default) — the content attributes (`gen_ai.prompt`,
+  `gen_ai.completion`, `gen_ai.input.messages`, `gen_ai.output.messages`)
+  are stripped from every span and span event, and
+  `agnes.content_stripped=true` is added wherever something was actually
+  removed; the structural turn/step/tool spans still flow — refusing the
+  whole batch would lose what answers "what did this turn do" to protect
+  something a removal already protects. A logs batch is accepted and its
+  bodies dropped, so the exporter sees a 2xx rather than retrying a
+  decision the operator made.
+- **`pseudonymized`** — every content attribute and log body is rewritten
+  through the instance anonymizer, and the batch is re-serialised
+  uncompressed (the caller drops the `content-encoding` header it was
+  about to forward).
+- **`full`** — the bytes are forwarded byte-for-byte, compression header
+  and all — no decode, no re-serialise.
+
+Metrics (`/v1/metrics`) are always forwarded as sent — counts, never
+content. A gzip-encoded batch is decompressed for scrubbing and re-sent
+uncompressed; a batch that cannot be decoded (bad gzip, not a valid
+protobuf of the declared signal, or a decompression past the relay's own
+ceiling) is refused with `400 otlp_batch_undecodable` rather than
+forwarded unstripped — a relay that cannot read a batch cannot claim the
+batch is free of content, so it fails **closed** under `off`/`pseudonymized`,
+the same way `export_text` fails closed for the app's own spans.
+
+## Conversation corpus export — for evaluation, under the content policy
+
+Telemetry (above) is one span/row per LLM call, content capped, for "what did
+this cost and where does it burn". The corpus export is a different product:
+one COMPLETE record per chat session, every surface (web, Slack, Telegram,
+agent API), built on-instance from what the instance already keeps
+(`chat_sessions`, `chat_messages`, `llm_calls`, `chat_message_feedback`,
+`agent_memories`) — for "why are the answers bad, at scale".
+
+### Shape
+
+One record per session:
+
+| field | source |
+|---|---|
+| `thread_id` | `chat_sessions.id` |
+| `source` | literal `agnes` |
+| `surface`, `agent_id`, `user_id` | the session — **never the email** |
+| `deployment_environment` | the instance label the logs and spans carry |
+| `conversation_start`, `conversation_end`, `duration_seconds` | first and last message timestamps |
+| `turn_count`, `message_count`, `tool_call_count`, `tool_calls_sequence` | derived from messages and parts |
+| `llm_run_count`, `total_prompt_tokens`, `total_completion_tokens`, `llm_cache_read_tokens`, `llm_cache_creation_tokens`, `total_cost`, `primary_model`, `provider` | summed from the session's `llm_calls` rows; fallback to `chat_messages` token columns when no `llm_calls` row exists |
+| `cost_status` | `ledger` (measured from `llm_calls`), `transcript` (priced from `chat_messages` token columns), or `unavailable` (zeros, never a silent zero) |
+| `messages_json` | `[{role, content, turn_id, created_at, parts}]` — complete, tool_use and tool_result blocks included, in order |
+| `tool_calls_json` | `[{turn_id, tool_name, input, output, is_error, started_at}]` |
+| `first_user_message`, `last_message_role`, `final_assistant_message_complete` | derived |
+| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames, plus the transcript's own last word (`interrupted` when the turn was lost, `cancelled` when a person stopped it — the second is not an error) — a call is `ok`, `error` (the upstream refused or was unreachable) or `incomplete` (a stream that returned HTTP 200 but never reached its stop reason, i.e. a half-delivered answer), and `has_error` counts everything that is not `ok` |
+| `feedback_json` | `[{turn_id, user_id, verdict, comment, created_at}]` |
+| `memory_writes_json` | `[{memory_id, turn_id, status, content_length}]` — the memory's own content is never included, only its length |
+| `content_mode` | `full` or `pseudonymized` — what this record's text went through |
+| `exported_at` | |
+
+### Under the content policy
+
+Both the field table's content-bearing fields and the export as a whole are
+gated by the same `observability.content_export` policy the OTel export
+above obeys (mode/placement/basis/approved_by/workloads — see *Content
+policy — placement and consent* above). A pull refuses
+`403 content_export_disabled` — with a `reason` of `mode_off`, `no_basis`
+or `workload_excluded` — when the policy is off, has no recorded basis, or
+its `workloads` allowlist excludes `chat`. Under `mode: pseudonymized`,
+`messages_json`, `tool_calls_json` and
+`first_user_message` go through the same instance anonymizer the OTel path
+uses, once at export time (never per span, unlike the telemetry above);
+under `full` they export verbatim. `content_mode` on every record says
+which happened, so a downstream consumer never has to guess. No new
+retention: the export reads what `chat_messages` already keeps.
+
+### Pulling it
+
+By default the pull's upper bound lags by the same five-minute settle
+window the push sink uses, so a turn still being written is left for a later
+call; an explicit `until` is honoured exactly as given.
+
+`GET /api/admin/conversations/corpus?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+— admin-only, Postgres-only (a DuckDB-backed instance answers a typed
+`501`), newline-delimited JSON by default, `limit` at most 500, a keyset
+cursor on `(last_message_at, id)` returned as both the `X-Next-Cursor`
+header and `next_cursor` in the JSON body (`format=json`). `since` is
+required — a bare call is a `400 since_required`, not an unbounded scan of
+every conversation the instance has ever held.
+
+```bash
+curl -s -H "Authorization: Bearer $PAT" \
+  "$SERVER/api/admin/conversations/corpus?since=2026-01-01&limit=200" \
+  | tee conversations.jsonl
+```
+
+`agnes admin conversations export --since 2026-01-01 --out conversations.jsonl`
+mirrors it from the terminal, following the cursor across pages until
+exhausted (`--json` writes one array instead). A data platform pulls this
+with a generic HTTP extractor and a personal access token — the format is
+deliberately transport-neutral, no vendor-specific client required.
+
+Every pull writes one `conversations.export` audit row (`since`, `until`,
+`surface`, `agent_id`, `count`, `content_mode`, `placement`, `delivery:
+"pull"` — never the exported content itself).
+
+### Pushing it
+
+Set `observability.conversation_export.{endpoint, headers_secret_env,
+interval_minutes, surfaces}` in `instance.yaml` to turn on a scheduled push.
+A `conversation-export` worker job (LIGHT lane, one at a time — an
+idempotency key plus a Postgres advisory lease acquired only once the config
+and content-export-policy gates below pass, so an unconfigured or
+policy-off instance never opens a database connection for it) reads a
+Postgres-persisted watermark (`export_watermarks`, Postgres-only — a
+`(last_message_at, id)` keyset position, not a bare timestamp, so the
+trailing conversation of a run is never re-sent on the next tick, keyed by
+a hash of `endpoint` + `surfaces` rather than one fixed row — repointing
+`endpoint` or widening/narrowing `surfaces` therefore re-delivers the
+whole corpus under the new configuration from a fresh cursor, so the
+destination collector must upsert by `thread_id`), walks every
+conversation completed since it, and POSTs newline-delimited JSON
+batches (at most 200 records or 8 MiB per request — a single conversation
+whose own line already exceeds 8 MiB is still offered to the destination,
+since the export is "complete, never truncated" and there is nothing
+smaller to send; if the destination refuses it the run steps over that one
+record rather than stopping, counting it as `oversized_skipped` in the
+audit row and naming it in the log, so one outsized transcript cannot block
+every conversation behind it, and the pull endpoint — which has no batch
+cap — still serves it whole) to `endpoint`, with the auth headers parsed
+`OTEL_EXPORTER_OTLP_HEADERS`-style from the environment variable named by
+`headers_secret_env` — the header value itself never sits in
+`instance.yaml`. Because that request carries a secret and customer
+conversations, `endpoint` is held to a narrow shape — an `https://` URL to
+a named host (plain `http://` only to the loopback host, for a local relay)
+with no credentials in it — and, when `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`
+is set, its host must be on that list, the same egress control the
+credentialed remote `ATTACH` uses; anything else leaves the sink off with a
+warning rather than posting anywhere. `surfaces` narrows the underlying query itself, not just
+what gets POSTed, so an excluded surface is never fetched at all. A
+conversation is exported once its last message is at least 5 minutes old;
+a thread that continues later is re-exported with the fuller transcript,
+so the destination upserts by `thread_id`. Delivery is retried three
+times (four attempts total, exponential backoff: 1s, 2s, 4s) on a 5xx or a
+connection error; a 4xx (including 429) is never retried within a run and
+leaves the watermark exactly where the last successful batch left it, to
+be retried on the next tick rather than skipped or resent from scratch.
+`interval_minutes` (default 60) sets the scheduler cadence; with `endpoint`
+unset the scheduler has no such row at all. The same content-export policy
+gates it: when the policy is `off`, has no recorded basis, or excludes the
+`chat` workload, the job sends nothing and leaves the watermark alone
+(warned once per process, not once per tick). Audited as
+`conversations.export` with `delivery: "push"`, `count`, `refreshed` and
+`endpoint_host` — never headers, never content. A run that fails
+unexpectedly mid-walk is caught, logged, and audited with
+`result: "failed"` and the exception's class name (never its message) —
+the job itself never raises. On a DuckDB-backed instance the job is a
+clean no-op.
+
+The main watermark only ever advances past a `chat_sessions` row once, so a
+thumbs-up/down (or a comment edit) filed on a turn AFTER its conversation
+was already delivered would otherwise sit in `chat_message_feedback`
+forever with nothing that ever revisits it — the delivered record's
+`feedback_json` would stay empty for good. After the main walk, the same
+run additionally sweeps for the session ids whose feedback changed since
+the last sweep — narrowed by the same `surfaces` allowlist as the main walk,
+pushed into the sweep's own query (a join against `chat_sessions`) rather
+than filtered on the ids afterwards, so an excluded surface's feedback
+neither ships nor consumes a slot in the capped page ahead of an included
+surface's update — and re-delivers just those records through the identical
+builder/batching/retry path (`refreshed` in the audit row, separate from
+`count`) — the destination already upserts by `thread_id`, so a
+re-delivered record simply replaces the stale one. This aux sweep tracks
+its own, coarser watermark (same `export_watermarks` table, one row per
+delivery configuration, suffixed `:feedback`) as a `(timestamp, session_id)`
+keyset position exactly like the main watermark, and is capped at 500
+session ids per run: when a page comes back full the watermark advances
+only to the last id it actually scanned, so the NEXT run resumes the same
+burst instead of jumping ahead and dropping everything past the cap; a page
+that comes back short (the window is exhausted) advances all the way to the
+run's own upper bound. A session the main walk already delivered in the
+same run is never swept twice — its feedback at query time already rode
+along in that record. Memory-status changes (`agent_memories`) are NOT
+covered by this sweep: that table has no single "last changed" timestamp
+column to sweep on, only separate `created_at`/`activated_at`/`archived_at`
+markers for each lifecycle step.
 
 ## No telemetry vendor
 

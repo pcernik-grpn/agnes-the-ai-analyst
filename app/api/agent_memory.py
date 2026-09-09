@@ -49,6 +49,7 @@ from pydantic import BaseModel, field_validator
 from app.api.agent_sessions import SessionRuntimePrincipal, require_session_principal
 from app.auth.access import require_agent_profiles_enabled
 from app.chat.config import ChatConfig
+from app.chat.turn_context import read_turn, started_no_later_than
 from src.repositories import agent_memories_repo, audit_repo
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,19 @@ async def remember(
 
     status = "active" if mode == "auto" else "pending"
     memory_id = str(uuid4())
+    # Memory provenance (design 2026-09-08 §3.5, finding B): fill the source
+    # turn/message from the session's live chat turn, but only a turn that
+    # is BOTH still open (``is_open()`` — closed, or a legacy record with no
+    # ``ended_at`` key to say either way, means "no", never "assume open")
+    # AND not newer than this write (``started_no_later_than``, the same
+    # rule the broker applies to a late completion, finding A). A write
+    # that happens outside any live turn — an owner note through the API, a
+    # curator job — must never borrow whatever stale or unrelated turn
+    # `read_turn` still has to return; no provenance is honest, a wrong one
+    # is not.
+    write_started_at = datetime.now(timezone.utc)
+    turn = read_turn(session_id)
+    attribute_turn = turn is not None and turn.is_open() is True and started_no_later_than(turn, write_started_at)
     repo.create(
         id=memory_id,
         agent_id=agent["id"],
@@ -207,6 +221,8 @@ async def remember(
         content=body.content,
         source_session_id=session_id,
         status=status,
+        source_turn_id=turn.turn_id if attribute_turn else None,
+        source_message_id=turn.message_id if attribute_turn else None,
     )
     _audit(
         action="agent.memory.write",
@@ -215,6 +231,11 @@ async def remember(
         agent_id=agent["id"],
         session_id=session_id,
         # content length only — never the content itself.
-        extra={"memory_id": memory_id, "status": status, "content_length": len(body.content)},
+        extra={
+            "memory_id": memory_id,
+            "status": status,
+            "content_length": len(body.content),
+            "turn_id": turn.turn_id if attribute_turn else None,
+        },
     )
     return {"id": memory_id, "status": status}

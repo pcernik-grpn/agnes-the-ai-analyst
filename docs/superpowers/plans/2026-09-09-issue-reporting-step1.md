@@ -30,7 +30,7 @@
 
 **Files:**
 - Create: `src/models/issue_reports.py`
-- Create: `migrations/versions/0116_issue_reports.py`
+- Create: `migrations/versions/0119_issue_reports.py`
 - Modify: `src/models/__init__.py:90-94` (alphabetized import block)
 - Create: `src/repositories/issue_reports_pg.py`
 - Modify: `src/repositories/__init__.py:696` (`_REGISTRY`) and `:1213` (factory functions)
@@ -162,7 +162,7 @@ from src.models.issue_reports import IssueComment, IssueReport
 
 - [ ] **Step 2: Write the migration**
 
-Check the head first: `ls migrations/versions | tail -3` — if a `0114_*` already exists, take the next number and revise the newest head. `migrations/versions/0116_issue_reports.py`:
+Check the head first: `ls migrations/versions | tail -3` — if a `0114_*` already exists, take the next number and revise the newest head. `migrations/versions/0119_issue_reports.py`:
 
 ```python
 """issue_reports + issue_comments (issue reporting, step 1)
@@ -171,7 +171,7 @@ PG-ONLY (A3 PG-first ratchet): this table pair landed after the DuckDB
 app-state backend was frozen, so there is no ``src/db.py`` ladder step and
 no DuckDB repository. ``SCHEMA_VERSION`` does not move.
 
-Revision ID: 0116_issue_reports
+Revision ID: 0119_issue_reports
 Revises: 0113_data_apps_data_identity
 Create Date: 2026-09-09
 """
@@ -182,7 +182,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "0116_issue_reports"
+revision = "0119_issue_reports"
 down_revision = "0113_data_apps_data_identity"
 branch_labels = None
 depends_on = None
@@ -771,7 +771,7 @@ Run: `.venv/bin/python -m pytest tests/test_issue_notifier.py tests/test_instanc
 Run: `.venv/bin/python scripts/verify_syncmap.py` and `.venv/bin/python -m pytest tests/ connectors/ --lane impacted --tb=short -n auto -q`. Expected: clean / PASS.
 
 ```bash
-git add src/models/issue_reports.py src/models/__init__.py migrations/versions/0116_issue_reports.py \
+git add src/models/issue_reports.py src/models/__init__.py migrations/versions/0119_issue_reports.py \
         src/repositories/issue_reports_pg.py src/repositories/__init__.py \
         connectors/internal/access.py connectors/internal/registry.py \
         app/services/issue_notifier.py config/instance.yaml.example \

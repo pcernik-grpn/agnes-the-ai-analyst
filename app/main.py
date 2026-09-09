@@ -598,6 +598,7 @@ from app.api.admin_user_sessions import router as admin_user_sessions_router
 from app.api.admin_sessions import router as admin_sessions_router
 from app.api.admin_usage import router as admin_usage_router
 from app.api.admin_usage_summary import router as admin_usage_summary_router
+from app.api.conversations_export import router as conversations_export_router
 from app.api.admin_reports import router as admin_reports_router
 from app.api.admin_dashboard import router as admin_dashboard_router
 from app.api.admin_adoption import router as admin_adoption_router
@@ -973,6 +974,10 @@ async def lifespan(app):
     from src.observability.otel import configure_otel
 
     configure_otel(role=os.environ.get("AGNES_ROLE") or "app")
+
+    from src.observability.content_policy import announce_content_export_policy
+
+    announce_content_export_policy()
 
     # Surface an unsafe/no-op data-apps posture at startup: enabled, but
     # same-origin serving off and no isolated origin configured, so no hosted
@@ -3161,6 +3166,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_sessions_router)
     app.include_router(admin_usage_router)
     app.include_router(admin_usage_summary_router)
+    app.include_router(conversations_export_router)
     app.include_router(admin_reports_router)
     app.include_router(admin_dashboard_router)
     app.include_router(admin_adoption_router)

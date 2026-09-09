@@ -345,26 +345,30 @@ def _stub_turn(message: str, draft: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _llm_turn(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+def _llm_turn(
+    prompt: str, schema: Dict[str, Any], *, user_id: str | None = None, subject_id: str | None = None
+) -> Dict[str, Any]:
     from app.instance_config import load_instance_config
     from connectors.llm import create_extractor_from_env_or_config
+    from src.observability.llm_context import llm_context
 
     try:
         instance_config = load_instance_config()
     except (ValueError, FileNotFoundError):
         instance_config = {}
     extractor = create_extractor_from_env_or_config((instance_config or {}).get("ai"))
-    return extractor.extract_json(
-        prompt=prompt,
-        max_tokens=2000,
-        json_schema=schema,
-        schema_name="mcp_builder_turn",
-        system=SYSTEM,
-    )
+    with llm_context(workload="builder", purpose="mcp_builder_turn", user_id=user_id, subject_id=subject_id):
+        return extractor.extract_json(
+            prompt=prompt,
+            max_tokens=2000,
+            json_schema=schema,
+            schema_name="mcp_builder_turn",
+            system=SYSTEM,
+        )
 
 
 @router.post("/builder/turn")
-async def mcp_builder_turn(payload: McpTurnRequest):
+async def mcp_builder_turn(payload: McpTurnRequest, user: dict = Depends(require_admin)):
     """Run one turn of the MCP builder. Proposes into the panel; writes nothing.
 
     Registering the source, storing its secret and granting its tools are all
@@ -381,8 +385,14 @@ async def mcp_builder_turn(payload: McpTurnRequest):
         result: Dict[str, Any] = _stub_turn(message, draft)
     else:
         try:
+            # No subject_id: an MCP source draft has no row until the admin
+            # registers it — there is nothing yet to attribute this turn's
+            # calls to.
             result = await asyncio.to_thread(
-                _llm_turn, _prompt(message=message, history=payload.history, draft=draft), _schema()
+                _llm_turn,
+                _prompt(message=message, history=payload.history, draft=draft),
+                _schema(),
+                user_id=user["id"],
             )
         except ValueError as e:
             logger.warning("mcp builder: no LLM configured: %s", e)

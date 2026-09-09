@@ -40,6 +40,42 @@ def otel_exporter(monkeypatch):
     otel.shutdown_otel()
 
 
+@pytest.fixture
+def content_policy_full(monkeypatch):
+    """Content export ON under a complete policy record — what an operator
+    who filled in mode/placement/basis/approver gets."""
+    from src.observability import content_policy
+
+    # ``workload=None`` default: a real ``content_export_mode`` accepts one
+    # too (spec 3.6's per-workload allowlist), and every producer now passes
+    # its own — an unfiltered `full` here means no allowlist is configured.
+    monkeypatch.setattr(content_policy, "content_export_mode", lambda workload=None: "full")
+    return content_policy
+
+
+@pytest.fixture
+def content_policy_pseudonymized(monkeypatch):
+    from src.observability import content_policy
+
+    monkeypatch.setattr(content_policy, "content_export_mode", lambda workload=None: "pseudonymized")
+    monkeypatch.setattr(content_policy, "_pseudonym_key", lambda: b"unit-test-key")
+    return content_policy
+
+
+@pytest.fixture
+def content_policy_full_for_builder_only(monkeypatch):
+    """``mode: full`` narrowed to the ``builder`` workload only (spec 3.6's
+    ``workloads`` allowlist) — a `chat` completion carries no content while a
+    `builder` generation does, under the very same base mode."""
+    from src.observability import content_policy
+
+    def _mode(workload=None):
+        return "full" if workload in (None, "builder") else "off"
+
+    monkeypatch.setattr(content_policy, "content_export_mode", _mode)
+    return content_policy
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle and resource
 # ---------------------------------------------------------------------------
@@ -104,9 +140,9 @@ def test_configure_is_idempotent(otel_exporter):
 
 
 def test_trace_generation_emits_a_span(otel_exporter):
-    with trace_generation(provider="anthropic", model="claude-x", distinct_id="u1") as cap:
+    with trace_generation(provider="anthropic", model="claude-x", distinct_id="u1", purpose="unit") as cap:
         cap.set_input("hello")
-        cap.set_tokens(10, 5)
+        cap.set_tokens(10, 5, cache_read_tokens=7, cache_creation_tokens=1)
         cap.set_output("world!")
     (span,) = otel_exporter.get_finished_spans()
     attrs = dict(span.attributes)
@@ -115,6 +151,10 @@ def test_trace_generation_emits_a_span(otel_exporter):
     assert attrs["gen_ai.request.model"] == "claude-x"
     assert attrs["gen_ai.usage.input_tokens"] == 10
     assert attrs["gen_ai.usage.output_tokens"] == 5
+    assert attrs["gen_ai.usage.cache_read_input_tokens"] == 7
+    assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 1
+    assert attrs["agnes.cost_usd"] > 0  # priced here, not re-derived by a collector
+    assert attrs["agnes.purpose"] == "unit"
     assert attrs["agnes.prompt_chars"] == 5
     assert attrs["agnes.completion_chars"] == 6
     assert attrs["agnes.user_id"] == "u1"
@@ -125,12 +165,125 @@ def test_trace_generation_emits_a_span(otel_exporter):
 
 
 def test_trace_generation_marks_a_failure(otel_exporter):
-    with pytest.raises(RuntimeError):
-        with trace_generation(provider="openai_compat", model="m"):
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), trace_generation(provider="openai_compat", model="m"):
+        raise RuntimeError("boom")
     (span,) = otel_exporter.get_finished_spans()
     assert span.status.status_code.name == "ERROR"
     assert dict(span.attributes)["error.type"] == "RuntimeError"
+
+
+def test_a_vertex_extractor_generation_is_labelled_gcp_vertex_ai(otel_exporter):
+    """``VertexExtractor`` bills through Google Cloud, not a direct
+    Anthropic call — its generation span carries ``gen_ai.system=
+    gcp.vertex_ai``, the same label every other Vertex call site uses
+    (``src/observability/llm_tracing.py::provider_label``), never the bare
+    ``"vertex"`` setting value the config resolves to."""
+    from connectors.llm.vertex_provider import VertexExtractor
+
+    with trace_generation(provider=VertexExtractor._TRACE_PROVIDER, model="claude-haiku-4-5") as cap:
+        cap.set_input("hello")
+        cap.set_output("world")
+    (span,) = otel_exporter.get_finished_spans()
+    assert dict(span.attributes)["gen_ai.system"] == "gcp.vertex_ai"
+
+
+# ---------------------------------------------------------------------------
+# Call context, cost and cache tokens on the spans; ids and remote parents
+# ---------------------------------------------------------------------------
+
+
+def test_a_completion_span_carries_the_call_context_and_never_the_email(otel_exporter):
+    from src.observability.llm_context import LlmCallContext
+
+    ctx = LlmCallContext(workload="chat", purpose="completion", turn_id="t1", user_id="u1", agent_id="a1")
+    span = otel.start_completion_span(
+        upstream="anthropic", model="m", stream=False, session_id="s", ticket_scope="main", context=ctx
+    )
+    otel.end_completion_span(span, status_code=200, cost_usd=0.125)
+    (finished,) = otel_exporter.get_finished_spans()
+    attrs = dict(finished.attributes)
+    assert attrs["agnes.workload"] == "chat"
+    assert attrs["agnes.purpose"] == "completion"
+    assert attrs["agnes.turn_id"] == "t1"
+    assert attrs["agnes.user_id"] == "u1"
+    assert attrs["agnes.agent_id"] == "a1"
+    assert attrs["agnes.cost_usd"] == 0.125
+    # Identity minimisation: the id joins, the email is personal data with no
+    # join value off-instance.
+    assert "agnes.user_email" not in attrs
+
+
+def test_an_explicit_identity_argument_wins_over_the_context(otel_exporter):
+    from src.observability.llm_context import LlmCallContext
+
+    span = otel.start_completion_span(
+        upstream="anthropic",
+        model="m",
+        stream=False,
+        session_id="explicit",
+        ticket_scope="main",
+        user_id="explicit-user",
+        context=LlmCallContext(session_id="from-context", user_id="from-context"),
+    )
+    otel.end_completion_span(span, status_code=200)
+    (finished,) = otel_exporter.get_finished_spans()
+    attrs = dict(finished.attributes)
+    assert attrs["agnes.session_id"] == "explicit"
+    assert attrs["agnes.user_id"] == "explicit-user"
+
+
+def test_a_generation_span_carries_cache_tokens_and_cost(otel_exporter):
+    from src.observability.llm_context import LlmCallContext
+
+    span = otel.start_generation_span(
+        provider="anthropic", model="m", context=LlmCallContext(workload="ocr", purpose="scan_ocr", job_id="j1")
+    )
+    otel.end_generation_span(
+        span,
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=7,
+        cache_creation_tokens=1,
+        cost_usd=0.5,
+    )
+    (finished,) = otel_exporter.get_finished_spans()
+    attrs = dict(finished.attributes)
+    assert attrs["gen_ai.usage.cache_read_input_tokens"] == 7
+    assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 1
+    assert attrs["agnes.cost_usd"] == 0.5
+    assert attrs["agnes.workload"] == "ocr" and attrs["agnes.job_id"] == "j1"
+
+
+def test_span_ids_and_remote_parent_context(otel_exporter):
+    """The ledger row stores the ids so it joins to the exported span, and a
+    span opened in another process can still be the parent."""
+    parent = otel.start_completion_span(
+        upstream="anthropic", model="m", stream=False, session_id="s", ticket_scope="main"
+    )
+    trace_id, span_id = otel.span_ids(parent)
+    assert trace_id and span_id and len(trace_id) == 32 and len(span_id) == 16
+    int(trace_id, 16), int(span_id, 16)  # lowercase hex, parseable
+
+    child = otel.start_completion_span(
+        upstream="anthropic",
+        model="m",
+        stream=False,
+        session_id="s",
+        ticket_scope="main",
+        parent_context=otel.remote_parent_context(trace_id, span_id),
+    )
+    otel.end_completion_span(child, status_code=200)
+    otel.end_completion_span(parent, status_code=200)
+
+    (child_finished,) = [s for s in otel_exporter.get_finished_spans() if s.parent is not None]
+    assert child_finished.parent.span_id == int(span_id, 16)
+    assert child_finished.context.trace_id == int(trace_id, 16)
+
+
+def test_span_ids_and_remote_parent_context_degrade_quietly():
+    assert otel.span_ids(otel._NoopSpan()) == (None, None)
+    assert otel.remote_parent_context("zz", "yy") is None
+    assert otel.remote_parent_context(None, None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -370,10 +523,11 @@ def test_broker_completion_emits_one_span(otel_broker, otel_exporter):
     assert "secret answer" not in json.dumps(attrs)
 
 
-def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_exporter, monkeypatch):
+def test_broker_streamed_completion_with_content_and_identity(
+    otel_broker, otel_exporter, content_policy_full, monkeypatch
+):
     from app.chat.types import Surface
 
-    monkeypatch.setenv(otel.CAPTURE_CONTENT_VAR, "1")
     session = chat_session_repo().create_session(user_email="otel-user@test.com", surface=Surface.WEB)
     tok = ticket_repo().mint(session.id, "llm", ttl_seconds=60)  # the engine's egress scope
     _FakeUpstream.content_type = "text/event-stream"
@@ -429,7 +583,10 @@ def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_
     assert attrs["agnes.response_bytes"] > 0
     assert attrs["agnes.ticket_scope"] == "llm"
     assert attrs["agnes.session_id"] == session.id
-    assert attrs["agnes.user_email"] == "otel-user@test.com"
+    # Identity minimisation (spec 3.6): the session row is no longer read on
+    # the span path at all, and the address never leaves the instance — this
+    # session has no bound agent, so the id fields are simply absent too.
+    assert "agnes.user_email" not in attrs
     assert attrs["gen_ai.response.model"] == "claude-stream"
     assert attrs["gen_ai.usage.input_tokens"] == 20
     assert attrs["gen_ai.usage.output_tokens"] == 4  # the stream's final (max) figure, not a sum
@@ -449,6 +606,89 @@ def test_broker_streamed_completion_with_content_and_identity(otel_broker, otel_
     assert attrs["agnes.prompt_chars"] == len(events[otel.PROMPT_EVENT]["gen_ai.prompt"])
     assert attrs["agnes.completion_chars"] == len(events[otel.COMPLETION_EVENT]["gen_ai.completion"])
     assert "agnes.content_truncated" not in attrs
+
+
+def test_the_env_var_alone_exports_no_content(otel_broker, otel_exporter, monkeypatch):
+    """``AGNES_OTEL_CAPTURE_CONTENT`` used to be the whole switch. It is now a
+    deprecated alias: without a recorded policy it enables nothing, so the
+    span carries sizes and no events."""
+    monkeypatch.setenv(otel.CAPTURE_CONTENT_VAR, "1")
+    tok = ticket_repo().mint("chat_otel_envvar", "main", ttl_seconds=60)
+
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-x", "messages": [{"role": "user", "content": "patient Nováková"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    (span,) = otel_exporter.get_finished_spans()
+    assert span.events == ()
+    assert dict(span.attributes)["agnes.prompt_chars"] > 0
+    assert "Nováková" not in json.dumps(dict(span.attributes))
+
+
+def test_generation_span_carries_content_events_under_policy(otel_exporter, content_policy_pseudonymized):
+    """A server-side generation (a builder turn, an extraction) exports the
+    same two content events a completion does — pseudonymised, sizes intact."""
+    with trace_generation(provider="anthropic", model="claude-x", purpose="agent_builder") as cap:
+        cap.set_input("Hello jane@example.com")
+        cap.set_output("fine")
+
+    (span,) = otel_exporter.get_finished_spans()
+    events = {e.name: dict(e.attributes) for e in span.events}
+    assert set(events) == {otel.PROMPT_EVENT, otel.COMPLETION_EVENT}
+    prompt = json.loads(events[otel.PROMPT_EVENT]["gen_ai.prompt"])
+    assert prompt[0]["role"] == "user"
+    text = prompt[0]["parts"][0]["content"]
+    assert "jane@example.com" not in text and "EMAIL_" in text
+    completion = json.loads(events[otel.COMPLETION_EVENT]["gen_ai.completion"])
+    assert completion == [{"role": "assistant", "parts": [{"type": "text", "content": "fine"}]}]
+    attrs = dict(span.attributes)
+    # Sizes measure what the model saw, not what the collector got.
+    assert attrs["agnes.prompt_chars"] == len("Hello jane@example.com")
+    assert attrs["agnes.completion_chars"] == len("fine")
+    assert "agnes.content_truncated" not in attrs
+
+
+def test_generation_span_has_no_content_events_by_default(otel_exporter):
+    with trace_generation(provider="anthropic", model="claude-x") as cap:
+        cap.set_input("patient Nováková")
+        cap.set_output("the answer")
+
+    (span,) = otel_exporter.get_finished_spans()
+    assert span.events == ()
+    assert dict(span.attributes)["agnes.prompt_chars"] == len("patient Nováková")
+
+
+def test_workload_allowlist_narrows_which_producer_gets_content(
+    otel_broker, otel_exporter, content_policy_full_for_builder_only
+):
+    """``mode: full, workloads: [builder]`` (spec 3.6): the broker's completion
+    span is workload `chat` by construction and carries NO content events
+    under that policy, while a `builder`-labelled generation does — same base
+    mode, different producers."""
+    from src.observability.llm_context import llm_context
+
+    tok = ticket_repo().mint("chat_otel_workload_gate", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200, r.text
+    (completion_span,) = otel_exporter.get_finished_spans()
+    assert completion_span.events == ()
+    assert dict(completion_span.attributes)["agnes.prompt_chars"] > 0
+
+    with llm_context(workload="builder"), trace_generation(provider="anthropic", model="claude-x") as cap:
+        cap.set_input("draft")
+        cap.set_output("patch")
+
+    generation_span = otel_exporter.get_finished_spans()[-1]
+    assert {e.name for e in generation_span.events} == {otel.PROMPT_EVENT, otel.COMPLETION_EVENT}
 
 
 def test_broker_aborted_stream_is_marked_incomplete(otel_broker, otel_exporter):

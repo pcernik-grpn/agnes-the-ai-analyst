@@ -27,7 +27,7 @@ _SCRIPTS_DEV = Path(__file__).resolve().parents[1] / "scripts" / "dev"
 if str(_SCRIPTS_DEV) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DEV))
 
-from prompt_phrases import BANNED_PHRASES, REQUIRED_FACTS  # noqa: E402
+from prompt_phrases import BANNED_PHRASES, REQUIRED_FACTS
 
 
 def _assert_clean(text: str, *, label: str) -> None:
@@ -172,13 +172,14 @@ def test_the_seed_template_carries_the_same_two_hardenings_as_the_renderer():
     kept a bare `curl -fsSL -OJ` and the original "an earlier run already
     saved the credential, so just continue" false positive — which tells the
     agent to proceed on a machine where `/cli/install.sh` wrote `server:` and
-    nobody ever signed in.
+    nobody ever signed in. It also carried a `{server_url}/home step 4`
+    reference to a page that no longer hosts that step.
 
     The banned-phrase tiers cannot catch this: they scan for phrases that must
-    be ABSENT, and both gaps are about text that must be PRESENT.
+    be ABSENT, and these gaps are about text that must be PRESENT.
     """
-    from src.connectors_manifest import bundled_seed_path
     from app.web.setup_instructions import resolve_lines
+    from src.connectors_manifest import bundled_seed_path
 
     tmpl = (bundled_seed_path() / "install-prompt" / "template.md.tmpl").read_text(encoding="utf-8")
     # The renderer is compared on its RENDERED output, not its source: its
@@ -192,3 +193,9 @@ def test_the_seed_template_carries_the_same_two_hardenings_as_the_renderer():
             f"{source}: the token pre-check must require a saved credential, not just a server match"
         )
         assert "so just continue" not in text, f"{source}: the false-positive wording is back"
+        assert "{server_url}/home" not in text, f"{source}: /home no longer hosts a sign-in step"
+        # Both numbered steps must say to surface the finished command line
+        # when the agent isn't the one running it (#2380 for step 1; a live
+        # session missing it for step 2 is what prompted adding it there too).
+        assert 'not a reference to "step 1"' in text, f"{source}: step 1 must relay its exact commands"
+        assert 'not a reference to "step 2"' in text, f"{source}: step 2 must relay its exact command"
