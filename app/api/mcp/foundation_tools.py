@@ -1078,7 +1078,7 @@ def register_foundation_tools(
             return r.json()
 
     @tool(read_only=True)
-    async def collection_file_read(collection_id: str, file_id: str) -> dict:
+    async def collection_file_read(collection_id: str, file_id: str, offset: int = 0) -> dict:
         """Read one file's text straight, without guessing search terms.
 
         Use this when you know WHICH file you want — "what is in this
@@ -1086,28 +1086,39 @@ def register_foundation_tools(
         when you do not: it needs words that appear in the body, and it
         cannot enumerate a collection (see its own note).
 
-        Returns ``kind`` plus, for readable files, ``text`` and
-        ``truncated``. The server caps the text (~20k characters), so
-        ``truncated: true`` means you are holding a PREFIX — do not
-        summarise it as the whole document; fall back to
-        ``collections_search`` with a distinctive term to reach the rest.
-        Read ``text`` regardless of ``kind``: ``kind`` describes how a
-        BROWSER would show the file (``text`` / ``pdf`` / ``image``), and a
-        PDF comes back ``kind="pdf"`` while still carrying its ingested
+        Returns ``kind`` plus, for readable files, ``text``, ``truncated``,
+        ``offset``, ``next_offset`` and ``total_chars``. One call returns
+        at most ~20k characters — a page, so a single read can never flood
+        the context window. ``truncated: true`` means you are holding a
+        PREFIX: do not summarise it as the whole document. To continue,
+        call again with ``offset=next_offset`` and keep going until
+        ``next_offset`` is null; ``total_chars`` says up front how many
+        pages that is, so decide whether the whole file is worth reading
+        before you page (a 200k-character file is ten calls). ``truncated:
+        true`` with ``next_offset: null`` means a very large plain-text
+        file continues past what the server reads of it — the rest is
+        reachable only through ``collections_search`` with a distinctive
+        term. Read ``text`` regardless of ``kind``: ``kind`` describes how
+        a BROWSER would show the file (``text`` / ``pdf`` / ``image``), and
+        a PDF comes back ``kind="pdf"`` while still carrying its ingested
         text. When ``text`` is empty, ``reason`` says why (still ingesting,
         rejected, or nothing extractable) — relay that rather than
         reporting an access error.
 
         Do not loop this over a whole collection: reading many files to
-        answer one question is what retrieval is for.
+        answer one question is what retrieval is for. Paging through the
+        ONE file you were asked about is what ``offset`` exists for.
 
         Args:
             collection_id: Collection id from ``collections_list`` (``col_...``).
             file_id: File id from ``collection_get`` (``cf_...``).
+            offset: Character offset to read from — ``0`` (the default) for
+                the start, the previous response's ``next_offset`` to continue.
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{base_url}/api/collections/{collection_id}/files/{file_id}/preview",
+                params={"offset": offset},
                 headers=headers_fn(),
                 timeout=30,
             )

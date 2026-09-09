@@ -2204,9 +2204,53 @@ _PREVIEW_TEXTUAL_EXTS: frozenset[str] = frozenset(
 )
 
 # A preview is a glance, not the file: cap what we read off disk AND what we
-# return, so a 100 MiB CSV can't turn a modal into a 100 MiB response.
+# return per call, so a 100 MiB CSV can't turn a modal into a 100 MiB
+# response. The per-call cap is a PAGE, though, not a wall: `offset` / `limit`
+# walk the text and the response carries `next_offset` / `total_chars`, so a
+# non-browser reader (`agnes collections cat`, the `collection_file_read` MCP
+# tool) reaches the rest one context-sized page at a time. Before that,
+# `_extracted_text` stopped joining chunks at the cap and NO surface could
+# reach a long file's remainder — an agent asked to summarise a long deck read
+# the first third and had to guess search terms for the rest.
 _PREVIEW_READ_MAX_BYTES = 512 * 1024
 _PREVIEW_MAX_CHARS = 20_000
+
+
+def _clamp_preview_offset(offset: int) -> int:
+    """Clamp to ``>= 0`` — silently, never a 422, same reasoning as the
+    file-list clamps above: a paging client builds these itself."""
+    return max(0, offset)
+
+
+def _clamp_preview_limit(limit: int) -> int:
+    """Clamp to ``1.._PREVIEW_MAX_CHARS``: the per-call cap is the endpoint's
+    guarantee to the context window, whatever a caller asks for."""
+    return max(1, min(limit, _PREVIEW_MAX_CHARS))
+
+
+def _text_page(text: str, offset: int, limit: int, *, continues_beyond: bool = False) -> dict:
+    """One page of ``text`` plus the fields a paging reader chains on.
+
+    ``next_offset`` is where the next call starts — ``None`` when this page
+    reaches the end of ``text``. ``truncated`` keeps its original meaning,
+    "this response is not the end of the text", which is why it is ALSO true
+    on the last page when ``continues_beyond`` says the source holds more
+    than ``text`` does (the textual branch's byte window): the caller then
+    sees ``truncated: true`` with no ``next_offset`` — an honest "the file
+    goes on, but not through here" rather than a prefix passed off as the
+    whole. ``total_chars`` counts what is reachable through this endpoint.
+    """
+    total = len(text)
+    page = text[offset : offset + limit]
+    end = offset + len(page)
+    next_offset = end if end < total else None
+    return {
+        "text": page,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total_chars": total,
+        "truncated": next_offset is not None or continues_beyond,
+    }
 
 
 def _document_text_visible(caller: Any, collection_id: str) -> bool:
@@ -2335,27 +2379,26 @@ def _no_text_reason(row: dict) -> str:
 
 
 def _extracted_text(file_id: str) -> str:
-    """Joined chunk text for a file — the only text a docx/xlsx/pdf-scan has."""
+    """Joined chunk text for a file — the only text a docx/xlsx/pdf-scan has.
+
+    The WHOLE file: chunks come back ``ORDER BY ordinal`` and every one is
+    joined. This used to stop at ``_PREVIEW_MAX_CHARS``, which left chunk 21
+    onward unreachable through any surface — the cap belongs to the page the
+    endpoint returns, not to the text it pages over. The database work is
+    unchanged (``list_for_file`` already loaded every row); only the join
+    grew, and extracted text is small next to the chunk rows it came from.
+    """
     chunks = corpus_chunks_repo().list_for_file(file_id)
-    if not chunks:
-        return ""
-    out: list[str] = []
-    total = 0
-    for c in chunks:
-        text = (c.get("text") or "").strip()
-        if not text:
-            continue
-        out.append(text)
-        total += len(text)
-        if total >= _PREVIEW_MAX_CHARS:
-            break
-    return "\n\n".join(out)
+    parts = [text for c in chunks if (text := (c.get("text") or "").strip())]
+    return "\n\n".join(parts)
 
 
 @router.get("/{collection_id}/files/{file_id}/preview")
 async def preview_file(
     collection_id: str,
     file_id: str,
+    offset: int = 0,
+    limit: int = _PREVIEW_MAX_CHARS,
     user=Depends(get_current_user),
 ):
     """What to show for this file, and how — the modal's single fetch.
@@ -2365,14 +2408,28 @@ async def preview_file(
     * ``image`` / ``pdf`` — fetch ``raw_url`` and let the browser draw it.
     * ``text`` — ``text`` holds the preview (source for textual uploads, the
       ingested text for formats whose bytes aren't readable), ``truncated``
-      says a glance is all this is.
+      says this response is not the end of the text.
     * ``none`` — nothing to show yet; ``reason`` says why, in the words the
       modal shows the caller.
+
+    The text is paged. ``offset`` (characters, default ``0``) and ``limit``
+    (default and maximum ``_PREVIEW_MAX_CHARS``; both clamped, never a 422)
+    select one page; the response echoes the ``offset`` it used and adds
+    ``next_offset`` (``null`` when the page reaches the end) and
+    ``total_chars``. A caller wanting the whole file chains
+    ``offset=next_offset`` until it is ``null``. The modal sends no
+    parameters and gets the first page, exactly as before. For a textual
+    upload the text is what fits in ``_PREVIEW_READ_MAX_BYTES`` of the
+    file: ``total_chars`` counts that window and, when the file continues
+    past it, the last page is still ``truncated: true`` with no
+    ``next_offset`` — the byte cap is reported, never hidden by paging.
 
     Deliberately one endpoint for every format: the client should not have to
     know which extensions are streamable, which are text and which are only
     previewable once ingestion has run.
     """
+    offset = _clamp_preview_offset(offset)
+    limit = _clamp_preview_limit(limit)
     row = _readable_file_or_404(collection_id, file_id, user)
     ext = (row.get("file_type") or "").lower()
     base = {
@@ -2384,6 +2441,9 @@ async def preview_file(
         "raw_url": None,
         "text": None,
         "truncated": False,
+        "offset": offset,
+        "next_offset": None,
+        "total_chars": 0,
         "source": None,
         "reason": None,
     }
@@ -2439,16 +2499,16 @@ async def preview_file(
             return {
                 **base,
                 "kind": "text",
-                "text": media_text[:_PREVIEW_MAX_CHARS],
-                "truncated": len(media_text) > _PREVIEW_MAX_CHARS,
+                **_text_page(media_text, offset, limit),
                 "source": "extracted",
             }
+        page = _text_page(media_text, offset, limit)
         return {
             **base,
             "kind": "image" if ext != "pdf" else "pdf",
             "raw_url": f"/api/collections/{collection_id}/files/{file_id}/raw",
-            "text": media_text[:_PREVIEW_MAX_CHARS] or None,
-            "truncated": len(media_text) > _PREVIEW_MAX_CHARS,
+            **page,
+            "text": page["text"] or None,
             "source": "extracted" if media_text else None,
             # A text-less image/PDF must still say why: a bare `text: null`
             # gives a non-browser caller nothing to relay.
@@ -2470,12 +2530,10 @@ async def preview_file(
             data = fh.read(_PREVIEW_READ_MAX_BYTES + 1)
         clipped = len(data) > _PREVIEW_READ_MAX_BYTES
         text = data[:_PREVIEW_READ_MAX_BYTES].decode("utf-8", errors="replace")
-        truncated = clipped or len(text) > _PREVIEW_MAX_CHARS
         return {
             **base,
             "kind": "text",
-            "text": text[:_PREVIEW_MAX_CHARS],
-            "truncated": truncated,
+            **_text_page(text, offset, limit, continues_beyond=clipped),
             "source": "file",
         }
 
@@ -2484,8 +2542,7 @@ async def preview_file(
         return {
             **base,
             "kind": "text",
-            "text": text[:_PREVIEW_MAX_CHARS],
-            "truncated": len(text) > _PREVIEW_MAX_CHARS,
+            **_text_page(text, offset, limit),
             "source": "extracted",
         }
 

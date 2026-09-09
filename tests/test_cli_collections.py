@@ -31,8 +31,18 @@ FOUNDATION_TOOLS_SRC = ROOT / "app" / "api" / "mcp" / "foundation_tools.py"
 def test_collections_help_lists_subcommands():
     r = runner.invoke(collections_app, ["--help"])
     assert r.exit_code == 0, r.output
-    for cmd in ("create", "list", "show", "upload", "rm", "rm-file"):
+    for cmd in ("create", "list", "show", "upload", "cat", "rm", "rm-file"):
         assert cmd in r.output, f"missing subcommand {cmd!r} in help"
+
+
+def test_cat_help_uses_the_canonical_paging_flags():
+    """`--offset` / `--limit` / `--json`, the same vocabulary `show` uses —
+    no new boolean or `--k`-style flag (command-ux playbook)."""
+    r = runner.invoke(collections_app, ["cat", "--help"])
+    assert r.exit_code == 0, r.output
+    for flag in ("--offset", "--limit", "--json"):
+        assert flag in r.output, f"cat --help does not list {flag}"
+    assert "whole" in r.output.lower(), "the help must say the default prints the whole file"
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +438,7 @@ def test_mcp_collection_get_docstring_documents_pagination_and_search():
     m = re.search(
         r"(?:async\s+)?def\s+collection_get\s*\(.*?\)\s*->[^:]*:\s*\"\"\"(.*?)\"\"\"",
         src,
-        re.S,
+        re.DOTALL,
     )
     assert m, "collection_get has no docstring in foundation_tools.py"
     doc = m.group(1).lower()

@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import io
+from datetime import UTC
 
 import pytest
 
@@ -866,7 +867,7 @@ class TestSearch:
         """#898: without the embeddings extra the ranking silently degrades to
         lexical-only — the response must say so instead of leaving clients to
         read server logs."""
-        import src.ingest.retrieval as retrieval
+        from src.ingest import retrieval
 
         monkeypatch.setattr(retrieval, "embedding_capability", lambda: False)
         c = seeded_app["client"]
@@ -882,7 +883,7 @@ class TestSearch:
     def test_search_response_labels_hybrid_retrieval(self, seeded_app, monkeypatch):
         """#898: with an embedding model available the response labels the
         ranking as hybrid."""
-        import src.ingest.retrieval as retrieval
+        from src.ingest import retrieval
 
         monkeypatch.setattr(retrieval, "embedding_capability", lambda: True)
         # Keep ranking deterministic without a real model — the label reflects
@@ -902,7 +903,7 @@ class TestSearch:
         """P0 OOM fix, 2026-09: an additive `candidates_capped: true` on the
         response when the bounded candidate scan hit its configured limit —
         never present (and never `false`) when it did not."""
-        import src.ingest.retrieval as retrieval
+        from src.ingest import retrieval
 
         c = seeded_app["client"]
         cid = self._seed_corpus_with_chunk(seeded_app, "CapOne", "widget revenue widget revenue", grant=True)
@@ -1171,7 +1172,7 @@ def test_reingest_stale_processing_is_recoverable(seeded_app, tmp_path):
     must be treated as crash-abandoned, not in-flight, so reingest proceeds
     (202) instead of 409 — otherwise a crash mid-ingest would permanently
     block the only recovery path for the stuck row."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from app.api.collections import REINGEST_STALE_PROCESSING_MINUTES
     from src.repositories import corpus_files_repo, file_corpora_repo
@@ -1191,7 +1192,7 @@ def test_reingest_stale_processing_is_recoverable(seeded_app, tmp_path):
 
     # Backdate updated_at past the threshold — simulates a crash mid-ingest,
     # where the row never got a chance to move past 'processing'.
-    stale_at = datetime.now(timezone.utc) - timedelta(minutes=REINGEST_STALE_PROCESSING_MINUTES + 5)
+    stale_at = datetime.now(UTC) - timedelta(minutes=REINGEST_STALE_PROCESSING_MINUTES + 5)
     conn = get_system_db()
     conn.execute(
         "UPDATE corpus_files SET updated_at = ? WHERE id = ?",
@@ -1886,6 +1887,88 @@ class TestFilePreview:
         assert body["kind"] == "text"
         assert body["truncated"] is True
         assert len(body["text"]) == _PREVIEW_MAX_CHARS
+        # The glance is a page, not a wall: the response says where the next
+        # one starts and how much text there is in all.
+        assert body["offset"] == 0
+        assert body["next_offset"] == _PREVIEW_MAX_CHARS
+        assert body["total_chars"] == _PREVIEW_MAX_CHARS + 5000
+
+    def test_preview_without_params_is_the_modal_contract(self, seeded_app):
+        """The modal sends no query string and must see exactly what it
+        always saw — plus the paging fields, which it ignores."""
+        cid = self._collection(seeded_app, "Preview Default")
+        fid = self._upload(seeded_app, cid, "notes.md", b"short body", "text/markdown")
+
+        body = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", headers=_auth(seeded_app["admin_token"]))
+            .json()
+        )
+        assert body["text"] == "short body"
+        assert body["truncated"] is False
+        assert body["offset"] == 0
+        assert body["next_offset"] is None
+        assert body["total_chars"] == len("short body")
+
+    def test_textual_file_pages_within_the_byte_window(self, seeded_app, monkeypatch):
+        """A textual file is read off disk up to `_PREVIEW_READ_MAX_BYTES`.
+        Pages walk that window; when the file continues past it the last
+        page still says `truncated: true` — with no `next_offset`, because
+        the endpoint cannot reach further — and `total_chars` counts only
+        what is reachable. A byte cap that paging silently hid would turn a
+        prefix into "the file"."""
+        monkeypatch.setattr("app.api.collections._PREVIEW_READ_MAX_BYTES", 64)
+        cid = self._collection(seeded_app, "Preview Window")
+        fid = self._upload(seeded_app, cid, "big.log", b"a" * 200, "text/plain")
+        url = f"/api/collections/{cid}/files/{fid}/preview"
+        tok = _auth(seeded_app["admin_token"])
+
+        first = seeded_app["client"].get(url, params={"limit": 50}, headers=tok).json()
+        assert first["text"] == "a" * 50
+        assert first["next_offset"] == 50
+        assert first["truncated"] is True
+        assert first["total_chars"] == 64
+
+        last = seeded_app["client"].get(url, params={"offset": 50, "limit": 50}, headers=tok).json()
+        assert last["text"] == "a" * 14
+        assert last["next_offset"] is None, "nothing past the byte window is reachable here"
+        assert last["truncated"] is True, "…but the file DOES continue, and the response must say so"
+        assert last["total_chars"] == 64
+
+    def test_textual_file_inside_the_byte_window_ends_cleanly(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.api.collections._PREVIEW_READ_MAX_BYTES", 64)
+        cid = self._collection(seeded_app, "Preview Window Fits")
+        fid = self._upload(seeded_app, cid, "small.log", b"b" * 60, "text/plain")
+
+        body = (
+            seeded_app["client"]
+            .get(
+                f"/api/collections/{cid}/files/{fid}/preview",
+                params={"offset": 50},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            .json()
+        )
+        assert body["text"] == "b" * 10
+        assert body["next_offset"] is None
+        assert body["truncated"] is False
+        assert body["total_chars"] == 60
+
+    def test_a_textless_preview_still_carries_the_paging_fields(self, seeded_app):
+        """One shape for every `kind`, so a paging client never branches on
+        whether the fields exist."""
+        cid = self._collection(seeded_app, "Preview None Paging")
+        fid = self._upload(seeded_app, cid, "deck.pptx", b"PK\x03\x04 fake", "application/octet-stream")
+
+        body = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", headers=_auth(seeded_app["admin_token"]))
+            .json()
+        )
+        assert body["kind"] == "none"
+        assert body["offset"] == 0
+        assert body["next_offset"] is None
+        assert body["total_chars"] == 0
 
     def test_image_previews_through_the_raw_endpoint(self, seeded_app):
         png = b"\x89PNG\r\n\x1a\n" + b"0" * 40

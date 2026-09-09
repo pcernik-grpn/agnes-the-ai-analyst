@@ -86,11 +86,45 @@ class TestBothMcpServersExposeIt:
     def test_docstring_points_back_at_search_for_long_files(self, source, which):
         """A read tool competes with retrieval; say when NOT to use it."""
         text = source.read_text(encoding="utf-8")
-        m = re.search(rf"(?:async\s+)?def\s+{TOOL}\s*\(.*?\)\s*->[^:]*:\s*\"\"\"(.*?)\"\"\"", text, re.S)
+        m = re.search(rf"(?:async\s+)?def\s+{TOOL}\s*\(.*?\)\s*->[^:]*:\s*\"\"\"(.*?)\"\"\"", text, re.DOTALL)
         assert m, f"{TOOL} has no docstring in the {which} server"
         doc = m.group(1).lower()
         assert "truncat" in doc, "does not warn that long files are truncated"
         assert "search" in doc, "does not point at search for the many-documents case"
+
+    @pytest.mark.parametrize(("source", "which"), [(HTTP_TOOLS, "HTTP"), (STDIO_TOOLS, "stdio")])
+    def test_tool_takes_an_offset_on_both_servers(self, source, which):
+        """The per-call cap stays; ``offset`` is how the rest is reached.
+
+        Both servers, or an agent on one of them holds a prefix with no way
+        to continue — `test_mcp_tool_parity.py` pins argument parity in
+        general; this names the argument that matters here.
+        """
+        import ast
+
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        fn = next(
+            n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == TOOL
+        )
+        params = {a.arg: None for a in fn.args.args}
+        assert "offset" in params, f"{TOOL} on the {which} server takes no offset"
+        defaults = dict(zip([a.arg for a in fn.args.args][-len(fn.args.defaults) :], fn.args.defaults))
+        assert isinstance(defaults.get("offset"), ast.Constant) and defaults["offset"].value == 0, (
+            f"{TOOL} on the {which} server must default offset to 0 so the first call needs no arguments"
+        )
+
+    @pytest.mark.parametrize(("source", "which"), [(HTTP_TOOLS, "HTTP"), (STDIO_TOOLS, "stdio")])
+    def test_docstring_explains_how_to_continue(self, source, which):
+        """A truncated read must tell the agent how to get the rest, not
+        only that it is holding a prefix."""
+        text = source.read_text(encoding="utf-8")
+        m = re.search(rf"(?:async\s+)?def\s+{TOOL}\s*\(.*?\)\s*->[^:]*:\s*\"\"\"(.*?)\"\"\"", text, re.DOTALL)
+        assert m, f"{TOOL} has no docstring in the {which} server"
+        doc = m.group(1)
+        assert "next_offset" in doc, "does not say to continue from next_offset"
+        assert "offset=" in doc, "does not show the continuation call"
+        assert "loop" in doc.lower(), "lost the do-not-loop-over-a-collection warning"
+        assert "prefix" in doc.lower(), "lost the a-prefix-is-not-the-document warning"
 
 
 class TestEndpointBehaviourItWraps:
@@ -113,6 +147,153 @@ class TestEndpointBehaviourItWraps:
         body = seeded_app["client"].get(f"/api/collections/{cid}/files/{fid}/preview", headers=_auth(tok)).json()
         assert body["truncated"] is True
         assert len(body["text"]) <= 20_000
+        # A capped page is a PREFIX the caller can continue from, not a wall:
+        # the response says where it stopped and how much there is in all.
+        assert body["offset"] == 0
+        assert body["next_offset"] == len(body["text"])
+        assert body["total_chars"] == 60_000
+
+    def test_offset_pages_through_to_the_end(self, seeded_app):
+        """The complaint that produced this: a deck whose text was ~4 pages
+        long could only ever be read up to page one. Chaining ``next_offset``
+        must reassemble the whole file, one context-sized page at a time."""
+        tok = seeded_app["admin_token"]
+        full = "".join(f"slide {i:05d} " for i in range(6_000))  # ~72k chars
+        cid, fid = _collection_with_file(seeded_app, tok, full.encode())
+
+        pages: list[str] = []
+        offset: int | None = 0
+        while offset is not None:
+            body = (
+                seeded_app["client"]
+                .get(
+                    f"/api/collections/{cid}/files/{fid}/preview",
+                    params={"offset": offset},
+                    headers=_auth(tok),
+                )
+                .json()
+            )
+            assert body["offset"] == offset, "the response must echo the offset it actually used"
+            assert len(body["text"]) <= 20_000, "one call must never exceed the per-call cap"
+            assert body["total_chars"] == len(full)
+            pages.append(body["text"])
+            if body["next_offset"] is None:
+                assert body["truncated"] is False, "the last page is the end of the text"
+            else:
+                assert body["truncated"] is True
+                assert body["next_offset"] == offset + len(body["text"])
+            offset = body["next_offset"]
+
+        assert len(pages) == 4
+        assert "".join(pages) == full
+
+    def test_offset_and_limit_are_clamped_not_refused(self, seeded_app):
+        """The per-call cap is the endpoint's guarantee: a caller asking for
+        more gets the cap, a caller asking for nonsense gets a sane page."""
+        tok = seeded_app["admin_token"]
+        cid, fid = _collection_with_file(seeded_app, tok, ("y" * 50_000).encode())
+        url = f"/api/collections/{cid}/files/{fid}/preview"
+
+        big = seeded_app["client"].get(url, params={"limit": 999_999}, headers=_auth(tok)).json()
+        assert len(big["text"]) == 20_000
+        assert big["next_offset"] == 20_000
+
+        tiny = seeded_app["client"].get(url, params={"limit": 0, "offset": -7}, headers=_auth(tok)).json()
+        assert tiny["offset"] == 0
+        assert len(tiny["text"]) == 1
+        assert tiny["next_offset"] == 1
+
+        small = seeded_app["client"].get(url, params={"limit": 5, "offset": 10}, headers=_auth(tok)).json()
+        assert small["text"] == "yyyyy"
+        assert small["offset"] == 10
+        assert small["next_offset"] == 15
+        assert small["truncated"] is True
+
+    def test_offset_past_the_end_is_empty_not_an_error(self, seeded_app):
+        tok = seeded_app["admin_token"]
+        cid, fid = _collection_with_file(seeded_app, tok, b"short")
+
+        body = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", params={"offset": 500}, headers=_auth(tok))
+            .json()
+        )
+        assert body["kind"] == "text"
+        assert body["text"] == ""
+        assert body["next_offset"] is None
+        assert body["truncated"] is False
+        assert body["total_chars"] == 5
+
+    def test_extracted_text_is_assembled_whole(self, monkeypatch):
+        """``_extracted_text`` used to stop joining chunks at the cap, so no
+        offset could ever reach chunk 21 of a docx. It must build the whole
+        file; the endpoint pages over it."""
+        from app.api import collections as mod
+
+        chunks = [{"ordinal": i, "text": f"chunk {i:03d} " + "z" * 990} for i in range(40)]
+
+        class _Repo:
+            def list_for_file(self, file_id):
+                assert file_id == "cf_x"
+                return chunks
+
+        monkeypatch.setattr(mod, "corpus_chunks_repo", lambda: _Repo())
+
+        text = mod._extracted_text("cf_x")
+        assert len(text) > 20_000
+        assert text.endswith("chunk 039 " + "z" * 990)
+        assert text.count("\n\n") == 39
+
+    def test_extracted_branch_pages_too(self, seeded_app, monkeypatch):
+        """A pdf/docx has no readable bytes: its pages come from chunk text
+        and must chain exactly like a textual file's."""
+        tok = seeded_app["admin_token"]
+        c = seeded_app["client"].post("/api/collections", json={"name": "Deck"}, headers=_auth(tok))
+        cid = c.json()["id"]
+        up = seeded_app["client"].post(
+            f"/api/collections/{cid}/files",
+            files={
+                "files": (
+                    "deck.pptx",
+                    b"PK\x03\x04 fake",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                )
+            },
+            headers=_auth(tok),
+        )
+        assert up.status_code == 201, up.text
+        fid = up.json()[0]["file_id"]
+        full = "".join(f"slide {i:05d}\n" for i in range(4_000))  # ~48k chars
+        monkeypatch.setattr("app.api.collections._extracted_text", lambda _fid: full)
+
+        first = seeded_app["client"].get(f"/api/collections/{cid}/files/{fid}/preview", headers=_auth(tok)).json()
+        assert first["kind"] == "text"
+        assert first["source"] == "extracted"
+        assert first["truncated"] is True
+        assert first["next_offset"] == 20_000
+        assert first["total_chars"] == len(full)
+
+        rest = (
+            seeded_app["client"]
+            .get(
+                f"/api/collections/{cid}/files/{fid}/preview",
+                params={"offset": first["next_offset"]},
+                headers=_auth(tok),
+            )
+            .json()
+        )
+        assert rest["offset"] == 20_000
+        assert first["text"] + rest["text"] == full[:40_000]
+        assert rest["next_offset"] == 40_000
+
+        last = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", params={"offset": 40_000}, headers=_auth(tok))
+            .json()
+        )
+        assert last["next_offset"] is None
+        assert last["truncated"] is False
+        assert first["text"] + rest["text"] + last["text"] == full
 
     def test_a_foreign_collection_is_not_readable(self, seeded_app):
         tok = seeded_app["admin_token"]
@@ -288,3 +469,113 @@ class TestCliCat:
         with patch("cli.commands.collections.api_get_json", return_value=payload):
             r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", "--json"])
         assert json.loads(r.output)["text"] == "alpha"
+
+
+class TestCliCatPagesThroughTheFile:
+    """`cat` means the whole file. The server pages at ~20k characters; the
+    command follows ``next_offset`` so the terminal reader never has to."""
+
+    FULL = "".join(f"line {i:04d}\n" for i in range(600))  # 6 000 chars
+
+    @classmethod
+    def _server(cls, page_size: int = 2_500):
+        """A fake preview endpoint with the real paging contract, so the test
+        exercises the client's loop and not a hand-written page list."""
+        calls: list[dict] = []
+
+        def fake(path, **params):
+            offset = max(0, int(params.get("offset", 0)))
+            limit = max(1, min(int(params.get("limit", page_size)), page_size))
+            calls.append({"offset": offset, "limit": limit})
+            page = cls.FULL[offset : offset + limit]
+            end = offset + len(page)
+            nxt = end if end < len(cls.FULL) else None
+            return {
+                "kind": "text",
+                "text": page,
+                "offset": offset,
+                "next_offset": nxt,
+                "total_chars": len(cls.FULL),
+                "truncated": nxt is not None,
+                "filename": "long.txt",
+            }
+
+        return fake, calls
+
+    def test_default_prints_the_whole_file_with_no_warning(self):
+        fake, calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1"])
+        assert r.exit_code == 0, r.output
+        assert r.output.startswith(self.FULL), "pages must be concatenated verbatim"
+        assert "truncated" not in r.output.lower(), "the whole file was printed; nothing to warn about"
+        assert [c["offset"] for c in calls] == [0, 2_500, 5_000]
+
+    def test_limit_prints_a_prefix_and_says_so(self):
+        fake, calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", "--limit", "100"])
+        assert r.exit_code == 0, r.output
+        assert r.output.startswith(self.FULL[:100])
+        assert self.FULL[:101] not in r.output
+        assert "truncated" in r.output.lower()
+        assert "--offset 100" in r.output, "the warning must name the offset to continue from"
+        assert calls == [{"offset": 0, "limit": 100}]
+
+    def test_limit_larger_than_a_page_keeps_paging_up_to_the_limit(self):
+        fake, calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", "--limit", "4000"])
+        assert r.exit_code == 0, r.output
+        assert r.output.startswith(self.FULL[:4_000])
+        assert self.FULL[:4_001] not in r.output
+        assert [c["offset"] for c in calls] == [0, 2_500]
+        assert calls[-1]["limit"] == 1_500, "the last page asks only for what the limit leaves"
+        assert "--offset 4000" in r.output
+
+    def test_offset_starts_there_and_reads_to_the_end(self):
+        fake, calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", "--offset", "5900"])
+        assert r.exit_code == 0, r.output
+        assert r.output.startswith(self.FULL[5_900:])
+        assert "truncated" not in r.output.lower()
+        assert calls == [{"offset": 5_900, "limit": 2_500}]
+
+    def test_json_emits_exactly_one_page(self):
+        fake, calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", "--json", "--offset", "2500"])
+        assert r.exit_code == 0, r.output
+        body = json.loads(r.output)
+        assert body["offset"] == 2_500
+        assert body["next_offset"] == 5_000
+        assert body["text"] == self.FULL[2_500:5_000]
+        assert len(calls) == 1, "--json is one page, never a loop"
+
+    def test_says_when_the_server_itself_could_not_reach_the_end(self):
+        """``truncated: true`` with no ``next_offset`` is the server's byte
+        cap on a huge textual file: the text continues but is not reachable
+        here. Silence would be a prefix passed off as the file."""
+        payload = {
+            "kind": "text",
+            "text": "beginning",
+            "offset": 0,
+            "next_offset": None,
+            "total_chars": 9,
+            "truncated": True,
+        }
+        with patch("cli.commands.collections.api_get_json", return_value=payload):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1"])
+        assert r.exit_code == 0, r.output
+        assert "truncated" in r.output.lower()
+        assert "search" in r.output.lower(), "must point at the way to reach the rest"
+
+    def test_does_not_loop_on_a_server_that_does_not_advance(self):
+        """Defensive: a ``next_offset`` that does not move forward must end
+        the loop, not spin it."""
+        payload = {"kind": "text", "text": "same", "offset": 0, "next_offset": 0, "total_chars": 99, "truncated": True}
+        with patch("cli.commands.collections.api_get_json", return_value=payload) as api:
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1"])
+        assert r.exit_code == 0, r.output
+        assert api.call_count == 1
