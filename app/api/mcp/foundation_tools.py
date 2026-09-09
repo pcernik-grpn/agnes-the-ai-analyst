@@ -21,13 +21,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
-
-from pydantic import Field
+from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from src.mcp_tooling import (
     compact_search_results,
@@ -3596,6 +3596,8 @@ def register_foundation_tools(
         source: str = "",
         trail: str = "",
         q: str = "",
+        cursor_ts: str = "",
+        cursor_id: str = "",
     ) -> dict:
         """Tail the unified Activity Center timeline (admin only).
 
@@ -3618,6 +3620,18 @@ def register_foundation_tools(
                             "llm" | "agent_scope". Empty (default) returns the
                             unified timeline across all four.
             q:             Free-text search over the row's params JSON.
+            cursor_ts:      Pagination cursor, timestamp half — pass the prior
+                             page's ``next_cursor["ts"]`` verbatim. Both
+                             ``cursor_ts`` and ``cursor_id`` must be set
+                             together or neither is sent.
+            cursor_id:      Pagination cursor, id half — pass the prior page's
+                             ``next_cursor["id"]`` verbatim.
+
+        When a returned page's ``next_cursor`` is non-null, continue by
+        calling again with ``cursor_ts=next_cursor["ts"]`` and
+        ``cursor_id=next_cursor["id"]`` — every other filter must stay
+        identical across pages, since the cursor only makes sense relative to
+        the same query.
 
         Returns ``{"rows": [{"timestamp", "trail", "source", "action",
         "resource", "user_id", "user_email", "result", "params", ...}, ...],
@@ -3639,6 +3653,9 @@ def register_foundation_tools(
             params["trail"] = trail
         if q:
             params["q"] = q
+        if cursor_ts and cursor_id:
+            params["cursor_ts"] = cursor_ts
+            params["cursor_id"] = cursor_id
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
             _raise_for_status_with_detail(r)

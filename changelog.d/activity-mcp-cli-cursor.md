@@ -1,0 +1,2 @@
+### Fixed
+- **`agnes admin activity` and the `activity` MCP tool can now page past the first window of rows.** The Activity Center timeline endpoint has always paginated (`next_cursor`), but neither agent-facing wrapper had a way to send it back — the CLI's own hint suggested `--limit higher`, which cannot work past the 200-row cap. `agnes admin activity` gained `--cursor` (takes the `next_cursor` object printed by a prior `--json` call verbatim) and the hint now names it; the `activity` MCP tool gained `cursor_ts`/`cursor_id`, forwarded to the server only when both are set.

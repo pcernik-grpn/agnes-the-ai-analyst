@@ -42,10 +42,11 @@ def fresh_db(monkeypatch):
 
 def _make_admin_test_client():
     from fastapi.testclient import TestClient
-    from app.main import app
+
     from app.auth.jwt import create_access_token
+    from app.main import app
+    from src.db import close_system_db, get_system_db
     from src.repositories.users import UserRepository
-    from src.db import get_system_db, close_system_db
 
     conn = get_system_db()
     try:
@@ -53,8 +54,7 @@ def _make_admin_test_client():
         UserRepository(conn).create(id=uid, email="admin@activity.test", name="admin")
         admin_group = conn.execute("SELECT id FROM user_groups WHERE name = 'Admin'").fetchone()
         conn.execute(
-            "INSERT INTO user_group_members (user_id, group_id, source, added_by) "
-            "VALUES (?, ?, 'admin', 'test')",
+            "INSERT INTO user_group_members (user_id, group_id, source, added_by) VALUES (?, ?, 'admin', 'test')",
             [uid, admin_group[0]],
         )
         token = create_access_token(user_id=uid, email="admin@activity.test")
@@ -69,10 +69,11 @@ def _make_admin_test_client():
 
 def _make_non_admin_test_client():
     from fastapi.testclient import TestClient
-    from app.main import app
+
     from app.auth.jwt import create_access_token
+    from app.main import app
+    from src.db import close_system_db, get_system_db
     from src.repositories.users import UserRepository
-    from src.db import get_system_db, close_system_db
 
     conn = get_system_db()
     try:
@@ -98,9 +99,11 @@ def cli_admin(monkeypatch, fresh_db):
         return test_client.get(path, params=params)
 
     import cli.client
+
     monkeypatch.setattr(cli.client, "api_get", _get)
 
     import cli.commands.admin_activity as mod
+
     monkeypatch.setattr(mod, "api_get", _get)
 
     return CliRunner(), mod.activity_app
@@ -116,9 +119,11 @@ def cli_non_admin(monkeypatch, fresh_db):
         return test_client.get(path, params=params)
 
     import cli.client
+
     monkeypatch.setattr(cli.client, "api_get", _get)
 
     import cli.commands.admin_activity as mod
+
     monkeypatch.setattr(mod, "api_get", _get)
 
     return CliRunner(), mod.activity_app
@@ -186,6 +191,84 @@ class TestTimeline:
         assert r.exit_code == 0, _clean(r.output)
         data = json.loads(r.output)
         assert "rows" in data
+
+
+# ---------------------------------------------------------------------------
+# Cursor pagination tests — the endpoint has always paged (app/api/activity.py
+# cursor_ts/cursor_id), but nothing let a CLI caller hand the cursor back.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_cursor_rows():
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    repo.log(action="test.cursor.first", result="success")
+    repo.log(action="test.cursor.second", result="success")
+    conn.close()
+
+
+class TestCursorPagination:
+    def test_cursor_flag_advances_to_the_next_page(self, cli_admin):
+        runner, app = cli_admin
+        _seed_two_cursor_rows()
+
+        r1 = runner.invoke(app, ["--action", "test.cursor.", "--limit", "1", "--json"])
+        assert r1.exit_code == 0, _clean(r1.output)
+        page1 = json.loads(r1.output)
+        assert len(page1["rows"]) == 1
+        assert page1["rows"][0]["action"] == "test.cursor.second"
+        assert page1["next_cursor"] is not None
+
+        cursor_arg = json.dumps(page1["next_cursor"])
+        r2 = runner.invoke(app, ["--action", "test.cursor.", "--limit", "1", "--cursor", cursor_arg, "--json"])
+        assert r2.exit_code == 0, _clean(r2.output)
+        page2 = json.loads(r2.output)
+        assert len(page2["rows"]) == 1
+        # Second page must surface a row the first page did not.
+        assert page2["rows"][0]["action"] == "test.cursor.first"
+        assert page2["rows"][0]["action"] != page1["rows"][0]["action"]
+
+    def test_cursor_forwards_ts_and_id_to_the_server(self, cli_admin, monkeypatch):
+        runner, app = cli_admin
+        captured: dict = {}
+
+        import cli.commands.admin_activity as mod
+
+        real_get = mod.api_get
+
+        def _spy(path, **kw):
+            captured["params"] = kw.get("params") or {}
+            return real_get(path, **kw)
+
+        monkeypatch.setattr(mod, "api_get", _spy)
+
+        cursor_arg = json.dumps({"ts": "2026-09-09T10:00:00+00:00", "id": "abc-123"})
+        r = runner.invoke(app, ["--cursor", cursor_arg, "--json"])
+        assert r.exit_code == 0, _clean(r.output)
+        assert captured["params"]["cursor_ts"] == "2026-09-09T10:00:00+00:00"
+        assert captured["params"]["cursor_id"] == "abc-123"
+
+    def test_malformed_cursor_is_a_clean_error(self, cli_admin):
+        runner, app = cli_admin
+        r = runner.invoke(app, ["--cursor", "not-json", "--json"])
+        assert r.exit_code != 0
+        assert "--cursor" in _clean(r.output)
+
+    def test_more_rows_hint_names_the_cursor_flag(self, cli_admin):
+        """The old hint ('pass --limit higher') was unachievable — --limit
+        caps at 200 and narrowing --since cannot reach row 201 either. The
+        fixed hint must name a flag that actually exists."""
+        runner, app = cli_admin
+        _seed_two_cursor_rows()
+
+        r = runner.invoke(app, ["--action", "test.cursor.", "--limit", "1"])
+        assert r.exit_code == 0, _clean(r.output)
+        out = _clean(r.output)
+        assert "--cursor" in out
+        assert "--limit higher" not in out
 
 
 # ---------------------------------------------------------------------------

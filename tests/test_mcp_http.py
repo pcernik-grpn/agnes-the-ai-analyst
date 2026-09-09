@@ -1277,6 +1277,37 @@ class TestActivityTool:
         params = get_mock.call_args.kwargs["params"]
         assert set(params) == {"since_minutes", "limit"}
 
+    def test_forwards_cursor_when_both_parts_present(self):
+        """The endpoint requires cursor_ts AND cursor_id together
+        (app/api/activity.py:105) — the tool must forward both or neither."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00", cursor_id="abc-123"))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["cursor_ts"] == "2026-09-09T10:00:00+00:00"
+        assert params["cursor_id"] == "abc-123"
+
+    def test_omits_cursor_when_only_one_part_present(self):
+        """A partial cursor (e.g. the caller forgot cursor_id) must not reach
+        the endpoint — sending only one half is not a valid cursor per the
+        endpoint's own `cursor_ts and cursor_id` gate."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00"))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert "cursor_ts" not in params
+        assert "cursor_id" not in params
+
 
 # ── my_secret_test tool ──────────────────────────────────────────────────────
 
