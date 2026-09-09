@@ -115,6 +115,10 @@
   `llm_calls` rows — the spend record survives (deleting it would rewrite cost
   history) but stops naming anyone. `retention.chat_feedback_days` puts a
   clock on feedback comments through the daily retention sweep.
+- A request a provider refuses outright — the anonymizer's temperature retry
+  is the case in point — now records its own zero-cost error row beside the
+  attempt that succeeded, so a rejection is visible in the call counts
+  without being priced twice.
 - Every batch extraction outcome now reaches the ledger: a result that
   errored, was canceled, expired or never came back writes a zero-cost
   `llm_calls` row, and an answer whose document vanished before it could be
