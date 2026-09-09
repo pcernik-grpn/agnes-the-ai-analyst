@@ -70,6 +70,7 @@ from app.api.broker_vertex import (
 )
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
+from app.chat.turn_context import TurnRecord, read_turn
 from app.chat.turn_usage import add_turn_usage
 from src.observability import otel as _otel
 from src.observability.llm_context import LlmCallContext
@@ -882,11 +883,28 @@ def _completion_request_hints(raw_body: bytes, vertex_target: Any) -> "tuple[Opt
     return model, stream
 
 
+def _turn_for_row(row: Dict[str, Any]) -> Optional[TurnRecord]:
+    """The live chat turn for the ticket's session, if one was published.
+
+    ``None`` when the ticket carries no session, when no turn is in flight,
+    and when the coordination backend cannot say — a completion whose turn
+    is unknown is a root span with a null ``turn_id``, never a failed
+    forward (spec 3.2).
+    """
+    try:
+        session_id = row.get("session_id")
+        return read_turn(session_id) if session_id else None
+    except Exception:  # noqa: BLE001 - a measurement never costs a forward
+        logger.debug("broker: could not read the turn record", exc_info=True)
+        return None
+
+
 def _completion_context(
     row: Dict[str, Any],
     *,
     agent_row: Optional[Dict[str, Any]],
     caller_user_id: Optional[str],
+    turn: Optional[TurnRecord] = None,
 ) -> LlmCallContext:
     """The labels for one brokered completion: what work it is, whose it is.
 
@@ -896,13 +914,21 @@ def _completion_context(
     there is one; an agent-less session is labelled all the same, because a
     call nobody can attribute is exactly the one a cost report must not
     lose.
+
+    ``turn`` is the chat turn that caused the call (``_turn_for_row``). It
+    supplies what the ticket cannot: which turn this is, whether the
+    session is agent-API or chat work, and — only where the ticket has
+    nothing of its own — the user and agent ChatManager resolved when the
+    turn opened. The ticket's own resolution always wins: it is first-hand,
+    and the turn record may be one turn stale.
     """
     return LlmCallContext(
-        workload="chat",
+        workload=turn.workload if turn else "chat",
         purpose="completion",
         session_id=row.get("session_id"),
-        user_id=caller_user_id,
-        agent_id=agent_row.get("id") if agent_row else None,
+        turn_id=turn.turn_id if turn else None,
+        user_id=caller_user_id or (turn.user_id if turn else None),
+        agent_id=(agent_row.get("id") if agent_row else (turn.agent_id if turn else None)),
     )
 
 
@@ -1391,18 +1417,30 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     upstream_label = "dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic")
     completion_context: Optional[LlmCallContext] = None
     requested_model: Optional[str] = None
+    # Which chat turn this call belongs to (spec 3.2). The engine propagates
+    # no trace context, so the turn announces itself over the coordination
+    # backend and the broker reads it here — one small read per completion.
+    # A `traceparent` request header would be preferred if the engine ever
+    # sent one; until then this is the only link that exists.
+    turn: Optional[TurnRecord] = None
     if is_completion:
-        completion_context = _completion_context(row, agent_row=agent_row, caller_user_id=caller_user_id)
+        turn = _turn_for_row(row)
+        completion_context = _completion_context(row, agent_row=agent_row, caller_user_id=caller_user_id, turn=turn)
         requested_model, _requested_stream = _completion_request_hints(raw_body, vertex_target)
     otel_span = None
     if completion_context is not None and _otel.is_enabled():
         try:
+            # The turn's span normally lives in another process, so the
+            # parent is a remote, non-recording context; the collector
+            # stitches the two on the trace id.
+            parent_context = _otel.remote_parent_context(turn.trace_id, turn.span_id) if turn else None
             otel_span = await _start_otel_completion_span(
                 row=row,
                 raw_body=raw_body,
                 vertex_target=vertex_target,
                 upstream=upstream_label,
                 context=completion_context,
+                parent_context=parent_context,
             )
         except Exception:  # noqa: BLE001 - a measurement must never cost a forward
             logger.debug("broker: could not open the completion span", exc_info=True)
