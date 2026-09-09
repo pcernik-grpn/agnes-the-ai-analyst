@@ -1266,11 +1266,22 @@ authoring-suggestions queue (never an admin-direct write).
 - /api/admin/telemetry/chat-cost
 - /api/admin/telemetry/export
 - /api/admin/telemetry/facets
+- /api/admin/telemetry/feedback
 - /api/admin/telemetry/kpis
+- /api/admin/telemetry/llm-calls
+- /api/admin/telemetry/llm-cost
 - /api/admin/telemetry/prune
 - /api/admin/telemetry/query
 - /api/admin/telemetry/reprocess
 - /api/admin/telemetry/summary
+
+  `llm-cost`, `llm-calls` and `feedback` are the LLM observability read
+  surfaces (design 2026-09-08): cross-workload cost grouped by workload /
+  agent / user / model / purpose, the underlying `llm_calls` detail rows for
+  one session/turn/job/user, and the chat-turn thumbs feedback queue. All
+  three are admin-only, Postgres-backed only (typed `501
+  requires_postgres_backend` on the frozen DuckDB app-state backend), and
+  mirrored by `agnes admin usage llm-cost|llm-calls|feedback`.
 
 ### `/api/admin/sessions` — Session management (admin)
 

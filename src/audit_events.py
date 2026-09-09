@@ -128,6 +128,11 @@ CATALOG: dict[str, AuditEvent] = {
         "usage.chat_cost", "read", "Measured chat token/cost breakdown was read across users."
     ),
     "usage.export": AuditEvent("usage.export", "read", "Usage data was exported."),
+    "usage.feedback_list": AuditEvent("usage.feedback_list", "read", "An admin read chat feedback rows."),
+    "usage.llm_calls": AuditEvent(
+        "usage.llm_calls", "read", "An admin read LLM call ledger rows for a session, turn or job."
+    ),
+    "usage.llm_cost": AuditEvent("usage.llm_cost", "read", "An admin read the cross-workload LLM cost summary."),
     "usage.summary": AuditEvent("usage.summary", "read", "A usage summary was read."),
     # -- system: scheduler ticks, startup, broker guardrails, review internals
     "admin_elevation_paused": AuditEvent(

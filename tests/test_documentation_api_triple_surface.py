@@ -1256,6 +1256,23 @@ _EXEMPT: dict[str, str] = {
         "surface over their own data, and an agent has no business reading "
         "every user's spend."
     ),
+    "/api/admin/telemetry/llm-cost": (
+        "admin-only cross-workload cost telemetry read (LLM observability "
+        "design 2026-09-08), same shape as its sibling `/api/admin/"
+        "telemetry/chat-cost` right above. CLI surface `agnes admin usage "
+        "llm-cost`. No MCP tool: an agent has no business reading every "
+        "user's spend."
+    ),
+    "/api/admin/telemetry/llm-calls": (
+        "admin-only LLM call ledger detail read, same reasoning as "
+        "llm-cost above. CLI surface `agnes admin usage llm-calls`. No MCP "
+        "tool."
+    ),
+    "/api/admin/telemetry/feedback": (
+        "admin-only chat feedback queue read, same reasoning as llm-cost "
+        "above. CLI surface `agnes admin usage feedback`. No MCP tool: an "
+        "agent has no business reading every user's feedback."
+    ),
     "/api/admin/prompts/{kind}": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/source": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/bind-git": _PROMPTS_REASON,
