@@ -605,6 +605,65 @@ def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_ra
 
 
 # ---------------------------------------------------------------------------
+# reassign_file_corpus — the single-file move path's chunk re-homing
+# ---------------------------------------------------------------------------
+
+
+def test_reassign_file_corpus_rehomes_only_that_files_chunks(repo):
+    """Moving a file between collections must carry its chunks along:
+    ``corpus_chunks.corpus_id`` is the column body search scopes on, so a
+    chunk left behind keeps answering under the collection the file just
+    left. Only the moved file's rows move; a sibling file's stay put."""
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "relocated body zebra"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "relocated body zebra two"},
+        ]
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": "cf_stays", "ordinal": 0, "text": "staying body zebra"}])
+
+    moved = repo.reassign_file_corpus(FILE_ID, "col_target")
+
+    assert moved == 2
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == ["col_target", "col_target"]
+    assert [r["file_id"] for r in repo.list_for_corpus(CORPUS_ID)] == ["cf_stays"]
+    # Body search follows the move: nothing of the file under the source,
+    # all of it under the target.
+    assert {r["file_id"] for r in repo.search_candidates([CORPUS_ID], "relocated", limit=10)} == set()
+    assert {r["file_id"] for r in repo.search_candidates(["col_target"], "relocated", limit=10)} == {FILE_ID}
+
+
+def test_reassign_file_corpus_unknown_file_is_zero(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "untouched"}])
+    assert repo.reassign_file_corpus("cf_nope", "col_target") == 0
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]
+
+
+def test_reassign_file_corpus_expected_corpus_id_only_moves_rows_still_there(repo):
+    """``expected_corpus_id`` makes the write a compare-and-set.
+
+    The move endpoint compensates a failed move by putting the content back,
+    and an unconditional put-back is a race: a concurrent move of the same
+    file that SUCCEEDED would have its content dragged back to the original
+    source, recreating the leak in a request that did nothing wrong. Passing
+    the collection the caller expects the rows to be in makes the
+    compensation touch only the rows still belonging to its own attempt.
+    """
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "contested body"}])
+    repo.reassign_file_corpus(FILE_ID, "col_other_winner")
+
+    # Someone else already moved the rows on: a put-back that expects them
+    # under our own target must be a no-op.
+    assert repo.reassign_file_corpus(FILE_ID, CORPUS_ID, expected_corpus_id="col_our_target") == 0
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == ["col_other_winner"]
+
+    # Matching the actual current collection moves them.
+    assert repo.reassign_file_corpus(FILE_ID, CORPUS_ID, expected_corpus_id="col_other_winner") == 1
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]
+
+
+
+# ---------------------------------------------------------------------------
 # Stored tsvector (migration 0114_corpus_chunks_tsv, PG-only — the DuckDB
 # sibling neither stores nor ranks, see its docstring)
 # ---------------------------------------------------------------------------

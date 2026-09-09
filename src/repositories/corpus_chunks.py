@@ -131,6 +131,41 @@ class CorpusChunksRepository:
         """Remove all chunks for the given file (idempotent)."""
         self.conn.execute("DELETE FROM corpus_chunks WHERE file_id = ?", [file_id])
 
+    def reassign_file_corpus(
+        self, file_id: str, target_corpus_id: str, *, expected_corpus_id: Optional[str] = None
+    ) -> int:
+        """Repoint one file's chunks at the collection it now lives in; return
+        the count.
+
+        ``corpus_chunks.corpus_id`` is denormalized from ``corpus_files`` and
+        is the column body search scopes candidates on
+        (``search_candidates``), so a chunk left behind after a move keeps
+        answering under the collection the file just left. Called on the
+        single-file move path BEFORE the file row itself moves, so that a
+        failure there cannot strand the body in the collection the file is
+        leaving (``app/api/collections.py::move_file`` explains the ordering,
+        and compensates this write if the file-row move then fails). The
+        collection-consolidation path re-homes chunks the same way, in bulk.
+        Unknown file → 0.
+
+        ``expected_corpus_id`` turns the write into a compare-and-set: only
+        rows currently in that collection move. The move endpoint's
+        compensation path needs it — putting content back unconditionally
+        would drag back rows a CONCURRENT, successful move of the same file
+        has since claimed, recreating the leak in a request that did nothing
+        wrong.
+
+        Counted via ``RETURNING`` rather than ``rowcount``: DuckDB's DBAPI
+        ``rowcount`` is ``-1`` for DML.
+        """
+        sql = "UPDATE corpus_chunks SET corpus_id = ? WHERE file_id = ?"
+        params: List[Any] = [target_corpus_id, file_id]
+        if expected_corpus_id is not None:
+            sql += " AND corpus_id = ?"
+            params.append(expected_corpus_id)
+        moved = self.conn.execute(sql + " RETURNING id", params).fetchall()
+        return len(moved)
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------

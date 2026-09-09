@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any
+from typing import Any, Dict, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -419,25 +419,23 @@ class CorpusFilesPgRepository:
                 {"status": status, "detail": detail_json, "id": file_id},
             )
 
-    def move_to_corpus(self, file_id: str, target_corpus_id: str) -> bool:
+    def move_to_corpus(
+        self, file_id: str, target_corpus_id: str, *, expected_corpus_id: Optional[str] = None
+    ) -> bool:
         """Reparent a file into another corpus (the Library's drag-and-drop).
 
         Returns False if the file doesn't exist. ``path`` is cleared — see the
-        DuckDB twin for why.
+        DuckDB twin for why, and for what ``expected_corpus_id`` (a
+        compare-and-set against concurrent moves) is for.
         """
-        row = self.get(file_id)
-        if row is None:
-            return False
+        sql = "UPDATE corpus_files SET corpus_id = :cid, path = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = :id"
+        params: Dict[str, Any] = {"cid": target_corpus_id, "id": file_id}
+        if expected_corpus_id is not None:
+            sql += " AND corpus_id = :expected"
+            params["expected"] = expected_corpus_id
         with self._engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "UPDATE corpus_files "
-                    "SET corpus_id = :cid, path = NULL, updated_at = CURRENT_TIMESTAMP "
-                    "WHERE id = :id"
-                ),
-                {"cid": target_corpus_id, "id": file_id},
-            )
-        return True
+            res = conn.execute(sa.text(sql), params)
+            return bool(res.rowcount)
 
     def delete(self, file_id: str) -> None:
         """Hard-delete a file row (individual files are not soft-deleted)."""
