@@ -3350,9 +3350,12 @@ class ChatManager:
         caller already minted one for the user row it just persisted
         (``send_user_message``, so the row and this turn agree on the same
         id), in which case it is passed in as ``turn_id`` and reused as-is.
-        ``message_id`` is the persisted user row when the caller has one
-        (``send_user_message``); the stream-delivery path does not carry
-        either.
+        ``message_id`` is that same persisted user row's id when the caller
+        has one — ``send_user_message``'s direct-owner path always does,
+        and ``_inbound_consumer_loop``'s forwarded-delivery path does too
+        once ``produce_inbound_user_message`` published it on the entry
+        (#2365 review); an entry from an older replica carries neither key
+        and this stays ``None``, same as before.
         """
         payload = json.dumps({"type": "user_msg", "text": text}) + "\n"
         async with live._stdin_lock:
@@ -4135,10 +4138,15 @@ class ChatManager:
                         # produce_inbound_user_message started minting it
                         # before persisting the user row) is threaded
                         # through so this turn agrees with the persisted
-                        # row; an entry from an older replica carries none,
-                        # and _deliver_local_user_message mints a fresh one
-                        # exactly as it always has.
-                        await self._deliver_local_user_message(live, text, turn_id=entry.get("turn_id"))
+                        # row; entry["message_id"] (that same row's own id,
+                        # #2365 review) is threaded the same way so memory
+                        # provenance can record source_message_id for a
+                        # forwarded turn too. An entry from an older replica
+                        # carries neither, and _deliver_local_user_message
+                        # mints a fresh turn id exactly as it always has.
+                        await self._deliver_local_user_message(
+                            live, text, turn_id=entry.get("turn_id"), message_id=entry.get("message_id")
+                        )
                     except Exception:
                         logger.exception("inbound consumer: delivery failed for %s seq %s; skipping", chat_id, seq)
                     live.inbound_last_seq = seq
@@ -4350,9 +4358,10 @@ class ChatManager:
             details={"session_id": chat_id, "chars": len(text)},
         )
         self._emit_chat_message_event(chat_id=chat_id, surface=live.surface, sender=sender)
-        # The persisted user row's id goes onto the turn record (spec 3.2):
-        # this is the only delivery path that has one — the inbound-stream
-        # path carries text, not the row it was written as.
+        # The persisted user row's id goes onto the turn record (spec 3.2);
+        # the forwarded (produce_inbound_user_message) path threads the
+        # same id through its own persisted row via the chat-in entry's
+        # message_id (#2365 review).
         await self._deliver_local_user_message(
             live, text, message_id=getattr(user_message, "id", None), turn_id=turn_id
         )
@@ -4563,6 +4572,16 @@ class ChatManager:
                 tokens_in=None,
                 tokens_out=None,
                 model=None,
+                # #2365 review: the user row of this same turn was persisted
+                # with a turn_id (send_user_message / produce_inbound_user_
+                # message mint one before persist) -- the partial answer must
+                # share it, or a reload can never rate it or join it to its
+                # own turn in the corpus export. None when a caller reaches
+                # here with no live turn ever delivered (turn_id defaults to
+                # None); the frozen DuckDB backend accepts and drops the
+                # value regardless (A3, same as the normal assistant write
+                # above this method).
+                turn_id=live.turn_id,
             )
         except Exception:
             # Teardown is best-effort throughout — a failed partial-save must
@@ -5757,7 +5776,13 @@ async def produce_inbound_user_message(
         return
     turn_id = str(uuid4())
     try:
-        repo.append_message(
+        # #2365 review: the returned row used to be discarded here, so a
+        # forwarded turn's message id never reached the chat-in entry below
+        # (unlike the direct-owner path's send_user_message, which already
+        # threads its own persisted row's id through _deliver_local_user_
+        # message) -- a memory written during that turn could record
+        # source_turn_id but never source_message_id.
+        user_message = repo.append_message(
             session_id=chat_id,
             role="user",
             content=text,
@@ -5781,4 +5806,10 @@ async def produce_inbound_user_message(
         surface=getattr(session.surface, "value", str(session.surface)),
         sender=sender,
     )
-    await inbound.publish_inbound(chat_id, text, slack=slack_origin, turn_id=turn_id)
+    await inbound.publish_inbound(
+        chat_id,
+        text,
+        slack=slack_origin,
+        turn_id=turn_id,
+        message_id=getattr(user_message, "id", None),
+    )

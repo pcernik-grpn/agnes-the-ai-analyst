@@ -172,7 +172,12 @@ async def _publish_entry(chat_id: str, payload: dict) -> int:
 
 
 async def publish_inbound(
-    chat_id: str, text: str, *, slack: Optional[dict] = None, turn_id: Optional[str] = None
+    chat_id: str,
+    text: str,
+    *,
+    slack: Optional[dict] = None,
+    turn_id: Optional[str] = None,
+    message_id: Optional[str] = None,
 ) -> int:
     """Append a user message to ``chat_id``'s inbound stream and best-effort
     notify any subscribed owner. Returns the assigned seq.
@@ -193,9 +198,13 @@ async def publish_inbound(
     ``app.chat.manager.produce_inbound_user_message``), so the owning
     gateway's consumer can reuse the SAME id for the turn instead of
     minting a fresh one that would leave the user row and the assistant
-    row disagreeing. Omitted entirely when not given, so an entry
-    published by an older replica (before this field existed) round-trips
-    unchanged and the consumer falls back to minting its own, as before.
+    row disagreeing. ``message_id`` is that same persisted user row's own
+    id (#2365 review: the producer used to discard it, so a forwarded
+    turn's memory provenance could record ``source_turn_id`` but never
+    ``source_message_id``). Both are omitted entirely when not given, so an
+    entry published by an older replica (before either field existed)
+    round-trips unchanged and the consumer falls back to minting its own
+    turn id, as before.
     """
     payload: dict = {"type": "user_message", "text": text}
     if slack:
@@ -204,6 +213,8 @@ async def publish_inbound(
             payload["slack"] = origin
     if turn_id:
         payload["turn_id"] = turn_id
+    if message_id:
+        payload["message_id"] = message_id
     return await _publish_entry(chat_id, payload)
 
 
