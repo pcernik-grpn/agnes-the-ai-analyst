@@ -1711,7 +1711,6 @@ JOB_POSTURE: dict[str, str] = {
     # or a caught mid-walk failure), same shape as the pull endpoint's own
     # `conversations.export` row. Per the "Names a more specific action"
     # bullet above, the generic `job.run` row still fires too.
-    "conversation-export": "conversations.export",
 }
 
 # MCP foundation tools (app/api/mcp/foundation_tools.py::FOUNDATION_TOOL_NAMES,
