@@ -80,17 +80,35 @@ must NOT carry the literal token list — that's why this agent reads it from
 
 ### 3. AI attribution
 
-The `Co-Authored-By: Claude …` commit trailer and the standard
-`🤖 Generated with [Claude Code](…)` PR-body footer are ACCEPTED
-(`CLAUDE.md` → *Git commits & pull requests*): the agent tooling appends
-them and `main` already carries them — do not report them. What must not
-mention AI authorship is everything else:
+Two forms are ACCEPTED anywhere (`CLAUDE.md` → *Git commits & pull
+requests*) — the agent tooling appends them and `main` already carries
+them, so never report them:
 
-    git log --format='%s' <base>..HEAD | grep -i -E 'claude|copilot|chatgpt|ai-generated'
-    git diff <base>..HEAD -- . ':!CHANGELOG.md' ':!docs/archive' | grep -i -E '^\+.*(generated with claude|claude code|co-authored-by)'
+- the `Co-Authored-By: Claude …` commit trailer,
+- the `🤖 Generated with [Claude Code](…)` PR-body footer.
 
-Expected: zero matches for both (commit SUBJECTS; code, comments and docs in
-the diff). Also read the PR title and body: the footer is fine, an
+Report any OTHER claim of AI authorship: in a commit subject, in a commit
+BODY outside that trailer, in the PR title or prose, or in added code,
+comments or docs.
+
+    # 1. commit subjects AND bodies, with the two accepted forms filtered out
+    git log --format='%s%n%b' <base>..HEAD \
+      | grep -ivE '^Co-Authored-By: Claude|^🤖 Generated with \[Claude Code\]' \
+      | grep -inE '(generated|written|authored|created) (with|by) (claude|copilot|chatgpt|an? (ai|llm))|ai[- ]generated|🤖'
+
+    # 2. added lines, EXCLUDING the files that define this convention — they
+    #    quote the accepted strings on purpose, so scanning them makes every
+    #    edit to the convention itself self-report.
+    git diff <base>..HEAD -- . ':!CHANGELOG.md' ':!docs/archive' \
+      ':!CLAUDE.md' ':!.claude/agents/agnes-reviewer-rules.md' \
+      | grep -inE '^\+.*(co-authored-by:[[:space:]]*claude|🤖 generated with)'
+
+Expected: zero matches for both. Both patterns are deliberately narrow —
+they match an authorship CLAIM, not the product name: "Claude Code" is a
+first-class subject of this repo (hooks, marketplace, the CLI) and appears
+in ordinary code and docs, and `claude/*` shows up in branch names inside
+merge-commit subjects. A bare `claude` grep reports those as violations.
+Also read the PR title and body yourself: the footer is fine, an
 "AI-generated" claim in the title or prose is Missing — main agent must
 remove it before opening the PR.
 
