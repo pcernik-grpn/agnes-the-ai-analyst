@@ -575,6 +575,37 @@ class TestLlmReviewRunnerNotifiesSubmitter:
 # ---------------------------------------------------------------------------
 
 
+class TestTheReviewCallIsLabelled:
+    def test_the_bundle_review_says_which_workload_it_belongs_to(self, plugin_dir):
+        """Every upload triggers one review call; the record carries the
+        store-guardrails workload so that spend is separable from the chat
+        and extraction paths it shares a model with."""
+        from src.observability.llm_context import current_llm_context
+        from src.store_guardrails import llm_review
+
+        seen = {}
+
+        with patch("src.store_guardrails.llm_review.AnthropicExtractor") as MockEx:
+
+            def _record(**_kwargs):
+                seen["context"] = current_llm_context()
+                return {"risk_level": "safe", "summary": "ok", "findings": []}
+
+            MockEx.return_value.extract_json.side_effect = _record
+            llm_review.review_bundle(
+                plugin_dir,
+                type_="skill",
+                name="x",
+                version="1.0.0",
+                description="x" * 30,
+                api_key="sk-test",
+                model="claude-haiku-4-5-20251001",
+            )
+
+        ctx = seen["context"]
+        assert (ctx.workload, ctx.purpose) == ("store_guardrails", "llm_review")
+
+
 class TestReviewBundleErrorTransport:
     def test_anthropic_timeout_returns_error_dict(self, plugin_dir):
         from src.store_guardrails import llm_review

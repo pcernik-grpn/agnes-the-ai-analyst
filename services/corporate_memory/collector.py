@@ -554,13 +554,16 @@ def check_sensitivity(extractor, item: dict) -> bool:
         tags=", ".join(item.get("tags", [])),
     )
 
+    from src.observability.llm_context import llm_context
+
     try:
-        result = extractor.extract_json(
-            prompt,
-            max_tokens=256,
-            json_schema=SENSITIVITY_SCHEMA,
-            schema_name="sensitivity_check",
-        )
+        with llm_context(workload="corporate_memory", purpose="sensitivity_check"):
+            result = extractor.extract_json(
+                prompt,
+                max_tokens=256,
+                json_schema=SENSITIVITY_SCHEMA,
+                schema_name="sensitivity_check",
+            )
 
         if not result.get("safe", False):
             reason = result.get("reason", "unknown")
@@ -774,14 +777,17 @@ def collect_all(dry_run: bool = False) -> dict:
         f"and {len(existing.get('items', {}))} existing items"
     )
 
+    from src.observability.llm_context import llm_context
+
     try:
-        response_data = extractor.extract_json(
-            prompt,
-            max_tokens=8192,
-            json_schema=CATALOG_SCHEMA,
-            schema_name="catalog_refresh",
-            system=CATALOG_REFRESH_SYSTEM,
-        )
+        with llm_context(workload="corporate_memory", purpose="catalog_refresh"):
+            response_data = extractor.extract_json(
+                prompt,
+                max_tokens=8192,
+                json_schema=CATALOG_SCHEMA,
+                schema_name="catalog_refresh",
+                system=CATALOG_REFRESH_SYSTEM,
+            )
         response_items = response_data.get("items", [])
         stats["items_extracted"] = len(response_items)
         logger.info(f"Extractor returned {len(response_items)} catalog items")

@@ -484,7 +484,15 @@ message row carries the turn's LLM latency as the secret broker measured
 it per completion (`llm_calls` / `llm_duration_ms` / `llm_ttfb_ms`, PG-only,
 migration `0115`), summed per turn through `app/chat/turn_usage.py`. The daily
 spend cap remains deliberately coarser (a two-bucket counter with no model
-attached) and says so.
+attached) and says so. Since the 2026-09-08 LLM observability design every
+call — brokered or server-side — also lands as one priced row in the
+Postgres-only `llm_calls` ledger (`src/observability/llm_record.py` prices
+it with the same table at write time; `GET /api/admin/telemetry/llm-cost`
+groups it by workload/agent/user/model/purpose), carrying the `turn_id`
+that `chat_messages`, `usage_turns` and the exported spans share. Content
+export (spans and the engine's relay) is governed by
+`observability.content_export` in `instance.yaml`, never by an environment
+variable — see `docs/observability.md` → *Content policy*.
 
 ### Config Loading
 1. `config/loader.py` loads `instance.yaml`.

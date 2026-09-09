@@ -291,12 +291,15 @@ def run_digest_pass() -> Dict[str, Any]:
             fp = fingerprints[d["id"]]
             prompt = _build_prompt(d)
             generations_this_pass += 1
-            result = extractor.extract_json(
-                prompt,
-                max_tokens=max_tokens,
-                json_schema=_JSON_SCHEMA,
-                schema_name="knowledge_digest",
-            )
+            from src.observability.llm_context import llm_context
+
+            with llm_context(workload="knowledge", purpose="digest", subject_id=str(d["id"])):
+                result = extractor.extract_json(
+                    prompt,
+                    max_tokens=max_tokens,
+                    json_schema=_JSON_SCHEMA,
+                    schema_name="knowledge_digest",
+                )
             markdown = (result or {}).get("markdown") or ""
             if not markdown.strip():
                 reason = "LLM returned empty digest"

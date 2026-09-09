@@ -28,6 +28,8 @@ class AgentMemoriesPgRepository:
         content: str,
         source_session_id: Optional[str],
         status: str = "pending",
+        source_turn_id: Optional[str] = None,
+        source_message_id: Optional[str] = None,
     ) -> None:
         now = datetime.now(timezone.utc)
         activated_at = now if status == "active" else None
@@ -36,9 +38,11 @@ class AgentMemoriesPgRepository:
                 sa.text(
                     """
                     INSERT INTO agent_memories
-                      (id, agent_id, owner_user_id, content, source_session_id, status, created_at, activated_at)
+                      (id, agent_id, owner_user_id, content, source_session_id, status, created_at, activated_at,
+                       source_turn_id, source_message_id)
                     VALUES
-                      (:id, :agent_id, :owner_user_id, :content, :source_session_id, :status, :created_at, :activated_at)
+                      (:id, :agent_id, :owner_user_id, :content, :source_session_id, :status, :created_at, :activated_at,
+                       :source_turn_id, :source_message_id)
                     """
                 ),
                 {
@@ -50,6 +54,8 @@ class AgentMemoriesPgRepository:
                     "status": status,
                     "created_at": now,
                     "activated_at": activated_at,
+                    "source_turn_id": source_turn_id,
+                    "source_message_id": source_message_id,
                 },
             )
 
@@ -149,3 +155,29 @@ class AgentMemoriesPgRepository:
                 {"agent_id": agent_id},
             ).first()
         return int(row[0]) if row else 0
+
+    def list_for_sessions(self, session_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Every memory write attributed to ``session_ids`` (``source_session_id``),
+        grouped by session and ordered oldest-first -- the conversation-corpus
+        export's bulk read (design 2026-09-08 §3.12), one query for a whole
+        page of sessions rather than one lookup per memory.
+        """
+        if not session_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT * FROM agent_memories "
+                        "WHERE source_session_id = ANY(:session_ids) "
+                        "ORDER BY source_session_id ASC, created_at ASC"
+                    ),
+                    {"session_ids": list(session_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["source_session_id"], []).append(dict(r))
+        return out

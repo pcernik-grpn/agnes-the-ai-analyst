@@ -694,6 +694,48 @@ body.chat-page-body main { margin: 0; padding: 0; }
    written turn has no stable content to copy. */
 .msg.is-streaming .msg-actions { display: none; }
 
+/* Thumbs on a completed assistant turn (LLM observability design §3.5) —
+   same muted row as the copy button next to it. The selected verdict stays
+   visible without hover, and keeps the whole actions row visible too (the
+   row otherwise fades to opacity 0 on mouse-out — a picked thumb must not
+   disappear with it). */
+.msg-feedback {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-2);
+}
+.msg-feedback-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.msg-feedback-btn:hover { background: var(--ds-surface-dim); color: var(--ds-text-primary); }
+.msg-feedback-btn.is-selected { color: var(--ds-primary); }
+.msg-feedback-btn svg { width: 13px; height: 13px; }
+.msg:has(.msg-feedback-btn.is-selected) .msg-actions { opacity: 1; }
+.msg-feedback-comment {
+  font: inherit;
+  font-size: var(--text-xs);
+  padding: 2px 6px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--radius-sm);
+  background: var(--ds-surface);
+  color: var(--ds-text-primary);
+  min-width: 220px;
+}
+
 /* Inline SVG is the ONE channel an answer has for a chart: the sandbox
    filesystem is not the user's computer, so a file path delivers nothing, and
    a `data:` image URI is stripped by renderMarkdownSafe's scheme allowlist.

@@ -147,3 +147,64 @@ def test_delete_for_agent(repo):
 def test_delete_for_agent_with_no_rows_is_a_noop(repo):
     repo.delete_for_agent("no-such-agent")
     assert repo.list_for_agent("no-such-agent") == []
+
+
+def test_create_accepts_turn_provenance_on_both_backends(repo):
+    """Memory provenance (design 2026-09-08 §3.5, migration 0117): the PG
+    side stores ``source_turn_id``/``source_message_id``, the frozen DuckDB
+    side accepts and silently drops both — the same accept-and-drop pattern
+    as the chat_messages cache columns (migration 0092)."""
+    repo.create(
+        id="m1",
+        agent_id="a1",
+        owner_user_id="u1",
+        content="x",
+        source_session_id="c1",
+        source_turn_id="t1",
+        source_message_id="msg_1",
+    )
+    row = repo.get("m1")
+    assert row["source_session_id"] == "c1"
+    assert row.get("source_turn_id") in ("t1", None) and row.get("source_message_id") in ("msg_1", None)
+
+
+def test_pg_stores_turn_provenance(repo):
+    if not hasattr(repo, "_engine"):
+        pytest.skip("PG side only")
+    repo.create(
+        id="m2",
+        agent_id="a1",
+        owner_user_id="u1",
+        content="x",
+        source_session_id="c1",
+        source_turn_id="t1",
+        source_message_id="msg_1",
+    )
+    assert repo.get("m2")["source_turn_id"] == "t1"
+
+
+def test_list_for_sessions_groups_by_session_oldest_first(repo):
+    """The conversation-corpus export's bulk read (design 2026-09-08
+    §3.12): one query for a whole page of sessions rather than one lookup
+    per memory."""
+    repo.create(id="m1", agent_id="a1", owner_user_id="u1", content="first", source_session_id="c1")
+    repo.create(id="m2", agent_id="a1", owner_user_id="u1", content="second", source_session_id="c1")
+    repo.create(id="m3", agent_id="a1", owner_user_id="u1", content="other-session", source_session_id="c2")
+    repo.create(id="m4", agent_id="a1", owner_user_id="u1", content="unrequested", source_session_id="c3")
+
+    by_session = repo.list_for_sessions(["c1", "c2"])
+
+    assert set(by_session.keys()) == {"c1", "c2"}
+    assert [m["id"] for m in by_session["c1"]] == ["m1", "m2"]  # oldest first
+    assert [m["id"] for m in by_session["c2"]] == ["m3"]
+
+
+def test_list_for_sessions_omits_sessions_with_no_memories(repo):
+    repo.create(id="m1", agent_id="a1", owner_user_id="u1", content="x", source_session_id="c1")
+    by_session = repo.list_for_sessions(["c1", "no-such-session"])
+    assert set(by_session.keys()) == {"c1"}
+
+
+def test_list_for_sessions_empty_input_returns_empty_dict(repo):
+    repo.create(id="m1", agent_id="a1", owner_user_id="u1", content="x", source_session_id="c1")
+    assert repo.list_for_sessions([]) == {}

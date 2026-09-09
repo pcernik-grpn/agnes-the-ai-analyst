@@ -101,10 +101,16 @@ class ChatMessage:
     #: reports as unavailable rather than as zero.
     cache_read_tokens: Optional[int] = None
     cache_creation_tokens: Optional[int] = None
+    #: The chat turn that produced this row — the same id `usage_turns.
+    #: turn_uuid` and `llm_calls.turn_id` carry (design 2026-09-08 §3.2,
+    #: migration 0117). Postgres app-state only, same reasoning as the
+    #: cache columns above: NULL on the frozen DuckDB backend, which drops
+    #: the value on write.
+    turn_id: Optional[str] = None
     #: The turn's LLM latency, summed over its completions by the secret
     #: broker (app/chat/turn_usage.py): how many completions the turn made,
     #: their total wall time and their total time-to-first-byte. Postgres
-    #: app-state only (migration 0115), same NULL-means-unrecorded rule as
+    #: app-state only (migration 0117), same NULL-means-unrecorded rule as
     #: the prompt-cache columns above.
     llm_calls: Optional[int] = None
     llm_duration_ms: Optional[int] = None

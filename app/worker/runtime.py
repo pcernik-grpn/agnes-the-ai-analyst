@@ -143,8 +143,8 @@ import os
 import socket
 import time
 
-from app.job_correlation import bind_request_id, unbind_request_id
 from app.api.health_probes import to_thread_drain_on_cancel
+from app.job_correlation import bind_request_id, unbind_request_id
 from app.observability import metrics as obs_metrics
 from app.worker import wakeup
 from app.worker.kinds import dispatch_job
@@ -653,6 +653,9 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
     # `None`) when the payload has no (or a malformed) `_enqueued_by_request`
     # — never raises, so a missing/malformed key can't break job execution.
     rid_token = bind_request_id(job.get("payload_json"))
+    from src.observability.llm_context import bind_llm_context, unbind_llm_context
+
+    llm_token = bind_llm_context(job_id=str(job.get("id") or "") or None)
     try:
         hb_task = asyncio.create_task(
             _heartbeat_loop(job["id"], worker_id, lease_token, kind.lease_seconds),
@@ -771,6 +774,7 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
         # handed-off handler — it only prevents this contextvar from
         # leaking into whatever `_lane_slot` claims next in this same task.
         unbind_request_id(rid_token)
+        unbind_llm_context(llm_token)
 
 
 async def _lane_slot(

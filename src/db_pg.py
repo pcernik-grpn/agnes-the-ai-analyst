@@ -976,3 +976,57 @@ def knowledge_packaging_lease() -> Iterator[bool]:
             if acquired:
                 conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _KNOWLEDGE_PACKAGING_LEASE_ID})
                 conn.commit()
+
+
+#: Session-scoped PG advisory lock id for the conversation-export worker job
+#: handler — "AGNU" packed as an int, distinct from every lease id above.
+_CONVERSATION_EXPORT_LEASE_ID = 0x41474E55
+
+
+@contextlib.contextmanager
+def conversation_export_lease() -> Iterator[bool]:
+    """Non-blocking, session-scoped Postgres advisory lock guarding the
+    ``conversation-export`` worker job handler (design 2026-09-08 §3.12,
+    Task 11) — the exact same belt-and-braces shape as
+    :func:`knowledge_packaging_lease` above, for the exact same reason.
+
+    Belt-and-braces on top of the primary safeguard, which is the job
+    queue's own idempotency-keyed enqueue (``jobs_repo().enqueue(...,
+    idempotency_key="conversation-export")`` — see
+    ``services/scheduler/__main__.py``): that dedupe already prevents a
+    SECOND ``conversation-export`` job row from ever being queued while one
+    is ``'queued'``/``'running'``. This lock instead guards the narrower gap
+    dedup doesn't cover — a stray manual enqueue via ``POST /api/jobs``, or
+    two worker replicas' lane slots racing to claim two DIFFERENT job rows
+    that both ended up runnable. Without it, two concurrent runs could each
+    read the SAME watermark, send an overlapping batch to the destination
+    endpoint, and then race to advance the watermark — harmless for an
+    idempotent receiver, but needless duplicate egress and audit noise for
+    everyone else.
+
+    Yields ``True`` when the lock was acquired (caller should run its
+    export pass) or ``False`` when another run already holds it (caller
+    should skip, not wait). No-op (always yields ``True``) on the DuckDB
+    backend — a ``conversation-export`` job never actually reaches this far
+    there anyway, since the handler resolves ``llm_calls_repo()`` (PG-only)
+    first and swallows the resulting ``RequiresPostgresBackend``.
+
+    See :func:`knowledge_packaging_lease`'s docstring for why the
+    acquisition is followed by an explicit ``commit()`` (session-scoped, not
+    transaction-scoped locks under SQLAlchemy 2.x "commit as you go").
+    """
+    if not _lease_use_pg():
+        yield True
+        return
+    engine = get_engine()
+    with engine.connect() as conn:
+        acquired = bool(
+            conn.execute(sa.text("SELECT pg_try_advisory_lock(:key)"), {"key": _CONVERSATION_EXPORT_LEASE_ID}).scalar()
+        )
+        conn.commit()
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _CONVERSATION_EXPORT_LEASE_ID})
+                conn.commit()

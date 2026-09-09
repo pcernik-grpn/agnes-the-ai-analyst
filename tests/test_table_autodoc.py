@@ -23,8 +23,7 @@ class _FakeExtractor:
         self.calls = []
 
     def extract_json(self, *, prompt, max_tokens, json_schema, schema_name):
-        self.calls.append({"prompt": prompt, "schema_name": schema_name,
-                           "max_tokens": max_tokens})
+        self.calls.append({"prompt": prompt, "schema_name": schema_name, "max_tokens": max_tokens})
         if self.error:
             raise self.error
         return {"description": self.description}
@@ -104,15 +103,16 @@ def seeded(monkeypatch, tmp_path):
 
     # A: empty description + profile -> a target.
     reg.register(id="orders", name="Orders", source_type="bigquery")
-    prof.save("orders", {
-        "columns": [{"name": "id", "type": "STRING"}, {"name": "amount", "type": "NUMERIC"}],
-        "sample_rows": [{"id": "a1", "amount": "9.99"}],
-    })
+    prof.save(
+        "orders",
+        {
+            "columns": [{"name": "id", "type": "STRING"}, {"name": "amount", "type": "NUMERIC"}],
+            "sample_rows": [{"id": "a1", "amount": "9.99"}],
+        },
+    )
     # B: already described + profile -> must be left untouched.
-    reg.register(id="users", name="Users", source_type="bigquery",
-                 description="Already described.")
-    prof.save("users", {"columns": [{"name": "uid", "type": "STRING"}],
-                        "sample_rows": [{"uid": "u1"}]})
+    reg.register(id="users", name="Users", source_type="bigquery", description="Already described.")
+    prof.save("users", {"columns": [{"name": "uid", "type": "STRING"}], "sample_rows": [{"uid": "u1"}]})
     # C: empty description, NO profile -> skipped.
     reg.register(id="events", name="Events", source_type="bigquery")
     return tmp_path
@@ -133,9 +133,9 @@ def test_cli_fills_empty_description_and_respects_existing(seeded, monkeypatch):
     assert r.exit_code == 0, r.output
 
     reg = _reg()
-    assert reg.get("orders")["description"] == "One row per order."   # filled
-    assert reg.get("users")["description"] == "Already described."     # not clobbered
-    assert (reg.get("events")["description"] or "") == ""              # skipped (no profile)
+    assert reg.get("orders")["description"] == "One row per order."  # filled
+    assert reg.get("users")["description"] == "Already described."  # not clobbered
+    assert (reg.get("events")["description"] or "") == ""  # skipped (no profile)
 
 
 def test_cli_dry_run_saves_nothing(seeded, monkeypatch):
@@ -163,3 +163,21 @@ def test_cli_unknown_table_errors(seeded, monkeypatch):
     monkeypatch.setattr(m, "_build_extractor", lambda: _FakeExtractor())
     r = CliRunner().invoke(_cli_app(), ["autodoc-tables", "--table", "nope"])
     assert r.exit_code == 1
+
+
+def test_the_description_call_names_the_table_it_documents():
+    """An autodoc sweep is one call per table — the record says which."""
+    from src.observability.llm_context import current_llm_context
+
+    seen = {}
+
+    class _RecordingExtractor(_FakeExtractor):
+        def extract_json(self, **kwargs):
+            seen["context"] = current_llm_context()
+            return super().extract_json(**kwargs)
+
+    generate_description(_RecordingExtractor(), "orders", None, None)
+
+    ctx = seen["context"]
+    assert (ctx.workload, ctx.purpose) == ("semantic_layer", "table_autodoc")
+    assert ctx.subject_id == "orders"

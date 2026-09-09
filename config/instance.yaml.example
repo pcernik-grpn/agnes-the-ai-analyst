@@ -402,6 +402,62 @@ auth:
 #   sampling:
 #     chat.tool_call: 0.1   # keep 1 in 10 chat tool-call rows
 
+# --- Observability: content export policy (LLM observability design, 2026-09-08) ---
+# Prompt and completion TEXT leaves this instance (on OTLP spans, and through
+# the embedded engine's telemetry relay) only under a recorded decision. Sizes
+# and token counts are always exported; text never is unless `mode` is set AND
+# the consent fields below are filled in — a mode without a basis is treated as
+# `off` and logged at startup. `AGNES_OTEL_CAPTURE_CONTENT` is deprecated and
+# no longer enables content on its own. The effective policy is written to the
+# audit trail once per start (`observability.content_export`).
+# observability:
+#   content_export:
+#     mode: off             # off | pseudonymized | full
+#                           # pseudonymized = every exported text goes through
+#                           # this instance's anonymizer first (stable
+#                           # EMAIL_<hmac>/PERSON_<hmac> tokens, never the value)
+#     placement: operator   # operator | third_party — who runs the collector
+#                           # (T1 vs T2 in docs/observability.md)
+#     basis: ""             # the contract clause / DPA reference / "internal dev instance" that permits it
+#     approved_by: ""       # a person, never blank unless mode is off
+#     approved_at: ""       # ISO date — required; an undated approval is off
+#     workloads: []         # allowlist of workloads whose content may leave;
+#                           # empty = every workload once mode is not off. An
+#                           # operator may open builder/corporate-memory
+#                           # content for quality work while keeping chat at
+#                           # off — content classes differ by workload:
+#                           #   chat / agent_api      — prompt: the customer's own conversation and data;
+#                           #                           completion: the customer's own conversation
+#                           #   extraction (facts,    — prompt: the customer's document;
+#                           #   OCR, vision, NER)       completion: a derived artifact (facts, proposals)
+#                           #   builder               — prompt: an admin-authored draft plus candidate ids;
+#                           #                           completion: a config patch
+#                           #   corporate_memory /    — prompt: employee notes, catalog text;
+#                           #   knowledge /             completion: derived notes
+#                           #   semantic_layer
+#                           # An unknown workload name is dropped and warned
+#                           # about at startup rather than silently kept.
+#   conversation_export:    # optional push sink for the conversation-corpus
+#                           # export (design 2026-09-08 §3.12) — a
+#                           # `conversation-export` worker job POSTs
+#                           # newline-delimited JSON batches of completed
+#                           # conversations to `endpoint` on a schedule.
+#                           # Unset (the default) = the scheduler never
+#                           # enqueues the job. Same content-export policy
+#                           # gate as the pull endpoint above (`GET
+#                           # /api/admin/conversations/corpus`): refuses
+#                           # with no outbound request at all, and never
+#                           # moves the watermark, when `content_export`
+#                           # above is off or excludes workload `chat`.
+#     endpoint: ""          # https URL the batches are POSTed to; blank = off
+#     headers_secret_env: "" # name of an env var holding
+#                           # OTEL_EXPORTER_OTLP_HEADERS-shaped
+#                           # "k1=v1,k2=v2" auth headers — never the header
+#                           # value itself in this file
+#     interval_minutes: 60  # how often the scheduler enqueues the job
+#     surfaces: []          # optional allowlist (web, slack_dm, api, ...);
+#                           # empty = every surface
+
 # --- Per-trail retention (optional, Track E3 Slice 1) ---
 # Opt-in day windows for the other unbounded audit/activity trails. EVERY
 # key below defaults to 0 = keep forever = the daily retention-prune
@@ -414,6 +470,7 @@ auth:
 #                                      # touches sync_state (current per-table
 #                                      # state, not a trail).
 #   llm_usage_days: 0                 # llm_usage rows (per-call token ledger), by created_at.
+#   llm_calls_days: 0                 # llm_calls rows (the LLM observability ledger), by created_at.
 #   agent_scope_snapshots_days: 0     # agent_scope_snapshots rows, by created_at.
 #                                      # Never touches the live agents table.
 #   usage_events_days: 0              # usage_events rows, by occurred_at. The

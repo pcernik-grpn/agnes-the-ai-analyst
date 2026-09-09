@@ -3898,6 +3898,16 @@ function attachMessageActions(article, copyText) {
   };
   wrap.appendChild(copy);
 
+  // Thumbs up/down on a completed assistant turn (LLM observability design
+  // §3.5) — only when the article carries the turn id the client learns
+  // from the WS frames (finalizeAssistantMessage / renderMessage stamp it
+  // onto `article.dataset.turnId`). A row with no turn id (a synthetic
+  // system card, an orphaned/interrupted turn) gets no thumbs — there is
+  // nothing to key the rating on.
+  if (article.classList.contains("msg-assistant") && article.dataset.turnId) {
+    wrap.appendChild(buildFeedbackControls(article.dataset.turnId));
+  }
+
   // "↻ Ask again" — only meaningful on assistant turns; CSS keeps
   // it hidden on every assistant message except .is-latest-assistant
   // so the user sees one button at a time at the bottom of the
@@ -3925,6 +3935,107 @@ function attachMessageActions(article, copyText) {
   }
 
   appendRow();
+}
+
+/** Build the thumbs up/down control for one completed assistant turn (LLM
+ *  observability design §3.5). Verdict POSTs on click; a thumbs-down also
+ *  reveals a one-line optional comment box whose Enter/blur re-submits WITH
+ *  the comment — server-side this is the SAME `(turn_id, user_id)` row,
+ *  upserted, never a second opinion. */
+function buildFeedbackControls(turnId) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg-feedback";
+  let commentInput = null;
+
+  const removeComment = () => {
+    if (commentInput) {
+      commentInput.remove();
+      commentInput = null;
+    }
+  };
+  const select = (verdict) => {
+    up.classList.toggle("is-selected", verdict === "up");
+    down.classList.toggle("is-selected", verdict === "down");
+  };
+
+  const up = document.createElement("button");
+  up.type = "button";
+  up.className = "msg-feedback-btn";
+  up.dataset.verdict = "up";
+  up.title = "Good answer";
+  up.setAttribute("aria-label", "Good answer");
+  up.innerHTML =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M2 14h2.5V6.5H2V14Z"/>' +
+    '<path d="M6 6.5l1-4a1.4 1.4 0 0 1 2.75.4V6H12a1.5 1.5 0 0 1 1.46 1.82l-.9 4.5A2 2 0 0 1 10.6 14H6V6.5Z"/>' +
+    "</svg>";
+  up.onclick = async (e) => {
+    e.stopPropagation();
+    removeComment();
+    if (await submitFeedback(turnId, "up")) select("up");
+  };
+  wrap.appendChild(up);
+
+  const down = document.createElement("button");
+  down.type = "button";
+  down.className = "msg-feedback-btn";
+  down.dataset.verdict = "down";
+  down.title = "Bad answer";
+  down.setAttribute("aria-label", "Bad answer");
+  down.innerHTML =
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M14 2h-2.5v7.5H14V2Z"/>' +
+    '<path d="M10 9.5l-1 4a1.4 1.4 0 0 1-2.75-.4V10H4a1.5 1.5 0 0 1-1.46-1.82l.9-4.5A2 2 0 0 1 5.4 2H10v7.5Z"/>' +
+    "</svg>";
+  down.onclick = async (e) => {
+    e.stopPropagation();
+    if (!(await submitFeedback(turnId, "down"))) return;
+    select("down");
+    if (commentInput) return;
+    commentInput = document.createElement("input");
+    commentInput.type = "text";
+    commentInput.className = "msg-feedback-comment";
+    commentInput.maxLength = 2000;
+    commentInput.placeholder = "What was wrong? (optional)";
+    const resend = () => {
+      const comment = commentInput.value.trim();
+      if (comment) submitFeedback(turnId, "down", comment);
+    };
+    commentInput.addEventListener("click", (ev) => ev.stopPropagation());
+    commentInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        commentInput.blur();
+      }
+    });
+    commentInput.addEventListener("blur", resend);
+    wrap.appendChild(commentInput);
+    commentInput.focus();
+  };
+  wrap.appendChild(down);
+
+  return wrap;
+}
+
+/** POST one turn's verdict (LLM observability design §3.5). Resolves true on
+ *  success — callers gate the ``is-selected`` state on it so a failed submit
+ *  never shows a rating that did not actually land. */
+async function submitFeedback(turnId, verdict, comment) {
+  const body = { turn_id: turnId, verdict };
+  if (comment) body.comment = comment;
+  try {
+    await api(`/api/chat/sessions/${currentChatId}/feedback`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return true;
+  } catch (err) {
+    showToast(
+      err.status === 501 ? "Feedback needs the Postgres app-state backend." : "Couldn't send feedback.",
+      "warn",
+    );
+    return false;
+  }
 }
 
 /** Whether a persisted assistant row is a partial-save of an interrupted turn
@@ -4047,6 +4158,12 @@ function renderMessage(m) {
   // of the answer on reload too, not a tail stapled after its first segment.
   const tailBubble = tailArticle.querySelector(".msg-bubble");
   if (m.role === "assistant") renderSourcesChips(tailBubble, m.sources);
+
+  // The feedback thumbs (attachMessageActions, below) key off this — a
+  // history row from GET /sessions/{id}/messages carries the same `turn_id`
+  // the live frame does (§3.2), NULL for a pre-migration row or the frozen
+  // DuckDB backend, in which case the thumbs simply don't render.
+  if (m.role === "assistant" && m.turn_id) tailArticle.dataset.turnId = m.turn_id;
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
   // only (see the note on stripSourcesFence) — but drops the next_actions
@@ -4964,6 +5081,8 @@ function finalizeAssistantMessage(frame) {
     renderSourcesChips(bubble, frame && frame.sources);
     renderNextActions(bubble, extractNextActions(content).actions);
     renderFactsScopeLine(bubble);
+    // Before attachMessageActions renders the feedback thumbs off it (§3.5).
+    if (frame && frame.turn_id) article.dataset.turnId = frame.turn_id;
     attachMessageActions(article, stripNextActionsFence(content));
     _markLatestAssistant(article);
     // Every other finish path caps an over-long answer; this one must too, or
@@ -4988,6 +5107,8 @@ function finalizeAssistantMessage(frame) {
     renderSourcesChips(currentAssistantBody.closest(".msg-bubble"), frame && frame.sources);
     renderNextActions(currentAssistantBody.closest(".msg-bubble"), extractNextActions(content).actions);
     renderFactsScopeLine(currentAssistantBody.closest(".msg-bubble"));
+    // Before attachMessageActions renders the feedback thumbs off it (§3.5).
+    if (frame && frame.turn_id) currentAssistantArticle.dataset.turnId = frame.turn_id;
     // The copy row hands over the WHOLE answer — the bubble shows the tail,
     // but nobody copying "the answer" wants it cut at the last tool card.
     attachMessageActions(currentAssistantArticle, stripNextActionsFence(content));
@@ -5006,6 +5127,8 @@ function finalizeAssistantMessage(frame) {
       tool_calls: frame && frame.tool_calls,
       sources: frame && frame.sources,
       created_at: new Date().toISOString(),
+      // renderMessage stamps this onto the article for the feedback thumbs.
+      turn_id: frame && frame.turn_id,
     });
     // This fallback path (no streamed article — e.g. a tokenless turn) must
     // end in the same state as the streamed one: chips under the answer.

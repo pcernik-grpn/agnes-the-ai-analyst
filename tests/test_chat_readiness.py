@@ -237,6 +237,63 @@ def test_test_anthropic_key_auth_failure_classified(monkeypatch):
     assert "authentication failed" in r["detail"]
 
 
+def test_a_credential_probe_is_recorded_as_readiness_work(monkeypatch):
+    """A probe is a real (tiny) LLM call. It is recorded like one, under its
+    own workload, so a burst of admin "test connection" clicks never reads
+    as chat spend."""
+    import asyncio
+
+    import anthropic
+
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+
+    class _Msgs:
+        def create(self, **kw):
+            return SimpleNamespace(content=[])
+
+    class _FakeClient:
+        def __init__(self, **kw):
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeClient)
+    assert asyncio.run(readiness.test_anthropic_key(api_key="sk-good"))["ok"] is True
+
+    assert len(records) == 1
+    assert (records[0].workload, records[0].purpose) == ("readiness", "probe")
+    assert records[0].provider == "anthropic"
+
+
+def test_a_failed_probe_is_recorded_as_an_error_and_still_answers(monkeypatch):
+    """The probe's own contract is "classify, never raise" — the wrap must
+    not change that, and must not lose the failed call either."""
+    import asyncio
+
+    import anthropic
+
+    records: list = []
+    monkeypatch.setattr("src.observability.llm_tracing.record_call", records.append)
+
+    class _AuthErr(Exception):
+        status_code = 401
+
+    class _Msgs:
+        def create(self, **kw):
+            raise _AuthErr("invalid x-api-key")
+
+    class _FakeClient:
+        def __init__(self, **kw):
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeClient)
+    r = asyncio.run(readiness.test_anthropic_key(api_key="sk-bad"))
+
+    assert r["ok"] is False
+    assert len(records) == 1
+    assert records[0].status == "error"
+    assert records[0].purpose == "probe"
+
+
 # ---------------------------------------------------------------------------
 # Vertex mode (chat.llm.provider: vertex)
 # ---------------------------------------------------------------------------

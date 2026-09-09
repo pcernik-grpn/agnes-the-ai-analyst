@@ -323,3 +323,32 @@ def test_pending_digest_generates_first_time(repo, corpus_fps):
     assert row["status"] == "fresh"
     assert row["output_md"] == "# first generation"
     assert result["generated"] == ["d1"]
+
+
+def test_a_generation_says_which_digest_it_was_for(repo, corpus_fps):
+    """A digest pass regenerates several digests in one loop; the record
+    names the digest so a runaway one is findable."""
+    from src.knowledge_digests import run_digest_pass
+    from src.observability.llm_context import current_llm_context
+
+    digest_id = repo.create(
+        slug="d1",
+        title="D1",
+        instructions="Summarize the source material.",
+        source_corpus_ids=["col_a"],
+        created_by="u",
+    )
+
+    seen: list = []
+
+    class _RecordingExtractor(FakeExtractor):
+        def extract_json(self, *args, **kwargs):
+            seen.append(current_llm_context())
+            return super().extract_json(*args, **kwargs)
+
+    with patch("src.knowledge_digests._make_extractor", lambda: _RecordingExtractor()):
+        run_digest_pass()
+
+    assert len(seen) == 1
+    assert (seen[0].workload, seen[0].purpose) == ("knowledge", "digest")
+    assert seen[0].subject_id == str(digest_id)

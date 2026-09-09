@@ -120,3 +120,16 @@ class TestBudgetTokens:
         import inspect
 
         assert "cache_read_tokens" not in inspect.signature(budget_tokens).parameters
+
+
+class TestResolvePriceKey:
+    def test_resolve_price_key_names_the_table_row_or_none(self):
+        """A stored ``priced_as`` has to be able to say "this figure is a
+        guess at the default tier" rather than pass as a measurement."""
+        from src.llm_pricing import resolve_price_key
+
+        assert resolve_price_key("claude-sonnet-5-20260101") == "claude-sonnet-5"
+        assert resolve_price_key("anthropic.claude-opus-5") == "claude-opus-5"
+        assert resolve_price_key("totally-unknown") is None
+        assert resolve_price_key(None) is None
+        assert resolve_price("totally-unknown") is DEFAULT_PRICE

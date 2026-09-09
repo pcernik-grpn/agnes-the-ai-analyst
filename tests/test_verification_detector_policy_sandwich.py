@@ -121,3 +121,22 @@ def test_extract_verifications_no_turns_never_calls_llm():
     result = detector_module.extract_verifications(extractor, "alice", "sess-1", [])
     assert result == []
     extractor.extract_json.assert_not_called()
+
+
+def test_extract_verifications_labels_its_call_as_verification_work():
+    """Detection runs on a 15-minute cadence over every new session — a
+    workload of its own, and one an operator has to be able to price."""
+    import services.verification_detector.detector as detector_module
+    from src.observability.llm_context import current_llm_context
+
+    seen = {}
+
+    class _RecordingExtractor:
+        def extract_json(self, **_kwargs):
+            seen["context"] = current_llm_context()
+            return {"verifications": []}
+
+    detector_module.extract_verifications(_RecordingExtractor(), "alice", "sess-1", [{"role": "user", "content": "hi"}])
+
+    ctx = seen["context"]
+    assert (ctx.workload, ctx.purpose) == ("verification", "detector")

@@ -91,6 +91,25 @@ PRICES: dict[str, ModelPrice] = {
 DEFAULT_PRICE = PRICES["claude-opus-5"]
 
 
+def _resolve(model: str | None) -> tuple[str | None, ModelPrice]:
+    """``(the PRICES key that matched, its rates)`` — ``(None, DEFAULT_PRICE)``
+    when nothing matched. The one resolver both public functions share, so a
+    price and the name of the row it came from can never disagree."""
+    if not model:
+        return None, DEFAULT_PRICE
+    key = model.strip().lower()
+    exact = PRICES.get(key)
+    if exact is not None:
+        return key, exact
+    # Vertex spells a dated snapshot `model@date`; strip the platform
+    # prefix Bedrock adds (`anthropic.claude-opus-5`) before matching.
+    key = key.removeprefix("anthropic.")
+    for known in sorted(PRICES, key=len, reverse=True):
+        if key.startswith(known):
+            return known, PRICES[known]
+    return None, DEFAULT_PRICE
+
+
 def resolve_price(model: str | None) -> ModelPrice:
     """Rates for ``model`` — exact match, else longest known prefix, else
     :data:`DEFAULT_PRICE`.
@@ -101,19 +120,15 @@ def resolve_price(model: str | None) -> ModelPrice:
     ``claude-opus-4-8`` cannot be captured by a shorter ``claude-opus-4``
     style key if one is ever added.
     """
-    if not model:
-        return DEFAULT_PRICE
-    key = model.strip().lower()
-    exact = PRICES.get(key)
-    if exact is not None:
-        return exact
-    # Vertex spells a dated snapshot `model@date`; strip the platform
-    # prefix Bedrock adds (`anthropic.claude-opus-5`) before matching.
-    key = key.removeprefix("anthropic.")
-    for known in sorted(PRICES, key=len, reverse=True):
-        if key.startswith(known):
-            return PRICES[known]
-    return DEFAULT_PRICE
+    return _resolve(model)[1]
+
+
+def resolve_price_key(model: str | None) -> str | None:
+    """The ``PRICES`` key ``model`` resolved to, or ``None`` when it priced at
+    :data:`DEFAULT_PRICE` — so a stored ``priced_as`` can say "this figure is
+    a guess at the most expensive general-purpose tier", not pass as a
+    measurement."""
+    return _resolve(model)[0]
 
 
 def cost_usd(
