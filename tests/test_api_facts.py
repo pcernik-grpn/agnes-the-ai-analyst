@@ -275,6 +275,32 @@ def test_neighbors_include_claims_over_3_is_422(facts_client):
     assert r.status_code == 422
 
 
+def test_search_statement_timeout_is_a_typed_hinted_error(seeded_app, monkeypatch):
+    """A `FactsQueryTimeout` from the repository (the statement outlived
+    its Postgres statement timeout) is translated to a typed `504` whose
+    `detail` carries a stable `reason` and the repository's own forward-
+    pointing `hint` — never an unhandled `500` with the driver message. The
+    CLI's `render_error` already pretty-prints `{"reason", "hint"}` dicts,
+    so the same body reads well on every surface."""
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    import app.api.facts as facts_mod
+    from src.repositories.facts_pg import FactsQueryTimeout
+
+    class _FakeRepo:
+        def search(self, user, **kwargs):
+            raise FactsQueryTimeout("The fact search did not finish in time. Narrow `q` to a longer name.")
+
+    monkeypatch.setattr(facts_mod, "facts_repo", lambda: _FakeRepo())
+
+    r = seeded_app["client"].post(
+        "/api/facts/search", json={"type": "person", "q": "llr"}, headers=_headers(seeded_app)
+    )
+    assert r.status_code == 504, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "facts_search_timeout"
+    assert "Narrow `q`" in detail["hint"]
+
+
 def test_search_include_claims_over_3_is_422(facts_client):
     r = facts_client["client"].post("/api/facts/search", json={"include_claims": 4}, headers=_headers(facts_client))
     assert r.status_code == 422
