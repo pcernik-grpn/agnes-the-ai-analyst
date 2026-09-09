@@ -1,7 +1,7 @@
 {#
   "Report a problem" dialog (#issue-dialog).
 
-  Included once, from base_ds.html, inside the `can_report_issue` gate —
+  Included from BOTH base layouts, inside the `can_report_issue` gate —
   issue reports (issue_reports/issue_comments) are a Postgres-only table
   pair (A3 PG-first ratchet); a DuckDB-backed instance renders no button and
   no dialog rather than one that answers 501 (see
@@ -26,6 +26,12 @@
   Behaviour + auto-attached context: app/web/static/js/issue_report.js.
   Content and privacy notes: docs/issue-reporting.md.
 #}
+{# Self-contained on purpose: `base_ds.html` auto-imports these macros, but
+   the legacy `base.html` does NOT, and it renders the same rail — so without
+   this import the dialog raised `'ds' is undefined` on every page still
+   extending it. Importing here shadows the parent's identical binding and
+   costs nothing (Devin review on #2402). #}
+{% import '_components.html' as ds %}
 <div id="issue-dialog" class="modal-backdrop modal-overlay" role="dialog"
      aria-modal="true" aria-labelledby="issue-dialog-title">
   <div class="modal-card issue-dialog__card" data-preserve-newlines="1">

@@ -123,3 +123,43 @@ def _app_scripts_source() -> str:
 
     path = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "_app_scripts.html"
     return path.read_text(encoding="utf-8")
+
+
+class TestTheLegacyBaseCarriesTheDialogToo:
+    """`_app_rail.html` is shared by BOTH base layouts.
+
+    It renders the report button, so any layout that includes the rail must
+    also include the dialog the button opens — otherwise the button appears
+    and clicking it does nothing, because `issue_report.js` returns early
+    when `#issue-dialog` is absent. Three live catalog detail pages still
+    extend `base.html` (Devin review on #2402).
+    """
+
+    def _sources(self) -> tuple[str, str]:
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1] / "app" / "web" / "templates"
+        return (
+            (root / "base.html").read_text(encoding="utf-8"),
+            (root / "base_ds.html").read_text(encoding="utf-8"),
+        )
+
+    def test_every_layout_including_the_rail_also_includes_the_dialog(self):
+        for src in self._sources():
+            if "_app_rail.html" in src:
+                assert "_issue_dialog.html" in src, (
+                    "a layout that renders the rail's report button must include "
+                    "_issue_dialog.html, or the button is dead on those pages"
+                )
+
+    def test_the_legacy_base_gates_the_dialog_like_the_new_one(self):
+        legacy, _ = self._sources()
+        # The include sits inside a can_report_issue gate, not unconditionally:
+        # a DuckDB instance renders no button, so it needs no dialog either.
+        idx = legacy.index("_issue_dialog.html")
+        assert "can_report_issue" in legacy[max(0, idx - 400) : idx]
+
+    def test_the_legacy_base_loads_the_dialog_stylesheets(self):
+        legacy, _ = self._sources()
+        assert "css/issue_dialog.css" in legacy
+        assert "css/drawer.css" in legacy
