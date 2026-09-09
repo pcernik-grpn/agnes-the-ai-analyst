@@ -386,3 +386,29 @@ def test_a_rejected_screenshot_leaves_no_temp_file(state_backend, seeded_app_bot
     shot_dir = tmp_path / "issues" / row["id"]
     if shot_dir.exists():
         assert list(shot_dir.iterdir()) == [], "a refused upload wrote something"
+
+
+def test_the_409_names_who_actually_resolved_it(state_backend, seeded_app_both):
+    """The losing admin learns who won, not "resolved by None at None".
+
+    The conflict used to be formatted from the row read while the report was
+    still open, so it omitted exactly the two facts it exists to carry
+    (Devin review on #2402).
+    """
+    if state_backend != "pg":
+        pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
+    c, tok, adm = (
+        seeded_app_both["client"],
+        _auth(seeded_app_both["analyst_token"]),
+        _auth(seeded_app_both["admin_token"]),
+    )
+    row = c.post("/api/issues", json={"title": "resolved twice", "kind": "bug"}, headers=tok).json()
+
+    first = c.post(f"/api/admin/issues/{row['id']}/resolve", json={"resolution_note": "done"}, headers=adm)
+    assert first.status_code == 200, first.text
+
+    second = c.post(f"/api/admin/issues/{row['id']}/resolve", json={}, headers=adm)
+    assert second.status_code == 409, second.text
+    message = second.json()["detail"]["message"]
+    assert "None" not in message, f"the conflict hid the winner: {message!r}"
+    assert first.json()["resolved_by"] in message

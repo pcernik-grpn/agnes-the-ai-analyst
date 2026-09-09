@@ -220,3 +220,31 @@ class TestARestrictedPrincipalDoesNotCrash:
             intersection={},
         )
         assert _is_admin(p) is False
+
+
+class TestTheContextCapCountsBytes:
+    """`_MAX_CONTEXT_BYTES` is named in bytes; Python string length is not.
+
+    One emoji is four UTF-8 bytes, so counting code points accepted a context
+    several times over the promised limit (Devin review on #2402).
+    """
+
+    def test_multibyte_context_over_the_cap_is_refused(self):
+        import pytest as _pytest
+        from fastapi import HTTPException
+
+        from app.api.issues import _MAX_CONTEXT_BYTES, _cap_context
+
+        # Comfortably under the cap in characters, far over it in bytes.
+        payload = {"notes": ["🙂" * 300 for _ in range(50)]}
+        as_chars = len(str(payload))
+        assert as_chars < _MAX_CONTEXT_BYTES, "fixture must be under the cap by character count"
+
+        with _pytest.raises(HTTPException) as exc:
+            _cap_context(payload)
+        assert exc.value.detail["error"] == "context_too_large"
+
+    def test_a_normal_context_still_passes(self):
+        from app.api.issues import _cap_context
+
+        assert _cap_context({"app_version": "0.101.0", "recent_errors": []}) is not None

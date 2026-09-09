@@ -351,6 +351,9 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
             "Problems, wrong answers, missing things and questions reported through "
             "'Report a problem', `agnes issue report` or the report_issue tool. "
             "Own rows only — a reporter sees the issues they filed; admins see all. "
+            "Inside a chat sandbox this table is empty by design — an agent's "
+            "restricted identity matches no reporter; use the report_issue / "
+            "list_my_issues tools there instead. "
             "Server-side only (Postgres backend); not synced by agnes pull."
         ),
         column_descriptions={
@@ -383,6 +386,7 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
         display_name="Comments on my issue reports",
         description=(
             "Public replies on issue reports — by the reporter or an admin. Own rows only: "
+            "Empty inside a chat sandbox for the same reason as `agnes_issues`. "
             "a reporter sees every comment on the issues they filed; admins see all. "
             "Server-side only (Postgres backend); not synced by agnes pull."
         ),

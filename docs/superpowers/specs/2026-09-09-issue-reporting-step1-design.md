@@ -47,8 +47,12 @@ In:
 - **Any agent can answer "what are my open issues?"** through the existing
   internal-table mechanism: `agnes_issues` and `agnes_issue_comments` are
   registered as `query_mode='internal'` tables with the per-user row filter,
-  so `agnes query "SELECT … FROM agnes_issues"` works everywhere `agnes
-  query` works.
+  so `agnes query "SELECT … FROM agnes_issues"` works wherever `agnes query`
+  runs under a real user identity. NOT inside a chat sandbox: every internal
+  table binds a restricted principal to a synthetic id that matches no user
+  (`app/api/query.py`), so an agent reads its own reports through
+  `list_my_issues`, not SQL. Widening that binding is a shared decision
+  across every internal table and is deliberately out of scope here.
 - **Admin queue** on CLI and MCP (`agnes admin issue …`, `issue_queue_list`
   / `issue_reply` / `issue_resolve`). No admin web page in step 1.
 

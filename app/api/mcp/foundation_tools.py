@@ -3932,18 +3932,25 @@ def register_foundation_tools(
 
     @tool(read_only=False)
     async def issue_reply(issue_id: str, body: str) -> dict:
-        """Reply to a user's issue report (admin only).
+        """Reply on an issue report, as the admin working the queue.
 
-        Same endpoint as ``issue_comment`` — an admin's reply on someone
-        else's report; the response marks it ``author_kind: "admin"``.
+        The SAME owner-or-admin endpoint as ``issue_comment``, offered under
+        the triager's name so the admin queue reads as one set of tools. It
+        is not an extra authorization gate and never was: the server decides
+        ``author_kind`` from the caller, so a reporter calling this on their
+        own report simply leaves an ordinary reporter comment. Calling it on
+        somebody else's report is what requires admin — and that is enforced
+        by the endpoint, not by which of the two tool names you picked
+        (Devin review on #2402, which flagged the docstring's "admin only"
+        as a promise the tool could not keep).
 
         Args:
-            issue_id: The issue id, or its number.
+            issue_id: The issue id, or its number (``42`` or ``#42``).
             body: The reply text (≤8000 chars).
 
         Mirrors ``POST /api/issues/{issue_id}/comments`` and ``agnes admin issue reply``.
 
-        Requires an admin PAT and the Postgres app-state backend.
+        Requires the Postgres app-state backend.
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(

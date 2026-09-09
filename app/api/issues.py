@@ -135,7 +135,10 @@ def _cap_context(ctx: dict[str, Any] | None) -> dict[str, Any] | None:
         return v
 
     capped = cap(ctx)
-    if len(json.dumps(capped, default=str)) > _MAX_CONTEXT_BYTES:
+    # Encoded bytes, not code points: the cap is named in bytes and one
+    # emoji is four of them, so counting characters accepted payloads several
+    # times over the promised limit (Devin review on #2402).
+    if len(json.dumps(capped, default=str).encode("utf-8")) > _MAX_CONTEXT_BYTES:
         raise _err(400, "context_too_large", "context must be under 32 KB after truncation")
     return capped
 
@@ -492,11 +495,16 @@ async def resolve_issue(
             row["id"], resolved_by=admin.get("email") or admin.get("id"), resolution_note=_clean(body.resolution_note)
         )
     except IssueAlreadyResolved:
-        raise _err(
-            409,
-            "already_resolved",
-            f"#{row['number']} was already resolved by {row.get('resolved_by')} at {row.get('resolved_at')}",
-        )
+        # Re-read: `row` was fetched while the report was still open, so it
+        # carries no resolver and no timestamp. Formatting the conflict from
+        # it told the losing admin "#42 was already resolved by None at None"
+        # — the one thing this response exists to say, missing (Devin review
+        # on #2402).
+        winner = repo.get(row["id"]) or row
+        by, at = winner.get("resolved_by"), winner.get("resolved_at")
+        detail = f" by {by}" if by else ""
+        when = f" at {at}" if at else ""
+        raise _err(409, "already_resolved", f"#{row['number']} was already resolved{detail}{when}")
 
     from src.audit_helpers import log_safe
 
