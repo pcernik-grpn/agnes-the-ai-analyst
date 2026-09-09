@@ -1048,6 +1048,11 @@ class KaiEngineHandle:
                     "tool_use_id": tool_call_id,
                     "tool": tool_name,
                     "args": args,
+                    # Pairing clock for the manager's `chat.tool_call`
+                    # duration — see the same key in app/chat/runner.py.
+                    # Stamped at event arrival from the engine, before the
+                    # pump and its sinks get involved.
+                    "emitted_at": time.monotonic(),
                 }
             )
         elif etype == "tool-approval-request":
@@ -1139,6 +1144,7 @@ class KaiEngineHandle:
                     # anywhere else ("Catalog Error: Table … does not exist")
                     # was rendering with a success tick and folded shut.
                     "is_error": etype == "tool-output-error",
+                    "emitted_at": time.monotonic(),
                 }
             )
         elif etype == "error":

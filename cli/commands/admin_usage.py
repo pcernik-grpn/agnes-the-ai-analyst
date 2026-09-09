@@ -156,6 +156,13 @@ def summary(
         typer.echo("  * not in the table registry (parsed from query SQL)")
 
 
+def _ms(value) -> str:
+    """``1234`` → ``1.2s``; ``None`` (no timed completion) → ``n/a``."""
+    if not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value / 1000:.1f}s"
+
+
 @app.command("chat-cost")
 def chat_cost(
     window: str = typer.Option("7d", "--window", help="1d|7d|30d|all"),
@@ -174,6 +181,10 @@ def chat_cost(
 
     A row marked `cache:unavailable` predates the recording of prompt-cache
     figures: its cached tokens are unknown, not zero, and its cost is a floor.
+
+    `llm/call` is the session's average completion wall time as the secret
+    broker measured it (request start → last upstream byte); `n/a` means no
+    timed completion was recorded for that session, not that it was instant.
     """
     if window not in ("1d", "7d", "30d", "all"):
         typer.echo(f"[err] window must be 1d|7d|30d|all, got {window!r}", err=True)
@@ -208,13 +219,19 @@ def chat_cost(
         f"cache read {t.get('cache_read_tokens', 0):,}   cache write {t.get('cache_creation_tokens', 0):,}"
     )
     typer.echo(f"  share of read input served from cache: {share_str}")
+    if t.get("llm_calls"):
+        typer.echo(
+            f"  llm: {t.get('llm_calls', 0):,} completions   "
+            f"avg {_ms(t.get('avg_completion_ms'))} per completion   "
+            f"avg first byte {_ms(t.get('avg_ttfb_ms'))}"
+        )
 
     sessions = data.get("sessions") or []
     if not sessions:
         typer.echo("  (no assistant messages in this window)")
     else:
         typer.echo("")
-        typer.echo(f"  {'session':<26} {'model':<20} {'msgs':>5} {'cost':>10} {'cached%':>8}  cache")
+        typer.echo(f"  {'session':<26} {'model':<20} {'msgs':>5} {'cost':>10} {'cached%':>8} {'llm/call':>9}  cache")
         for row in sessions:
             read_input = (
                 (row.get("input_tokens") or 0)
@@ -227,7 +244,7 @@ def chat_cost(
                 f"{str(row.get('model') or '-')[:19]:<20} "
                 f"{row.get('messages', 0):>5} "
                 f"${row.get('cost_usd', 0):>9.4f} "
-                f"{pct:>8}  {row.get('cache_accounting', '?')}"
+                f"{pct:>8} {_ms(row.get('avg_completion_ms')):>9}  {row.get('cache_accounting', '?')}"
             )
 
     for note in data.get("notes") or []:

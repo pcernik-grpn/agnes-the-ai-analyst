@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import random
+import time
 import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
@@ -69,7 +70,7 @@ from app.api.broker_vertex import (
 )
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
-from app.chat.turn_usage import add_turn_usage
+from app.chat.turn_usage import add_turn_timing, add_turn_usage
 from src.observability import otel as _otel
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
@@ -1334,6 +1335,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             logger.debug("broker: could not open the completion span", exc_info=True)
             otel_span = None
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
+    # Completion timing (app/chat/turn_usage.py::add_turn_timing): measured
+    # from HERE — the first attempt's send, after every gate — to the last
+    # upstream byte, so a retried 429 counts as the wait the caller really
+    # sat through and a refused call counts for nothing. Recorded next to
+    # the token usage below; tokens said what a turn cost, never how long
+    # the model took.
+    forward_started = time.perf_counter()
     # Retry loop for upstream rate limiting. A provider 429 (a Vertex
     # per-minute token/request quota is the usual one) means the request was
     # refused WITHOUT being processed, so replaying it is safe and normally
@@ -1421,6 +1429,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             if otel_span is not None:
                 _otel.end_completion_span(otel_span, error=_exc)
             raise
+    # The response head is the first upstream byte of a buffered reply, and
+    # the fallback first-byte mark for a stream that ends before its first
+    # chunk arrives.
+    upstream_head_at = time.perf_counter()
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
     if vertex_mode and resp.status_code == 401:
@@ -1466,17 +1478,23 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         turn_session_id = row.get("session_id") if is_completion else None
         collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
-        state = {"overflow": False}
+        state: dict[str, Any] = {"overflow": False, "first_byte_at": None, "exhausted": False}
 
         async def _passthrough():
             try:
                 async for chunk in resp.aiter_bytes():
+                    if state["first_byte_at"] is None:
+                        state["first_byte_at"] = time.perf_counter()
                     if (collect_usage or otel_span is not None) and not state["overflow"]:
                         if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
                             collected.extend(chunk)
                         else:
                             state["overflow"] = True
                     yield chunk
+                # Reached only when the upstream ran to its natural end AND
+                # the client consumed all of it — a drop on either side
+                # leaves this False and the timing below unrecorded.
+                state["exhausted"] = True
             finally:
                 await resp.aclose()
                 await client.aclose()
@@ -1509,6 +1527,18 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                             "llm usage recording failed for agent %s (stream already forwarded)",
                             agent_row.get("id"),
                         )
+                if turn_session_id and resp.status_code == 200 and state["exhausted"]:
+                    # Independent of the usage parse above (an over-long
+                    # stream still took its time), but NOT of the stream
+                    # finishing: a completion cut short — the upstream
+                    # dropping, the client walking away — is not a
+                    # completion, and its truncated wall time would pull
+                    # every latency average toward whatever aborted it.
+                    # The partial usage above is still recorded: tokens
+                    # were spent either way, time was not fully measured.
+                    _record_completion_timing(
+                        turn_session_id, forward_started, state["first_byte_at"] or upstream_head_at
+                    )
                 if otel_span is not None:
                     _otel.end_completion_span(
                         otel_span,
@@ -1550,6 +1580,8 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # than written here. Must never break the response path: any parse/add
     # failure is caught and logged, not raised.
     turn_session_id = row.get("session_id") if is_completion else None
+    if turn_session_id and resp.status_code == 200:
+        _record_completion_timing(turn_session_id, forward_started, upstream_head_at)
     if (agent_row is not None or turn_session_id is not None) and resp.status_code == 200:
         try:
             usage = parse_usage(resp.content, resp.headers.get("content-type", ""))
@@ -1609,6 +1641,20 @@ def _anthropic_error_message(resp: httpx.Response) -> str:
         return resp.text[:500]
     except Exception:
         return ""
+
+
+def _record_completion_timing(session_id: str, started: float, first_byte_at: float) -> None:
+    """Hand one 2xx completion's wall time and first-byte latency to the
+    session's turn counters (``app/chat/turn_usage.py``), where ChatManager
+    sums them per turn onto the assistant message. ``started`` /
+    ``first_byte_at`` are ``time.perf_counter()`` marks; "now" is the last
+    upstream byte. Never raises — ``add_turn_timing`` swallows everything."""
+    now = time.perf_counter()
+    add_turn_timing(
+        session_id,
+        duration_ms=int((now - started) * 1000),
+        ttfb_ms=int((first_byte_at - started) * 1000),
+    )
 
 
 def _record_llm_health(app_state: Any, resp: httpx.Response) -> None:
