@@ -1,4 +1,4 @@
-"""Behavioural tests for the coach-mark engine's two pure functions.
+"""Behavioural tests for the coach-mark engine — the parts shape cannot cover.
 
 `tests/test_tour_step_transitions.py` next door is a source-shape guard, which
 is the house style for this engine (no headless browser in CI). Shape is the
@@ -12,6 +12,11 @@ something numeric and both have already been wrong once —
   • the horizontal half of `_positionPopover` clamped a right-edge anchor's
     card back under that anchor's own column, hiding the per-row controls the
     step was describing.
+
+The third section does the same for the one LIFECYCLE hole worth executing:
+whether a cross-page hop still arms its recovery when there is no card to
+decorate. That is a control-flow question between two functions, and a
+substring assertion cannot answer it.
 
 So run the shipped source through node, the way
 tests/test_chat_facts_rendering_ui.py already does for chat.js. Skipped when
@@ -181,3 +186,105 @@ def test_the_card_never_overlaps_the_anchor_it_points_at():
         # flip branch must clear it entirely.
         if p0 < a0:
             assert overlap <= 0, f"anchor at {a0} overlapped by card at {p0}"
+
+
+# --- the cross-page hop's recovery arming ----------------------------------
+#
+# Not a pure function, but the one lifecycle hole worth executing rather than
+# pinning by shape: `_gotoStep` arms the recovery timer, `_markPopoverPending`
+# bails when there is no card, and an anchor-miss reaches the hop with the card
+# already gone. Whether the flag still becomes recoverable on THAT path is a
+# question about control flow, which a substring assertion cannot answer.
+#
+# The collaborators stubbed below (`_endTour`, `_showStep`, `stashPending`) are
+# not what is under test — the arming order is — and `_markPopoverPending` is
+# the real shipped source, so its early return is the real one.
+
+_HOP_HARNESS = """
+let navigated = null, shown = null, ended = false, stashed = null;
+const window = { location: { pathname: '/chat', set href(v) { navigated = v; } } };
+function _endTour() { ended = true; }
+function _showStep(i) { shown = i; }
+function stashPending(id, i) { stashed = i; }
+const TOURS = { welcome: [{page: '/chat'}, {page: '/chat'}, {page: '/library'}] };
+"""
+
+
+def _run_hop(active_extra: str, assertions: str) -> dict:
+    src = "\n".join(
+        [
+            _HOP_HARNESS,
+            "let _active = { id: 'welcome', steps: TOURS.welcome, index: 1,"
+            " navigating: false, navStuckTimer: null, popover: null, "
+            + active_extra
+            + " };",
+            _fn_source("pathMatches"),
+            _fn_source("_gotoStep"),
+            _fn_source("_markPopoverPending"),
+            _fn_source("_unmarkPopoverPending"),
+            "const NAV_STUCK_MS = 30000;",
+            assertions,
+            # A pending 30s timer keeps node alive until it fires; exit as soon
+            # as the assertions have printed.
+            "process.exit(0);",
+        ]
+    )
+    return json.loads(_node_run(src))
+
+
+def test_an_anchor_miss_hop_still_arms_recovery_with_no_card_on_screen():
+    """_showStep removes the popover before resolving the next anchor, and an
+    anchor-miss routes straight into the cross-page branch. Arming the timer
+    inside _markPopoverPending left this path with `navigating` stuck on for
+    good — the tour silently refusing every press from then on."""
+    got = _run_hop(
+        "",  # popover: null — the anchor-miss case
+        """
+        _gotoStep(2);
+        const armed = _active.navStuckTimer !== null;
+        // Fire whatever was scheduled, the way a cancelled navigation would.
+        clearTimeout(_active.navStuckTimer);
+        _unmarkPopoverPending();
+        console.log(JSON.stringify({
+          navigatedTo: navigated, armed, recovered: _active.navigating === false,
+        }));
+        """,
+    )
+    assert got["navigatedTo"] == "/library", "the hop must still navigate"
+    assert got["armed"], "no recovery armed: a cancelled navigation would freeze the tour"
+    assert got["recovered"], "`navigating` must be clearable without a card"
+
+
+def test_a_second_press_during_the_hop_does_not_navigate_again():
+    got = _run_hop(
+        "",
+        """
+        _gotoStep(2);
+        const first = navigated;
+        navigated = null;
+        _gotoStep(2);
+        _gotoStep(2);
+        console.log(JSON.stringify({first, afterRepeats: navigated}));
+        """,
+    )
+    assert got["first"] == "/library"
+    assert got["afterRepeats"] is None, "a repeat press re-fired the navigation"
+
+
+def test_a_same_page_step_neither_navigates_nor_arms_recovery():
+    """The guard and the timer are for cross-page hops only; an in-page step
+    must stay instant."""
+    got = _run_hop(
+        "",
+        """
+        _gotoStep(0);
+        console.log(JSON.stringify({
+          navigatedTo: navigated, shownStep: shown,
+          armed: _active.navStuckTimer !== null, navigating: _active.navigating,
+        }));
+        """,
+    )
+    assert got["navigatedTo"] is None
+    assert got["shownStep"] == 0
+    assert got["armed"] is False
+    assert got["navigating"] is False

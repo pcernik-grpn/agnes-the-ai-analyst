@@ -291,19 +291,37 @@ def test_a_navigation_that_never_lands_cannot_leave_the_tour_dead():
     """`navigating` + every button disabled is a one-way door unless something
     reopens it. A `beforeunload` the reader cancels, a destination that answers
     with a download, a request they Stop — the page lives on with the card
-    permanently inert and Escape (which marks the tour SEEN) the only way out.
-    A timer armed with the pending state is what makes it recoverable."""
-    pending = _fn("_markPopoverPending")
-    assert "NAV_STUCK_MS" in pending
-    assert "setTimeout(_unmarkPopoverPending" in pending
+    permanently inert and Escape (which marks the tour SEEN) the only way out."""
     undo = _fn("_unmarkPopoverPending")
     assert "_active.navigating = false" in undo
     assert "classList.remove('tour-popover--pending')" in undo
     assert "btn.disabled = false" in undo
-    # A generous budget: a slow destination must never look like a stuck one.
+    # The flag is cleared before the DOM half bails on a missing card.
+    assert undo.index("_active.navigating = false") < undo.index("if (!pop) return;")
+
+
+def test_recovery_is_armed_for_every_hop_not_only_ones_with_a_card():
+    """An anchor-miss routes into the cross-page branch with the popover
+    already removed by `_showStep`, so `_markPopoverPending` returns early.
+    Arming the timer in there left exactly that path stuck on `navigating`
+    with no way back — the flag is what blocks the tour, so the flag is what
+    has to be recoverable."""
+    goto = _fn("_gotoStep")
+    assert "setTimeout(_unmarkPopoverPending, NAV_STUCK_MS)" in goto
+    assert goto.index("_active.navigating = true") < goto.index("setTimeout(")
+    assert goto.index("setTimeout(") < goto.index("_markPopoverPending()")
+    # ...and NOT in the DOM-only half, which is allowed to bail.
+    assert "setTimeout(" not in _fn("_markPopoverPending")
+
+
+def test_the_stuck_threshold_cannot_fire_during_a_real_page_load():
+    """Too low and it re-enables the card mid-navigation, where a second press
+    restarts the request and delays the arrival it was waiting for. The load
+    this fires against measures ~1.8s throttled; the worst report is 5-10s."""
     js = _js()
-    assert re.search(r"const NAV_STUCK_MS = (\d+);", js)
-    assert int(re.search(r"const NAV_STUCK_MS = (\d+);", js).group(1)) >= 5000
+    m = re.search(r"const NAV_STUCK_MS = (\d+);", js)
+    assert m, "the recovery threshold must be a named constant"
+    assert int(m.group(1)) >= 20000, "too close to a legitimately slow load"
 
 
 def test_the_stuck_timer_is_cleared_when_the_tour_ends():

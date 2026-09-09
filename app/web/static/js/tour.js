@@ -1104,6 +1104,13 @@ function _gotoStep(nextIndex) {
     // seconds, and it reads as a dead button, not as a wait ("Agnes is showing
     // me around but won't let me click next here").
     _active.navigating = true;
+    // Arm recovery FIRST, and independently of the card. An anchor-miss routes
+    // into this branch with the popover already removed by `_showStep`, and
+    // `_markPopoverPending` returns early when there is nothing to decorate —
+    // arming inside it left exactly that path with `navigating` stuck on and
+    // no way back. The flag is what blocks the tour, so the flag is what has
+    // to be recoverable; the pending LOOK stays conditional on a live card.
+    _active.navStuckTimer = setTimeout(_unmarkPopoverPending, NAV_STUCK_MS);
     _markPopoverPending();
     stashPending(id, nextIndex, _active.skipped);
     window.location.href = nextStep.page;
@@ -1114,10 +1121,18 @@ function _gotoStep(nextIndex) {
 }
 
 // How long a committed cross-page hop may leave the card pending before we
-// assume the navigation is not happening. Generous: a slow destination must
-// never be mistaken for a stuck one, and the page is normally gone long
-// before this fires.
-const NAV_STUCK_MS = 8000;
+// conclude the navigation is not happening.
+//
+// There is no browser signal for "the navigation was cancelled" — `pagehide`
+// only fires once the document is actually being replaced, which is the case
+// we do NOT need to recover from — so a timer is the only mechanism available.
+// That makes the threshold the whole design: too low and it re-enables the
+// card DURING a legitimately slow load, where a second press would restart
+// the request and delay the arrival it was waiting for. The destination this
+// fires against loads in ~1.8s under 4x CPU + 900kbps throttling and the
+// worst report we have is 5-10s, so 30s is far outside the range of a real
+// load while still turning a permanently dead card into a recoverable one.
+const NAV_STUCK_MS = 30000;
 
 // Put the card into its "working on it" state: actions dead, progress bar
 // running. Used for the one transition the engine cannot make instant — a
@@ -1135,13 +1150,6 @@ function _markPopoverPending() {
     pop.setAttribute('tabindex', '-1');
     pop.focus();
   }
-  // A navigation that never replaces the document leaves this card dead for
-  // good: every action disabled and `_gotoStep` refusing every press, with
-  // Escape (which marks the tour SEEN, so it never returns) the only way out.
-  // It happens — a `beforeunload` prompt the reader cancels, a destination
-  // that answers with a download, a request they Stop. Undo the pending state
-  // if we are somehow still here.
-  _active.navStuckTimer = setTimeout(_unmarkPopoverPending, NAV_STUCK_MS);
 }
 
 // Undo _markPopoverPending: the hop did not take us anywhere.
