@@ -460,6 +460,7 @@ class TestToolRegistration:
             # Triple-surface with GET /api/admin/source-connections +
             # `agnes admin connection list`.
             "admin_source_connections_list",
+            "admin_access_picture",
             # Register a table from an upstream source. Triple-surface with
             # POST /api/admin/register-table + `agnes admin register-table`.
             "admin_register_table",

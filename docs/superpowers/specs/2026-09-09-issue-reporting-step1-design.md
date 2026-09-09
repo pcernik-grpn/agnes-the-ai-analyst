@@ -2,7 +2,7 @@
 
 Date: 2026-09-09
 Status: approved design, step 1 of 3
-Branch: `ZS/agnes-issue-reporting-1db265`
+Branch: `zs/agnes-issue-reporting-1db265`
 
 ## Why
 
@@ -64,7 +64,7 @@ Out (later steps, named so nobody builds them here):
 
 ## Data model (Postgres-only, A3 ratchet)
 
-Alembic revision `0114_issue_reports` (revises `0113_data_apps_data_identity`;
+Alembic revision `0115_issue_reports` (revises `0114_corpus_chunks_tsv`;
 re-check the head before writing). SQLAlchemy models in
 `src/models/issue_reports.py`, imported from `src/models/__init__.py`. No
 `src/db.py` step, no DuckDB repository.

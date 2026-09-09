@@ -40,17 +40,18 @@ def _register_table(name: str = "t_pkg_test") -> str:
 def _audit_actions_for_resource(resource: str) -> list[dict]:
     conn = get_system_db()
     rows = conn.execute(
-        "SELECT action, params FROM audit_log WHERE resource = ? "
-        "ORDER BY timestamp",
+        "SELECT action, params FROM audit_log WHERE resource = ? ORDER BY timestamp",
         [resource],
     ).fetchall()
     conn.close()
     out = []
     for action, params in rows:
-        out.append({
-            "action": action,
-            "params": json.loads(params) if params else None,
-        })
+        out.append(
+            {
+                "action": action,
+                "params": json.loads(params) if params else None,
+            }
+        )
     return out
 
 
@@ -259,3 +260,49 @@ class TestDataPackagesJunction:
             headers=headers,
         )
         assert resp.status_code == 404
+
+
+class TestDataPackagesListLimit:
+    """``?limit=`` on the list — the repository always had one (default 200)
+    but the endpoint never exposed it, so a composed reader (the
+    ``admin_access_picture`` MCP tool) could not ask for a complete inventory
+    and silently lost every package past the 200th, misclassifying their
+    tables as unpackaged."""
+
+    def _create(self, seeded_app, n: int) -> None:
+        c = seeded_app["client"]
+        for i in range(n):
+            resp = c.post(
+                "/api/admin/data-packages",
+                json={"name": f"Limit {i}", "slug": f"limit-{i}"},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            assert resp.status_code == 201, resp.text
+
+    def test_limit_bounds_the_page(self, seeded_app):
+        self._create(seeded_app, 3)
+        resp = seeded_app["client"].get(
+            "/api/admin/data-packages",
+            params={"limit": 2},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()) == 2
+
+    def test_default_page_is_unchanged(self, seeded_app):
+        self._create(seeded_app, 3)
+        resp = seeded_app["client"].get(
+            "/api/admin/data-packages",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()) == 3
+
+    def test_limit_out_of_range_is_422(self, seeded_app):
+        for bad in (0, 5001):
+            resp = seeded_app["client"].get(
+                "/api/admin/data-packages",
+                params={"limit": bad},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            assert resp.status_code == 422, (bad, resp.text)
