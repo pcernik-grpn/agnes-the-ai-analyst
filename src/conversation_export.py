@@ -26,10 +26,12 @@ testable without a database:
 never ``"off"``; the caller (the route) refuses the whole request under
 ``off`` before any of this runs (spec 3.12, "under the content policy").
 Under ``pseudonymized`` every text leaf in ``messages_json``,
-``tool_calls_json`` and ``first_user_message`` goes through ``anonymizer``
-exactly once (never per span, never twice for the same leaf shared between
-the two JSON blobs) — see :func:`_pseudonymize_parts`. Ids and timestamps
-are never touched.
+``tool_calls_json``, ``first_user_message`` and ``feedback_json[].comment``
+goes through ``anonymizer`` exactly once (never per span, never twice for
+the same leaf shared between the two JSON blobs) — see
+:func:`_pseudonymize_parts`. Ids and timestamps are never touched.
+``memory_writes_json`` never carries free text at all — only
+``content_length`` — so there is nothing to scrub there.
 
 **``conversation_end`` vs. the pull endpoint's keyset cursor.** The pull
 route pages sessions on ``chat_sessions.last_message_at``, while
@@ -331,17 +333,23 @@ def _totals(calls: Mapping[str, Any] | None, messages: Sequence[Mapping[str, Any
     )
 
 
-def _feedback_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+def _feedback_entry(row: Mapping[str, Any], scrub: Callable[[Any], Any]) -> dict[str, Any]:
+    """``comment`` is free text (spec 3.12) and goes through the SAME scrub
+    the caller applies to messages/tool calls/``first_user_message`` — a
+    record's ``content_mode`` describes the whole record, not a subset of it.
+    """
     return {
         "turn_id": row.get("turn_id"),
         "user_id": row.get("user_id"),
         "verdict": row.get("verdict"),
-        "comment": row.get("comment"),
+        "comment": scrub(row.get("comment")),
         "created_at": _iso(row.get("created_at")),
     }
 
 
 def _memory_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+    # No scrub needed: only `content_length` (an int) leaves here, never the
+    # memory's own text.
     content = row.get("content") or ""
     return {
         "memory_id": row.get("id"),
@@ -451,7 +459,7 @@ def build_conversation_record(
         "last_run_status": totals["last_run_status"],
         "has_error": totals["has_error"],
         "error_types": totals["error_types"],
-        "feedback_json": [_feedback_entry(f) for f in feedback],
+        "feedback_json": [_feedback_entry(f, _text) for f in feedback],
         "memory_writes_json": [_memory_entry(m) for m in memories],
         "content_mode": content_mode,
         "exported_at": _iso(datetime.now(UTC)),

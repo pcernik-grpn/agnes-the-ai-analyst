@@ -268,6 +268,52 @@ class TestContentPolicy:
         assert tool_part["tool_use_id"] == "tu1"
         assert record["messages_json"][0]["turn_id"] == "t1"
 
+    def test_pseudonymized_mode_scrubs_the_feedback_comment_exactly_once(self):
+        """``feedback_json[].comment`` is free text too — a record whose
+        ``content_mode`` says `pseudonymized` must not leak it verbatim."""
+        seen: list[str] = []
+
+        def fake_anonymizer(text: str) -> str:
+            seen.append(text)
+            return f"REDACTED({text})"
+
+        feedback = [
+            {
+                "turn_id": "t1",
+                "user_id": "user_123",
+                "verdict": "down",
+                "comment": "call me at bob@example.com",
+                "created_at": _dt("2026-01-01T10:05:00"),
+            }
+        ]
+        record = build_conversation_record(
+            _session(), [_msg()], None, feedback, [], content_mode="pseudonymized", anonymizer=fake_anonymizer
+        )
+        assert record["feedback_json"][0]["comment"] == "REDACTED(call me at bob@example.com)"
+        assert seen.count("call me at bob@example.com") == 1
+
+    def test_pseudonymized_mode_leaves_an_absent_feedback_comment_alone(self):
+        seen: list[str] = []
+
+        def fake_anonymizer(text: str) -> str:
+            seen.append(text)
+            return f"REDACTED({text})"
+
+        feedback = [
+            {
+                "turn_id": "t1",
+                "user_id": "user_123",
+                "verdict": "down",
+                "comment": None,
+                "created_at": _dt("2026-01-01T10:05:00"),
+            }
+        ]
+        record = build_conversation_record(
+            _session(), [_msg()], None, feedback, [], content_mode="pseudonymized", anonymizer=fake_anonymizer
+        )
+        assert record["feedback_json"][0]["comment"] is None
+        assert None not in seen
+
 
 class TestCostStatus:
     def test_ledger_when_llm_calls_rows_exist(self):

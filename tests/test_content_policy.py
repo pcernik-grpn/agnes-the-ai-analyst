@@ -101,6 +101,67 @@ def test_unknown_workload_name_is_dropped_and_warned_about():
     assert any("not_a_real_workload" in w for w in p.warnings)
 
 
+def test_typo_only_workloads_list_disables_export_instead_of_meaning_everything():
+    """A list with nothing valid in it must not fall back to "every
+    workload" — that would let a typo silently widen content export."""
+    p = cp.load_content_export_policy(
+        _cfg(
+            mode="full",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="2026-09-01",
+            workloads=["chatt"],
+        )
+    )
+    assert p.mode == "off"
+    assert p.requested_mode == "full"
+    assert p.workloads == ()
+    assert any("no valid entry" in w for w in p.warnings)
+
+
+def test_bare_string_workloads_value_is_a_one_element_allowlist():
+    p = cp.load_content_export_policy(
+        _cfg(mode="full", placement="operator", basis="b", approved_by="a", approved_at="2026-09-01", workloads="chat")
+    )
+    assert p.mode == "full"
+    assert p.workloads == ("chat",)
+    assert p.warnings == ()
+
+
+def test_comma_separated_string_workloads_value_splits_into_entries():
+    p = cp.load_content_export_policy(
+        _cfg(
+            mode="full",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="2026-09-01",
+            workloads="chat, builder",
+        )
+    )
+    assert p.mode == "full"
+    assert p.workloads == ("chat", "builder")
+    assert p.warnings == ()
+
+
+def test_mapping_workloads_value_is_invalid_and_disables_export():
+    p = cp.load_content_export_policy(
+        _cfg(
+            mode="full",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="2026-09-01",
+            workloads={"chat": True},
+        )
+    )
+    assert p.mode == "off"
+    assert p.requested_mode == "full"
+    assert p.workloads == ()
+    assert any("must be a list" in w for w in p.warnings)
+
+
 def test_content_export_mode_excludes_a_workload_not_on_the_allowlist(monkeypatch):
     monkeypatch.setattr(
         cp,
