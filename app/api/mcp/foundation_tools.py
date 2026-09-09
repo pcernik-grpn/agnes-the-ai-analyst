@@ -107,6 +107,159 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+def _compose_access_picture(
+    overview: dict,
+    packages: list[dict],
+    catalog: dict,
+    *,
+    include_tables: bool,
+) -> dict:
+    """Fold the three admin reads behind ``admin_access_picture`` into one picture.
+
+    Pure -- no I/O -- so the fold rules are testable without an HTTP round
+    trip. The "unreachable when unpackaged" rule is the ``/admin`` gap card's
+    (``app.services.admin_dashboard._DISTRIBUTABLE_QUERY_MODES``): imported,
+    not restated, so the tool and the dashboard cannot disagree about which
+    tables reach nobody.
+    """
+    from app.services.admin_dashboard import _DISTRIBUTABLE_QUERY_MODES
+    from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+    from src.grant_scopes import EVERYONE_TARGET_ID
+
+    account_total = int(overview.get("account_total") or 0)
+    groups = [
+        {
+            "id": g["id"],
+            "name": g.get("name") or g["id"],
+            "is_system": bool(g.get("is_system", False)),
+            "is_everyone": bool(g.get("is_everyone", False)),
+            "member_count": int(g.get("member_count") or 0),
+        }
+        for g in (overview.get("groups") or [])
+    ]
+    groups_by_id = {g["id"]: g for g in groups}
+
+    def _is_everyone_grant(gr: dict) -> bool:
+        # `audience` is what the overview resolved (scope column on Postgres,
+        # carrier-group membership on the frozen DuckDB ladder); the holder
+        # check is the belt to that suspender for a payload that lacks it.
+        if gr.get("audience") == EVERYONE_TARGET_ID or gr.get("scope") == EVERYONE_TARGET_ID:
+            return True
+        holder = groups_by_id.get(gr.get("group_id") or "")
+        return bool(holder and holder["is_everyone"])
+
+    grants_by_pkg: dict[str, list[dict]] = {}
+    for gr in overview.get("grants") or []:
+        if gr.get("resource_type") != "data_package":
+            continue
+        holder = groups_by_id.get(gr.get("group_id") or "")
+        everyone = _is_everyone_grant(gr)
+        grants_by_pkg.setdefault(str(gr.get("resource_id")), []).append(
+            {
+                "group_id": gr.get("group_id"),
+                "group_name": SYSTEM_EVERYONE_GROUP if everyone else (holder["name"] if holder else gr.get("group_id")),
+                "requirement": gr.get("requirement") or "available",
+                "audience": EVERYONE_TARGET_ID if everyone else "group",
+                "member_count": account_total if everyone else (holder["member_count"] if holder else None),
+            }
+        )
+
+    tables_by_id = {t["id"]: t for t in (catalog.get("tables") or [])}
+    packaged: set[str] = set()
+    pkgs_out: list[dict] = []
+    for p in packages:
+        table_ids = [str(t) for t in (p.get("table_ids") or [])]
+        packaged.update(table_ids)
+        entry: dict[str, Any] = {
+            "id": p["id"],
+            "slug": p.get("slug"),
+            "name": p.get("name") or p["id"],
+            "status": p.get("status") or "prod",
+            "table_count": len(table_ids),
+            "granted_to": grants_by_pkg.get(p["id"], []),
+        }
+        if include_tables:
+            entry["tables"] = [
+                {"id": tid, "name": (tables_by_id.get(tid) or {}).get("name") or tid} for tid in table_ids
+            ]
+        pkgs_out.append(entry)
+
+    unpackaged = sorted(
+        (
+            {"id": t["id"], "name": t.get("name") or t["id"], "query_mode": t.get("query_mode") or "local"}
+            for t in tables_by_id.values()
+            if (t.get("query_mode") or "") in _DISTRIBUTABLE_QUERY_MODES and t["id"] not in packaged
+        ),
+        key=lambda t: t["name"],
+    )
+    ungranted = [{"id": p["id"], "name": p["name"]} for p in pkgs_out if not p["granted_to"]]
+
+    everyone_pkgs = [
+        {"id": p["id"], "name": p["name"], "requirement": g["requirement"], "via": EVERYONE_TARGET_ID}
+        for p in pkgs_out
+        for g in p["granted_to"]
+        if g["audience"] == EVERYONE_TARGET_ID
+    ]
+    by_group: list[dict] = [
+        {
+            "group_id": EVERYONE_TARGET_ID,
+            "group_name": SYSTEM_EVERYONE_GROUP,
+            "member_count": account_total,
+            "bypasses_grants": False,
+            "packages": everyone_pkgs,
+        }
+    ]
+    for g in groups:
+        if g["is_everyone"]:
+            continue  # the carrier is the `everyone` baseline above, not a roster
+        is_admin = g["is_system"] and g["name"] == SYSTEM_ADMIN_GROUP
+        if is_admin:
+            reach = [{"id": p["id"], "name": p["name"], "requirement": None, "via": "admin"} for p in pkgs_out]
+        else:
+            direct = [
+                {"id": p["id"], "name": p["name"], "requirement": gr["requirement"], "via": "group"}
+                for p in pkgs_out
+                for gr in p["granted_to"]
+                if gr["audience"] == "group" and gr["group_id"] == g["id"]
+            ]
+            seen = {d["id"] for d in direct}
+            reach = direct + [e for e in everyone_pkgs if e["id"] not in seen]
+        by_group.append(
+            {
+                "group_id": g["id"],
+                "group_name": g["name"],
+                "member_count": g["member_count"],
+                "bypasses_grants": is_admin,
+                "packages": reach,
+            }
+        )
+
+    notes = [
+        f"Members of the '{SYSTEM_ADMIN_GROUP}' group bypass grants and reach every package and table.",
+        (
+            "member_count counts group rows (service accounts included); an everyone-scoped grant reaches "
+            "every person, so its member_count is account_total."
+        ),
+        (
+            "tables_in_no_package lists distributable tables only (query_mode blank/local/materialized): "
+            "remote tables answer server-side without a package and internal rows have no parquet to pull."
+        ),
+        (
+            "A package is invisible to analysts until it is granted to a group; 'required' grants land in "
+            "the stack automatically, 'available' ones are opt-in."
+        ),
+    ]
+    return {
+        "source": "server",
+        "account_total": account_total,
+        "groups": groups,
+        "packages": pkgs_out,
+        "by_group": by_group,
+        "unreachable": {"tables_in_no_package": unpackaged, "packages_granted_to_no_group": ungranted},
+        "notes": notes,
+    }
+
+
 FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "server_info",
     "catalog",
@@ -204,6 +357,14 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "delete_contributed_skill",
     "admin_config_surface",
     "admin_source_connections_list",
+    # The access picture behind the chat landing page's admin starters ("who
+    # has access to which data", "what is shared with no one", "what does a
+    # non-admin see"): packages -> granted groups -> member counts, plus what
+    # nobody can reach. Composes GET /api/admin/access-overview +
+    # GET /api/admin/data-packages + GET /api/catalog/tables -- no new REST
+    # surface, so no new CLI verb is owed; the CLI leg is the existing
+    # `agnes admin group list` / `grant list` / `data-package list`.
+    "admin_access_picture",
     # Register a table from an upstream source (admin only). Triple-surface with
     # POST /api/admin/register-table + `agnes admin register-table`.
     "admin_register_table",
@@ -2515,6 +2676,66 @@ def register_foundation_tools(
             )
             _raise_for_status_with_detail(r)
             return {"connections": r.json()}
+
+    @tool(read_only=True)
+    async def admin_access_picture(include_tables: bool = True) -> dict:
+        """Admin-only access picture: every data package, which groups are granted it and how many accounts each holds, what nobody can reach (distributable tables in no package, packages granted to no group), and what each group can see. Answers "who has access to which data", "what is shared with no one" and "what does a non-admin see" from the real grants -- call it instead of guessing from the catalog.
+
+        Composes the three admin reads the ``/admin`` overview itself uses --
+        ``GET /api/admin/access-overview`` (groups, grants, people total),
+        ``GET /api/admin/data-packages?include_table_ids=true`` and
+        ``GET /api/catalog/tables`` -- so the answer is the dashboard's, not a
+        second opinion. Requires an admin identity: a non-admin caller gets
+        those routes' own 403, never a partial picture.
+
+        Args:
+            include_tables: Include each package's table list (default). Pass
+                ``False`` on a large instance when the response trips the
+                output cap -- ``table_count`` and the unreachable tray stay.
+
+        Returns ``{"source": "server", "account_total", "groups", "packages",
+        "by_group", "unreachable", "notes"}``:
+
+        - ``groups``: ``[{id, name, is_system, is_everyone, member_count}]``.
+          ``member_count`` counts group rows (service accounts included); the
+          Everyone carrier's roster is every account by construction.
+        - ``packages``: ``[{id, slug, name, status, table_count, tables?,
+          granted_to: [{group_id, group_name, requirement, audience,
+          member_count}]}]``. ``audience`` is ``"everyone"`` for an
+          everyone-scoped grant (``member_count`` is then the people total)
+          and ``"group"`` otherwise. ``requirement`` is ``required`` (always
+          in the analyst's stack) or ``available`` (opt-in).
+        - ``by_group``: what a member of each group can reach -- an
+          ``everyone`` baseline entry first, then every group with its direct
+          grants plus that baseline (``via``: ``group`` | ``everyone`` |
+          ``admin``). ``bypasses_grants`` is true for the Admin group, which
+          reaches everything regardless of grants. This is the "what would a
+          non-admin see" answer: pick the group, read its ``packages``.
+        - ``unreachable.tables_in_no_package``: registered tables no analyst
+          can ever pull -- distributable ``query_mode`` (blank / ``local`` /
+          ``materialized``) and in no package. ``remote`` tables answer
+          server-side without a package and ``internal`` rows have no
+          parquet, so neither is listed. Fix: add the table to a package.
+        - ``unreachable.packages_granted_to_no_group``: packages no analyst
+          can see. Fix: grant the package to a group on ``/admin/access``.
+        """
+        async with httpx.AsyncClient() as c:
+            ov = await c.get(f"{base_url}/api/admin/access-overview", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(ov)
+            pk = await c.get(
+                f"{base_url}/api/admin/data-packages",
+                headers=headers_fn(),
+                params={"include_table_ids": "true"},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(pk)
+            tb = await c.get(f"{base_url}/api/catalog/tables", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(tb)
+        return ensure_output_size(
+            _compose_access_picture(ov.json(), pk.json(), tb.json(), include_tables=include_tables),
+            "admin_access_picture",
+            hint="call again with include_tables=False",
+        )
 
     @tool(read_only=False)
     async def admin_register_table(
