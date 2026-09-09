@@ -22,6 +22,8 @@ from cli.config import _config_dir, get_server_url
 from cli.lib.hooks import maybe_refresh_claude_hooks
 from cli.update_check import UpdateInfo, check, format_outdated_notice
 from cli.upgrade_status import record_outcome
+from cli.win_app_control import block_reason, is_app_control_block
+from cli.win_app_control import hint as app_control_hint
 
 self_upgrade_app = typer.Typer(
     name="self-upgrade",
@@ -608,6 +610,15 @@ def _smoke_test_new_binary(install_method: str, expected_version: str, *, user: 
             env=env,
         )
         if out.returncode != 0:
+            # Windows application control (Smart App Control / WDAC) refusing
+            # the freshly-installed, unsigned binary — one of the two places a
+            # 4551 is observable at all, because THIS process is still running
+            # (#2342; `cli/win_app_control.py` documents where it is not).
+            # Return the CLASSIFIED reason rather than the raw stderr: the
+            # caller keys its hint off it, and the raw text is truncated here
+            # (and again by `record_outcome`), which can cut the marker out.
+            if is_app_control_block(out.stderr):
+                return False, block_reason(str(binary))
             return False, f"exit {out.returncode}: {out.stderr.strip()[:200]}"
         # Use Version() equality (PEP 440-aware) so "0.40.0" doesn't match "0.40.10".
         from packaging.version import InvalidVersion, Version
@@ -621,6 +632,13 @@ def _smoke_test_new_binary(install_method: str, expected_version: str, *, user: 
             return False, f"unparseable version output: {out.stdout.strip()[:80]}"
         return True, out.stdout.strip()
     except (subprocess.TimeoutExpired, OSError) as e:
+        # The spawn never got off the ground. On Windows that includes an
+        # application-control policy refusing the unsigned binary at LOAD
+        # (`winerror == 4551`) — classified the same as the non-zero-exit
+        # branch above, so the caller's hint doesn't depend on which of the
+        # two shapes the block arrived in.
+        if is_app_control_block(e):
+            return False, block_reason(str(binary))
         return False, f"{type(e).__name__}: {e}"
 
 
@@ -860,6 +878,13 @@ def _do_install_with_smoke_and_rollback(info: UpdateInfo, *, quiet: bool) -> int
     ok, detail = _smoke_test_new_binary(smoke_method, expected_version=info.latest, user=is_user)
     if not ok:
         sys.stderr.write(f"agnes self-upgrade: new binary failed smoke test ({detail}).\n")
+        if is_app_control_block(detail):
+            # Windows refused the installed binary on policy grounds. The
+            # rollback below still runs (the cached wheel may predate the
+            # policy flipping to enforcing), but it regenerates an equally
+            # unsigned trampoline, so it cannot be relied on — say what this
+            # is and what the operator can actually do about it (#2342).
+            sys.stderr.write(app_control_hint())
         server = get_server_url().rstrip("/")
         bootstrap_recovery = f"  Manual recovery: curl -fsSL {server}/cli/install.sh | bash\n"
         cached = _cached_wheel_for(prior_meta)

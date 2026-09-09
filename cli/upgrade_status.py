@@ -17,8 +17,9 @@ This module records each self-upgrade outcome to
 The quiet SessionStart path stays silent but increments the counter on
 failure and resets it on success. The next NON-quiet `agnes` command emits
 a one-line stderr warning (once, via the root-callback banner path in
-``cli/main.py``) when ``consecutive_failures >= _WARN_THRESHOLD``. ``--quiet``
-commands never warn.
+``cli/main.py``) when ``consecutive_failures >= _WARN_THRESHOLD`` — or on the
+FIRST failure when the recorded reason is a Windows application-control block,
+which never clears on its own (#2342). ``--quiet`` commands never warn.
 
 Best-effort throughout: a read/write failure here must never break a
 working `agnes` command — that is the whole point of the feature.
@@ -32,6 +33,7 @@ import time
 from typing import Optional
 
 from cli.config import _config_dir
+from cli.win_app_control import is_app_control_block
 
 _STATUS_FILENAME = "upgrade_status.json"
 
@@ -123,8 +125,16 @@ def consecutive_failures() -> int:
 
 
 def should_warn() -> bool:
-    """True iff the last ``_WARN_THRESHOLD`` self-upgrade attempts all failed
+    """True iff self-upgrade has failed enough times to be worth surfacing
     AND we have not already warned at this exact failure count.
+
+    "Enough times" is ``_WARN_THRESHOLD`` for an ordinary failure — a network
+    blip or a transient lock is usually gone by the next session, and warning
+    on the first one would be noise. One class of failure is exempt: a Windows
+    application-control block (#2342) is a policy decision, not a transient,
+    so it never clears on its own and the analyst is stuck on a stale CLI
+    until they act. Waiting three sessions to say so would be three sessions
+    of silence about something already permanent.
 
     The "already warned at this count" check keeps the warning to ONCE per
     distinct failure level: a non-quiet command at 3 failures warns; the
@@ -133,7 +143,9 @@ def should_warn() -> bool:
     is getting worse, not better."""
     s = read_status()
     n = s.get("consecutive_failures", 0)
-    if not (isinstance(n, int) and n >= _WARN_THRESHOLD):
+    if not isinstance(n, int) or n < 1:
+        return False
+    if n < _WARN_THRESHOLD and not is_app_control_block(s.get("last_failure_reason")):
         return False
     warned_at = s.get("warned_at_failures")
     return warned_at != n
@@ -157,7 +169,8 @@ def format_failure_notice() -> str:
     so the analyst sees WHY it's failing without having to re-run the command.
     """
     n = consecutive_failures()
-    base = f"agnes self-upgrade has failed {n} times — run `agnes self-upgrade` to see the error."
+    times = "time" if n == 1 else "times"
+    base = f"agnes self-upgrade has failed {n} {times} — run `agnes self-upgrade` to see the error."
     reason = read_status().get("last_failure_reason")
     if isinstance(reason, str) and reason:
         base += f" Last error: {reason}"

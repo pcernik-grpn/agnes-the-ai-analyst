@@ -133,6 +133,72 @@ It always produces the file: run it offline, or without admin rights, and the
 parts it could not reach say so explicitly rather than going quiet. Use
 `agnes diagnose` when you want live checks and a verdict instead of an artifact.
 
+### Windows: Smart App Control blocks the CLI (`os error 4551`)
+
+**Symptom.** On Windows 11, an `agnes` command — or the self-upgrade that runs
+on session start — fails with `os error 4551`, or with
+`[WinError 4551] An Application Control policy has blocked this file`. Launching
+`agnes` may produce nothing at all: no traceback, no log line, just an
+immediately dead process. It typically looks like "it worked yesterday and
+nothing changed", because nothing on your side did.
+
+The refusal comes from **Smart App Control** (SAC), Microsoft's
+reputation-based application-control policy. It blocks binaries it cannot
+verify at *load* time, before any of the program's own code runs — which is why
+there is no Agnes error message to read. Two files a `uv tool install` produces
+are exactly that kind of binary: the `agnes.exe` launcher uv generates locally,
+and the portable Python interpreter uv downloads. Neither is signed.
+
+Where Agnes *can* see the block, it now says so: a self-upgrade whose
+freshly-installed binary is refused prints the diagnosis and the confirmation
+command below instead of an opaque smoke-test failure, and records it so a
+later command repeats it. A block on the binary you launch yourself cannot be
+reported by Agnes at all — the process never starts.
+
+**Confirm it is Smart App Control.** In a terminal:
+
+```
+reg query "HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy" /v VerifiedAndReputablePolicyState
+```
+
+`0x2` (2) = enforcing — this is your problem. `0x1` (1) = evaluation mode, where
+SAC is watching and may switch itself to enforcing later. `0x0` (0) or a missing
+value = off, so look elsewhere.
+
+**Who is exposed.** A narrow but real group:
+
+- SAC exists only on a Windows 11 machine that was **cleanly installed or
+  reset** — an in-place upgrade from Windows 10 or an earlier Windows 11 build
+  never has it.
+- It ships enabled only in **some regions**.
+- It starts in evaluation mode and Microsoft's heuristic **turns it off for
+  users it detects as developers**. It flips to enforcing for the rest.
+
+So the exposed case is a *new or freshly-reset* Windows 11 machine, before that
+heuristic has classified its owner as a developer — including a developer whose
+machine simply has not been used like one yet. This is also why it appears
+overnight without a config change: evaluation mode became enforcement.
+
+**Workaround, and its honest cost.** SAC has **no per-app allowlist** — unlike
+SmartScreen, there is no "Run anyway" for one binary, and no signature you can
+add locally. The available options today:
+
+- Run the CLI where the policy does not apply: inside WSL or a Linux container.
+- Turn Smart App Control off: *Windows Security → App & browser control → Smart
+  App Control*. This is **system-wide** — it lowers protection for every
+  program on the machine, not just Agnes — and per Microsoft it **cannot be
+  turned back on without resetting or reinstalling Windows**. Treat it as a
+  one-way decision.
+
+**There is no signed Agnes install path yet.** A signed Windows executable
+would fix this properly for everyone, and it is not available: it needs a
+code-signing certificate and release-side signing infrastructure that Agnes
+does not ship today. Until then the two options above are the whole list.
+
+Reference:
+[Smart App Control overview](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/overview)
+(Microsoft Learn).
+
 ## Hackathon
 
 See [`archive/HACKATHON.md`](archive/HACKATHON.md) for the deploy-and-develop playbook (archived event runbook). Per-developer dev VMs are the supported pattern — point your VM at your branch image with `gcloud compute ssh <vm> --command "sudo sed -i 's/^AGNES_TAG=.*/AGNES_TAG=dev-<slug>/' /opt/agnes/.env && sudo /usr/local/bin/agnes-auto-upgrade.sh"`.

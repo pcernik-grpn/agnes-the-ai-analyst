@@ -26,6 +26,11 @@ Two Windows realities this handles beyond the swap itself:
    not against a guaranteed lock) and retried patiently, and for the duration of
    the swap a ``deferred-update.active`` sentinel tells the statusline to step
    aside.
+3. APPLICATION CONTROL — Smart App Control / WDAC can refuse the unsigned
+   artifacts of a uv tool install (the generated ``agnes.exe`` trampoline, the
+   downloaded interpreter) with ``os error 4551``. Unlike a lock it never
+   clears, so it is classified first, never retried, and named in the recorded
+   outcome — this console-less helper's only channel to the human (#2342).
 
 Uses ONLY the standard library plus the ``uv`` executable on PATH — it never
 imports ``cli``, so it holds no lock on the tool venv it is replacing.
@@ -145,20 +150,58 @@ def _looks_like_lock(text: str) -> bool:
     return any(h in t for h in _LOCK_HINTS)
 
 
+# Windows application control (Smart App Control / WDAC) refusing a binary it
+# cannot verify, at LOAD time — `os error 4551`. Both artifacts of a uv tool
+# install are unsigned: the generated `agnes.exe` trampoline and the
+# interpreter uv downloads (#2342).
+#
+# Stdlib-only twin of `cli.win_app_control.is_app_control_block` /
+# `block_reason`. That module cannot be imported here: this file runs from a
+# temp copy OUTSIDE the tool venv and must hold no handle inside it (see the
+# module docstring). `tests/test_win_app_control.py` pins both the marker
+# tuple and the reason wording to the original.
+_APP_CONTROL_WINERROR = 4551
+_APP_CONTROL_MARKERS = ("error 4551", "errno 4551",
+                        "application control policy has blocked")
+_APP_CONTROL_DOC = 'docs/QUICKSTART.md → "Windows: Smart App Control blocks the CLI"'
+
+
+def _looks_like_app_control(failure: object) -> bool:
+    """True iff ``failure`` (an exception from a spawn, or another process's
+    captured stderr) is an application-control block."""
+    if failure is None:
+        return False
+    if getattr(failure, "winerror", None) == _APP_CONTROL_WINERROR:
+        return True
+    t = str(failure).lower()
+    return any(m in t for m in _APP_CONTROL_MARKERS)
+
+
+def _app_control_reason(binary: str | None = None) -> str:
+    """One short line for ``upgrade_status.json`` (capped at 200 chars there),
+    naming the block so the next non-quiet agnes command can explain it."""
+    what = binary.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] if binary else ""
+    return (f"windows application control blocked {what or 'the agnes binary'} "
+            f"(os error 4551) — Smart App Control refuses unsigned binaries; "
+            f"see {_APP_CONTROL_DOC}")
+
+
 def _uv_install(wheel: str, *, config_dir: "str | None" = None,
                 budget_s: float = _INSTALL_BUDGET_S,
-                backoff_s: float = _INSTALL_BACKOFF_S) -> int:
-    """``uv tool install --force <wheel>`` (headless). Returns 0 on success,
-    else the last rc.
+                backoff_s: float = _INSTALL_BACKOFF_S) -> tuple[int, str]:
+    """``uv tool install --force <wheel>`` (headless). Returns ``(0, "")`` on
+    success, else ``(last rc, one-line reason)`` — the reason travels back to
+    `run` so the recorded outcome can say WHAT failed, not just that it did.
 
     Retries ONLY while the failure looks like a Windows file lock — the venv
     being replaced is briefly held by a concurrent agnes process (a statusline
     render / another session). To land an attempt in the gap between renders
     rather than hammer `uv` against a guaranteed lock, it attempts only when the
     venv python looks free (near the deadline it attempts regardless). ANY other
-    error (a bad wheel filename, uv missing, …) FAILS FAST with the real stderr
-    logged — retrying it would just waste the budget and, historically, get
-    mislabeled as 'venv locked'."""
+    error (a bad wheel filename, uv missing, an application-control policy
+    refusing the unsigned artifacts) FAILS FAST with the real stderr logged —
+    retrying it would just waste the budget and, historically, get mislabeled
+    as 'venv locked'."""
     py = _venv_python()
     deadline = time.monotonic() + max(0.0, budget_s)
     rc, err = 1, ""
@@ -174,25 +217,35 @@ def _uv_install(wheel: str, *, config_dir: "str | None" = None,
             except OSError as e:
                 rc, err = 1, str(e)
             if rc == 0:
-                return 0
+                return 0, ""
+            # Checked BEFORE the lock hints: an application-control message can
+            # carry lock-ish words, and burning the 5-minute budget on a policy
+            # that never clears would bury the real cause.
+            if _looks_like_app_control(err):
+                if config_dir:
+                    _log(config_dir, f"uv install blocked by application control rc={rc}: {err[:300]}")
+                return rc, _app_control_reason()
             if not _looks_like_lock(err):
                 if config_dir:
                     _log(config_dir, f"uv install failed rc={rc}: {err[:300]}")
-                return rc  # not a lock — it won't fix itself; don't retry
+                # not a lock — it won't fix itself; don't retry
+                return rc, f"windows deferred install failed rc={rc}"
         if time.monotonic() >= deadline:
             if config_dir:
                 _log(config_dir,
                      f"uv install gave up rc={rc} after ~{int(budget_s)}s (venv locked): {err[:200]}")
-            return rc
+            return rc, f"windows deferred install failed rc={rc} (venv locked)"
         # Jittered backoff so we don't beat in lockstep with a ~1 Hz statusline.
         time.sleep(backoff_s + (time.monotonic() % 0.7))
 
 
-def _installed_version_ok(expected_version: str) -> bool:
+def _installed_version_ok(expected_version: str) -> tuple[bool, str]:
     """Run the freshly-installed agnes and confirm it boots and reports the
-    expected version. Resolves the binary at the uv tool bin dir (not via PATH)
-    when possible, and sets the recursion sentinel so its own update check is
-    inert."""
+    expected version. Returns ``(ok, detail)`` — the same shape as
+    ``cli.commands.self_upgrade._smoke_test_new_binary``, so a verify failure
+    can name itself in the recorded outcome. Resolves the binary at the uv tool
+    bin dir (not via PATH) when possible, and sets the recursion sentinel so
+    its own update check is inert."""
     binp = ""
     try:
         out = subprocess.run(["uv", "tool", "dir", "--bin"],
@@ -208,8 +261,17 @@ def _installed_version_ok(expected_version: str) -> bool:
     try:
         r = subprocess.run([exe, "--version"], capture_output=True, text=True,
                            timeout=30, env=env, creationflags=_NO_WINDOW)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired) as e:
+        # An application-control policy refusing the just-installed, unsigned
+        # trampoline at LOAD lands here (`winerror == 4551`). The block is
+        # invisible to the process it kills, so this spawn — from a process
+        # that IS running — is the only place the deferred update can see it.
+        if _looks_like_app_control(e):
+            return False, _app_control_reason(exe)
+        return False, f"verify spawn failed: {type(e).__name__}"
+    if r.returncode != 0 and _looks_like_app_control(r.stderr or ""):
+        # The trampoline started but the interpreter it loads was refused.
+        return False, _app_control_reason(exe)
     # Exact match on the version TOKEN, not a substring: `expected in stdout`
     # would let "0.72.9" pass against a binary reporting "0.72.90" (or any
     # superstring), so a failed/partial swap could be scored as success and
@@ -218,7 +280,10 @@ def _installed_version_ok(expected_version: str) -> bool:
     # (`_smoke_test_new_binary`), minus the `packaging` dep this file forbids.
     tokens = (r.stdout or "").split()
     actual = tokens[-1] if tokens else ""
-    return r.returncode == 0 and actual == expected_version
+    if r.returncode == 0 and actual == expected_version:
+        return True, actual
+    return False, (f"verify reported '{actual}' rc={r.returncode}, "
+                   f"expected {expected_version}")
 
 
 def _sha256(path: str) -> str:
@@ -304,28 +369,32 @@ def run(parent_pid: int, staged_wheel: str, expected_version: str,
     # in `finally` — a crash leaves only a stale sentinel, ignored past its TTL.
     _set_updating(config_dir)
     try:
-        rc = _uv_install(staged_wheel, config_dir=config_dir)
+        rc, detail = _uv_install(staged_wheel, config_dir=config_dir)
         if rc != 0:
             _log(config_dir, f"install failed rc={rc} (see reason above)")
             _write_status(config_dir, success=False,
-                         reason=f"windows deferred install failed rc={rc}")
+                         reason=detail or f"windows deferred install failed rc={rc}")
             return 2
 
-        if _installed_version_ok(expected_version):
+        ok, detail = _installed_version_ok(expected_version)
+        if ok:
             _record_last_known_good(config_dir, staged_wheel, expected_version)
             _write_status(config_dir, success=True)
             _log(config_dir, f"SUCCESS: installed {expected_version}")
             return 0
 
         # Verify failed → roll back to the last-known-good cached wheel if we have one.
-        _log(config_dir, "verify failed after install")
+        # An application-control block is recorded verbatim: the rollback
+        # reinstalls an equally unsigned trampoline, so the reason the human
+        # eventually reads must name the policy, not the version.
+        _log(config_dir, f"verify failed after install: {detail}")
         if rollback_wheel and os.path.exists(rollback_wheel):
-            rb = _uv_install(rollback_wheel, config_dir=config_dir)
+            rb, _ = _uv_install(rollback_wheel, config_dir=config_dir)
             _log(config_dir, f"rollback to {rollback_wheel} rc={rb}")
         else:
             _log(config_dir, "no rollback wheel available; leaving as-is")
         _write_status(config_dir, success=False,
-                     reason=f"windows deferred: smoke failed for {expected_version}")
+                     reason=detail or f"windows deferred: smoke failed for {expected_version}")
         return 1
     finally:
         _clear_updating(config_dir)

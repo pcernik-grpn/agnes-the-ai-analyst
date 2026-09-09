@@ -11,8 +11,8 @@ from cli.commands import _win_deferred_update as h
 
 def test_run_success_writes_status_and_lkg(monkeypatch, tmp_path):
     monkeypatch.setattr(h, "_wait_for_exit", lambda pid, **k: None)
-    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: 0)
-    monkeypatch.setattr(h, "_installed_version_ok", lambda v: True)
+    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: (0, ""))
+    monkeypatch.setattr(h, "_installed_version_ok", lambda v: (True, v))
 
     wheel = tmp_path / "0.72.2.whl"
     wheel.write_bytes(b"new-wheel-bytes")
@@ -34,7 +34,7 @@ def test_run_success_writes_status_and_lkg(monkeypatch, tmp_path):
 
 def test_run_install_fails_records_failure_reason(monkeypatch, tmp_path):
     monkeypatch.setattr(h, "_wait_for_exit", lambda pid, **k: None)
-    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: 2)  # never succeeds
+    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: (2, ""))  # never succeeds
     cfg = tmp_path / "cfg"
     cfg.mkdir()
     (cfg / "upgrade_status.json").write_text('{"consecutive_failures": 1}')
@@ -51,8 +51,8 @@ def test_run_install_fails_records_failure_reason(monkeypatch, tmp_path):
 def test_run_verify_fails_rolls_back(monkeypatch, tmp_path):
     installed = []
     monkeypatch.setattr(h, "_wait_for_exit", lambda pid, **k: None)
-    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: installed.append(wheel) or 0)
-    monkeypatch.setattr(h, "_installed_version_ok", lambda v: False)  # smoke fails
+    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: installed.append(wheel) or (0, ""))
+    monkeypatch.setattr(h, "_installed_version_ok", lambda v: (False, "version mismatch"))  # smoke fails
 
     staged = tmp_path / "0.72.2.whl"
     staged.write_bytes(b"new")
@@ -100,8 +100,8 @@ def test_venv_free_true_when_absent_or_openable(tmp_path):
 def test_run_clears_updating_sentinel_on_success(monkeypatch, tmp_path):
     # The status-bar "step aside" sentinel must not linger once the swap is done.
     monkeypatch.setattr(h, "_wait_for_exit", lambda pid, **k: None)
-    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: 0)
-    monkeypatch.setattr(h, "_installed_version_ok", lambda v: True)
+    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: (0, ""))
+    monkeypatch.setattr(h, "_installed_version_ok", lambda v: (True, v))
 
     wheel = tmp_path / "0.72.3.whl"
     wheel.write_bytes(b"w")
@@ -114,7 +114,7 @@ def test_run_clears_updating_sentinel_on_success(monkeypatch, tmp_path):
 
 def test_run_clears_updating_sentinel_on_install_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(h, "_wait_for_exit", lambda pid, **k: None)
-    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: 2)
+    monkeypatch.setattr(h, "_uv_install", lambda wheel, **k: (2, ""))
     cfg = tmp_path / "cfg"
     cfg.mkdir()
 
@@ -157,7 +157,7 @@ def test_uv_install_non_lock_error_fails_fast(monkeypatch, tmp_path):
     slept = []
     monkeypatch.setattr(h.time, "sleep", lambda s: slept.append(s))
 
-    rc = h._uv_install("x.whl", config_dir=str(tmp_path), budget_s=5.0, backoff_s=0.01)
+    rc, _ = h._uv_install("x.whl", config_dir=str(tmp_path), budget_s=5.0, backoff_s=0.01)
     assert rc == 2
     assert len(calls) == 1  # fail-fast: no retry on a non-lock error
     assert slept == []
@@ -182,7 +182,7 @@ def test_uv_install_lock_then_success_retries(monkeypatch, tmp_path):
 
     monkeypatch.setattr(h.subprocess, "run", fake_run)
 
-    rc = h._uv_install("x.whl", config_dir=str(tmp_path), budget_s=5.0, backoff_s=0.01)
+    rc, _ = h._uv_install("x.whl", config_dir=str(tmp_path), budget_s=5.0, backoff_s=0.01)
     assert rc == 0
     assert seen == [1, 0]  # retried after the lock error, then succeeded
 
@@ -194,13 +194,13 @@ def test_installed_version_ok_exact_match_not_substring(monkeypatch):
     # the caller rolls back instead of scoring it as success.
     monkeypatch.setattr(h.subprocess, "run",
                         lambda *a, **k: _FakeProc(0, stdout="agnes 0.72.90\n"))
-    assert h._installed_version_ok("0.72.9") is False
+    assert h._installed_version_ok("0.72.9")[0] is False
 
     monkeypatch.setattr(h.subprocess, "run",
                         lambda *a, **k: _FakeProc(0, stdout="agnes 0.72.9\n"))
-    assert h._installed_version_ok("0.72.9") is True
+    assert h._installed_version_ok("0.72.9")[0] is True
 
     # Non-zero exit is never OK regardless of stdout.
     monkeypatch.setattr(h.subprocess, "run",
                         lambda *a, **k: _FakeProc(1, stdout="agnes 0.72.9\n"))
-    assert h._installed_version_ok("0.72.9") is False
+    assert h._installed_version_ok("0.72.9")[0] is False
