@@ -202,6 +202,49 @@ def _tool_calls_from_parts(turn_id: Any, parts: list[dict] | None, started_at: s
     return calls
 
 
+def _tool_calls_from_legacy_column(
+    turn_id: Any,
+    tool_calls: list[dict] | None,
+    started_at: str | None,
+    text_fn: Callable[[str], str],
+) -> list[dict]:
+    """Fallback for a message with no ``parts`` at all (written before
+    schema v123 -- ``app/chat/message_parts.py`` -- so its calls survive
+    only in the legacy positionless ``tool_calls`` column). Mirrors the
+    same compatibility path the chat-session-jsonl export already has
+    (``app/chat/session_export.py::_assistant_blocks``'s legacy fallback).
+
+    That legacy shape is ``[{"tool": ..., "args": ...}]`` only
+    (``parts_to_tool_calls``) -- no result, no error flag, no
+    ``tool_use_id`` was ever recorded alongside it, so ``output`` stays
+    ``None`` and ``is_error`` stays ``False`` here rather than guessing at
+    an outcome the row never stored. A killed/cancelled-turn marker
+    (``_partial_save``'s ``{"interrupted": True, "reason": ...}``) has no
+    ``tool`` key and is skipped, not read as a bogus call.
+    """
+    calls: list[dict] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        tool_name = call.get("tool")
+        if not isinstance(tool_name, str):
+            continue
+        args = call.get("args")
+        if args is not None:
+            args = _walk_strings(args, text_fn)
+        calls.append(
+            {
+                "turn_id": turn_id,
+                "tool_name": tool_name,
+                "input": args,
+                "output": None,
+                "is_error": False,
+                "started_at": started_at,
+            }
+        )
+    return calls
+
+
 def _iso(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -401,9 +444,8 @@ def build_conversation_record(
     tool_calls_json: list[dict[str, Any]] = []
     for m in ordered:
         created_at_iso = _iso(m.get("created_at"))
-        transformed_parts = (
-            _pseudonymize_parts(m.get("parts"), _text) if content_mode == "pseudonymized" else m.get("parts")
-        )
+        raw_parts = m.get("parts")
+        transformed_parts = _pseudonymize_parts(raw_parts, _text) if content_mode == "pseudonymized" else raw_parts
         messages_json.append(
             {
                 "role": m.get("role"),
@@ -413,7 +455,16 @@ def build_conversation_record(
                 "parts": transformed_parts,
             }
         )
-        tool_calls_json.extend(_tool_calls_from_parts(m.get("turn_id"), transformed_parts, created_at_iso))
+        if raw_parts:
+            tool_calls_json.extend(_tool_calls_from_parts(m.get("turn_id"), transformed_parts, created_at_iso))
+        else:
+            # A row written before `parts` existed (schema v123) keeps its
+            # calls only in the legacy `tool_calls` column -- without this
+            # fallback a historical conversation exports as if the model
+            # used no tools at all (#2365 review).
+            tool_calls_json.extend(
+                _tool_calls_from_legacy_column(m.get("turn_id"), m.get("tool_calls"), created_at_iso, _text)
+            )
 
     turn_ids = {m.get("turn_id") for m in ordered if m.get("turn_id")}
     first_user = next((m for m in ordered if m.get("role") == "user"), None)
