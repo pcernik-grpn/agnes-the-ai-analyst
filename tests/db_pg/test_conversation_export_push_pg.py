@@ -144,7 +144,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
 
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
         watermark = export_watermarks_repo().get(_watermark_name_for())
         assert watermark is not None
@@ -165,7 +165,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
         assert len(attempts) == MAX_ATTEMPTS
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1, "oversized_skipped": 0}
         assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     def test_second_run_after_success_sends_zero_records(self, pg_client, pg_engine):
@@ -181,10 +181,10 @@ class TestWatermarkAdvancesOnlyOn2xx:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
 
     def test_forked_session_with_diverged_last_message_at_is_not_resent(self, pg_client, pg_engine):
@@ -215,7 +215,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
         assert len(requests) == 1
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
 
     def test_a_failure_on_batch_2_advances_the_key_only_through_batch_1(self, pg_client, pg_engine, monkeypatch):
@@ -241,7 +241,7 @@ class TestWatermarkAdvancesOnlyOn2xx:
 
         result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 1, "batches": 1, "batches_failed": 1}
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 1, "oversized_skipped": 0}
         watermark = export_watermarks_repo().get(_watermark_name_for())
         assert watermark is not None
         _watermark_ts, cursor_id = watermark
@@ -285,13 +285,13 @@ class TestSurfacesFilterPushedIntoQuery:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
         (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
         assert delivered["thread_id"] == web_id
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert second == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert second == {"sent": 0, "batches": 0, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1  # the slack session never triggers a delivery
 
 
@@ -313,7 +313,7 @@ class TestRetrySemantics:
         assert MAX_ATTEMPTS == 4
         assert len(attempts) == 4
         assert sleeps == [1.0, 2.0, 4.0]
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1, "oversized_skipped": 0}
         assert export_watermarks_repo().get(_watermark_name_for()) is None
 
     @pytest.mark.parametrize("status", [400, 404, 429])
@@ -332,7 +332,7 @@ class TestRetrySemantics:
 
         assert len(attempts) == 1
         assert sleeps == []
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 1}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 1, "oversized_skipped": 0}
 
 
 class TestFailureHandling:
@@ -482,6 +482,56 @@ class TestBatching:
         assert all(size <= MAX_BATCH_BYTES for size in batch_byte_sizes)
 
 
+class TestOversizedRecordNeverBlocksTheCorpus:
+    """Review finding: a single conversation whose own ndjson line exceeds
+    the advertised batch cap used to be posted anyway. A collector that
+    enforces the cap rejects it on every run, and the watermark never gets
+    past it -- one outsized transcript blocks the whole corpus forever."""
+
+    def test_an_oversized_record_is_skipped_and_the_ones_behind_it_still_deliver(
+        self, pg_client, pg_engine, monkeypatch
+    ):
+        from app.worker import kinds_conversation_export as mod
+        from src.repositories import export_watermarks_repo
+
+        # A cap far below 8 MiB so the test does not have to build a real
+        # 8 MiB transcript: an ordinary record is a couple of KB and fits,
+        # the padded one does not.
+        monkeypatch.setattr(mod, "MAX_BATCH_BYTES", 20_000)
+        _seed_session(pg_engine, index=0, content="x" * 40_000)
+        _seed_session(pg_engine, index=1, content="hi")
+
+        posted: list[bytes] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posted.append(request.content)
+            return httpx.Response(200)
+
+        result = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+
+        assert result["oversized_skipped"] == 1
+        assert all(len(body) <= 20_000 for body in posted), "an over-contract body was posted anyway"
+        assert b"hi" in b"".join(posted), "the record behind the oversized one never arrived"
+        # The watermark moved past BOTH, so the next run does not re-walk
+        # the oversized record forever.
+        watermark = export_watermarks_repo().get(_watermark_name_for())
+        assert watermark is not None
+        posted.clear()
+        again = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
+        assert again["sent"] == 0 and posted == []
+
+    def test_the_skip_is_counted_in_the_audit_row(self, pg_client, pg_engine, monkeypatch):
+        from app.worker import kinds_conversation_export as mod
+
+        monkeypatch.setattr(mod, "MAX_BATCH_BYTES", 20_000)
+        _seed_session(pg_engine, index=0, content="x" * 40_000)
+
+        mod.run_conversation_export_once(client=_mock_client(lambda _r: httpx.Response(200)), sleep=lambda *_: None)
+        params = _latest_export_audit_params(pg_engine)
+        assert params["oversized_skipped"] == 1
+        assert params["count"] == 0
+
+
 class TestHeadersAndAudit:
     def test_headers_come_from_the_env_var_and_never_appear_in_the_audit_row(self, pg_client, pg_engine):
         from app.worker.kinds_conversation_export import run_conversation_export_once
@@ -583,7 +633,7 @@ class TestWatermarkTracksDeliveryConfig:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
 
         new_endpoint = "https://new-collector.example.com/ingest"
@@ -591,7 +641,7 @@ class TestWatermarkTracksDeliveryConfig:
 
         second = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert second == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 2
         assert str(requests[1].url) == new_endpoint
 
@@ -624,7 +674,7 @@ class TestWatermarkTracksDeliveryConfig:
             return httpx.Response(200)
 
         first = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert first == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         (delivered,) = [json.loads(line) for line in requests[0].content.decode("utf-8").splitlines()]
         assert delivered["thread_id"] == web_id
 
@@ -637,7 +687,7 @@ class TestWatermarkTracksDeliveryConfig:
         # everything that now matches the filter (both sessions), not only
         # the newly-included one. That IS the fix: the slack conversation,
         # previously unreachable under any cursor, is finally delivered.
-        assert second == {"sent": 2, "batches": 1, "batches_failed": 0}
+        assert second == {"sent": 2, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 2
         delivered2 = {json.loads(line)["thread_id"] for line in requests[1].content.decode("utf-8").splitlines()}
         assert delivered2 == {web_id, slack_session.id}
@@ -662,7 +712,7 @@ class TestSettleWindow:
 
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert result == {"sent": 0, "batches": 0, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 0
         assert export_watermarks_repo().get(_watermark_name_for()) is None
 
@@ -679,7 +729,7 @@ class TestSettleWindow:
 
         result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert result == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert result == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
 
     def test_a_message_inside_the_window_is_exported_once_the_window_passes(self, pg_client, pg_engine, monkeypatch):
@@ -706,13 +756,13 @@ class TestSettleWindow:
         monkeypatch.setattr(mod, "datetime", _FrozenDatetime)
 
         first = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
-        assert first == {"sent": 0, "batches": 0, "batches_failed": 0}
+        assert first == {"sent": 0, "batches": 0, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 0
 
         _FrozenDatetime._fixed = base_now + timedelta(minutes=6)
         second = mod.run_conversation_export_once(client=_mock_client(handler), sleep=lambda *_: None)
 
-        assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
+        assert second == {"sent": 1, "batches": 1, "batches_failed": 0, "oversized_skipped": 0}
         assert len(requests) == 1
 
 

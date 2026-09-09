@@ -304,9 +304,10 @@ def _batches(items: Iterable[_RecordAndKey]) -> Iterator[list[_RecordAndKey]]:
     most :data:`MAX_BATCH_RECORDS` records or :data:`MAX_BATCH_BYTES`
     (whichever is hit first) — batch boundaries, not page boundaries,
     since a page and a batch are sized independently. A single record
-    whose own serialized line already exceeds the byte cap is still sent
+    whose own serialized line already exceeds the byte cap is yielded
     alone — spec 3.12 says this export is "complete, never truncated", so
-    there is no smaller unit to split it into.
+    there is no smaller unit to split it into, and the run loop, not this
+    splitter, decides what to do with an over-contract line.
     """
     batch: list[_RecordAndKey] = []
     batch_bytes = 0
@@ -456,11 +457,32 @@ def run_conversation_export_once(
     total_sent = 0
     batches_sent = 0
     batches_failed = 0
+    oversized_skipped = 0
     exc_class: str | None = None
     try:
         for batch in _batches(_records(bundle, since=since, until=until, surfaces=surfaces, start_cursor=start_cursor)):
             records = [record for record, _key in batch]
             body = b"".join(serialize_jsonl(records))
+            if len(batch) == 1 and len(body) > MAX_BATCH_BYTES:
+                # One conversation whose own line is larger than the batch
+                # size this sink advertises to the collector. It cannot be
+                # split (the export is "complete, never truncated"), and
+                # posting it anyway breaks the contract the collector
+                # enforces -- which then rejects it on every run and blocks
+                # every conversation behind it forever. Skip it, count it,
+                # and advance past it: one outsized transcript costs one
+                # record, not the whole corpus. The pull endpoint, which
+                # has no batch cap, still serves it.
+                last_ts, last_id = batch[0][1]
+                logger.warning(
+                    "conversation-export: one conversation serializes to %d bytes, over the %d-byte batch cap -- "
+                    "skipped and the watermark advanced past it; fetch it with the pull endpoint",
+                    len(body),
+                    MAX_BATCH_BYTES,
+                )
+                oversized_skipped += 1
+                watermark_repo.set(name, last_ts, last_id)
+                continue
             response = _post_with_retry(http_client, endpoint, headers, body, sleep=sleep)
             if response is None or not (200 <= response.status_code < 300):
                 logger.warning(
@@ -485,6 +507,7 @@ def run_conversation_export_once(
         "since": since.isoformat(),
         "until": until.isoformat(),
         "count": total_sent,
+        "oversized_skipped": oversized_skipped,
         "content_mode": mode,
         "placement": load_content_export_policy().placement,
         "delivery": "push",
@@ -511,7 +534,12 @@ def run_conversation_export_once(
         client_kind="scheduler",
     )
 
-    return {"sent": total_sent, "batches": batches_sent, "batches_failed": batches_failed}
+    return {
+        "sent": total_sent,
+        "batches": batches_sent,
+        "batches_failed": batches_failed,
+        "oversized_skipped": oversized_skipped,
+    }
 
 
 def run_conversation_export(payload: dict) -> dict:

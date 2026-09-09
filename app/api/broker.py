@@ -980,6 +980,15 @@ def _record_completion(
     try:
         trace_id, span_id = _otel.span_ids(span) if span is not None else (None, None)
         failed = error is not None or (status_code is not None and status_code >= 400)
+        # A STREAM that never reached a stop reason -- the client walked
+        # away, the upstream cut the connection mid-answer -- returned a
+        # perfectly good HTTP 200, so a status derived from the status code
+        # alone would file a half-delivered answer under "ok" and quietly
+        # flatter every error and quality summary built on this ledger.
+        # It gets its own status instead. `stream_complete` is None for a
+        # non-streaming call (only `text/event-stream` sets it), so nothing
+        # but a real interrupted stream can land here.
+        incomplete = not failed and summary.stream_complete is False
         record = build_record(
             kind="completion",
             context=context,
@@ -989,8 +998,12 @@ def _record_completion(
             model_response=(usage or {}).get("model") or summary.model,
             usage=usage,
             latency_ms=latency_ms,
-            status="error" if failed else "ok",
-            error_type=(type(error).__name__ if error is not None else (str(status_code) if failed else None)),
+            status=("error" if failed else "incomplete" if incomplete else "ok"),
+            error_type=(
+                type(error).__name__
+                if error is not None
+                else (str(status_code) if failed else ("stream_incomplete" if incomplete else None))
+            ),
             http_status=status_code,
             prompt_chars=summary.prompt_chars,
             completion_chars=summary.completion_chars,

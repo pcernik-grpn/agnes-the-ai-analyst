@@ -346,13 +346,18 @@ class LlmCallsPgRepository:
         """Per-session run status for the conversation-corpus export: the
         most recent call's ``status`` and the distinct ``error_type``s seen,
         for sessions that have at least one ``llm_calls`` row.
+
+        ``has_error`` is every status that is not ``ok`` -- an ``error`` row
+        and an ``incomplete`` one (a stream the model never finished) are
+        both answers something went wrong with, which is the question the
+        corpus's ``has_error`` exists to answer.
         """
         if not session_ids:
             return {}
         sql = """
             SELECT session_id,
                    (array_agg(status ORDER BY created_at DESC))[1] AS last_run_status,
-                   bool_or(status = 'error') AS has_error,
+                   bool_or(status <> 'ok') AS has_error,
                    array_remove(array_agg(DISTINCT error_type), NULL) AS error_types
             FROM llm_calls
             WHERE session_id = ANY(:session_ids)

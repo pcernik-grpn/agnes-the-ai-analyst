@@ -838,7 +838,7 @@ One record per session:
 | `messages_json` | `[{role, content, turn_id, created_at, parts}]` — complete, tool_use and tool_result blocks included, in order |
 | `tool_calls_json` | `[{turn_id, tool_name, input, output, is_error, started_at}]` |
 | `first_user_message`, `last_message_role`, `final_assistant_message_complete` | derived |
-| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames |
+| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames — a call is `ok`, `error` (the upstream refused or was unreachable) or `incomplete` (a stream that returned HTTP 200 but never reached its stop reason, i.e. a half-delivered answer), and `has_error` counts everything that is not `ok` |
 | `feedback_json` | `[{turn_id, user_id, verdict, comment, created_at}]` |
 | `memory_writes_json` | `[{memory_id, turn_id, status, content_length}]` — the memory's own content is never included, only its length |
 | `content_mode` | `full` or `pseudonymized` — what this record's text went through |
@@ -902,9 +902,13 @@ a hash of `endpoint` + `surfaces` rather than one fixed row — repointing
 whole corpus under the new configuration from a fresh cursor, so the
 destination collector must upsert by `thread_id`), walks every
 conversation completed since it, and POSTs newline-delimited JSON
-batches (at most 200 records or 8 MiB per request — a single record whose
-own line already exceeds 8 MiB is still sent alone, since this export is
-"complete, never truncated") to `endpoint`, with the auth headers parsed
+batches (at most 200 records or 8 MiB per request — a single conversation
+whose own line already exceeds 8 MiB is skipped rather than posted over the
+cap this sink advertises, counted as `oversized_skipped` in the run's audit
+row and logged, so one outsized transcript costs one record instead of
+blocking every conversation behind it; the export is "complete, never
+truncated", so there is nothing smaller to send and the pull endpoint,
+which has no batch cap, still serves it) to `endpoint`, with the auth headers parsed
 `OTEL_EXPORTER_OTLP_HEADERS`-style from the environment variable named by
 `headers_secret_env` — the header value itself never sits in
 `instance.yaml`. Because that request carries a secret and customer

@@ -36,7 +36,7 @@ def _row(**kw):
         model_response=None,
         usage=_USAGE,
         latency_ms=7,
-        status="ok",
+        status=kw.pop("status", "ok"),
         **kw,
     ).to_row()
 
@@ -163,3 +163,21 @@ class TestLedgerEndToEndOnPostgres:
 
         rows = repo.list_calls(limit=10)
         assert any(r["purpose"] == "flush-e2e" for r in rows)
+
+
+def test_has_error_counts_an_incomplete_stream_not_just_an_error(repo):
+    """``has_error`` feeds the corpus's "was this answer bad" question. A
+    stream the model never finished returned HTTP 200 and is filed as
+    ``incomplete`` (not ``error``) -- it still has to count, or a session
+    whose only fault was a half-delivered answer reads as clean (review
+    finding)."""
+    repo.insert_batch([_row(session_id="s_incomplete", status="incomplete", error_type="stream_incomplete")])
+    repo.insert_batch([_row(session_id="s_clean", status="ok")])
+
+    out = repo.statuses_for_sessions(["s_incomplete", "s_clean"])
+
+    assert out["s_incomplete"]["has_error"] is True
+    assert out["s_incomplete"]["last_run_status"] == "incomplete"
+    assert out["s_incomplete"]["error_types"] == ["stream_incomplete"]
+    assert out["s_clean"]["has_error"] is False
+    assert out["s_clean"]["last_run_status"] == "ok"

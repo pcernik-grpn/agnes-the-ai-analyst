@@ -12,8 +12,10 @@
   purpose), `GET /api/admin/telemetry/llm-calls` (`agnes admin usage llm-calls`,
   the rows of one session / turn / job / user, paged with a `before` +
   `before_id` keyset cursor so rows sharing a timestamp are never skipped;
-  buffered rows reach the ledger within 30 s even on an idle instance), the
-  new "LLM cost" section on
+  buffered rows reach the ledger within 30 s even on an idle instance; a
+  streamed completion that never reached its stop reason is recorded as
+  `incomplete` rather than `ok`, and the corpus's `has_error` counts it),
+  the new "LLM cost" section on
   `/admin/telemetry`, and the `agnes_llm_calls` table in the `agnes-usage`
   package. `retention.llm_calls_days` prunes it (default 0 = forever). See
   `docs/observability.md` → *LLM call ledger*.
@@ -52,7 +54,9 @@
   turn in flight is never exported half-finished. The endpoint must be an
   `https://` URL to a named host (plain `http://` only to loopback) without
   credentials, and `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`, when set, applies to
-  its host too. A run that fails mid-walk is audited as
+  its host too. A single conversation whose own line exceeds the 8 MiB batch
+  cap is skipped and counted rather than posted over the advertised limit,
+  so it cannot block every conversation behind it. A run that fails mid-walk is audited as
   failed, never raised into the worker. Migration `0116_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and

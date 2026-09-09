@@ -137,6 +137,68 @@ def test_streamed_completion_writes_a_row_with_stream_completeness(otel_broker, 
     assert row["latency_ms"] is not None and row["latency_ms"] >= 0
 
 
+def test_interrupted_stream_is_not_an_ok_row(otel_broker, otel_exporter, ledger):  # noqa: F811
+    """A stream that stops before its `message_delta` still returns HTTP 200,
+    so a status taken from the status code alone would file a half-delivered
+    answer under `ok` and flatter every summary built on this ledger. It gets
+    its own `incomplete` status instead (review finding)."""
+    from app.api.broker_agent_policy import usage_accumulator
+
+    _FakeUpstream.content_type = "text/event-stream"
+    _FakeUpstream.sse_chunks = _sse(
+        [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {"model": "claude-stream", "usage": {"input_tokens": 20, "output_tokens": 1}},
+                },
+            ),
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}},
+            ),
+        ]
+    )
+    tok = ticket_repo().mint("chat_ledger_cut", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-stream", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    usage_accumulator.flush()
+    (row,) = ledger
+    assert row["stream_complete"] is False
+    assert row["status"] == "incomplete"
+    assert row["error_type"] == "stream_incomplete"
+    assert row["http_status"] == 200
+
+
+def test_a_complete_stream_and_a_buffered_reply_both_stay_ok(otel_broker, otel_exporter, ledger):  # noqa: F811
+    """The counterpart to the test above: `incomplete` must not leak onto a
+    stream that finished, nor onto a non-streaming call (which never sets
+    `stream_complete` at all)."""
+    from app.api.broker_agent_policy import usage_accumulator
+
+    _FakeUpstream.content_type = "application/json"
+    _FakeUpstream.sse_chunks = None
+    tok = ticket_repo().mint("chat_ledger_ok", "main", ttl_seconds=60)
+    r = _post(
+        otel_broker,
+        tok,
+        "/api/broker/anthropic/v1/messages",
+        {"model": "claude-buffered", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    usage_accumulator.flush()
+    (row,) = ledger
+    assert row["status"] == "ok"
+    assert row["error_type"] is None
+    assert row["stream_complete"] is None
+
+
 def test_upstream_error_is_an_error_row(otel_broker, otel_exporter, ledger):  # noqa: F811
     from app.api.broker_agent_policy import usage_accumulator
 
