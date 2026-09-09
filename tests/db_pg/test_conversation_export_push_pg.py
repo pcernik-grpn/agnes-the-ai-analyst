@@ -604,9 +604,8 @@ class TestFeedbackSweepHonoursTheSettleWindow:
             message_id=None,
         )
 
-    def test_feedback_on_a_session_still_mid_turn_waits_for_the_next_run(self, pg_client, pg_engine):
+    def test_feedback_on_a_session_still_mid_turn_is_not_exported(self, pg_client, pg_engine):
         from app.worker import kinds_conversation_export as mod
-        from src.repositories import export_watermarks_repo
 
         # Settled long ago, then a brand-new user message arrives (mid-turn),
         # and only THEN does a thumbs land on the older answer.
@@ -626,9 +625,38 @@ class TestFeedbackSweepHonoursTheSettleWindow:
 
         assert result["refreshed"] == 0, "an unsettled conversation must not be rebuilt"
         assert posted == []
-        # And its feedback was NOT scanned past: no watermark yet, so the
-        # next run sees the same row again.
-        assert export_watermarks_repo().get(_feedback_watermark_name_for()) is None
+
+    def test_one_busy_conversation_does_not_hold_up_the_feedback_behind_it(self, pg_client, pg_engine):
+        """Review finding on the first version of this rule: cutting the page
+        in front of an unsettled conversation let ONE continuously active
+        session block every later feedback update. Unsettled sessions are
+        skipped instead -- nothing is lost, because a session whose last
+        message is newer than the settle bound is also newer than the MAIN
+        watermark and gets exported by that walk once it settles."""
+        from app.worker import kinds_conversation_export as mod
+
+        # Feedback lands on the busy session FIRST (so it sorts ahead), then
+        # on a settled one.
+        busy = _seed_session(pg_engine, index=1)
+        settled = _seed_session(pg_engine, index=2)
+        self._feedback(pg_engine, busy, turn_id="t_busy")
+        self._feedback(pg_engine, settled, turn_id="t_settled")
+        with pg_engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE chat_sessions SET last_message_at = :ts WHERE id = :id"),
+                {"ts": datetime.now(UTC), "id": busy},
+            )
+
+        posted: list[bytes] = []
+        result = mod.run_conversation_export_once(
+            client=_mock_client(lambda r: (posted.append(r.content), httpx.Response(200))[1]),
+            sleep=lambda *_: None,
+        )
+
+        body = b"".join(posted)
+        assert settled.encode() in body, "the settled conversation behind the busy one never went out"
+        assert busy.encode() not in body, "the busy conversation must not be exported mid-turn"
+        assert result["batches_failed"] == 0
 
     def test_once_the_conversation_settles_the_held_back_feedback_is_delivered(self, pg_client, pg_engine):
         from app.worker import kinds_conversation_export as mod
@@ -659,7 +687,10 @@ class TestFeedbackSweepHonoursTheSettleWindow:
             client=_mock_client(lambda r: (posted.append(r.content), httpx.Response(200))[1]),
             sleep=lambda *_: None,
         )
-        assert second["sent"] + second["refreshed"] >= 1, "the settled conversation must reach the destination"
+        assert second["sent"] + second["refreshed"] >= 1, (
+            "once it settles the conversation must reach the destination -- the MAIN walk covers it, "
+            "since its last_message_at is still ahead of that walk's own cursor"
+        )
         assert posted, "nothing was delivered on the second run"
 
 

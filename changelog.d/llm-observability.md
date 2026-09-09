@@ -50,7 +50,9 @@
   calls, feedback and memory writes joined in, never truncated — under the same
   content-export policy as the OTel export. Postgres-only; a pull is refused
   with `403 content_export_disabled` when the policy is off, has no recorded
-  basis, or excludes the `chat` workload.
+  basis, or excludes the `chat` workload. Its default upper bound lags by the
+  same five-minute settle window the push sink uses, so a pull never catches
+  a turn mid-write; an explicit `until` is honoured as given.
 - **The corpus can also be pushed on a schedule.**
   `observability.conversation_export` (`endpoint`, `headers_secret_env`,
   `interval_minutes`, `surfaces`) turns on a `conversation-export` worker job

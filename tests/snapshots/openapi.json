@@ -20259,7 +20259,7 @@
     },
     "/api/admin/conversations/corpus": {
       "get": {
-        "description": "The evaluation-corpus pull (spec 3.12). Admin-only, Postgres-only,\ncontent-export-policy-gated. ``since`` is required \u2014 a caller that omits\nit gets a typed 400, not an unbounded scan of every conversation ever\nheld.",
+        "description": "The evaluation-corpus pull (spec 3.12). Admin-only, Postgres-only,\ncontent-export-policy-gated. The default ``until`` lags by\n``SETTLE_WINDOW`` so an in-flight turn is not exported half-written;\nan explicit ``until`` is used as given. ``since`` is required \u2014 a caller that omits\nit gets a typed 400, not an unbounded scan of every conversation ever\nheld.",
         "operationId": "export_conversations_api_admin_conversations_corpus_get",
         "parameters": [
           {
@@ -20281,7 +20281,7 @@
             }
           },
           {
-            "description": "ISO date/datetime, exclusive upper bound. Default: now.",
+            "description": "ISO date/datetime, exclusive upper bound. Default: five minutes ago, so a turn still being written is left for a later call. An explicit value is honoured as given.",
             "in": "query",
             "name": "until",
             "required": false,
@@ -20294,7 +20294,7 @@
                   "type": "null"
                 }
               ],
-              "description": "ISO date/datetime, exclusive upper bound. Default: now.",
+              "description": "ISO date/datetime, exclusive upper bound. Default: five minutes ago, so a turn still being written is left for a later call. An explicit value is honoured as given.",
               "title": "Until"
             }
           },

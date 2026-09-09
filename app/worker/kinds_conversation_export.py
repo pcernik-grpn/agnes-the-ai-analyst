@@ -156,13 +156,16 @@ import logging
 import os
 import time
 from collections.abc import Callable, Iterable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
 from src.audit_helpers import log_safe
+from src.conversation_export import (
+    SETTLE_WINDOW as _SETTLE_WINDOW,
+)
 from src.conversation_export import (
     ConversationExportRepoBundle,
     encode_cursor,
@@ -189,7 +192,9 @@ IDEMPOTENCY_KEY = "conversation-export"
 #: before the record is complete; leaving it off this run's page (rather
 #: than exporting a half-turn and advancing the watermark past it) means a
 #: later tick re-checks a fresh "now" and picks it up once it is quiet.
-SETTLE_WINDOW = timedelta(minutes=5)
+#: Re-exported from `src.conversation_export`, which both delivery paths
+#: read so the pull endpoint and this job cannot drift apart.
+SETTLE_WINDOW = _SETTLE_WINDOW
 
 #: Spec 3.12: "batches of at most 200 records or 8 MiB".
 MAX_BATCH_RECORDS = 200
@@ -519,24 +524,31 @@ def _sweep_feedback_updates(
     # old answer says nothing about whether the conversation has settled,
     # and rebuilding it now would ship a transcript whose newest turn is
     # still being written -- the very thing SETTLE_WINDOW exists to prevent.
-    # Rows are walked in order and cut at the FIRST unsettled one, so its
-    # feedback is not scanned past: the watermark stops in front of it and
-    # the next run picks it up once the conversation settles.
+    # Such a session is SKIPPED, not stopped at: the rows are globally
+    # ordered by feedback time, so cutting the page in front of one would
+    # let a single continuously-active conversation hold up every later
+    # feedback update for as long as someone keeps talking to it.
+    #
+    # Skipping loses nothing. An unsettled session's `last_message_at` is by
+    # definition newer than the settle bound, so it is also newer than the
+    # MAIN watermark (which only ever advances through settled
+    # conversations) -- it is still ahead of the main walk's cursor and will
+    # be exported by that walk, feedback and all, as soon as it settles.
     settled_at = bundle.sessions.last_message_at_for([sid for sid, _ in rows])
-    held_back = False
-    for index, (sid, _updated_at) in enumerate(rows):
-        last_message_at = settled_at.get(sid)
-        if last_message_at is None or last_message_at >= settle_bound:
-            rows = rows[:index]
-            has_more = True  # there IS more to do; the watermark must not jump to `until`
-            held_back = True
-            break
-    if not rows:
-        return 0, False
-    if held_back:
-        logger.debug("conversation-export: feedback sweep stopped at an unsettled conversation")
 
-    session_ids = [sid for sid, _updated_at in rows if sid not in exclude]
+    def _settled(session_id: str) -> bool:
+        last_message_at = settled_at.get(session_id)
+        return last_message_at is not None and last_message_at < settle_bound
+
+    unsettled = [sid for sid, _updated_at in rows if not _settled(sid)]
+    if unsettled:
+        logger.debug(
+            "conversation-export: feedback sweep skipped %d unsettled conversation(s); "
+            "the main walk exports them once they settle",
+            len(unsettled),
+        )
+
+    session_ids = [sid for sid, _updated_at in rows if sid not in exclude and _settled(sid)]
     records = records_for_session_ids(bundle, session_ids) if session_ids else []
     refreshed = 0
     for batch in _batches((record, None) for record in records):

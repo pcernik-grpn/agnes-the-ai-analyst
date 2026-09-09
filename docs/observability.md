@@ -880,6 +880,10 @@ retention: the export reads what `chat_messages` already keeps.
 
 ### Pulling it
 
+By default the pull's upper bound lags by the same five-minute settle
+window the push sink uses, so a turn still being written is left for a later
+call; an explicit `until` is honoured exactly as given.
+
 `GET /api/admin/conversations/corpus?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
 — admin-only, Postgres-only (a DuckDB-backed instance answers a typed
 `501`), newline-delimited JSON by default, `limit` at most 500, a keyset

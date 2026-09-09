@@ -60,7 +60,7 @@ import os
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.llm_pricing import cost_usd
@@ -520,6 +520,15 @@ def build_conversation_record(
         "content_mode": content_mode,
         "exported_at": _iso(datetime.now(UTC)),
     }
+
+
+#: How long a conversation must have been quiet before it is exported.
+#: A session whose newest message is seconds old may be mid-turn (a user
+#: message whose answer has not been written yet), and half a turn is worse
+#: than a turn that arrives one tick later. Both delivery paths read this:
+#: the push sink bounds its walk with it, and the pull endpoint's DEFAULT
+#: upper bound lags by it (an explicit `until` is honoured as given).
+SETTLE_WINDOW = timedelta(minutes=5)
 
 
 def _messages_to_dicts(rows: Iterable[Any]) -> list[dict[str, Any]]:

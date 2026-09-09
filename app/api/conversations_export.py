@@ -38,7 +38,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.auth.access import require_admin
 from src.audit_helpers import log_safe
-from src.conversation_export import ConversationExportRepoBundle, iter_conversations, serialize_jsonl
+from src.conversation_export import (
+    SETTLE_WINDOW,
+    ConversationExportRepoBundle,
+    iter_conversations,
+    serialize_jsonl,
+)
 from src.observability.content_policy import (
     NO_BASIS_WARNING,
     content_export_mode,
@@ -110,7 +115,13 @@ def _export_denial_reason(workload: str) -> str:
 @router.get("/api/admin/conversations/corpus")
 def export_conversations(
     since: str | None = Query(None, description="ISO date/datetime, inclusive lower bound. Required."),
-    until: str | None = Query(None, description="ISO date/datetime, exclusive upper bound. Default: now."),
+    until: str | None = Query(
+        None,
+        description=(
+            "ISO date/datetime, exclusive upper bound. Default: five minutes ago, so a turn still "
+            "being written is left for a later call. An explicit value is honoured as given."
+        ),
+    ),
     surface: str | None = Query(None, description="Filter to one chat surface (web, slack_dm, api, ...)."),
     agent_id: str | None = Query(None, description="Filter to one shared agent's sessions."),
     format: str = Query("jsonl", description="jsonl (default, streamed) or json (one array)."),
@@ -120,7 +131,9 @@ def export_conversations(
     repos: dict = Depends(_export_repo_bundle_deps),
 ):
     """The evaluation-corpus pull (spec 3.12). Admin-only, Postgres-only,
-    content-export-policy-gated. ``since`` is required — a caller that omits
+    content-export-policy-gated. The default ``until`` lags by
+    ``SETTLE_WINDOW`` so an in-flight turn is not exported half-written;
+    an explicit ``until`` is used as given. ``since`` is required — a caller that omits
     it gets a typed 400, not an unbounded scan of every conversation ever
     held."""
     if since is None:
@@ -140,7 +153,13 @@ def export_conversations(
         )
 
     since_dt = _parse_dt(since, "since")
-    until_dt = _parse_dt(until, "until") if until else datetime.now(UTC)
+    # The DEFAULT upper bound lags by the same settle window the push sink
+    # uses: a conversation whose newest message is seconds old may be
+    # mid-turn (a user message with no answer yet), and a caller who did not
+    # name an upper bound is asking for "what is done", not "what is
+    # happening". An explicit `until` is honoured exactly as given — a
+    # caller naming a bound has said what they want.
+    until_dt = _parse_dt(until, "until") if until else datetime.now(UTC) - SETTLE_WINDOW
 
     mode = content_export_mode(workload="chat")
     if mode == "off":
