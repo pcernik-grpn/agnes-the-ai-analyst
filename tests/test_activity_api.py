@@ -607,3 +607,113 @@ def test_omitting_since_ts_falls_back_to_recomputing_the_floor(seeded_app, admin
         headers=admin_user,
     )
     assert r.status_code == 200
+
+
+def test_cursor_without_since_ts_still_pages_correctly(seeded_app, admin_user):
+    """The pre-change cursor shape (cursor_ts + cursor_id, no since_ts) must
+    keep paging through REAL rows correctly, not merely return 200 — a
+    caller that never forwards since_ts (an old integration, or a hand-built
+    cursor) must still reach page two, not silently restart at page one."""
+    from src.db import get_system_db
+    from src.repositories.audit import AuditRepository
+
+    conn = get_system_db()
+    repo = AuditRepository(conn)
+    repo.log(action="test.nosincets.first", result="success")
+    repo.log(action="test.nosincets.second", result="success")
+    conn.close()
+
+    c = seeded_app["client"]
+    page1 = c.get(
+        "/api/admin/activity",
+        params={"action_prefix": "test.nosincets.", "limit": 1},
+        headers=admin_user,
+    ).json()
+    assert page1["rows"][0]["action"] == "test.nosincets.second"
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+
+    page2 = c.get(
+        "/api/admin/activity",
+        params={
+            "action_prefix": "test.nosincets.",
+            "limit": 1,
+            "cursor_ts": cursor["ts"],
+            "cursor_id": cursor["id"],
+        },
+        headers=admin_user,
+    ).json()
+    assert page2["rows"][0]["action"] == "test.nosincets.first"
+
+
+# ---------------------------------------------------------------------------
+# Cursor / since_ts validation hardening (PR #2400 second review round)
+#
+# since_ts riding back in next_cursor let `since = since_ts if since_ts is
+# not None else ...` accept ANY absolute floor unconditionally — a caller
+# could pass a floor years back and scan the whole archive regardless of the
+# since_minutes ceiling (`ge=1, le=43200`). since_ts is now continuation-only
+# (requires a complete cursor) and bounded to at most since_minutes before
+# cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond
+# what since_minutes already allows. A half cursor (exactly one of
+# cursor_ts/cursor_id) is rejected the same way the MCP tool and CLI already
+# reject it, instead of silently restarting the timeline at page one.
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_since_ts_without_cursor_is_rejected(seeded_app, admin_user):
+    """A fresh (uncursored) read that sets since_ts directly must be
+    refused, not silently ignored — a silently ignored parameter is its own
+    trap (the caller believes the floor is pinned; it silently isn't)."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"since_ts": "2020-01-01T00:00:00+00:00"},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "since_ts" in r.json()["detail"]
+
+
+def test_since_ts_predating_the_window_is_rejected(seeded_app, admin_user):
+    """A hand-built cursor cannot use since_ts to widen a single read's scan
+    beyond what since_minutes bounds — since_ts more than since_minutes
+    before cursor_ts must be refused, not silently honoured."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={
+            "since_minutes": 60,
+            "cursor_ts": "2026-09-09T12:00:00+00:00",
+            "cursor_id": "abc-123",
+            "since_ts": "2020-01-01T00:00:00+00:00",
+        },
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "since_ts" in r.json()["detail"]
+
+
+def test_half_cursor_ts_only_is_rejected_at_endpoint(seeded_app, admin_user):
+    """The MCP tool and CLI already reject a half cursor — the endpoint
+    itself must too, rather than silently returning page one for a REST
+    caller supplying only one half."""
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_ts": "2026-09-09T12:00:00+00:00"},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_id" in r.json()["detail"]
+
+
+def test_half_cursor_id_only_is_rejected_at_endpoint(seeded_app, admin_user):
+    c = seeded_app["client"]
+    r = c.get(
+        "/api/admin/activity",
+        params={"cursor_id": "abc-123"},
+        headers=admin_user,
+    )
+    assert r.status_code == 400
+    assert "cursor_ts" in r.json()["detail"]

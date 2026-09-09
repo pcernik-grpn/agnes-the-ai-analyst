@@ -3631,13 +3631,18 @@ def register_foundation_tools(
                              ``next_cursor["id"]`` verbatim.
             since_ts:       Pagination floor — pass the prior page's
                              ``next_cursor["since_ts"]`` verbatim alongside
-                             cursor_ts/cursor_id. ``since_minutes`` computes a
-                             floor relative to "now", which drifts forward
-                             between calls; forwarding the pinned since_ts
-                             keeps a multi-page read over the same window the
-                             first call saw, so a row near the window's edge
-                             cannot silently fall out between pages. Omit
-                             only on the first (uncursored) call.
+                             cursor_ts/cursor_id. Continuation-only: setting
+                             it without both cursor halves raises ValueError,
+                             and the server independently rejects it as more
+                             than since_minutes before cursor_ts, so it can
+                             never widen a single read's scan past what
+                             since_minutes already allows. ``since_minutes``
+                             computes a floor relative to "now", which drifts
+                             forward between calls; forwarding the pinned
+                             since_ts keeps a multi-page read over the same
+                             window the first call saw, so a row near the
+                             window's edge cannot silently fall out between
+                             pages. Omit only on the first (uncursored) call.
 
         When a returned page's ``next_cursor`` is non-null, continue by
         calling again with ``cursor_ts=next_cursor["ts"]``,
@@ -3660,6 +3665,12 @@ def register_foundation_tools(
                 f"activity: cursor_ts and cursor_id must be passed together — {missing} is "
                 "missing. Pass both halves from a prior page's next_cursor (or neither, for "
                 "a fresh read)."
+            )
+        if since_ts and not (cursor_ts and cursor_id):
+            raise ValueError(
+                "activity: since_ts is continuation-only — pass it together with a complete "
+                "cursor_ts and cursor_id from a prior page's next_cursor, never on a fresh "
+                "(uncursored) read."
             )
         params: dict[str, Any] = {"since_minutes": since_minutes, "limit": limit}
         if action_prefix:

@@ -305,6 +305,18 @@ class TestCursorPagination:
         assert r.exit_code != 0
         assert "--cursor" in _clean(r.output)
 
+    def test_empty_cursor_flag_value_is_rejected(self, cli_admin):
+        """`--cursor ''` used to guard with `if cursor:`, and the empty
+        string is falsy — the empty value skipped _parse_cursor entirely,
+        both params were omitted, and the command quietly returned page one
+        instead of failing (PR #2400 review round 2, Finding C). Guarding on
+        `is not None` sends it through the validator, which rejects it the
+        same as any other malformed cursor."""
+        runner, app = cli_admin
+        r = runner.invoke(app, ["--cursor", "", "--json"])
+        assert r.exit_code != 0
+        assert "--cursor" in _clean(r.output)
+
     def test_more_rows_hint_names_the_cursor_flag(self, cli_admin):
         """The old hint ('pass --limit higher') was unachievable — --limit
         caps at 200 and narrowing --since cannot reach row 201 either. The

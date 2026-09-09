@@ -1319,6 +1319,21 @@ class TestActivityTool:
                 _run(mod.activity(cursor_id="abc-123"))
             get_mock.assert_not_called()
 
+    def test_standalone_since_ts_without_cursor_raises(self):
+        """since_ts is continuation-only (PR #2400 review round 2, Finding
+        A) — setting it on a fresh (uncursored) read must raise locally,
+        never silently reach the server as an unbounded read, and never
+        reach the server at all."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            with pytest.raises(ValueError, match="since_ts"):
+                _run(mod.activity(since_ts="2026-09-09T09:00:00+00:00"))
+            get_mock.assert_not_called()
+
     def test_forwards_since_ts_alongside_full_cursor(self):
         """since_ts pins the pagination floor a prior page computed
         (PR #2400 review, Finding B) — forwarded verbatim when present."""

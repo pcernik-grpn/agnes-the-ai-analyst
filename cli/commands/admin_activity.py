@@ -181,7 +181,7 @@ def timeline(
         raise typer.Exit(2)
 
     cursor_ts = cursor_id = cursor_since_ts = None
-    if cursor:
+    if cursor is not None:
         try:
             cursor_ts, cursor_id, cursor_since_ts = _parse_cursor(cursor)
         except typer.BadParameter as e:

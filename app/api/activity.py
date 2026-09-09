@@ -98,19 +98,55 @@ def activity_timeline(
     cursor_id: str | None = None,
     since_ts: datetime | None = Query(
         default=None,
-        description="Absolute floor for this page, carried verbatim from a prior page's "
-        "next_cursor.since_ts. since_minutes computes a floor relative to 'now', which "
-        "drifts forward between calls — passing the pinned since_ts back keeps a "
-        "multi-page read over the same window the first call saw, so a row near the "
-        "window's edge cannot fall out between pages. Omit on a fresh (uncursored) call; "
-        "the server computes the floor from since_minutes and returns it in "
-        "next_cursor.since_ts for the caller to carry forward.",
+        description="Pagination continuation floor — required together with a complete "
+        "cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. "
+        "Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to "
+        "'now', which drifts forward between calls — passing the pinned since_ts back keeps "
+        "a multi-page read over the same window the first call saw, so a row near the "
+        "window's edge cannot fall out between pages. Bounded to at most since_minutes "
+        "before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond "
+        "what since_minutes already allows. The server computes the floor from since_minutes "
+        "on a fresh call and returns it in next_cursor.since_ts for the caller to carry "
+        "forward on the next page.",
     ),
     limit: int = Query(default=50, ge=1, le=200),
     user: dict = Depends(require_admin),
 ):
+    if (cursor_ts is None) != (cursor_id is None):
+        missing = "cursor_id" if cursor_ts is not None else "cursor_ts"
+        raise HTTPException(
+            status_code=400,
+            detail=f"cursor_ts and cursor_id must be passed together — {missing} is missing. "
+            "Pass both halves from a prior page's next_cursor, or neither for a fresh read.",
+        )
+
+    if since_ts is not None:
+        if cursor_ts is None:
+            raise HTTPException(
+                status_code=400,
+                detail="since_ts is continuation-only — pass it together with a complete "
+                "cursor_ts + cursor_id from a prior page's next_cursor, never on a fresh "
+                "(uncursored) read.",
+            )
+        cursor_ts_utc = cursor_ts if cursor_ts.tzinfo else cursor_ts.replace(tzinfo=UTC)
+        since_ts_utc = since_ts if since_ts.tzinfo else since_ts.replace(tzinfo=UTC)
+        if since_ts_utc > cursor_ts_utc:
+            raise HTTPException(
+                status_code=400,
+                detail="since_ts must not be later than cursor_ts.",
+            )
+        if cursor_ts_utc - since_ts_utc > timedelta(minutes=since_minutes):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"since_ts predates the window since_minutes={since_minutes} allows: "
+                    "cursor_ts - since_ts exceeds since_minutes. A hand-built cursor cannot "
+                    "widen a single read's scan beyond what since_minutes bounds."
+                ),
+            )
+
     since = since_ts if since_ts is not None else datetime.now(UTC) - timedelta(minutes=since_minutes)
-    cursor = (cursor_ts, cursor_id) if cursor_ts and cursor_id else None
+    cursor = (cursor_ts, cursor_id) if cursor_ts is not None and cursor_id is not None else None
 
     try:
         rows, next_cursor = audit_repo().query_unified(
