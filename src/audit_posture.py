@@ -1683,6 +1683,7 @@ JOB_POSTURE: dict[str, str] = {
     "distribution-mirror": "job.run",
     "webhook-deliver": "job.run",
     "knowledge-packaging": "job.run",
+    "conversation-export": "conversations.export",
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
