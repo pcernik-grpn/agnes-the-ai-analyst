@@ -578,8 +578,48 @@ class GenericCopyTask:
 #     dangling grants (a table/package/etc. deleted without cascading to its
 #     grants) are dropped-with-warning instead of aborting the copy with a
 #     ForeignKeyViolation. Still a plain GenericCopyTask otherwise.
+#
+#   - corpus_chunks: a plain copy PLUS the stored-tsvector backfill. The
+#     cutover runs ``alembic upgrade head`` on an EMPTY target first, so
+#     ``0114_corpus_chunks_tsv``'s row-count gate sees nothing to backfill
+#     and warns about nothing — and the copy that follows carries only the
+#     DuckDB columns, so every migrated chunk would land with ``tsv`` NULL:
+#     correct (the ranking falls back per row) but paying the pre-0114
+#     re-tokenizing cost with no operator signal. ``CorpusChunksCopyTask``
+#     runs the same bounded, batched backfill the operator script uses,
+#     right after the copy.
+
+
+@dataclass
+class CorpusChunksCopyTask(GenericCopyTask):
+    """``corpus_chunks`` copy followed by the ``tsv`` backfill (0114).
+
+    The backfill is ``scripts.backfill_corpus_chunks_tsv.backfill`` — keyset
+    batches of ``batch_size`` rows, one short transaction each, idempotent —
+    so a cutover never opens one unbounded transaction over the whole
+    table, and a retried cutover only fills what is still NULL. Skipped on
+    ``dry_run`` like the copy itself.
+    """
+
+    def run(
+        self,
+        duck_conn: duckdb.DuckDBPyConnection,
+        pg_engine: Engine,
+        *,
+        dry_run: bool = False,
+    ) -> int:
+        considered = super().run(duck_conn, pg_engine, dry_run=dry_run)
+        if dry_run:
+            return considered
+        from scripts.backfill_corpus_chunks_tsv import backfill
+
+        updated = backfill(pg_engine, batch_size=max(self.batch_size, 1))
+        log.info("  corpus_chunks.tsv backfilled for %d migrated row(s)", updated)
+        return considered
+
 
 EXPLICIT_TASKS: Dict[str, GenericCopyTask] = {
+    "corpus_chunks": CorpusChunksCopyTask(table_name="corpus_chunks", pk_columns=["id"]),
     "resource_grants": GenericCopyTask(
         table_name="resource_grants",
         pk_columns=["id"],

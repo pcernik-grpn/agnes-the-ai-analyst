@@ -1819,6 +1819,8 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "delete_contributed_skill": "contributed_skill.delete",
     "admin_config_surface": "exempt:ui_support",
     "admin_source_connections_list": "exempt:ui_support",
+    # GET /api/admin/access-overview + /api/admin/data-packages + /api/admin/registry
+    "admin_access_picture": "exempt:ui_support",
     "admin_register_table": "register_table",  # dry_run branch -> table_registry.register_precheck, also real
     "admin_semantic_layer_coverage": "exempt:ui_support",
     "admin_knowledge_digests_list": "exempt:ui_support",

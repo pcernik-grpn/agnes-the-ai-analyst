@@ -19,9 +19,15 @@ write, and `SCHEMA_VERSION` must not move.
    def downgrade() -> None: ...  # exact inverse
    ```
 
-2. Update `src/db_pg.py` `Base.metadata` (the SQLAlchemy models) to match
+2. Append the new revision id on its own line to
+   `migrations/shipped_revision_ids.txt` — the append-only manifest of
+   every id that ever shipped (issue #2086). `tests/test_alembic_revision_
+   ratchet.py` fails until the line is there, and it is NOT in the
+   impacted lane's selection for a migration-only diff, so do it now,
+   not after CI.
+3. Update `src/db_pg.py` `Base.metadata` (the SQLAlchemy models) to match
    the new structural change — same as always.
-3. Build the repository **PG-only**: `src/repositories/<name>_pg.py`, no
+4. Build the repository **PG-only**: `src/repositories/<name>_pg.py`, no
    DuckDB sibling. See `references/repo-parity.md`.
 
 ## DuckDB side (`src/db.py`) — do not touch
@@ -57,10 +63,12 @@ write, and `SCHEMA_VERSION` must not move.
 
 1. TDD: add a test for the new table/column (PG-only contract test — see
    `references/repo-parity.md`).
-2. Alembic: new revision (up + down), chained to head.
+2. Alembic: new revision (up + down), chained to head; append its id to
+   `migrations/shipped_revision_ids.txt`.
 3. Update `src/db_pg.py` `Base.metadata`.
 4. Do NOT touch `src/db.py` / `SCHEMA_VERSION`.
-5. Green `test_db_schema_version_frozen.py` + `test_alembic_roundtrip.py`.
+5. Green `test_db_schema_version_frozen.py` + `test_alembic_roundtrip.py`
+   + `tests/test_alembic_revision_ratchet.py`.
 
 ## Anchors
 

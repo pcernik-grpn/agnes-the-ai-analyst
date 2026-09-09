@@ -256,6 +256,52 @@ def test_migrate_substitutes_default_for_not_null_columns_with_null_value(tmp_pa
     duck_conn.close()
 
 
+def test_migrate_corpus_chunks_populates_the_stored_tsvector(tmp_path, pg_with_schema):
+    """A DuckDB→PG cutover runs Alembic on an EMPTY target, so migration
+    ``0114_corpus_chunks_tsv``'s in-place backfill finds nothing; the copy
+    that follows carries only the DuckDB columns. The ``corpus_chunks`` task
+    therefore backfills ``tsv`` itself after the copy (bounded batches) —
+    otherwise every migrated chunk would rank through the slow per-row
+    fallback with no operator warning. Dry-run writes nothing."""
+    import sqlalchemy as sa
+
+    from scripts.migrate_duckdb_to_pg import TASKS, run_task, validate_task
+    from src.db import _ensure_schema
+    from src.repositories.corpus_chunks import CorpusChunksRepository
+
+    duck_conn = duckdb.connect(str(tmp_path / "src.duckdb"))
+    _ensure_schema(duck_conn)
+    CorpusChunksRepository(duck_conn).add_many(
+        [
+            {"corpus_id": "col_m", "file_id": "cf_m", "ordinal": 0, "text": "contract renewal terms"},
+            {"corpus_id": "col_m", "file_id": "cf_m", "ordinal": 1, "text": "unrelated weather report"},
+            {"corpus_id": "col_m", "file_id": "cf_m", "ordinal": 2, "text": None},
+        ]
+    )
+    task = next(t for t in TASKS if t.target_table == "corpus_chunks")
+
+    run_task(task, duck_conn, pg_with_schema, dry_run=True)
+    with pg_with_schema.connect() as conn:
+        assert conn.execute(sa.text("SELECT COUNT(*) FROM corpus_chunks")).scalar() == 0
+
+    run_task(task, duck_conn, pg_with_schema)
+    report = validate_task(task, duck_conn, pg_with_schema)
+    assert report["pg_rows"] == 3 and report["checksum_match"] is True
+    with pg_with_schema.connect() as conn:
+        rows = conn.execute(
+            sa.text(
+                "SELECT ordinal, tsv::text AS stored, to_tsvector('simple', text)::text AS fresh "
+                "FROM corpus_chunks ORDER BY ordinal"
+            )
+        ).all()
+    assert [(r.ordinal, r.stored == r.fresh, r.stored is not None) for r in rows] == [
+        (0, True, True),
+        (1, True, True),
+        (2, True, False),  # NULL text stays NULL on both sides
+    ]
+    duck_conn.close()
+
+
 def test_non_id_pk_tables_are_in_pk_columns_map():
     """Tables whose primary key isn't a single column named 'id' must be
     registered in _PK_COLUMNS so the generic copy loop knows what to

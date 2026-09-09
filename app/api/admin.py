@@ -5524,7 +5524,9 @@ async def list_registry(
         builder's picker offers it as a toggle. One batched membership read,
         like the sync_state join above; False for every row if that read
         fails, since a filter that silently claims everything is unpackaged
-        is worse than one that offers nothing.
+        is worse than one that offers nothing. The top-level
+        `packaged_read_ok` says whether that read succeeded, so a consumer
+        can tell "genuinely unpackaged" from "the stamp is a fallback".
       - `policy_mapping_status` (#2147): present only on a row with a
         policy attached (`access_policy_sql`). A list of
         `{"mapping_table": <id>, "state": "ok"|"empty"|"never_synced"|
@@ -5575,12 +5577,19 @@ async def list_registry(
         t["file_size_bytes"] = state.get("file_size_bytes") if state else None
 
     packaged: set = set()
+    # `packaged_read_ok` tells a reader whether the stamps below are real. On a
+    # failed membership read every row is stamped False -- which, read naively,
+    # claims every table is orphaned -- so a composed consumer (the
+    # `admin_access_picture` MCP tool) needs the flag to fall back rather than
+    # fabricate a gap list. The per-row fallback itself is unchanged.
+    packaged_read_ok = True
     try:
         from src.repositories import data_packages_repo
 
         for ids in data_packages_repo().list_member_ids_bulk().values():
             packaged.update(ids)
     except Exception:
+        packaged_read_ok = False
         logger.exception("Failed to read data-package membership for registry")
     for t in tables:
         t["packaged"] = t.get("id") in packaged
@@ -5608,7 +5617,7 @@ async def list_registry(
                 s["last_sync"] = ls.isoformat() if hasattr(ls, "isoformat") else ls
             t["policy_mapping_status"] = statuses
 
-    return {"tables": tables, "count": len(tables)}
+    return {"tables": tables, "count": len(tables), "packaged_read_ok": packaged_read_ok}
 
 
 # Wall-clock budget for the synchronous BQ materialization that runs after
@@ -8947,7 +8956,11 @@ def _policy_preview_referenced_group_literals(policy_sql: str) -> list[str]:
 
     for call in statement.find_all(exp.ArrayContains):
         a, b = call.this, call.expression
-        lit = _string_literal(b) if _is_user_groups_placeholder(a) else (_string_literal(a) if _is_user_groups_placeholder(b) else None)
+        lit = (
+            _string_literal(b)
+            if _is_user_groups_placeholder(a)
+            else (_string_literal(a) if _is_user_groups_placeholder(b) else None)
+        )
         if lit:
             names.add(lit)
 
@@ -9225,7 +9238,9 @@ def preview_table_policy_matrix(
                     persona_groups=persona["groups"],
                 )
             except Exception as exc:
-                raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+                raise HTTPException(
+                    status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)
+                ) from exc
             visible_keys = {_row_key(r) for r in result["sample_rows"]} & universe_keys
             persona_visible_keys.append(visible_keys)
             entries.append(

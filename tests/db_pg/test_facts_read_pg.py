@@ -1123,6 +1123,84 @@ def test_search_statement_timeout_is_a_typed_hinted_error(pg_env, repo, monkeypa
     assert excinfo.value.reason == "facts_search_timeout"
 
 
+def test_neighbors_and_summary_timeouts_are_typed_and_budgeted(pg_env, repo, monkeypatch):
+    """`neighbors` and `collection_facts_summary` run several statements per
+    transaction under ONE `_ReadBudget`: a blocked statement is cancelled at
+    the budget (not 20 s per statement) and surfaces as the typed, hinted
+    `FactsQueryTimeout` with a read-specific reason, never the raw driver
+    text. Same deterministic blocker as the search test."""
+    import time
+
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+    from src.repositories.facts_pg import FactsQueryTimeout
+
+    _seed_full_fixture()
+    alice = _grant_alice(pg_env)
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 300)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts, claims, fact_collection_stats IN ACCESS EXCLUSIVE MODE"))
+        for call, reason in (
+            (lambda: repo.neighbors(alice, "f_anything"), "facts_neighbors_timeout"),
+            (lambda: repo.collection_facts_summary(alice, CORPUS_A), "facts_summary_timeout"),
+        ):
+            started = time.monotonic()
+            with pytest.raises(FactsQueryTimeout) as excinfo:
+                call()
+            assert time.monotonic() - started < 5.0
+            assert excinfo.value.reason == reason
+            message = str(excinfo.value)
+            assert "canceling statement" not in message and "psycopg" not in message, message
+            assert "retry" in message
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_aggregate_reads_keep_their_own_fail_fast_guard(pg_env, repo, monkeypatch):
+    """The per-page-view aggregate reads (`approximate_counts_for_collections`,
+    `facet_top_values_for_collections`) run under `_AGGREGATE_STATEMENT_
+    TIMEOUT_MS`, NOT the interactive `_STATEMENT_TIMEOUT_MS` — raising the
+    interactive guard must never let an aggregate scan hold a pooled
+    connection longer (the pool-starvation incident their docstrings
+    record). Proven behaviourally: with the interactive guard left long and
+    only the aggregate guard shortened, a blocked aggregate read is
+    cancelled at the aggregate bound."""
+    import time
+
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+
+    assert facts_pg._AGGREGATE_STATEMENT_TIMEOUT_MS < facts_pg._STATEMENT_TIMEOUT_MS
+
+    _seed_full_fixture()
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 60_000)
+    monkeypatch.setattr(facts_pg, "_AGGREGATE_STATEMENT_TIMEOUT_MS", 200)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts, claims, fact_collection_stats IN ACCESS EXCLUSIVE MODE"))
+        for call in (
+            lambda: repo.approximate_counts_for_collections([CORPUS_A]),
+            lambda: repo.facet_top_values_for_collections([CORPUS_A], types=["organization"]),
+        ):
+            started = time.monotonic()
+            with pytest.raises(Exception) as excinfo:
+                call()
+            elapsed = time.monotonic() - started
+            assert "canceling statement" in str(excinfo.value) or isinstance(
+                excinfo.value, facts_pg.FactsQueryTimeout
+            ), excinfo.value
+            assert elapsed < 5.0, f"aggregate read waited {elapsed:.1f}s — ran under the interactive guard"
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
 # ---------------------------------------------------------------------------
 # S8 (read side) — corrections enforced at read time.
 # ---------------------------------------------------------------------------

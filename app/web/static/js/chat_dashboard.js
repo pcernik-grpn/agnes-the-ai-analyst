@@ -201,13 +201,21 @@ const MEMBER_ZERO_TASKS = [
 //
 // Each opener tells Agnes to CHECK rather than assert, and to say so when it
 // cannot: an admin acting on an invented access answer is worse served than one
-// told the question needs the admin pages.
+// told the question needs the admin pages. The check is the
+// `admin_access_picture` MCP foundation tool (app/api/mcp/foundation_tools.py)
+// — packages → granted groups → member counts, plus what nobody can reach —
+// added because these three starters shipped before any MCP tool could read
+// groups or grants, so the agent could only decline the page's own suggestions.
+//
+// Titles are plain questions an admin would ask a colleague. The first cut
+// ("Who can see what?", "What can nobody reach?") read as riddles: a card the
+// reader has to decode before clicking is a card nobody clicks.
 
 const ADMIN_TASKS = [
   {
     id: "admin-who-sees-what",
-    title: "Who can see what?",
-    description: "Which groups reach which packages, and who is in them",
+    title: "Who has access to which data?",
+    description: "Which groups can reach each data package, and how many people that is",
     icon: ICONS.person,
     available: true,
     opener:
@@ -217,8 +225,8 @@ const ADMIN_TASKS = [
   },
   {
     id: "admin-unreachable",
-    title: "What can nobody reach?",
-    description: "Tables in no package, and packages granted to no group",
+    title: "What is shared with no one?",
+    description: "Tables in no package and packages granted to no group — invisible to every analyst",
     icon: ICONS.search,
     available: true,
     opener:
@@ -239,8 +247,8 @@ const ADMIN_TASKS = [
   },
   {
     id: "admin-try-as-analyst",
-    title: "What would an analyst see?",
-    description: "The same workspace from a member's side",
+    title: "What does a non-admin see?",
+    description: "This workspace from a member's side: what they can ask, and where they hit a wall",
     icon: ICONS.compare,
     available: true,
     opener:
