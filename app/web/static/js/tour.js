@@ -482,6 +482,8 @@ function _startTour(id, steps, index, skipped) {
     // browser keeps painting until the destination is ready — stops acting on
     // presses. See _gotoStep.
     navigating: false,
+    // Fallback timer armed with the pending state; see _markPopoverPending.
+    navStuckTimer: null,
     // Targets whose transparent background we filled so the scrim cannot show
     // through them, with the inline value to put back — see
     // _applySpotlightBacking.
@@ -608,10 +610,14 @@ function _clearSpotlightBacking() {
 // is opaque black and ends in ", 0)" — a tail match would call it transparent
 // and repaint a legitimately black control surface-white.
 function _isFullyTransparent(color) {
-  if (!color) return true;
+  // An unreadable colour means DON'T repaint. `getComputedStyle` on a node
+  // detached between the two backing passes — the Add button this very step
+  // invites you to click re-renders its row — returns '', and a probe that
+  // decides whether to overwrite someone's background must fail closed.
+  if (!color) return false;
   if (color === 'transparent') return true;
-  // color(srgb r g b / a) and any other slash-separated alpha.
-  const slash = /\/\s*([\d.]+)(%?)\s*\)\s*$/.exec(color);
+  // color(srgb r g b / a) and any other slash-separated alpha, percent or not.
+  const slash = /\/\s*([\d.]+)%?\s*\)\s*$/.exec(color);
   if (slash) return parseFloat(slash[1]) === 0;
   // rgba()/hsla() carry alpha as a fourth comma-separated component; rgb() and
   // hsl() carry none at all and are therefore opaque.
@@ -730,8 +736,14 @@ function _showStep(index) {
   const step = steps[index];
   if (!step) { _endTour(true); return; }
 
-  // Clear previous popover + spotlight.
-  if (_active.popover) _active.popover.remove();
+  // Clear previous popover + spotlight. Dropping the reference matters as much
+  // as removing the node: an anchor-miss routes straight into _gotoStep, and a
+  // cross-page hop there would otherwise mark a card that is no longer in the
+  // document.
+  if (_active.popover) {
+    _active.popover.remove();
+    _active.popover = null;
+  }
   if (_active.spotlight) {
     _active.spotlight.classList.remove('tour-spotlight');
     _active.spotlight = null;
@@ -1101,6 +1113,12 @@ function _gotoStep(nextIndex) {
   _showStep(nextIndex);
 }
 
+// How long a committed cross-page hop may leave the card pending before we
+// assume the navigation is not happening. Generous: a slow destination must
+// never be mistaken for a stuck one, and the page is normally gone long
+// before this fires.
+const NAV_STUCK_MS = 8000;
+
 // Put the card into its "working on it" state: actions dead, progress bar
 // running. Used for the one transition the engine cannot make instant — a
 // full-page navigation to the next step's page.
@@ -1109,7 +1127,39 @@ function _markPopoverPending() {
   if (!pop) return;
   pop.classList.add('tour-popover--pending');
   pop.setAttribute('aria-busy', 'true');
+  const hadFocus = document.activeElement && pop.contains(document.activeElement);
   for (const btn of pop.querySelectorAll('button')) btn.disabled = true;
+  // Disabling the button that was just pressed drops focus to <body> without a
+  // word. Keep it on the card so a keyboard reader does not lose their place.
+  if (hadFocus) {
+    pop.setAttribute('tabindex', '-1');
+    pop.focus();
+  }
+  // A navigation that never replaces the document leaves this card dead for
+  // good: every action disabled and `_gotoStep` refusing every press, with
+  // Escape (which marks the tour SEEN, so it never returns) the only way out.
+  // It happens — a `beforeunload` prompt the reader cancels, a destination
+  // that answers with a download, a request they Stop. Undo the pending state
+  // if we are somehow still here.
+  _active.navStuckTimer = setTimeout(_unmarkPopoverPending, NAV_STUCK_MS);
+}
+
+// Undo _markPopoverPending: the hop did not take us anywhere.
+function _unmarkPopoverPending() {
+  if (!_active) return;
+  if (_active.navStuckTimer) {
+    clearTimeout(_active.navStuckTimer);
+    _active.navStuckTimer = null;
+  }
+  _active.navigating = false;
+  const pop = _active.popover;
+  if (!pop) return;
+  pop.classList.remove('tour-popover--pending');
+  pop.removeAttribute('aria-busy');
+  for (const btn of pop.querySelectorAll('button')) btn.disabled = false;
+  // "Back" is disabled on the first step by _buildPopover, not by the hop.
+  const back = pop.querySelector('.tour-btn-back');
+  if (back && _active.index === 0) back.disabled = true;
 }
 
 function _advanceStep() {
@@ -1121,6 +1171,7 @@ function _advanceStep() {
 
 function _endTour(markSeenNow) {
   if (!_active) return;
+  if (_active.navStuckTimer) clearTimeout(_active.navStuckTimer);
   if (markSeenNow) markSeen(_active.id);
   clearPending();
 
@@ -1276,15 +1327,12 @@ let _listenersAttached = false;
 // there greyed out and `_gotoStep` refuses every press.
 function _onPageShow(e) {
   if (!e.persisted || !_active || !_active.navigating) return;
-  _active.navigating = false;
-  const pop = _active.popover;
-  if (!pop) return;
-  pop.classList.remove('tour-popover--pending');
-  pop.removeAttribute('aria-busy');
-  for (const btn of pop.querySelectorAll('button')) btn.disabled = false;
-  // "Back" is disabled on the first step by _buildPopover, not by the hop.
-  const back = pop.querySelector('.tour-btn-back');
-  if (back && _active.index === 0) back.disabled = true;
+  // Instant recovery where the back/forward cache actually applies. It often
+  // does not: `app/main.py` sends `Cache-Control: no-store` on every text/html
+  // response, which makes Chrome and Firefox refuse to bfcache these pages at
+  // all (Safari is the long-standing exception). The NAV_STUCK_MS fallback in
+  // _markPopoverPending is what covers the rest — this just gets there sooner.
+  _unmarkPopoverPending();
 }
 
 function _attachListeners() {

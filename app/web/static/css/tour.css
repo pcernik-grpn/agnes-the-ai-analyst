@@ -68,6 +68,18 @@
   outline: none;
 }
 
+/* Forcing the ring above closes the only channel the target had left to show
+   keyboard focus: its own focus ring is now outranked, and `outline: none`
+   above was already suppressing the fallback. Step 0 asks the reader to type
+   into its anchor and /chat autofocuses it, so without this a keyboard user
+   cannot tell whether focus sits in the composer or on the card (WCAG 2.4.7).
+   Scoped to `:focus-visible`, so it costs the mouse path nothing. */
+.tour-spotlight:focus-visible,
+.tour-spotlight:has(:focus-visible) {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+
 /* A z-index on `.tour-spotlight` only outranks the scrim (9000) if the
    spotlighted element is NOT inside another positioned ancestor with its own
    z-index — e.g. the rail (`position: fixed; z-index: 40`, rail.css). Such an

@@ -51,6 +51,7 @@ assert the source contract the way test_tour_rail_spotlight.py and
 test_tour_onboarding_steps.py do.
 """
 
+import re
 from pathlib import Path
 
 TOUR_JS = Path("app/web/static/js/tour.js")
@@ -286,24 +287,78 @@ def test_transparency_is_read_from_the_alpha_channel_not_the_string_tail():
     assert "parseFloat(slash[1]) === 0" in fn
 
 
-def test_coming_back_from_the_bfcache_unfreezes_the_card():
-    """A cross-page hop leaves `navigating` set and the card pending. Press Back
-    and the browser can restore that page whole from the back/forward cache —
-    same DOM, same module state — so the tour comes back frozen: greyed-out
-    actions and a `_gotoStep` that refuses every press."""
+def test_a_navigation_that_never_lands_cannot_leave_the_tour_dead():
+    """`navigating` + every button disabled is a one-way door unless something
+    reopens it. A `beforeunload` the reader cancels, a destination that answers
+    with a download, a request they Stop — the page lives on with the card
+    permanently inert and Escape (which marks the tour SEEN) the only way out.
+    A timer armed with the pending state is what makes it recoverable."""
+    pending = _fn("_markPopoverPending")
+    assert "NAV_STUCK_MS" in pending
+    assert "setTimeout(_unmarkPopoverPending" in pending
+    undo = _fn("_unmarkPopoverPending")
+    assert "_active.navigating = false" in undo
+    assert "classList.remove('tour-popover--pending')" in undo
+    assert "btn.disabled = false" in undo
+    # A generous budget: a slow destination must never look like a stuck one.
+    js = _js()
+    assert re.search(r"const NAV_STUCK_MS = (\d+);", js)
+    assert int(re.search(r"const NAV_STUCK_MS = (\d+);", js).group(1)) >= 5000
+
+
+def test_the_stuck_timer_is_cleared_when_the_tour_ends():
+    """Otherwise it fires against a torn-down `_active` (or the next run's)."""
+    assert "clearTimeout(_active.navStuckTimer)" in _fn("_endTour")
+    assert "navStuckTimer: null," in _js()
+
+
+def test_coming_back_from_the_bfcache_reuses_the_same_undo():
+    """Where the back/forward cache applies the page returns whole — same DOM,
+    same module state — so the tour comes back frozen. This is the fast path to
+    the same recovery, not a second implementation of it."""
     fn = _fn("_onPageShow")
     assert "e.persisted" in fn
-    assert "_active.navigating = false" in fn
-    assert "classList.remove('tour-popover--pending')" in fn
-    assert "btn.disabled = false" in fn
-    # Wired up and torn down with the rest.
+    assert "_unmarkPopoverPending()" in fn
     assert "window.addEventListener('pageshow', _onPageShow)" in _fn("_attachListeners")
     assert "window.removeEventListener('pageshow', _onPageShow)" in _fn("_removeListeners")
 
 
-def test_the_first_steps_back_button_stays_disabled_after_a_bfcache_restore():
+def test_the_first_steps_back_button_stays_disabled_after_recovery():
     """Re-enabling every button wholesale would hand step 1 a live "Back" that
     _buildPopover had deliberately disabled."""
-    fn = _fn("_onPageShow")
+    fn = _fn("_unmarkPopoverPending")
     assert "_active.index === 0" in fn
     assert "back.disabled = true" in fn
+
+
+def test_going_pending_keeps_focus_inside_the_card():
+    """Disabling the button that was just pressed drops focus to <body> with no
+    announcement — the keyboard reader loses their place at the exact moment
+    the card claims to be working."""
+    fn = _fn("_markPopoverPending")
+    assert "document.activeElement" in fn
+    assert "pop.contains(document.activeElement)" in fn
+    assert "pop.focus()" in fn
+    assert "tabindex" in fn
+
+
+def test_a_detached_card_is_never_marked_pending():
+    """_showStep removes the popover before resolving the next anchor. An
+    anchor-miss routes into _gotoStep, and a cross-page hop there would
+    otherwise decorate a node that is no longer in the document."""
+    show = _fn("_showStep")
+    assert "_active.popover = null" in show
+    assert show.index("_active.popover.remove()") < show.index("_active.popover = null")
+
+
+def test_the_spotlight_keeps_a_keyboard_focus_indicator():
+    """Forcing the ring outranks the target's own focus ring, and
+    `.tour-spotlight` already sets `outline: none` — together that would leave
+    a spotlighted, autofocused input with no focus affordance at all, on a step
+    whose copy asks the reader to type into it (WCAG 2.4.7)."""
+    css = _css()
+    assert ".tour-spotlight:focus-visible" in css
+    assert ".tour-spotlight:has(:focus-visible)" in css
+    block = css[css.index(".tour-spotlight:focus-visible") :]
+    block = block[: block.index("}")]
+    assert "var(--ds-focus-outline)" in block
