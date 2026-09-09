@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import duckdb
 
@@ -54,12 +54,12 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _MAX_ILIKE_TERMS = 16
 
 
-def _ilike_terms(text: str) -> List[str]:
+def _ilike_terms(text: str) -> list[str]:
     """Lowercased, de-duplicated, order-preserving tokens, capped at
     ``_MAX_ILIKE_TERMS``. Tokenizer for the bounded body-candidate query
     below (the filename path receives pre-tokenized terms from the
     caller)."""
-    seen: List[str] = []
+    seen: list[str] = []
     for t in _TOKEN_RE.findall((text or "").lower()):
         if t not in seen:
             seen.append(t)
@@ -78,7 +78,7 @@ class CorpusChunksRepository:
     # Writes
     # ------------------------------------------------------------------
 
-    def add_many(self, chunks: List[Dict[str, Any]]) -> int:
+    def add_many(self, chunks: list[dict[str, Any]]) -> int:
         """Bulk-insert chunk rows.
 
         Each dict must contain ``corpus_id``, ``file_id``, ``ordinal``,
@@ -135,7 +135,7 @@ class CorpusChunksRepository:
     # Reads
     # ------------------------------------------------------------------
 
-    def list_for_file(self, file_id: str) -> List[Dict[str, Any]]:
+    def list_for_file(self, file_id: str) -> list[dict[str, Any]]:
         """All chunks for one file, ordered by ordinal."""
         rows = self.conn.execute(
             f"SELECT {_SELECT} FROM corpus_chunks WHERE file_id = ? ORDER BY ordinal",
@@ -143,7 +143,7 @@ class CorpusChunksRepository:
         ).fetchall()
         return [dict(zip(_COLS, r)) for r in rows]
 
-    def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
+    def list_for_corpus(self, corpus_id: str) -> list[dict[str, Any]]:
         """All chunks for an entire corpus, ordered by file_id then ordinal."""
         rows = self.conn.execute(
             f"SELECT {_SELECT} FROM corpus_chunks WHERE corpus_id = ? ORDER BY file_id, ordinal",
@@ -151,9 +151,7 @@ class CorpusChunksRepository:
         ).fetchall()
         return [dict(zip(_COLS, r)) for r in rows]
 
-    def list_for_corpus_batch(
-        self, corpus_id: str, *, after_id: Optional[str] = None, limit: int
-    ) -> List[Dict[str, Any]]:
+    def list_for_corpus_batch(self, corpus_id: str, *, after_id: str | None = None, limit: int) -> list[dict[str, Any]]:
         """One bounded, keyset-paginated page of a corpus's chunks, ordered
         by ``id`` ascending (TCRD-296 synthesis C.15 — knowledge-packaging
         memory bound).
@@ -190,11 +188,11 @@ class CorpusChunksRepository:
 
     def list_for_corpora(
         self,
-        corpus_ids: List[str],
+        corpus_ids: list[str],
         *,
-        query_terms: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+        query_terms: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Candidate chunks across several corpora, for retrieval (#2151).
 
         Column-pruned: never selects ``embedding`` (always ``None`` on the
@@ -220,7 +218,7 @@ class CorpusChunksRepository:
         if not corpus_ids:
             return []
         placeholders = ", ".join("?" for _ in corpus_ids)
-        params: List[Any] = list(corpus_ids)
+        params: list[Any] = list(corpus_ids)
         where_extra = ""
         if query_terms:
             term_clause = " OR ".join("text ILIKE ?" for _ in query_terms)
@@ -242,7 +240,7 @@ class CorpusChunksRepository:
             out.append(d)
         return out
 
-    def count_for_corpora(self, corpus_ids: List[str]) -> int:
+    def count_for_corpora(self, corpus_ids: list[str]) -> int:
         """Cheap ``COUNT(*)`` across several corpora — the precheck that
         decides whether ``list_for_corpora`` needs the cap/prefilter path
         (#2151). Empty ``corpus_ids`` → 0."""
@@ -255,7 +253,7 @@ class CorpusChunksRepository:
         ).fetchone()
         return int(row[0]) if row else 0
 
-    def list_embeddings_for_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+    def list_embeddings_for_ids(self, ids: list[str]) -> dict[str, list[float]]:
         """``{chunk_id: embedding}`` for the given ids that HAVE a stored
         vector (#2151) — phase 2 of the retrieval layer's two-phase hybrid
         fetch: rank lexically over ``list_for_corpora``'s (embedding-less)
@@ -271,7 +269,9 @@ class CorpusChunksRepository:
         ).fetchall()
         return {r[0]: list(r[1]) for r in rows if r[1] is not None}
 
-    def search_candidates(self, corpus_ids: List[str], query: str, *, limit: int) -> List[Dict[str, Any]]:
+    def search_candidates(
+        self, corpus_ids: list[str], query: str, *, limit: int, path_prefix: str | None = None
+    ) -> list[dict[str, Any]]:
         """Bounded, lexically-filtered candidate set for retrieval (P0 OOM
         fix, 2026-09 — see ``CorpusChunksPgRepository.search_candidates``
         for the production incident and the full design).
@@ -287,6 +287,23 @@ class CorpusChunksRepository:
         the retrieval layer fetches vectors for its shortlist via
         ``list_embeddings_for_ids``. Empty ``corpus_ids`` or a query with
         no indexable tokens → ``[]``.
+
+        This backend has ALWAYS been any-term (each token OR'd), which is
+        why the 2026-09 multi-word-selection bug — a natural-language
+        question selecting no candidates at all because no single chunk
+        carried every word — was Postgres-only: that sibling selected with
+        ``plainto_tsquery`` alone, whose semantics are AND. Nothing about
+        the any-term prefilter here needed changing, and it is NOT given
+        the PG sibling's per-term-window fan-out: with no ranking in this
+        query (rows come back in ``(file_id, ordinal)`` order either way and
+        ``rank_chunks`` re-sorts them), per-term windows would return the
+        identical row set for the identical cost. Which rows survive a
+        FILLED cap is therefore arbitrary on this backend and stays
+        arbitrary — a large-corpus concern, and this backend is frozen at
+        the scale it already has.
+
+        ``path_prefix`` narrows to files under one folder; see the PG
+        sibling's ``_path_prefix_clause`` for why.
         """
         if not corpus_ids:
             return []
@@ -295,16 +312,19 @@ class CorpusChunksRepository:
             return []
         placeholders = ", ".join("?" for _ in corpus_ids)
         term_clause = " OR ".join("text ILIKE ?" for _ in terms)
-        params: List[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + [limit]
+        scope_sql, scope_params = self._path_prefix_clause(path_prefix, corpus_ids, alias="")
+        params: list[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + scope_params + [limit]
         rows = self.conn.execute(
             f"SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
-            f"WHERE corpus_id IN ({placeholders}) AND ({term_clause}) "
+            f"WHERE corpus_id IN ({placeholders}) AND ({term_clause}) {scope_sql} "
             f"ORDER BY file_id, ordinal LIMIT ?",
             params,
         ).fetchall()
         return [dict(zip(_COLS_NO_EMBED, r), embedding=None) for r in rows]
 
-    def search_by_filename(self, corpus_ids: List[str], terms: List[str], *, limit: int) -> List[Dict[str, Any]]:
+    def search_by_filename(
+        self, corpus_ids: list[str], terms: list[str], *, limit: int, path_prefix: str | None = None
+    ) -> list[dict[str, Any]]:
         """Bounded candidate set of chunks whose FILE's name matches any of
         ``terms`` (P0 OOM fix, 2026-09).
 
@@ -319,17 +339,45 @@ class CorpusChunksRepository:
         does no NLP of its own, just an OR'd ``ILIKE`` per term.
         Column-pruned (``embedding`` always ``None``) like every candidate
         fetch here. Empty ``corpus_ids``/``terms`` → ``[]``.
+
+        ``path_prefix`` narrows to files under one folder, exactly as on the
+        body pass — a scoped search that let a name from OUTSIDE the scope
+        answer would not be scoped at all.
         """
         if not corpus_ids or not terms:
             return []
         placeholders = ", ".join("?" for _ in corpus_ids)
         term_clause = " OR ".join("cf.filename ILIKE ?" for _ in terms)
-        params: List[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + [limit]
+        scope_sql, scope_params = self._path_prefix_clause(path_prefix, corpus_ids, alias="cc")
+        params: list[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + scope_params + [limit]
         rows = self.conn.execute(
             f"SELECT {_SELECT_CC_NO_EMBED} FROM corpus_chunks cc "
             f"JOIN corpus_files cf ON cf.id = cc.file_id "
-            f"WHERE cc.corpus_id IN ({placeholders}) AND ({term_clause}) "
+            f"WHERE cc.corpus_id IN ({placeholders}) AND ({term_clause}) {scope_sql} "
             f"ORDER BY cc.file_id, cc.ordinal LIMIT ?",
             params,
         ).fetchall()
         return [dict(zip(_COLS_NO_EMBED, r), embedding=None) for r in rows]
+
+    @staticmethod
+    def _path_prefix_clause(path_prefix: str | None, corpus_ids: list[str], *, alias: str) -> tuple[str, list[Any]]:
+        """``(extra WHERE fragment, positional params)`` narrowing to files
+        under ``path_prefix`` — ``("", [])`` when no prefix is given.
+
+        Mirrors ``CorpusChunksPgRepository._path_prefix_clause`` (see it for
+        why corpus scoping exists) with DuckDB's positional placeholders and
+        ``IN (...)`` corpus list. The prefix is matched literally: LIKE
+        metacharacters are escaped, because ``_`` is ordinary in a real
+        folder name (``00_Customers/…``) and unescaped it is a wildcard.
+        """
+        prefix = (path_prefix or "").strip()
+        if not prefix:
+            return "", []
+        col = f"{alias}.file_id" if alias else "file_id"
+        placeholders = ", ".join("?" for _ in corpus_ids)
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clause = (
+            f"AND {col} IN (SELECT id FROM corpus_files "
+            f"WHERE corpus_id IN ({placeholders}) AND path LIKE ? ESCAPE '\\')"
+        )
+        return clause, list(corpus_ids) + [f"{escaped}%"]

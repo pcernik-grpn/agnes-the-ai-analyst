@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import duckdb
 import sqlalchemy as sa
@@ -34,13 +34,16 @@ from src.rbac import get_accessible_tables
 from src.repositories import audit_repo, resource_grants_repo, table_registry_repo, user_group_members_repo
 from src.search.unified import unified_search
 
-#: The chunk leg's degraded-request note (#2151) — shared by both failure
-#: reasons folded into the same disclosure (an outage and "the query was too
-#: broad to search this corpus safely" both reduce, from this combined
-#: endpoint's point of view, to "this one leg found nothing; the rest of the
-#: response is unaffected"). Per-leg-only, unlike collections_search's own
-#: dedicated 503/422 — a normal multi-source query should not fail outright
-#: over one leg's cap situation when the other legs can still answer.
+#: The chunk leg's note for a genuine OUTAGE (#2151). Per-leg-only, unlike
+#: collections_search's own dedicated 503/422 — a normal multi-source query
+#: should not fail outright over one leg when the other legs can answer.
+#:
+#: This used to cover the too-broad/capped case as well, on the reasoning
+#: that both reduce to "this one leg found nothing". They don't, from the
+#: caller's side: "retry shortly" is the right move for an outage and
+#: exactly the wrong one for a query whose candidate cap filled, which will
+#: fail identically on every retry until the SCOPE or the WORDS change. That
+#: case builds its own note at the call site (2026-09).
 _CHUNK_LEG_DEGRADED_NOTE = (
     "Document search is temporarily unavailable for this query; other results below "
     "are unaffected. Retry shortly, or narrow with a specific collection."
@@ -51,7 +54,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 
-def _resolve_knowledge_grants(user) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+def _resolve_knowledge_grants(user) -> tuple[list[str] | None, list[str] | None]:
     """(user_groups, granted_domains) for the knowledge source, factory-routed.
 
     Semantics mirror ``app.api.memory._effective_groups`` /
@@ -77,7 +80,7 @@ def _resolve_knowledge_grants(user) -> Tuple[Optional[List[str]], Optional[List[
     return groups, domains
 
 
-def _accessible_plugins(user) -> List[Dict[str, Any]]:
+def _accessible_plugins(user) -> list[dict[str, Any]]:
     """Marketplace plugins the caller may see, fail-closed.
 
     Mirrors ``/library``'s plugin band (app/web/router.py): admins see every
@@ -92,7 +95,7 @@ def _accessible_plugins(user) -> List[Dict[str, Any]]:
     """
     from src.repositories import marketplace_plugins_repo
 
-    def _live(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _live(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [r for r in rows if not r.get("admin_disabled")]
 
     try:
@@ -223,8 +226,10 @@ async def knowledge_search(
     # collections_search uses around search_with_meta, offloaded to a
     # worker thread for the same reason (real CPU + I/O work that must not
     # block the event loop).
-    chunk_hits: List[Dict[str, Any]] = []
+    chunk_hits: list[dict[str, Any]] = []
     chunk_degraded = False
+    chunk_degraded_reason = "search_unavailable"
+    chunk_degraded_note = _CHUNK_LEG_DEGRADED_NOTE
     if corpus_ids:
         try:
             chunk_meta = await asyncio.to_thread(search_with_meta, corpus_ids, q, k=k)
@@ -233,13 +238,26 @@ async def knowledge_search(
             # it off whatever chunk list it is handed and re-emits it on its
             # own return value, which the payload below reads).
             chunk_hits = SearchResults(chunk_meta["results"], capped=bool(chunk_meta["truncated"]))
-        except SearchQueryTooBroad:
-            # A stopword-only query over an oversized corpus is refused
-            # OUTRIGHT by collections_search (a dedicated, chunk-only
-            # endpoint, where a 422 is actionable); here it is one leg among
-            # several, and failing the WHOLE combined search over it would
-            # reintroduce exactly the surprise this fix removes elsewhere.
+        except SearchQueryTooBroad as exc:
+            # A query the cap ate — no usable term, or nothing matched in the
+            # slice that was read — is refused OUTRIGHT by collections_search
+            # (a dedicated, chunk-only endpoint, where a 422 is actionable);
+            # here it is one leg among several, and failing the WHOLE
+            # combined search over it would reintroduce exactly the surprise
+            # this fix removes elsewhere. But it is NOT an outage, and the
+            # generic note said "temporarily unavailable — retry shortly",
+            # which invites a caller to retry a query that will fail the
+            # same way every time. Named separately so the note can say what
+            # to change instead.
             chunk_degraded = True
+            chunk_degraded_reason = "search_query_too_broad"
+            chunk_degraded_note = (
+                "Document search read only part of the documents in scope for this query "
+                f"(its {exc.cap:,}-chunk candidate limit filled first), so an empty document "
+                "result below is NOT evidence a document is absent. Narrow with a specific "
+                "collection or a more distinctive query term and search documents again. "
+                "Other results below are unaffected."
+            )
         except (MemoryError, sa.exc.OperationalError, sa.exc.DBAPIError) as exc:
             logger.warning("knowledge search: chunk leg unavailable, degrading to empty: %s", exc)
             chunk_degraded = True
@@ -304,8 +322,8 @@ async def knowledge_search(
     if getattr(results, "capped", False):
         payload["candidates_capped"] = True
     if chunk_degraded:
-        payload["degraded"] = {"chunk": "search_unavailable"}
-        payload["degraded_note"] = _CHUNK_LEG_DEGRADED_NOTE
+        payload["degraded"] = {"chunk": chunk_degraded_reason}
+        payload["degraded_note"] = chunk_degraded_note
     if not results:
         payload["searched_collections"] = len(corpus_ids)
         payload["searched_tables"] = len(tables)
@@ -388,7 +406,7 @@ def _caller_can_read_digest(user, digest_id: str) -> bool:
 
 
 @router.get("/digests")
-async def list_knowledge_digests_for_caller(user=Depends(get_current_user)) -> Dict[str, Any]:
+async def list_knowledge_digests_for_caller(user=Depends(get_current_user)) -> dict[str, Any]:
     """The maintained digests THIS caller can read (K4, #799).
 
     The one missing piece of the analyst-facing digest surface. A digest's

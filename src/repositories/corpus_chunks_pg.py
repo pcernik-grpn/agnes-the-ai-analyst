@@ -7,8 +7,9 @@ by ``tests/db_pg/test_corpus_chunks_contract.py``.
 
 from __future__ import annotations
 
+import re
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -23,6 +24,18 @@ _SELECT_NO_EMBED = "id, corpus_id, file_id, ordinal, text, section_path, page, b
 # Qualified variant for the ``search_by_filename`` JOIN, where ``corpus_files``
 # also has ``id``/``corpus_id``/``created_at`` columns.
 _SELECT_CC_NO_EMBED = ", ".join(f"cc.{c}" for c in _SELECT_NO_EMBED.split(", "))
+
+
+def _qualified(alias: str) -> str:
+    """``_SELECT_NO_EMBED`` with every column prefixed by ``alias.``.
+
+    Needed wherever the candidate SELECT list appears inside a subquery that
+    carries its own alias (the any-term pass's ``DISTINCT ON`` wrapper);
+    ``_SELECT_CC_NO_EMBED`` is the same idea frozen to the ``cc`` alias the
+    filename JOIN uses.
+    """
+    return ", ".join(f"{alias}.{c}" for c in _SELECT_NO_EMBED.split(", "))
+
 
 # Same 5s budget as src/repositories/facts_pg.py's ``_STATEMENT_TIMEOUT_MS``
 # (SET LOCAL statement_timeout idiom) — duplicated per-module like
@@ -39,6 +52,43 @@ _STATEMENT_TIMEOUT_MS = 5_000
 _RANK_CANDIDATE_MULTIPLIER = 4
 _RANK_CANDIDATE_FLOOR = 20_000
 
+# How many DISTINCT query terms the any-term top-up pass (see
+# ``search_candidates``) will fan out over — one bounded index scan each, so
+# a pathologically long question must not turn into a pathologically wide
+# UNION. Deliberately well below the sibling term bounds (16, in this
+# module's DuckDB twin and in ``retrieval._MAX_FILENAME_TERMS``): the cost
+# here is per-term SCANS rather than per-term WHERE clauses, and the GIN
+# index that makes each one cheap may be absent on a given instance (see
+# ``search_candidates``).
+#
+# Trade-off, stated rather than hidden: terms past the 8th get no window of
+# their own, in first-seen order — so on a question long enough to reach
+# this bound, a discriminating term late in the sentence depends on the
+# ALL-terms pass to surface its chunks. Not reordered by any rarity
+# heuristic on purpose: the only stopword vocabulary in this codebase lives
+# in ``src.ingest.retrieval``, which imports THIS module, and a hand-copied
+# second list is the kind of duplication that drifts silently.
+_MAX_FTS_TERMS = 8
+
+
+def _fts_terms(query: str) -> list[str]:
+    """Distinct word tokens of ``query``, order-preserving, bounded.
+
+    Mirrors ``src.ingest.retrieval._tokenize``'s ``[a-z0-9]+`` alphabet
+    deliberately: these tokens are handed to ``plainto_tsquery`` one at a
+    time, so a token that the Python ranker would never score is a term this
+    pass should not spend an index scan on either.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in re.findall(r"[a-z0-9]+", (query or "").lower()):
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+        if len(out) >= _MAX_FTS_TERMS:
+            break
+    return out
+
 
 class CorpusChunksPgRepository:
     """Postgres twin of ``CorpusChunksRepository``."""
@@ -50,7 +100,7 @@ class CorpusChunksPgRepository:
     # Writes
     # ------------------------------------------------------------------
 
-    def add_many(self, chunks: List[Dict[str, Any]]) -> int:
+    def add_many(self, chunks: list[dict[str, Any]]) -> int:
         """Bulk-insert chunk rows.
 
         Each dict must contain ``corpus_id``, ``file_id``, ``ordinal``,
@@ -111,7 +161,7 @@ class CorpusChunksPgRepository:
     # Reads
     # ------------------------------------------------------------------
 
-    def list_for_file(self, file_id: str) -> List[Dict[str, Any]]:
+    def list_for_file(self, file_id: str) -> list[dict[str, Any]]:
         """All chunks for one file, ordered by ordinal."""
         with self._engine.connect() as conn:
             rows = (
@@ -128,7 +178,7 @@ class CorpusChunksPgRepository:
             )
         return [dict(r) for r in rows]
 
-    def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
+    def list_for_corpus(self, corpus_id: str) -> list[dict[str, Any]]:
         """All chunks for an entire corpus, ordered by file_id then ordinal."""
         with self._engine.connect() as conn:
             rows = (
@@ -146,9 +196,7 @@ class CorpusChunksPgRepository:
             )
         return [dict(r) for r in rows]
 
-    def list_for_corpus_batch(
-        self, corpus_id: str, *, after_id: Optional[str] = None, limit: int
-    ) -> List[Dict[str, Any]]:
+    def list_for_corpus_batch(self, corpus_id: str, *, after_id: str | None = None, limit: int) -> list[dict[str, Any]]:
         """One bounded, keyset-paginated page of a corpus's chunks, ordered
         by ``id`` ascending — the PG twin of
         ``CorpusChunksRepository.list_for_corpus_batch``. See that
@@ -188,11 +236,11 @@ class CorpusChunksPgRepository:
 
     def list_for_corpora(
         self,
-        corpus_ids: List[str],
+        corpus_ids: list[str],
         *,
-        query_terms: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+        query_terms: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Candidate chunks across several corpora, for retrieval (#2151).
 
         Mirrors ``src/repositories/corpus_chunks.py``'s DuckDB sibling —
@@ -206,7 +254,7 @@ class CorpusChunksPgRepository:
         """
         if not corpus_ids:
             return []
-        params: Dict[str, Any] = {"corpus_ids": list(corpus_ids)}
+        params: dict[str, Any] = {"corpus_ids": list(corpus_ids)}
         where_extra = ""
         if query_terms:
             term_clauses = []
@@ -234,7 +282,7 @@ class CorpusChunksPgRepository:
             out.append(d)
         return out
 
-    def count_for_corpora(self, corpus_ids: List[str]) -> int:
+    def count_for_corpora(self, corpus_ids: list[str]) -> int:
         """Cheap ``COUNT(*)`` across several corpora (#2151). On the search
         path this is consulted only when a stopword-only query filled the
         candidate cap (the ``SearchQueryTooBroad`` message carries it) —
@@ -251,7 +299,7 @@ class CorpusChunksPgRepository:
             ).first()
         return int(row[0]) if row else 0
 
-    def list_embeddings_for_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+    def list_embeddings_for_ids(self, ids: list[str]) -> dict[str, list[float]]:
         """``{chunk_id: embedding}`` for the given ids that HAVE a stored
         vector (#2151) — phase 2 of the retrieval layer's two-phase hybrid
         fetch. An id with no stored embedding (or that does not exist) is
@@ -268,7 +316,9 @@ class CorpusChunksPgRepository:
             ).all()
         return {r[0]: list(r[1]) for r in rows if r[1] is not None}
 
-    def search_candidates(self, corpus_ids: List[str], query: str, *, limit: int) -> List[Dict[str, Any]]:
+    def search_candidates(
+        self, corpus_ids: list[str], query: str, *, limit: int, path_prefix: str | None = None
+    ) -> list[dict[str, Any]]:
         """Bounded, server-ranked candidate set for retrieval (P0 OOM fix,
         2026-09).
 
@@ -347,12 +397,53 @@ class CorpusChunksPgRepository:
         uniform slice of the corpus, so which slice gets ranked barely
         changes the top results.
 
+        Two passes, ALL-terms then ANY-term (2026-09)
+        ---------------------------------------------
+        ``plainto_tsquery`` is AND-semantics: every term must occur in the
+        SAME chunk. As the only candidate pass that made a multi-word
+        natural-language question — the ordinary shape of a question an
+        agent asks — return nothing at all on a corpus that plainly
+        contained the answer. Observed live: four of six searches in one
+        session came back ``results: []``, among them "Riveron AI Execution
+        workstreams scope pods sprint"; no single chunk carried all seven
+        words, so candidate selection was empty and the document the agent
+        was asked to write from was never read. It also destroyed the
+        RANKING signal in the pass that did return rows: AND-semantics
+        guarantees every candidate contains every query term, so
+        ``rank_chunks``'s IDF-weighted overlap scored every one of them
+        identically and min-max normalization flattened the lot to exactly
+        1.0 — order by chunk id, not by relevance.
+
+        So the AND pass runs FIRST and unchanged (it is the most precise
+        candidate set there is, and when it fills ``limit`` nothing else
+        runs — the hot path is untouched), and only when it under-fills is
+        it TOPPED UP by an any-term pass: one bounded subquery PER term,
+        ``UNION ALL``-ed, de-duplicated, then ranked by ``ts_rank_cd``
+        against the OR'd tsquery.
+
+        Per-term windows rather than one OR'd query, deliberately: a single
+        ``LIMIT`` over an OR'd match lets the corpus's most COMMON term fill
+        the whole window (``ai`` matched ~everything in the session above)
+        and crowd out the rare term that actually identifies the document
+        (``riveron``). A window each guarantees every term contributes
+        candidates regardless of how common its neighbours are; which term
+        is the discriminating one is then decided by ``rank_chunks``'s IDF
+        over the returned set, which is where that judgment belongs.
+
         Empty ``corpus_ids`` → ``[]`` without querying, matching
         ``list_for_corpora``.
         """
         if not corpus_ids:
             return []
         rank_cap = max(limit * _RANK_CANDIDATE_MULTIPLIER, _RANK_CANDIDATE_FLOOR)
+        scope_sql, scope_params = self._path_prefix_clause(path_prefix, alias="")
+        params: dict[str, Any] = {
+            "corpus_ids": list(corpus_ids),
+            "query": query,
+            "limit": limit,
+            "rank_cap": rank_cap,
+            **scope_params,
+        }
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -361,19 +452,138 @@ class CorpusChunksPgRepository:
                         f"  SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
                         "   WHERE corpus_id = ANY(:corpus_ids) "
                         "     AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :query) "
+                        f"    {scope_sql} "
                         "   LIMIT :rank_cap"
                         ") c "
                         "ORDER BY ts_rank_cd(to_tsvector('simple', c.text), plainto_tsquery('simple', :query)) DESC "
                         "LIMIT :limit"
                     ),
-                    {"corpus_ids": list(corpus_ids), "query": query, "limit": limit, "rank_cap": rank_cap},
+                    params,
                 )
                 .mappings()
                 .all()
             )
+            out = [dict(r, embedding=None) for r in rows]
+            if len(out) >= limit:
+                return out
+
+            terms = _fts_terms(query)
+            if len(terms) < 2:
+                # A single-term query's AND pass IS its any-term pass —
+                # re-running it would return the identical rows.
+                return out
+            out.extend(
+                self._any_term_candidates(
+                    conn,
+                    corpus_ids,
+                    terms,
+                    limit=limit - len(out),
+                    rank_cap=rank_cap,
+                    exclude_ids=[str(r["id"]) for r in out],
+                    path_prefix=path_prefix,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _path_prefix_clause(path_prefix: str | None, *, alias: str) -> tuple[str, dict[str, Any]]:
+        """``(extra WHERE fragment, params)`` narrowing a chunk query to files
+        under ``path_prefix`` — ``("", {})`` when no prefix is given.
+
+        Corpus scoping (2026-09). One collection routinely holds every
+        client's files at once — a crawled ``00_Customers`` bucket is one
+        collection with every engagement's invoices, deal files and
+        contracts in it — so "search my accessible collections" was the only
+        available scope even when the caller knew the answer lived under one
+        folder, and one client's document had to out-rank thousands of
+        chunks of everyone else's invoices to be seen. A prefix match on
+        ``corpus_files.path`` narrows candidate SELECTION instead of hoping
+        ranking sorts it out.
+
+        A prefix is matched literally: LIKE metacharacters in it are escaped
+        (``_`` is common in real folder names — ``00_Customers/…`` — and an
+        unescaped one is a single-character wildcard).
+
+        ``alias`` is the ``corpus_chunks`` alias to correlate on (``""`` for
+        an unaliased table, ``"cc"`` inside the filename JOIN).
+        """
+        prefix = (path_prefix or "").strip()
+        if not prefix:
+            return "", {}
+        col = f"{alias}.file_id" if alias else "file_id"
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clause = (
+            f"AND {col} IN (SELECT id FROM corpus_files "
+            "WHERE corpus_id = ANY(:corpus_ids) AND path LIKE :path_prefix ESCAPE '\\')"
+        )
+        return clause, {"path_prefix": f"{escaped}%"}
+
+    def _any_term_candidates(
+        self,
+        conn: Any,
+        corpus_ids: list[str],
+        terms: list[str],
+        *,
+        limit: int,
+        rank_cap: int,
+        exclude_ids: list[str],
+        path_prefix: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The any-term top-up pass — see ``search_candidates``'s docstring.
+
+        One ``LIMIT``-ed subquery per term (each its own index scan, so a
+        rare term is never crowded out by a common one), ``UNION ALL``-ed,
+        de-duplicated by chunk id, then ranked against the OR'd tsquery.
+        Every term goes through ``plainto_tsquery`` — never a hand-built
+        ``to_tsquery`` string — so a token carrying tsquery syntax
+        (``&``, ``!``, ``:*``) is data, not an operator.
+        """
+        if limit <= 0 or not terms:
+            return []
+        per_term = max(1, rank_cap // len(terms))
+        scope_sql, scope_params = self._path_prefix_clause(path_prefix, alias="")
+        params: dict[str, Any] = {
+            "corpus_ids": list(corpus_ids),
+            "limit": limit,
+            "per_term": per_term,
+            **scope_params,
+        }
+        legs = []
+        for i, term in enumerate(terms):
+            params[f"t{i}"] = term
+            legs.append(
+                f"(SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
+                " WHERE corpus_id = ANY(:corpus_ids) "
+                f"  AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :t{i}) "
+                f"  {scope_sql} "
+                " LIMIT :per_term)"
+            )
+        or_query = " || ".join(f"plainto_tsquery('simple', :t{i})" for i in range(len(terms)))
+        exclude_sql = ""
+        if exclude_ids:
+            exclude_sql = "WHERE u.id <> ALL(:exclude_ids) "
+            params["exclude_ids"] = exclude_ids
+        rows = (
+            conn.execute(
+                sa.text(
+                    f"SELECT {_SELECT_NO_EMBED} FROM ("
+                    f"  SELECT DISTINCT ON (u.id) {_qualified('u')} FROM (" + " UNION ALL ".join(legs) + ") u "
+                    f"  {exclude_sql}"
+                    "   ORDER BY u.id"
+                    ") c "
+                    f"ORDER BY ts_rank_cd(to_tsvector('simple', c.text), ({or_query})) DESC "
+                    "LIMIT :limit"
+                ),
+                params,
+            )
+            .mappings()
+            .all()
+        )
         return [dict(r, embedding=None) for r in rows]
 
-    def search_by_filename(self, corpus_ids: List[str], terms: List[str], *, limit: int) -> List[Dict[str, Any]]:
+    def search_by_filename(
+        self, corpus_ids: list[str], terms: list[str], *, limit: int, path_prefix: str | None = None
+    ) -> list[dict[str, Any]]:
         """Bounded candidate set of chunks whose FILE's name matches any of
         ``terms`` (P0 OOM fix, 2026-09).
 
@@ -389,19 +599,27 @@ class CorpusChunksPgRepository:
         tokenize punctuation-heavy filenames (``quarterly-report.md``).
         Column-pruned (``embedding`` always ``None``) like every candidate
         fetch here. Empty ``corpus_ids``/``terms`` → ``[]``.
+
+        ``path_prefix`` narrows to files under one folder — see
+        ``_path_prefix_clause``. It applies here as well as to the body pass
+        because a scoped search that still let a name from OUTSIDE the scope
+        answer would not be scoped at all.
         """
         if not corpus_ids or not terms:
             return []
-        params: Dict[str, Any] = {"corpus_ids": list(corpus_ids), "limit": limit}
+        params: dict[str, Any] = {"corpus_ids": list(corpus_ids), "limit": limit}
         clauses = []
         for i, term in enumerate(terms):
             key = f"t{i}"
             clauses.append(f"cf.filename ILIKE :{key}")
             params[key] = f"%{term}%"
+        scope_sql, scope_params = self._path_prefix_clause(path_prefix, alias="cc")
+        params.update(scope_params)
         sql = (
             f"SELECT {_SELECT_CC_NO_EMBED} "
             "FROM corpus_chunks cc JOIN corpus_files cf ON cf.id = cc.file_id "
             "WHERE cc.corpus_id = ANY(:corpus_ids) AND (" + " OR ".join(clauses) + ") "
+            f"{scope_sql} "
             "ORDER BY cc.file_id, cc.ordinal LIMIT :limit"
         )
         with self._engine.connect() as conn:

@@ -763,3 +763,47 @@ def _surface_web():
     from app.chat.types import Surface
 
     return Surface.WEB
+
+
+def test_build_profile_appends_document_search_rails(monkeypatch):
+    """Fourth instance of the same gap, one section over again.
+
+    "Documents — find the folder before you search it" lives in the default
+    Workspace Prompt (`config/claude_md_template.txt`), and a persona
+    REPLACES that template wholesale — so a persona'd agent asked to draft
+    the next statement of work for one client searched every accessible
+    collection for a phrase, in a corpus where one collection holds every
+    client's paperwork, and never reached the folder that defined the work.
+    """
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    row = _agent_row(system_prompt="You write poems.")
+    md = agent_profile.build_profile(row).claude_md
+    assert agent_profile.DOCUMENT_SEARCH_RAILS in md
+    # The two behaviours the section exists for.
+    assert "path_prefix" in md
+    assert "Never offer scope you have not verified" in md
+    # Additive, never a replacement.
+    assert agent_profile.DATA_ACCESS_RAILS in md
+
+
+def test_document_search_rails_name_no_fact_tool(monkeypatch):
+    """The document rails are UNGATED, so they ship to instances with `facts`
+    off — where every fact tool 404s
+    (`app.auth.access.require_facts_enabled`). The graph route to a client's
+    folder therefore lives in the gated facts rails, not here."""
+    assert "fact_search" not in agent_profile.DOCUMENT_SEARCH_RAILS
+    assert "fact_neighbors" not in agent_profile.DOCUMENT_SEARCH_RAILS
+    # ...and it IS present in the gated sibling, so the route is not lost.
+    assert "fact_search" in agent_profile.FACTS_ACCESS_RAILS
+
+
+def test_workspace_prompt_teaches_folder_scoping_before_searching():
+    """The analyst-facing half of the same guidance. Both carriers say it or
+    the surface an analyst uses is the one that misses it."""
+    from pathlib import Path
+
+    template = Path("config/claude_md_template.txt").read_text(encoding="utf-8")
+    assert "## Documents — find the folder before you search it" in template
+    assert "path_prefix" in template
+    assert "Never offer scope you have not verified" in template
+    assert "capped_no_match" in template

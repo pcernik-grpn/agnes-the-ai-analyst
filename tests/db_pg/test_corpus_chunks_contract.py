@@ -67,7 +67,7 @@ def _make_pg_repo(pg_engine, monkeypatch):
         )
 
     monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
-    import src.db_pg as db_pg
+    from src import db_pg
 
     db_pg.dispose()
     db_pg.get_engine()
@@ -540,3 +540,228 @@ def test_search_candidates_returns_exactly_limit_rows_when_matches_exceed_the_ra
     rows = pg_repo.search_candidates([CORPUS_ID], "contract", limit=3)
     assert len(rows) == 3
     assert all("contract" in r["text"] for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Multi-word candidate selection + path-prefix scoping (2026-09)
+#
+# The failure these cover, observed live: four of six document searches in
+# one chat session returned `results: []` on a corpus that plainly held the
+# answer. Postgres candidate selection ran `plainto_tsquery` alone, which is
+# AND-semantics — every term in the SAME chunk — so a seven-word question
+# ("Riveron AI Execution workstreams scope pods sprint") selected nothing
+# and the document the agent was asked to write from was never read.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["duckdb", "pg"])
+def repo_and_files(request, tmp_path, pg_engine, monkeypatch):
+    """Both backends plus an ``add_file(file_id, filename, path)`` helper.
+
+    The path-prefix tests need real ``corpus_files.path`` values, which the
+    chunks repo cannot write itself, and the plain ``repo`` fixture hands
+    back no connection to write them with.
+    """
+    if request.param == "duckdb":
+        repo, conn = _make_duckdb_repo(tmp_path)
+
+        def add_file(file_id: str, filename: str, path: str) -> None:
+            conn.execute(
+                "INSERT INTO corpus_files (id, corpus_id, filename, path, sha256, file_type) "
+                "VALUES (?, ?, ?, ?, ?, 'md')",
+                [file_id, CORPUS_ID, filename, path, file_id],
+            )
+
+        yield repo, add_file
+        conn.close()
+    else:
+        repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+        from src import db_pg
+
+        engine = db_pg.get_engine()
+
+        def add_file(file_id: str, filename: str, path: str) -> None:
+            with engine.begin() as c:
+                c.execute(
+                    sa.text(
+                        "INSERT INTO corpus_files "
+                        "(id, corpus_id, filename, path, sha256, file_type) "
+                        "VALUES (:id, :cid, :fn, :p, :sha, 'md')"
+                    ),
+                    {"id": file_id, "cid": CORPUS_ID, "fn": filename, "p": path, "sha": file_id},
+                )
+
+        yield repo, add_file
+
+
+def test_search_candidates_finds_a_chunk_matching_only_some_query_terms(repo):
+    """A multi-word question whose terms are spread across the document must
+    still select candidates.
+
+    This is the regression: with AND-only selection the query below matched
+    no chunk at all, because no single chunk carried all seven words.
+    """
+    repo.add_many(
+        [
+            {
+                "corpus_id": CORPUS_ID,
+                "file_id": FILE_ID,
+                "ordinal": 0,
+                "text": "Riveron AI Execution — workstream overview and delivery pods.",
+            }
+        ]
+    )
+
+    rows = repo.search_candidates([CORPUS_ID], "Riveron AI Execution workstreams scope pods sprint", limit=10)
+
+    assert [r["ordinal"] for r in rows] == [0], (
+        "a chunk matching most of a multi-word question must be a candidate; AND-only selection returned nothing here"
+    )
+
+
+def test_search_candidates_multi_term_does_not_drop_the_rare_term(pg_repo):
+    """Per-term fairness: a term common to every chunk must not crowd the
+    rare term's chunk out of a tight candidate window.
+
+    ``scope`` is in all four chunks, ``riveron`` in exactly one. One OR'd
+    ``LIMIT`` fills entirely with ``scope`` rows; a window per term does
+    not.
+
+    PG-only on purpose. The DuckDB sibling does no ranking in this query at
+    all — rows come back in ``(file_id, ordinal)`` order and ``rank_chunks``
+    re-sorts them — so per-term windows would return the identical row set,
+    and which rows survive a FILLED cap is arbitrary there by documented
+    design (that backend is frozen at the scale it already has; the corpus
+    this matters for is Postgres). See ``search_candidates`` on both.
+    """
+    repo = pg_repo
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "scope of work one"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "scope of work two"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 2, "text": "scope of work three"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 3, "text": "Riveron scope"},
+        ]
+    )
+
+    rows = repo.search_candidates([CORPUS_ID], "riveron scope", limit=2)
+
+    assert 3 in [r["ordinal"] for r in rows], "the chunk carrying the rare term was crowded out"
+
+
+def test_search_candidates_multi_term_never_returns_duplicate_chunks(repo):
+    """A chunk matching several query terms is one candidate, not one per
+    term — the any-term pass fans out per term and must de-duplicate."""
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "riveron scope sprint pods"}])
+
+    rows = repo.search_candidates([CORPUS_ID], "riveron scope sprint pods", limit=10)
+
+    ids = [r["id"] for r in rows]
+    assert len(ids) == len(set(ids)), f"duplicate candidates: {ids}"
+
+
+def test_search_candidates_multi_term_respects_the_limit(repo):
+    """The per-term fan-out must not blow past ``limit`` in total."""
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"riveron scope row {i}"}
+            for i in range(10)
+        ]
+    )
+
+    rows = repo.search_candidates([CORPUS_ID], "riveron scope", limit=4)
+
+    assert len(rows) == 4
+
+
+def test_search_candidates_multi_term_still_scoped_to_given_corpora(repo):
+    """The any-term pass is a new SQL path — RBAC scoping has to hold on it
+    too, not just on the all-terms pass."""
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "riveron scope pods"}])
+
+    assert repo.search_candidates(["col_other"], "riveron scope pods", limit=10) == []
+
+
+def test_search_candidates_path_prefix_narrows_to_one_folder(repo_and_files):
+    """Corpus scoping: one collection routinely holds every client's files,
+    so a caller who knows the folder must be able to search inside it."""
+    repo, add_file = repo_and_files
+    add_file("cf_riv", "Riveron Scope.md", "00_Customers/Riveron/Riveron Scope.md")
+    add_file("cf_wil", "Wilmington Invoice.md", "00_Customers/Wilmington/Wilmington Invoice.md")
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": "cf_riv", "ordinal": 0, "text": "statement of work scope"},
+            {"corpus_id": CORPUS_ID, "file_id": "cf_wil", "ordinal": 0, "text": "statement of work scope"},
+        ]
+    )
+
+    rows = repo.search_candidates([CORPUS_ID], "statement of work scope", limit=10, path_prefix="00_Customers/Riveron/")
+
+    assert [r["file_id"] for r in rows] == ["cf_riv"]
+
+
+def test_search_candidates_path_prefix_matches_literally(repo_and_files):
+    """LIKE metacharacters in the prefix are escaped.
+
+    ``_`` is ordinary in a real folder name (``00_Customers``) and
+    unescaped it is a single-character wildcard, so an unescaped prefix
+    would silently match folders the caller did not ask for.
+    """
+    repo, add_file = repo_and_files
+    add_file("cf_a", "a.md", "00_Customers/Riveron/a.md")
+    add_file("cf_b", "b.md", "00XCustomers/Riveron/b.md")
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": "cf_a", "ordinal": 0, "text": "statement of work"},
+            {"corpus_id": CORPUS_ID, "file_id": "cf_b", "ordinal": 0, "text": "statement of work"},
+        ]
+    )
+
+    rows = repo.search_candidates([CORPUS_ID], "statement of work", limit=10, path_prefix="00_Customers/")
+
+    assert [r["file_id"] for r in rows] == ["cf_a"], "the `_` in the prefix acted as a wildcard"
+
+
+def test_search_by_filename_path_prefix_narrows_to_one_folder(repo_and_files):
+    """A scoped search that let a NAME from outside the scope answer would
+    not be scoped at all — the filename path takes the prefix too."""
+    repo, add_file = repo_and_files
+    add_file("cf_in", "riveron-sow.md", "00_Customers/Riveron/riveron-sow.md")
+    add_file("cf_out", "riveron-advisor.md", "00_Customers/HIG/riveron-advisor.md")
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": "cf_in", "ordinal": 0, "text": "body text"},
+            {"corpus_id": CORPUS_ID, "file_id": "cf_out", "ordinal": 0, "text": "body text"},
+        ]
+    )
+
+    rows = repo.search_by_filename([CORPUS_ID], ["riveron"], limit=10, path_prefix="00_Customers/Riveron/")
+
+    assert [r["file_id"] for r in rows] == ["cf_in"]
+
+
+def test_search_candidates_all_terms_pass_still_ranks_first_on_pg(pg_repo):
+    """The all-terms pass keeps its precedence: a chunk containing every
+    query term outranks one containing only some, because the AND pass runs
+    first and its rows are returned ahead of the top-up's."""
+    pg_repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "riveron only"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "riveron execution scope pods"},
+        ]
+    )
+
+    rows = pg_repo.search_candidates([CORPUS_ID], "riveron execution scope pods", limit=10)
+
+    assert rows[0]["ordinal"] == 1
+
+
+def test_search_candidates_top_up_does_not_re_run_for_a_single_term(pg_repo):
+    """A one-term query's all-terms pass IS its any-term pass; re-running it
+    would just duplicate rows."""
+    pg_repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": "riveron"} for i in range(3)])
+
+    rows = pg_repo.search_candidates([CORPUS_ID], "riveron", limit=10)
+
+    ids = [r["id"] for r in rows]
+    assert len(ids) == 3 == len(set(ids))

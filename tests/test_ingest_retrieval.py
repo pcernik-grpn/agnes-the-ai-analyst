@@ -72,7 +72,7 @@ def test_search_hybrid_uses_embeddings(e2e_env, monkeypatch):
     still the same assertion as before the bounded rewrite: hybrid ranking
     picks the cosine-aligned chunk over its lexical twin.
     """
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
     from src.ingest.retrieval import search
 
     # Query vector aligned with the first chunk's embedding.
@@ -156,7 +156,7 @@ def test_search_embeddings_absent_tie_is_deterministic(e2e_env, monkeypatch):
     """#756: with embeddings absent (the default deployment), a lexical-score
     tie must resolve deterministically (stable chunk-id tie-break) instead
     of by arbitrary DB fetch order."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
     from src.repositories import corpus_chunks_repo
 
     monkeypatch.setattr(retrieval, "embed_query", lambda q: None)
@@ -192,7 +192,7 @@ def test_retrieval_mode_never_loads_the_model(monkeypatch):
     """#898 review follow-up: labeling a response must not pay the model
     instantiation/download cost — `retrieval_mode` goes through the
     `embedding_capability` probe, never `_load_model`."""
-    import src.ingest.embeddings as embeddings
+    from src.ingest import embeddings
     from src.ingest.retrieval import retrieval_mode
 
     def _boom():
@@ -220,7 +220,7 @@ def test_search_reports_capped_when_candidates_exceed_the_configured_limit(e2e_e
     cap, and must say so via `.capped` when the cap was actually hit — the
     signal `app.api.knowledge_search` / `app.api.collections` surface as
     the additive `candidates_capped` response field."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 3)
     cid = _seed_files(
@@ -233,7 +233,7 @@ def test_search_reports_capped_when_candidates_exceed_the_configured_limit(e2e_e
 
 
 def test_search_not_capped_when_candidates_are_under_the_limit(e2e_env, monkeypatch):
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 100)
     cid = _seed("rs-nocap", [{"ordinal": 0, "text": "shared keyword apple"}])
@@ -276,7 +276,7 @@ def test_max_candidate_chunks_default(e2e_env):
 
 
 def test_max_candidate_chunks_reads_instance_config(monkeypatch):
-    import app.instance_config as instance_config
+    from app import instance_config
     from src.ingest.retrieval import _max_candidate_chunks
 
     def _fake_get_value(*keys, default=None):
@@ -291,7 +291,7 @@ def test_max_candidate_chunks_reads_instance_config(monkeypatch):
 def test_search_finds_a_filename_match_with_zero_body_overlap_even_when_capped(e2e_env, monkeypatch):
     """The filename fallback's bounded candidate path (`search_by_filename`)
     is independent of the body cap — a tiny body cap must not disable it."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 1)
     cid = _seed_files("rs-fn-cap", [("quarterly-report.md", [{"ordinal": 0, "text": "alpha bravo"}])])
@@ -307,7 +307,7 @@ def test_search_finds_a_filename_match_with_zero_body_overlap_even_when_capped(e
 
 
 def test_rank_chunks_uses_precomputed_q_vec_over_calling_embed_query(monkeypatch):
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     def _boom(_q):
         raise AssertionError("rank_chunks must not call embed_query when q_vec is given")
@@ -326,7 +326,7 @@ def test_rank_chunks_default_still_calls_embed_query(monkeypatch):
     """Backward compatibility: every existing caller (search_with_meta with
     no embeddings, src.search.local, scripts/bench_retrieval.py) omits
     q_vec and relies on rank_chunks calling embed_query itself."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     calls = []
     monkeypatch.setattr(retrieval, "embed_query", lambda q: calls.append(q) or None)
@@ -349,7 +349,7 @@ def test_search_with_meta_shortlists_before_fetching_embeddings(e2e_env, monkeyp
     shortlist. (Both chunks share the query's words on purpose — candidate
     SELECTION is lexical-first since the P0 OOM fix, so a chunk with zero
     body overlap is not a candidate at all; see ``search_with_meta``.)"""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
     from src.repositories.corpus_chunks import CorpusChunksRepository
 
     monkeypatch.setattr(retrieval, "embed_query", lambda q: [1.0] + [0.0] * 383)
@@ -384,7 +384,7 @@ def test_search_with_meta_shortlist_excludes_low_lexical_rank_from_vector_rerank
     to 1. (The weaker chunk still shares ONE query word so it reaches the
     lexical-first candidate set at all; it loses the shortlist slot, not
     the SQL prefilter.)"""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_VECTOR_SHORTLIST_SIZE", 1)
     monkeypatch.setattr(retrieval, "embed_query", lambda q: [1.0] + [0.0] * 383)
@@ -429,7 +429,7 @@ def test_search_with_meta_small_corpus_matches_search(e2e_env):
 
 
 def test_search_with_meta_under_cap_is_not_truncated(e2e_env, monkeypatch):
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 10)
     cid = _seed("rs-cap-under", [{"ordinal": i, "text": "kubernetes cluster guide"} for i in range(3)])
@@ -443,7 +443,7 @@ def test_search_with_meta_over_cap_is_truncated_and_prefiltered(e2e_env, monkeyp
     candidate fetch filled its LIMIT and says so (``truncated`` + the cap
     that bound). A chunk that shares no word with the query is not a
     candidate in the first place, so it does not count toward the cap."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 2)
     cid = _seed(
@@ -467,7 +467,7 @@ def test_search_with_meta_cap_is_min_of_both_config_keys(e2e_env, monkeypatch):
     ``collections.search_max_chunks`` is a second ceiling on the same
     candidate set — the effective LIMIT is the smaller of the two, and the
     reported ``cap`` is that number."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     cid = _seed("rs-cap-min", [{"ordinal": i, "text": "kubernetes cluster guide"} for i in range(3)])
 
@@ -494,7 +494,7 @@ def test_search_with_meta_over_cap_stopword_only_query_raises(e2e_env, monkeypat
     """A stopword-only query whose matches still fill the cap is an
     arbitrary slice of the corpus, not a search — refused, and the
     message carries the corpus-wide count (paid only on this path)."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
     cid = _seed(
@@ -513,7 +513,7 @@ def test_search_with_meta_over_cap_stopword_only_query_raises(e2e_env, monkeypat
 def test_search_with_meta_stopword_only_query_under_cap_is_not_refused(e2e_env, monkeypatch):
     """The refusal is about the cap, not the query: a stopword-only query
     over a corpus small enough not to fill the cap is answered normally."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 100)
     cid = _seed("rs-cap-broad-small", [{"ordinal": 0, "text": "the kubernetes cluster guide is here"}])
@@ -524,7 +524,7 @@ def test_search_with_meta_stopword_only_query_under_cap_is_not_refused(e2e_env, 
 def test_search_with_meta_over_cap_with_real_terms_never_raises(e2e_env, monkeypatch):
     """A query with at least one non-stopword term is never refused, even
     when it fills the cap — only an all-stopword query is."""
-    import src.ingest.retrieval as retrieval
+    from src.ingest import retrieval
 
     monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
     cid = _seed(
@@ -536,3 +536,224 @@ def test_search_with_meta_over_cap_with_real_terms_never_raises(e2e_env, monkeyp
     )
     meta = retrieval.search_with_meta([cid], "what is kubernetes")
     assert meta["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Ranking signal, scoping, and honest disclosure (2026-09)
+#
+# The failure these cover, observed live: a document search whose every hit
+# came back at `score: 1.0` — no ranking signal at all, order decided by the
+# chunk-id tie-break — and four sibling searches that came back
+# `results: []` with the candidate cap disclosed beside them, which an agent
+# read as "no such document exists".
+# ---------------------------------------------------------------------------
+
+
+def _seed_with_paths(slug: str, files: list[tuple[str, str, list[str]]]) -> str:
+    """Seed one corpus holding several files WITH logical paths.
+
+    ``files`` is ``[(filename, path, [chunk texts])]``. The plain ``_seed``
+    helper puts every chunk in one path-less file, which cannot express the
+    "one collection holds every client's folder" shape the path-prefix
+    scoping exists for.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo, file_corpora_repo
+
+    cid = file_corpora_repo().create(name=slug, slug=slug, description=None, created_by="u")
+    for filename, path, texts in files:
+        fid = corpus_files_repo().add(
+            corpus_id=cid,
+            filename=filename,
+            sha256=f"s-{filename}",
+            file_type="md",
+            size_bytes=1,
+            storage_path="/x",
+            path=path,
+        )
+        corpus_chunks_repo().add_many(
+            [{"corpus_id": cid, "file_id": fid, "ordinal": i, "text": t} for i, t in enumerate(texts)]
+        )
+    return cid
+
+
+def test_search_does_not_report_every_hit_at_the_same_score(e2e_env):
+    """Candidates that all match the same query terms must still be ranked.
+
+    Presence-only scoring gave each of them an identical raw score, which
+    min-max normalization's all-equal branch mapped to exactly 1.0 — a
+    result set that reports itself as uniformly perfect while its order is
+    really the chunk-id tie-break.
+    """
+    from src.ingest.retrieval import search
+
+    cid = _seed(
+        "rs-flat",
+        [
+            {"ordinal": 0, "text": "riveron scope"},
+            {"ordinal": 1, "text": "riveron riveron riveron scope scope of work for riveron"},
+            {"ordinal": 2, "text": "riveron and scope mentioned once each"},
+        ],
+    )
+
+    res = search([cid], "riveron scope")
+
+    scores = [r["score"] for r in res]
+    assert len(set(scores)) > 1, f"every hit scored the same — no ranking signal: {scores}"
+    assert res[0]["ordinal"] == 1, "the chunk that says the most about the query should lead"
+
+
+def test_search_still_ranks_a_distinctive_term_over_a_repeated_common_one(e2e_env):
+    """Term frequency must not overpower IDF.
+
+    A chunk hammering the common term cannot outrank one carrying the rare
+    term — TF saturates (``tf/(tf+k1)``), so repetition buys steeply less
+    each time while rarity keeps its full weight.
+    """
+    from src.ingest.retrieval import search
+
+    cid = _seed(
+        "rs-tf-idf",
+        [
+            {"ordinal": 0, "text": "scope scope scope scope scope scope scope scope"},
+            {"ordinal": 1, "text": "scope for riveron"},
+            {"ordinal": 2, "text": "scope of another engagement"},
+            {"ordinal": 3, "text": "scope of a third engagement"},
+        ],
+    )
+
+    res = search([cid], "riveron scope")
+
+    assert res[0]["ordinal"] == 1, "the chunk with the distinctive term must still lead"
+
+
+def test_search_with_meta_capped_scan_with_no_match_is_refused_not_empty(e2e_env, monkeypatch):
+    """A capped scan that ranked nothing raises instead of returning ``[]``.
+
+    This is the live failure: an empty list is indistinguishable from "no
+    such document exists", so an agent handed one stopped looking. The cap
+    having eaten the query is a fact the caller can act on.
+    """
+    from src.ingest import retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+    # Candidate SELECTION is substring-based on this backend while RANKING is
+    # whole-word, so `Riveronium` is a candidate for `riveron` and then
+    # scores zero — the cap fills with a row nothing can be made of, and the
+    # file's name offers no hit either. Exactly the shape that used to
+    # return `results: []` with the cap disclosed beside it.
+    cid = _seed("rs-capped-empty", [{"ordinal": 0, "text": "Riveronium is a compound"}])
+
+    with pytest.raises(retrieval.SearchQueryTooBroad) as excinfo:
+        retrieval.search_with_meta([cid], "riveron")
+
+    assert excinfo.value.reason == "capped_no_match"
+    assert excinfo.value.cap == 1
+
+
+def test_search_query_too_broad_reports_which_reason(e2e_env, monkeypatch):
+    """The two refusal reasons are distinguishable — a caller renders a
+    different next step for "your query has no real word" than for "the cap
+    ate your query"."""
+    from src.ingest import retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+    cid = _seed(
+        "rs-reason",
+        [
+            {"ordinal": 0, "text": "the kubernetes cluster guide is here and there"},
+            {"ordinal": 1, "text": "the weather report is unrelated and long"},
+        ],
+    )
+
+    with pytest.raises(retrieval.SearchQueryTooBroad) as excinfo:
+        retrieval.search_with_meta([cid], "the and is")
+
+    assert excinfo.value.reason == "no_usable_term"
+
+
+def test_search_with_meta_says_which_candidate_path_filled_the_cap(e2e_env, monkeypatch):
+    """``truncated_source`` separates "too many passages matched your words"
+    from "too many FILE NAMES matched" — the disclosure built from a single
+    `truncated` flag claimed the former while the latter was true, telling an
+    agent its query was too broad when no passage had matched at all."""
+    from src.ingest import retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+    cid = _seed(
+        "rs-trunc-source",
+        [
+            {"ordinal": 0, "text": "kubernetes cluster guide"},
+            {"ordinal": 1, "text": "kubernetes weather report"},
+        ],
+    )
+
+    meta = retrieval.search_with_meta([cid], "kubernetes")
+
+    assert meta["truncated"] is True
+    assert meta["truncated_source"] == "body"
+
+
+def test_search_with_meta_reports_no_truncation_source_when_under_cap(e2e_env, monkeypatch):
+    from src.ingest import retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 100)
+    cid = _seed("rs-trunc-none", [{"ordinal": 0, "text": "kubernetes cluster guide"}])
+
+    meta = retrieval.search_with_meta([cid], "kubernetes")
+
+    assert (meta["truncated"], meta["truncated_source"]) == (False, None)
+
+
+def test_search_path_prefix_narrows_to_one_folder(e2e_env):
+    """One collection holding every client's files is the normal shape of a
+    crawled bucket; a caller who knows the folder must be able to say so."""
+    from src.ingest.retrieval import search
+
+    cid = _seed_with_paths(
+        "rs-scope",
+        [
+            ("riveron-sow.md", "00_Customers/Riveron/riveron-sow.md", ["statement of work and fees"]),
+            ("acme-invoice.md", "00_Customers/Acme/acme-invoice.md", ["statement of work and fees"]),
+        ],
+    )
+
+    res = search([cid], "statement of work", path_prefix="00_Customers/Riveron/")
+
+    assert [r["filename"] for r in res] == ["riveron-sow.md"]
+
+
+def test_search_path_prefix_also_scopes_the_filename_fallback(e2e_env):
+    """A scoped search that let a NAME from outside the scope answer would
+    not be scoped at all."""
+    from src.ingest.retrieval import search
+
+    cid = _seed_with_paths(
+        "rs-scope-name",
+        [
+            ("riveron-sow.md", "00_Customers/Riveron/riveron-sow.md", ["body text"]),
+            ("riveron-advisor.md", "00_Customers/HIG/riveron-advisor.md", ["body text"]),
+        ],
+    )
+
+    res = search([cid], "riveron sow", path_prefix="00_Customers/Riveron/")
+
+    assert res, "the in-scope file should still be findable by name"
+    assert all(r["filename"] == "riveron-sow.md" for r in res)
+
+
+def test_search_without_path_prefix_is_unscoped(e2e_env):
+    """The parameter is additive — omitting it searches everything granted,
+    exactly as before."""
+    from src.ingest.retrieval import search
+
+    cid = _seed_with_paths(
+        "rs-scope-off",
+        [
+            ("a.md", "00_Customers/Riveron/a.md", ["statement of work"]),
+            ("b.md", "00_Customers/Acme/b.md", ["statement of work"]),
+        ],
+    )
+
+    res = search([cid], "statement of work")
+
+    assert {r["filename"] for r in res} == {"a.md", "b.md"}

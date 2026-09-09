@@ -657,7 +657,7 @@ def register_foundation_tools(
         return detail
 
     @tool(read_only=True)
-    async def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict:
+    async def collections_search(query: str, k: int = 10, collection_id: str = "", path_prefix: str = "") -> dict:
         """Hybrid search across your accessible file Collections (RBAC-filtered). Matching is whole word, there is no wildcard, and file names are a fallback, consulted only when no passage explains the question better — so an empty result is a wording miss far more often than an access problem; read the response's ``hint`` before concluding anything from it.
 
         Returns ranked chunks with citations (``filename``, ``ordinal``, ``text``,
@@ -710,14 +710,37 @@ def register_foundation_tools(
         silently ranking an arbitrary slice; the tool call raises with the
         server's ``search_query_too_broad`` detail in that case.
 
+        **Narrowing to a folder.** ``path_prefix`` restricts the search to
+        files whose path starts with it — the right move for follow-on work,
+        where a crawled bucket is ONE collection holding every client's
+        documents and ``collection_id`` cannot separate them. Resolve the
+        folder first (``collection_get(collection_id=…, q="<client>")``, or
+        the fact graph), then search inside it: one client's document should
+        not have to out-rank thousands of chunks of everyone else's
+        invoices. Prefixes match literally and are case-sensitive; pass the
+        ``path`` a file listing showed you, cut at the folder boundary
+        (e.g. ``"00_Customers/Acme/"``).
+
+        A refused search (``search_query_too_broad``) carries a ``reason``:
+        ``no_usable_term`` means rephrase with a real word; ``capped_no_match``
+        means the candidate limit filled before anything matched, so the
+        search read only PART of the documents in scope — that is not
+        evidence the document is absent, and the fix is a narrower scope
+        (``path_prefix``/``collection_id``) or a more distinctive term, not a
+        retry.
+
         Args:
             query: Natural-language or keyword query.
             k: Max results (default 10).
             collection_id: Optional ``col_...`` id to restrict the search.
+            path_prefix: Optional folder path prefix to restrict the search
+                (e.g. ``"00_Customers/Acme/"``). Empty string means no filter.
         """
         params: dict = {"q": query, "k": k}
         if collection_id:
             params["corpus_id"] = collection_id
+        if path_prefix:
+            params["path_prefix"] = path_prefix
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{base_url}/api/collections/search",

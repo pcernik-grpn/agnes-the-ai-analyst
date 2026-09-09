@@ -573,11 +573,7 @@ def test_a_shared_tool_takes_the_same_arguments_on_both_servers():
     shared = sorted(set(http) & set(stdio))
     assert shared, "expected the two servers to share tools; the AST scan found none"
 
-    drift = {
-        name: {"http": http[name], "stdio": stdio[name]}
-        for name in shared
-        if set(http[name]) != set(stdio[name])
-    }
+    drift = {name: {"http": http[name], "stdio": stdio[name]} for name in shared if set(http[name]) != set(stdio[name])}
     assert not drift, (
         "these tools take different arguments on the HTTP and stdio MCP servers — "
         f"the contract an agent reads depends on which server it reached: {drift}"
@@ -591,3 +587,42 @@ def test_fact_edges_is_a_registered_foundation_tool():
     from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
 
     assert "fact_edges" in FOUNDATION_TOOL_NAMES
+
+
+def test_collection_get_reads_the_files_endpoint_on_both_servers():
+    """Same arguments is not the same behaviour.
+
+    ``test_a_shared_tool_takes_the_same_arguments_on_both_servers`` above
+    passed while the stdio server sent ``limit``/``offset``/``q`` to
+    ``GET /api/collections/{id}`` — an endpoint that declares none of them,
+    so FastAPI dropped all three without a word. ``q="Riveron"`` came back
+    as that endpoint's own unfiltered 25-file preview, and an agent reading
+    the result concluded the collection held no matching file. Observed
+    live. Both servers must page through ``/files``, which is the endpoint
+    that implements the filter.
+    """
+    for path in ("app/api/mcp/foundation_tools.py", "cli/mcp/server.py"):
+        src = Path(path).read_text(encoding="utf-8")
+        start = src.index("def collection_get(")
+        body = src[start : src.index("@tool", start + 10)]
+        assert "/files" in body, (
+            f"{path}: collection_get must fetch its file page from "
+            "GET /api/collections/{id}/files — the detail endpoint accepts no "
+            "limit/offset/q and silently ignores them"
+        )
+        assert "params" in body, f"{path}: collection_get must forward its limit/offset/q params"
+
+
+def test_collections_search_offers_folder_scoping_on_both_servers():
+    """``path_prefix`` has to exist on whichever server an agent reached.
+
+    A crawled bucket is routinely ONE collection holding every client's
+    documents, so ``collection_id`` cannot express "only this engagement's
+    folder" — and without that, one client's document has to out-rank
+    thousands of chunks of everyone else's invoices to be seen.
+    """
+    http = _tool_params("app/api/mcp/foundation_tools.py")
+    stdio = _tool_params("cli/mcp/server.py")
+
+    assert "path_prefix" in http["collections_search"]
+    assert "path_prefix" in stdio["collections_search"]
