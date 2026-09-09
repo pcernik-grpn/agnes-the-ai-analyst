@@ -282,7 +282,13 @@ async def check_branding(app) -> dict:
     match = re.search(r"<title>(.*?)</title>", resp.text, re.DOTALL)
     title = match.group(1).strip() if match else ""
     leaked = [d for d in ("AI Harness", "Data Analyst Portal") if d in title]
-    if re.search(r"\bAgnes\b", title):
+    # Bare product name only — "Login - Agnes" ties to nothing but the OSS
+    # product itself, the same impersonation risk as the two defaults above.
+    # A `\bAgnes\b` substring match would also fire on a legitimately
+    # customized name that merely contains the word ("Acme Agnes Portal"),
+    # where "Acme" already supplies the operator identity this check exists
+    # to require — so only the exact bare title counts as unattributed.
+    if title == "Login - Agnes":
         leaked.append("Agnes")
     if leaked or not title:
         return _row(

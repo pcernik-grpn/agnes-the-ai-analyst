@@ -303,6 +303,28 @@ class TestBranding:
         check = _check(report, "branding")
         assert check["status"] == "ok"
 
+    def test_customized_name_that_contains_the_word_agnes_is_ok(self, seeded_app, monkeypatch):
+        """A legitimate customization can contain the product word "Agnes" as
+        part of a larger, operator-identifying name ("Acme Agnes Portal") —
+        the operator identity this check requires ("Acme") is right there.
+        Only the BARE title ("Login - Agnes") is the unattributed state,
+        indistinguishable from the OSS product itself."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Acme Agnes Portal")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "ok"
+
+    def test_bare_agnes_name_is_still_an_error(self, seeded_app, monkeypatch):
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Agnes")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
+
 
 class TestProbeProviders:
     """The provider probe helper this doctor rides on (app/auth/provider_registry)."""
