@@ -410,10 +410,21 @@ def cat_file(
     # `kind="pdf"` and still carries the ingested text a reader here wants.
     # Gating on `kind == "text"` refused exactly the format this command
     # exists for.
-    if not out.get("text"):
+    text = out.get("text")
+    if text is None or out.get("reason"):
         # `reason` is the server's own sentence for "indexed yet?", "rejected",
         # "no extractable text" — relaying it beats inventing a summary.
         typer.echo(out.get("reason") or "No text preview is available for this file.", err=True)
+        raise typer.Exit(1)
+    total = out.get("total_chars") or 0
+    if not text and total and offset >= total:
+        # An empty PAGE of a file that has text is the caller's offset past
+        # the end — not "no text", which is what the sentence above claims.
+        typer.echo(
+            f"Offset {offset} is past the end of this file's text "
+            f"({total} characters; valid offsets are 0..{total - 1}).",
+            err=True,
+        )
         raise typer.Exit(1)
 
     at = offset

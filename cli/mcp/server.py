@@ -206,8 +206,10 @@ def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict
     failing the call. When the response carries ``truncated: true``, each hit
     whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
     ``…``) — never summarise a prefix as the whole passage. Read the document
-    in full with ``collection_file_read(collection_id=<corpus_id>,
-    file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+    with ``collection_file_read(collection_id=<corpus_id>,
+    file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+    document's FIRST page; follow its ``next_offset`` with ``offset=``
+    until it is null, as its own docstring says — or narrow the query /
     lower ``k``; ``truncated_note`` says exactly what was cut.
 
     A large collection set (#2151) can ALSO set ``truncated: true`` for a
@@ -261,8 +263,10 @@ def knowledge_search(query: str, k: int = 10) -> dict:
     failing the call. When the response carries ``truncated: true``, each hit
     whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
     ``…``) — never summarise a prefix as the whole passage. Read the document
-    in full with ``collection_file_read(collection_id=<corpus_id>,
-    file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+    with ``collection_file_read(collection_id=<corpus_id>,
+    file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+    document's FIRST page; follow its ``next_offset`` with ``offset=``
+    until it is null, as its own docstring says — or narrow the query /
     lower ``k``; ``truncated_note`` says exactly what was cut.
     """
     try:
@@ -335,9 +339,9 @@ def collection_file_read(collection_id: str, file_id: str, offset: int = 0) -> d
 
     Args:
         collection_id: Collection id from ``collections_list`` (``col_...``).
+        file_id: File id from ``collection_get`` (``cf_...``).
         offset: Character offset to read from — ``0`` (the default) for
             the start, the previous response's ``next_offset`` to continue.
-        file_id: File id from ``collection_get`` (``cf_...``).
     """
     try:
         return api_get_json(f"/api/collections/{collection_id}/files/{file_id}/preview", offset=offset)

@@ -696,8 +696,10 @@ def register_foundation_tools(
         failing the call. When the response carries ``truncated: true``, each hit
         whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
         ``…``) — never summarise a prefix as the whole passage. Read the document
-        in full with ``collection_file_read(collection_id=<corpus_id>,
-        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+        document's FIRST page; follow its ``next_offset`` with ``offset=``
+        until it is null, as its own docstring says — or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
         A large collection set (#2151) can ALSO set ``truncated: true`` for a
@@ -759,8 +761,10 @@ def register_foundation_tools(
         failing the call. When the response carries ``truncated: true``, each hit
         whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
         ``…``) — never summarise a prefix as the whole passage. Read the document
-        in full with ``collection_file_read(collection_id=<corpus_id>,
-        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both) — that returns the
+        document's FIRST page; follow its ``next_offset`` with ``offset=``
+        until it is null, as its own docstring says — or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
         Args:

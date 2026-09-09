@@ -340,6 +340,27 @@ class TestInlineMediaStillCarriesItsText:
         assert body["raw_url"], "the modal still needs its draw URL"
         assert body["text"] == "Quarterly revenue was 4.2M.", "extracted text not surfaced"
 
+    def test_pdf_page_past_the_end_is_empty_not_null(self, seeded_app, monkeypatch):
+        """``text: null`` is the modal's "this medium has no text" signal.
+        A medium that HAS text, read at an offset past its end, is an empty
+        page: ``""`` with ``reason: null``, so a paging reader can tell the
+        two apart instead of reporting a readable file as unreadable."""
+        tok = seeded_app["admin_token"]
+        cid, fid = self._pdf_row(seeded_app, tok)
+        monkeypatch.setattr("app.api.collections._extracted_text", lambda _fid: "Quarterly revenue was 4.2M.")
+
+        body = (
+            seeded_app["client"]
+            .get(f"/api/collections/{cid}/files/{fid}/preview", params={"offset": 500}, headers=_auth(tok))
+            .json()
+        )
+
+        assert body["kind"] == "pdf"
+        assert body["text"] == ""
+        assert body["reason"] is None
+        assert body["next_offset"] is None
+        assert body["total_chars"] == len("Quarterly revenue was 4.2M.")
+
     def test_pdf_without_extracted_text_explains_itself(self, seeded_app, monkeypatch):
         """No text is fine — a silent `text: null` with no reason is not."""
         tok = seeded_app["admin_token"]
@@ -570,6 +591,18 @@ class TestCliCatPagesThroughTheFile:
         assert r.exit_code == 0, r.output
         assert "truncated" in r.output.lower()
         assert "search" in r.output.lower(), "must point at the way to reach the rest"
+
+    def test_offset_past_the_end_names_the_range_not_no_text(self):
+        """An empty PAGE is not "no text". The server answers an offset past
+        the end with ``text: ""`` and the file's ``total_chars``; printing the
+        no-preview sentence there denies the file has text at all."""
+        fake, _calls = self._server()
+        with patch("cli.commands.collections.api_get_json", side_effect=fake):
+            r = runner.invoke(collections_app, ["cat", "col_1", "cf_1", "--offset", "9000"])
+        assert r.exit_code == 1
+        assert "past the end" in r.output.lower()
+        assert str(len(self.FULL)) in r.output, "must name the file's length so the caller can pick a valid offset"
+        assert "no text preview" not in r.output.lower()
 
     def test_does_not_loop_on_a_server_that_does_not_advance(self):
         """Defensive: a ``next_offset`` that does not move forward must end

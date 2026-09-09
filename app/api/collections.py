@@ -2508,7 +2508,10 @@ async def preview_file(
             "kind": "image" if ext != "pdf" else "pdf",
             "raw_url": f"/api/collections/{collection_id}/files/{file_id}/raw",
             **page,
-            "text": page["text"] or None,
+            # `null` only when the medium has NO text (the modal's contract);
+            # an empty page of a medium that has text is an offset past the
+            # end, and `""` lets a paging reader tell the two apart.
+            "text": page["text"] if media_text else None,
             "source": "extracted" if media_text else None,
             # A text-less image/PDF must still say why: a bare `text: null`
             # gives a non-browser caller nothing to relay.
