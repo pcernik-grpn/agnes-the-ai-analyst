@@ -335,7 +335,7 @@ class TestFailureHandling:
 
         assert result == {"failed": "RuntimeError"}
         audit_result, params = _latest_export_audit_row(pg_engine)
-        assert audit_result == "failed"
+        assert audit_result == "error:RuntimeError"
         assert params["error"] == "RuntimeError"
         assert params["delivery"] == "push"
         serialized = json.dumps(params)

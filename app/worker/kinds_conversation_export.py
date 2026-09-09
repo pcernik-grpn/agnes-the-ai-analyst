@@ -60,7 +60,7 @@ flood of the same warning.
 **Errors never escape this job** (spec 3.9: a sink swallows its own
 exceptions). A ``RequiresPostgresBackend`` becomes a clean skip; any other
 exception raised mid-walk is caught, logged, audited with
-``result="failed"`` and the exception's CLASS NAME (never its message,
+``result="error:<ClassName>"`` with the exception's CLASS NAME (never its message,
 which could carry content or a header value) in ``params``, and the job
 returns ``{"failed": "<ClassName>"}`` rather than raising — the worker
 runtime's own generic failure handling is for a truly unexpected fault
@@ -322,7 +322,7 @@ def run_conversation_export_once(
     Never raises. A DuckDB-backed instance gets a clean
     ``{"skipped": "requires_postgres_backend"}``. Any OTHER exception
     raised while walking/posting is caught, logged, audited with
-    ``result="failed"``, and turned into ``{"failed": "<ClassName>"}`` —
+    ``result="error:<ClassName>"``, and turned into ``{"failed": "<ClassName>"}`` —
     spec 3.9: a sink swallows its own exceptions, it never fails the
     caller.
 
@@ -423,7 +423,7 @@ def run_conversation_export_once(
             action="conversations.export",
             resource="conversations:export",
             params={**base_params, "error": exc_class},
-            result="failed",
+            result=f"error:{exc_class}",
             client_kind="scheduler",
         )
         return {"failed": exc_class}
