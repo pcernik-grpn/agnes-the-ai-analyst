@@ -253,12 +253,11 @@ def test_search_notes_when_the_name_match_was_capped():
 
 
 def test_search_empty_but_capped_result_still_says_to_narrow_the_query():
-    """Devin finding on #2377: a capped search whose best-ranked candidates
-    all failed visibility/filters returns NO subjects — and the empty-result
-    branch used to exit before the `candidates_capped` note ran, presenting
-    an incomplete search as "no matches". The cap note must be printed in
-    that branch too, and the generic "drop the filters" hint must not be the
-    only advice (filters run AFTER the cap, so they cannot widen it)."""
+    """A capped search whose best-ranked candidates all failed visibility or
+    filters returns NO subjects. The empty-result branch must still print the
+    cap note — an incomplete search must never read as "no matches" — and the
+    generic "drop the filters" hint must not be the only advice, because
+    filters run AFTER the cap and cannot widen it."""
     data = {"subjects": [], "limit_applied": False, "candidates_capped": True}
     with patch("cli.commands.facts.api_post", return_value=_resp(200, data)):
         result = runner.invoke(app, ["facts", "search", "organization", "widget"])

@@ -140,9 +140,10 @@ def search_facts(
     if not subjects:
         typer.echo(f"No facts found for type '{fact_type}'{f' matching {q!r}' if q else ''}.")
         if capped:
-            # Devin finding on #2377: an empty page is NOT "no matches" when
-            # the server capped the name match — say so here too, never only
-            # on the non-empty branch.
+            # An empty page is not "no matches" when the server capped the
+            # name match: the best-ranked candidates all failed visibility or
+            # --filter, and matches may exist beyond the cap. Disclose it
+            # here exactly as the non-empty branch does.
             _echo_candidates_capped_note()
         else:
             typer.echo(
