@@ -23,6 +23,8 @@ success.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import sqlalchemy as sa
 
@@ -86,17 +88,15 @@ def ducklake_pg_env(pg_engine, monkeypatch, tmp_path):
 def _isolated_pg_url():
     """A pgserver instance dedicated to a single test.
 
-    Only the connection-count test below needs this — it requires a
+    Only the connection-counting tests below need this — they require a
     guaranteed-empty ``pg_stat_activity`` baseline. This module's other
     tests share the conftest's session-scoped ``pg_engine`` (cheaper —
-    pgserver boot is the expensive part), but that sharing means a prior
-    test's DuckLake attach can leave a warm connection behind that a
-    later attach against the *same* dsn transparently reuses instead of
-    opening a fresh one (observed directly while developing this test —
-    DuckDB's postgres/ducklake catalog support appears to pool/reuse a
-    connection per dsn+data_path target within a process). That reuse
-    would make a shared-server delta assertion flaky depending on test
-    order; a dedicated throwaway server sidesteps it entirely.
+    pgserver boot is the expensive part), but on a shared server the
+    other xdist workers' own connections come and go, and a prior test's
+    closed DuckLake session can leave an idle backend behind for a moment
+    (the postgres extension's pool releases connections asynchronously).
+    Either would make a shared-server count assertion order- and
+    timing-dependent; a dedicated throwaway server sidesteps both.
     """
     from tests.db_pg.conftest import _start_dedicated_pgserver
 
@@ -152,11 +152,21 @@ def test_pg_catalog_exactly_one_connection_per_attach(isolated_ducklake_pg_env):
     file-catalog restriction) brings the total to exactly two. Matches
     the wave-2G plan's "one connection per ATTACH" sizing claim.
 
+    "Exactly one" is only true because ``_attach_ducklake`` disables the
+    postgres extension's per-thread connection cache before the ATTACH
+    (see :func:`test_pg_catalog_pool_thread_local_cache_is_disabled`).
+    With that cache on, the attach opens a second backend whenever
+    DuckDB's worker thread — rather than the calling thread — happens to
+    run the nested ``ATTACH ... (TYPE postgres)`` task: the connection
+    the catalog constructor opened is parked in *that* thread's cache,
+    the first metadata query binds on the other thread, misses, and opens
+    a fresh one. Reproduced at 3/25 attaches on a loaded 14-core laptop
+    and 10+/40 in a 2-CPU Linux container; it flaked fleet-wide on the
+    2-CPU CI runners (issue #2403).
+
     Runs against a dedicated, single-test pgserver (``isolated_ducklake_pg_env``)
     rather than the module-shared ``pg_engine`` — see that fixture's
-    docstring for why a shared server makes this specific assertion
-    order-dependent (DuckDB reuses a pooled connection to the same DSN
-    across separate attaches once one has ever been opened in-process).
+    docstring.
     """
     from src.ducklake_session import get_ducklake_read, get_ducklake_write
 
@@ -176,6 +186,74 @@ def test_pg_catalog_exactly_one_connection_per_attach(isolated_ducklake_pg_env):
 
         r.close()
         w.close()
+    finally:
+        engine.dispose()
+
+
+def test_pg_catalog_pool_thread_local_cache_is_disabled(ducklake_pg_env):
+    """Both singletons attach with the postgres extension's per-thread
+    connection cache OFF — the setting that makes "one connection per
+    attach" deterministic instead of a scheduler race (issue #2403), and
+    that lets :func:`src.ducklake_session.close_ducklake_sessions` actually
+    close the backend instead of leaving it parked in a thread-local slot.
+
+    The extension reports its pool configuration through
+    ``postgres_configure_pool()``; DuckLake's metadata catalog is the only
+    postgres-typed catalog on either connection. The setting has to be
+    applied ``GLOBAL`` on the DuckDB instance — DuckLake attaches the
+    metadata catalog from an inner connection of its own, which is where
+    the pool is created and the setting read — so this asserts the
+    effective value the pool ended up with, not what ``SET`` was issued.
+    """
+    from src.ducklake_session import get_ducklake_read, get_ducklake_write
+
+    for opener in (get_ducklake_read, get_ducklake_write):
+        conn = opener()
+        try:
+            rows = conn.execute(
+                "SELECT catalog_name, thread_local_cache_enabled FROM postgres_configure_pool()"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert len(rows) == 1, f"{opener.__name__}: expected exactly one postgres-typed catalog, got {rows}"
+        assert rows[0][1] is False, f"{opener.__name__}: thread-local connection cache still enabled: {rows}"
+
+
+def test_pg_catalog_close_releases_every_backend(isolated_ducklake_pg_env):
+    """``close_ducklake_sessions()`` must give every catalog backend back to
+    Postgres — a reader re-open on a config change, or a role shutdown,
+    may not leak an idle connection per attach into the catalog server's
+    ``max_connections`` budget.
+
+    With the extension's per-thread cache enabled the connection a closed
+    session parked in its thread's slot outlives the DuckDB instance
+    (observed: still ``idle`` in ``pg_stat_activity`` 10 s after close);
+    with the cache disabled the pool closes it with the catalog. The poll
+    is bounded because the pool releases asynchronously — sub-second in
+    practice, the deadline is only there to fail loudly rather than hang.
+    """
+    from src.ducklake_session import close_ducklake_sessions, get_ducklake_read, get_ducklake_write
+
+    engine = sa.create_engine(isolated_ducklake_pg_env.replace("postgresql://", "postgresql+psycopg://", 1))
+    try:
+        assert _client_backend_pids(engine) == []
+        r = get_ducklake_read()
+        r.execute("SELECT 1")
+        w = get_ducklake_write()
+        w.execute("SELECT 1")
+        opened = _client_backend_pids(engine)
+        assert len(opened) == 2, f"expected the two attaches to open two backends, got {opened}"
+        r.close()
+        w.close()
+
+        close_ducklake_sessions()
+
+        deadline = time.monotonic() + 10.0
+        remaining = _client_backend_pids(engine)
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.05)
+            remaining = _client_backend_pids(engine)
+        assert remaining == [], f"backends still open 10 s after close_ducklake_sessions(): {remaining}"
     finally:
         engine.dispose()
 
