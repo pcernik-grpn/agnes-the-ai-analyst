@@ -311,6 +311,11 @@ repo module.
    "<table_name>"`. Read the generated file; verify `downgrade()` is the
    true inverse of `upgrade()`. Nothing lands in `src/db.py` —
    `SCHEMA_VERSION` does not move.
+   Then append the new revision id on its own line to
+   `migrations/shipped_revision_ids.txt` — the append-only manifest of every
+   id that ever shipped (issue #2086, see "A database stranded by a
+   renumbered revision" below); `tests/test_alembic_revision_ratchet.py`
+   fails until it is there.
 3. **Run round-trip + drift + pairwise tests**:
    ```bash
    pytest tests/db_pg/test_alembic_skeleton.py tests/db_pg/test_alembic_roundtrip.py
