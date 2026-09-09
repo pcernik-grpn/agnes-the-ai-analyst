@@ -415,6 +415,9 @@ async def package_builder_turn(payload: PackageTurnRequest, user: dict = Depends
         result: Dict[str, Any] = _stub_turn(message, draft, tables)
     else:
         try:
+            # No subject_id: a data-package draft has no row until the admin
+            # presses Create — there is nothing yet to attribute this turn's
+            # calls to.
             result = await asyncio.to_thread(
                 _llm_turn,
                 _prompt(message=message, history=payload.history, draft=draft, tables=tables, groups=groups),

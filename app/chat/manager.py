@@ -3327,7 +3327,14 @@ class ChatManager:
             on_limit = _notify
         await enforce_sender_limits(self._repo, self._config, sender, chat_id, on_limit=on_limit)
 
-    async def _deliver_local_user_message(self, live: LiveSession, text: str, *, message_id: str | None = None) -> None:
+    async def _deliver_local_user_message(
+        self,
+        live: LiveSession,
+        text: str,
+        *,
+        message_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
         """Write ``text`` as a ``user_msg`` stdin frame to ``live``'s runner
         and update local turn-state.
 
@@ -3339,10 +3346,13 @@ class ChatManager:
         text arrived via a direct call or the chat-in:{chat_id} stream.
 
         This is also where a turn BEGINS for observability (spec 3.2): the
-        turn id is minted here, next to ``turn_in_flight``, because this is
-        the one seam every surface's user message passes through.
+        turn id is minted here, next to ``turn_in_flight`` — unless the
+        caller already minted one for the user row it just persisted
+        (``send_user_message``, so the row and this turn agree on the same
+        id), in which case it is passed in as ``turn_id`` and reused as-is.
         ``message_id`` is the persisted user row when the caller has one
-        (``send_user_message``); the stream-delivery path does not carry it.
+        (``send_user_message``); the stream-delivery path does not carry
+        either.
         """
         payload = json.dumps({"type": "user_msg", "text": text}) + "\n"
         async with live._stdin_lock:
@@ -3355,7 +3365,7 @@ class ChatManager:
         # is never exported at all. Closing it first is a no-op in the
         # ordinary case, where the answer already closed it.
         self._close_turn(live, {"type": "done"})
-        live.turn_id = str(uuid4())
+        live.turn_id = turn_id or str(uuid4())
         live.turn_tool_calls = 0
         live.turn_tool_spans = {}
         live.turn_error_kind = None
@@ -4301,12 +4311,20 @@ class ChatManager:
                 client_msg_id,
             )
             return
+        # Minted HERE, before the user row is persisted, so the row, the
+        # turn span, the frames, the assistant row and usage_turns all agree
+        # on one id (spec 3.2) — this is the one delivery path that persists
+        # the user row itself, so it is the only place that CAN mint before
+        # persist. ``_deliver_local_user_message`` reuses it instead of
+        # minting its own.
+        turn_id = str(uuid4())
         try:
             user_message = self._repo.append_message(
                 session_id=chat_id,
                 role="user",
                 content=text,
                 sender_email=sender_email or live.user_email,
+                turn_id=turn_id,
             )
         except Exception:
             # Hand the claim back: the row does not exist, so the client's
@@ -4328,7 +4346,9 @@ class ChatManager:
         # The persisted user row's id goes onto the turn record (spec 3.2):
         # this is the only delivery path that has one — the inbound-stream
         # path carries text, not the row it was written as.
-        await self._deliver_local_user_message(live, text, message_id=getattr(user_message, "id", None))
+        await self._deliver_local_user_message(
+            live, text, message_id=getattr(user_message, "id", None), turn_id=turn_id
+        )
 
     async def leave_session(self, chat_id: str, participant_email: str) -> None:
         """SR-9: atomically stamp left_at, remove+close the leaver's sink,

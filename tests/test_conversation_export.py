@@ -320,6 +320,106 @@ class TestCostStatus:
         assert record["total_prompt_tokens"] == 0
 
 
+class TestInterruptedTurn:
+    """A killed/interrupted turn persists a real assistant row
+    (``app/chat/manager.py``'s ``_partial_save``:
+    ``tool_calls=[{"interrupted": True, "reason": ...}, ...]``) so the
+    session never dead-ends. The corpus record must not read that row as a
+    genuine complete answer (gap 8a), and must fold the marker into the
+    error signals it otherwise reads only from ``llm_calls`` (gap 8b).
+    """
+
+    def test_an_interrupted_last_assistant_row_is_not_complete(self):
+        messages = [
+            _msg(role="user", content="hi", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="partial answer",
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+                tool_calls=[{"interrupted": True, "reason": "killed"}],
+            ),
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["last_message_role"] == "assistant"
+        assert record["final_assistant_message_complete"] is False
+
+    def test_a_genuine_last_assistant_row_is_still_complete(self):
+        messages = [
+            _msg(role="user", content="hi", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(role="assistant", content="done", turn_id="t1", created_at=_dt("2026-01-01T10:00:05")),
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["final_assistant_message_complete"] is True
+
+    def test_interrupted_marker_folds_into_error_signals_with_no_ledger_row(self):
+        messages = [
+            _msg(role="user", content="hi", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+                tool_calls=[{"interrupted": True, "reason": "session_kill"}],
+            ),
+        ]
+        record = build_conversation_record(_session(), messages, None, [], [], content_mode="full")
+        assert record["has_error"] is True
+        assert record["last_run_status"] == "interrupted"
+        assert "interrupted:session_kill" in record["error_types"]
+
+    def test_interrupted_marker_folds_into_an_existing_ledger_verdict(self):
+        calls = {
+            "llm_run_count": 3,
+            "total_prompt_tokens": 100,
+            "total_completion_tokens": 50,
+            "llm_cache_read_tokens": 10,
+            "llm_cache_creation_tokens": 5,
+            "total_cost": 0.0021,
+            "primary_model": "claude-sonnet-5",
+            "provider": "anthropic",
+            "last_run_status": "ok",
+            "has_error": False,
+            "error_types": [],
+        }
+        messages = [
+            _msg(role="user", content="hi", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+                tool_calls=[{"interrupted": True, "reason": "turn_idle_timeout"}],
+            ),
+        ]
+        record = build_conversation_record(_session(), messages, calls, [], [], content_mode="full")
+        # The ledger's own most-recent-call status ("ok") is superseded: the
+        # killed turn's own completion may never have reached llm_calls at
+        # all, so "ok" would otherwise describe an EARLIER, unrelated turn
+        # as how the session ended.
+        assert record["last_run_status"] == "interrupted"
+        assert record["has_error"] is True
+        assert record["error_types"] == ["interrupted:turn_idle_timeout"]
+
+    def test_no_interrupted_marker_leaves_ledger_error_signals_untouched(self):
+        calls = {
+            "llm_run_count": 1,
+            "total_prompt_tokens": 10,
+            "total_completion_tokens": 5,
+            "llm_cache_read_tokens": 0,
+            "llm_cache_creation_tokens": 0,
+            "total_cost": 0.0001,
+            "primary_model": "claude-sonnet-5",
+            "provider": "anthropic",
+            "last_run_status": "error",
+            "has_error": True,
+            "error_types": ["rate_limited"],
+        }
+        record = build_conversation_record(_session(), [_msg()], calls, [], [], content_mode="full")
+        assert record["last_run_status"] == "error"
+        assert record["error_types"] == ["rate_limited"]
+
+
 class TestCursorCodec:
     def test_roundtrip(self):
         ts = _dt("2026-01-01T10:00:00")

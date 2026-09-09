@@ -464,6 +464,8 @@ async def entity_builder_turn(
         )
         schema = _schema(entity_type, categories)
         try:
+            # No subject_id: an entity draft has no row until Save — there is
+            # nothing yet to attribute this turn's calls to.
             result = await asyncio.to_thread(_llm_turn, prompt, schema, user_id=user["id"])
         except ValueError as e:
             # Nothing configured — say so in a way the page can act on, and

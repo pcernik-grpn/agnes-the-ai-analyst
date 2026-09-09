@@ -50,6 +50,25 @@ def test_pg_append_message_stores_turn_id_and_list_messages_returns_it(pg_repo):
     assert recent[0].turn_id == "t1"
 
 
+def test_pg_user_and_assistant_rows_share_one_turn_id(pg_repo):
+    """The gap this closes: the user row used to be persisted with no
+    ``turn_id`` at all (only the assistant row carried one), which left the
+    corpus export unable to pair a question with its answer. Both roles
+    round-trip the SAME id here, mirroring what ``ChatManager`` now does —
+    mint one ``turn_id`` before the user row is persisted and reuse it for
+    the assistant row."""
+    from src.repositories.chat_sessions_pg import ChatSessionPgRepository
+
+    sessions = ChatSessionPgRepository(pg_repo._engine)
+    session = sessions.create_session(user_email="a@test.com", surface=Surface.WEB)
+
+    pg_repo.append_message(session_id=session.id, role="user", content="hi", turn_id="turn-1")
+    pg_repo.append_message(session_id=session.id, role="assistant", content="hello", turn_id="turn-1")
+
+    got = pg_repo.list_messages(session.id)
+    assert [(m.role, m.turn_id) for m in got] == [("user", "turn-1"), ("assistant", "turn-1")]
+
+
 def test_pg_append_message_without_turn_id_is_none(pg_repo):
     from src.repositories.chat_sessions_pg import ChatSessionPgRepository
 

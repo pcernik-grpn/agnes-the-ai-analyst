@@ -30,6 +30,18 @@ Under ``pseudonymized`` every text leaf in ``messages_json``,
 exactly once (never per span, never twice for the same leaf shared between
 the two JSON blobs) — see :func:`_pseudonymize_parts`. Ids and timestamps
 are never touched.
+
+**``conversation_end`` vs. the pull endpoint's keyset cursor.** The pull
+route pages sessions on ``chat_sessions.last_message_at``, while
+``conversation_end`` here is the last message's own ``created_at``
+(``ordered[-1]``). The two are the same value by construction, not merely
+close: on Postgres ``ChatMessagePgRepository.append_message`` writes both
+columns from the SAME ``now`` variable inside one transaction
+(``src/repositories/chat_messages_pg.py``); on the frozen DuckDB backend
+``last_message_at`` is never stored at all — it is derived at READ time as
+``MAX(m.created_at)`` over exactly this table (``_SESSION_SELECT`` in
+``app/chat/persistence.py``). Paging on one and reporting the other is
+therefore safe without re-deriving anything here.
 """
 
 from __future__ import annotations
@@ -201,6 +213,47 @@ def _deployment_environment() -> str:
     return "unknown"
 
 
+def _interrupted_reason(message: Mapping[str, Any] | None) -> str | None:
+    """The ``reason`` off an interrupted-turn marker on ``message``'s
+    ``tool_calls`` (``app/chat/manager.py``'s ``_partial_save``:
+    ``tool_calls=[{"interrupted": True, "reason": ...}, ...]``), or
+    ``None``. A killed/cancelled turn still persists a real assistant row
+    so the session never dead-ends — this is what tells the corpus that
+    row is not a genuine complete answer.
+    """
+    if not isinstance(message, Mapping):
+        return None
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return None
+    for call in tool_calls:
+        if isinstance(call, Mapping) and call.get("interrupted"):
+            reason = call.get("reason")
+            return str(reason) if reason is not None else "unknown"
+    return None
+
+
+def _fold_interrupted_marker(totals: dict[str, Any], reason: str | None) -> dict[str, Any]:
+    """Fold the transcript-level interrupted marker into the ``llm_calls``-
+    sourced error figures. The killed turn's own completion may never have
+    reached ``llm_calls`` at all (the call was still running when the kill
+    landed), so without this the record's ``last_run_status`` would report
+    an EARLIER, unrelated turn as the session's last word — the marker is
+    the more accurate signal of how the conversation actually ended.
+    """
+    if reason is None:
+        return totals
+    folded = dict(totals)
+    folded["has_error"] = True
+    folded["last_run_status"] = "interrupted"
+    marker = f"interrupted:{reason}"
+    error_types = list(folded.get("error_types") or [])
+    if marker not in error_types:
+        error_types.append(marker)
+    folded["error_types"] = sorted(error_types)
+    return folded
+
+
 def _totals(calls: Mapping[str, Any] | None, messages: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], str]:
     """``(totals, cost_status)`` — ``ledger`` when ``calls`` (an
     ``llm_calls``-backed summary) is given, else ``transcript`` when at
@@ -353,6 +406,7 @@ def build_conversation_record(
     first_user = next((m for m in ordered if m.get("role") == "user"), None)
     first_user_message = _text(first_user.get("content")) if first_user is not None else None
     last_message = ordered[-1] if ordered else None
+    interrupted_reason = _interrupted_reason(last_message)
 
     conversation_start = _iso(ordered[0].get("created_at")) if ordered else None
     conversation_end = _iso(ordered[-1].get("created_at")) if ordered else None
@@ -362,6 +416,7 @@ def build_conversation_record(
         duration_seconds = (end_dt - start_dt).total_seconds()
 
     totals, cost_status = _totals(calls, ordered)
+    totals = _fold_interrupted_marker(totals, interrupted_reason)
 
     return {
         "thread_id": session.get("id"),
@@ -390,7 +445,9 @@ def build_conversation_record(
         "tool_calls_json": tool_calls_json,
         "first_user_message": first_user_message,
         "last_message_role": last_message.get("role") if last_message is not None else None,
-        "final_assistant_message_complete": bool(last_message is not None and last_message.get("role") == "assistant"),
+        "final_assistant_message_complete": bool(
+            last_message is not None and last_message.get("role") == "assistant" and interrupted_reason is None
+        ),
         "last_run_status": totals["last_run_status"],
         "has_error": totals["has_error"],
         "error_types": totals["error_types"],

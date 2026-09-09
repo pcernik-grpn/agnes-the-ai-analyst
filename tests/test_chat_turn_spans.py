@@ -356,6 +356,42 @@ def test_send_user_message_threads_the_message_id_into_the_record(manager: ChatM
     asyncio.run(_run())
 
 
+def test_send_user_message_mints_one_turn_id_shared_by_user_and_assistant_rows(manager: ChatManager):
+    """Gap fix: the user row used to be persisted with no ``turn_id`` at all
+    (only the assistant row carried one), so the corpus export could not
+    pair a question with its answer. ``send_user_message`` now mints the id
+    BEFORE the user row is persisted and reuses it for the assistant row —
+    wrap the real ``append_message`` (rather than swap ``_messages_pg``,
+    which several OTHER repo methods on this call path also read) to
+    observe what was PASSED while still exercising the real DuckDB persist
+    underneath."""
+    calls: list[dict] = []
+    real_append_message = manager._repo.append_message
+
+    def _recording_append_message(**kwargs):
+        calls.append(kwargs)
+        return real_append_message(**kwargs)
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        manager._repo.append_message = _recording_append_message
+        try:
+            await manager.send_user_message(s.id, "hello")
+            turn_id = live.turn_id
+            await _pump(manager, live, [dict(_ASSISTANT)])
+        finally:
+            manager._repo.append_message = real_append_message
+        user_calls = [c for c in calls if c["role"] == "user"]
+        assistant_calls = [c for c in calls if c["role"] == "assistant"]
+        assert user_calls and assistant_calls
+        assert turn_id is not None
+        assert user_calls[-1]["turn_id"] == turn_id
+        assert assistant_calls[-1]["turn_id"] == turn_id
+
+    asyncio.run(_run())
+
+
 def test_spans_never_break_the_pump(manager: ChatManager, monkeypatch):
     """Every span call is wrapped: a tracer that raises at open, at the tool
     seam and at close still leaves a persisted answer and a finished turn."""
