@@ -2373,6 +2373,44 @@ def warn_retired_sharepoint_flags() -> list[str]:
     return warned
 
 
+_REJECTED_EXPORT_ENDPOINTS: set[str] = set()
+
+
+def _conversation_export_endpoint_is_acceptable(endpoint: str) -> bool:
+    """The push sink posts customer conversations plus the headers from
+    ``headers_secret_env`` to ``endpoint`` — an outbound request to an
+    operator-chosen URL with a secret attached, which is exactly the shape
+    a server-side request forgery abuses. The URL is therefore held to a
+    narrow shape before it is ever used: ``https://`` to a named host, or
+    plain ``http://`` only to the loopback host (a local relay), never a
+    URL carrying credentials in its netloc, never another scheme. Anything
+    else disables the sink (the same "off" a blank endpoint means) with one
+    warning per distinct value, so a typo is loud instead of a leak.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(endpoint)
+        hostname = (parts.hostname or "").lower()
+    except ValueError:
+        parts = None
+        hostname = ""
+    ok = (
+        parts is not None
+        and bool(hostname)
+        and parts.username is None
+        and parts.password is None
+        and (parts.scheme == "https" or (parts.scheme == "http" and hostname in ("localhost", "127.0.0.1", "::1")))
+    )
+    if not ok and endpoint not in _REJECTED_EXPORT_ENDPOINTS:
+        _REJECTED_EXPORT_ENDPOINTS.add(endpoint)
+        logging.getLogger(__name__).warning(
+            "observability.conversation_export.endpoint is not an https URL to a named host "
+            "(or http to localhost) without credentials; the push sink stays off"
+        )
+    return ok
+
+
 def get_conversation_export_config() -> Optional[dict]:
     """Resolved ``observability.conversation_export`` block (design
     2026-09-08 §3.12, Task 11) — the settings the scheduler's
@@ -2408,6 +2446,8 @@ def get_conversation_export_config() -> Optional[dict]:
     """
     endpoint = str(get_value("observability", "conversation_export", "endpoint", default="") or "").strip()
     if not endpoint:
+        return None
+    if not _conversation_export_endpoint_is_acceptable(endpoint):
         return None
 
     raw_headers_env = get_value("observability", "conversation_export", "headers_secret_env", default=None)
