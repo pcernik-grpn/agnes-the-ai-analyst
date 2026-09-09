@@ -342,3 +342,25 @@ def test_content_export_mode_reads_the_config_per_call(monkeypatch):
     )
     assert cp.content_export_mode() == "full"
     assert cp.content_export_mode() == "off"
+
+
+@pytest.mark.parametrize("undated", ["", "   ", "last spring", "2026-13-45", "soon"])
+def test_a_mode_without_a_usable_approval_date_is_off(undated):
+    """Review finding: an approval with no date (or an unauditable one) used
+    to enable content export. WHEN consent was given is part of the record --
+    without it nothing can tell an approval granted for today's configuration
+    from one that predates it."""
+    p = cp.load_content_export_policy(
+        _cfg(mode="full", placement="operator", basis="DPA §4", approved_by="A. Person", approved_at=undated)
+    )
+    assert p.mode == "off" and p.requested_mode == "full"
+    assert any("approved_at" in w for w in p.warnings)
+
+
+@pytest.mark.parametrize("dated", ["2026-09-01", "2026-09-01T10:00:00", "2026-09-01T10:00:00+00:00"])
+def test_an_iso_date_or_datetime_is_accepted(dated):
+    p = cp.load_content_export_policy(
+        _cfg(mode="full", placement="operator", basis="DPA §4", approved_by="A. Person", approved_at=dated)
+    )
+    assert p.mode == "full" and p.approved_at == dated
+

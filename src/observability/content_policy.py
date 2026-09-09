@@ -73,6 +73,9 @@ DEPRECATED_ENV_VAR = "AGNES_OTEL_CAPTURE_CONTENT"
 WITHHELD = "[content withheld: pseudonymisation unavailable]"
 
 NO_BASIS_WARNING = "content export requested without a recorded basis; exporting sizes only"
+UNDATED_WARNING = (
+    "content export requested without a valid observability.content_export.approved_at date; exporting sizes only"
+)
 DEPRECATED_ENV_WARNING = f"{DEPRECATED_ENV_VAR} is deprecated and no longer enables content export on its own"
 
 #: One announce per process (the lifespan can run more than once in a test
@@ -115,6 +118,30 @@ def _text(value: Any) -> str:
     if value is True:
         return "on"
     return str(value).strip()
+
+
+def _is_a_date(value: str) -> bool:
+    """Whether ``approved_at`` reads as an ISO date (or datetime).
+
+    Deliberately narrow: this field exists to be compared with a date, and a
+    free-text "last spring" is exactly the kind of record that looks like
+    consent without being auditable.
+    """
+    text = (value or "").strip()
+    if not text:
+        return False
+    from datetime import date, datetime
+
+    try:
+        date.fromisoformat(text)
+        return True
+    except ValueError:
+        pass
+    try:
+        datetime.fromisoformat(text)
+        return True
+    except ValueError:
+        return False
 
 
 def _workloads(value: Any) -> tuple[tuple[str, ...], list[str], bool]:
@@ -211,6 +238,14 @@ def load_content_export_policy(config: Mapping[str, Any] | None = None) -> Conte
     # says so, so an operator can tell a typo from an omission.
     if mode != "off" and not (basis and approved_by and placement):
         warnings.append(NO_BASIS_WARNING)
+        mode = "off"
+    # WHEN consent was given is part of the record, not decoration: without a
+    # date nothing can tell an approval granted for today's configuration
+    # from one that predates it, and "who approved, on what basis" is only
+    # half an answer. An absent or unparseable date is therefore the same
+    # unfinished decision an absent basis is.
+    if mode != "off" and not _is_a_date(approved_at):
+        warnings.append(UNDATED_WARNING)
         mode = "off"
     if mode != "off" and placement not in PLACEMENTS:
         warnings.append(f"unknown observability.content_export.placement {placement!r}; exporting sizes only")

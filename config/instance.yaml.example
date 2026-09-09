@@ -420,7 +420,7 @@ auth:
 #                           # (T1 vs T2 in docs/observability.md)
 #     basis: ""             # the contract clause / DPA reference / "internal dev instance" that permits it
 #     approved_by: ""       # a person, never blank unless mode is off
-#     approved_at: ""       # ISO date
+#     approved_at: ""       # ISO date — required; an undated approval is off
 #     workloads: []         # allowlist of workloads whose content may leave;
 #                           # empty = every workload once mode is not off. An
 #                           # operator may open builder/corporate-memory

@@ -74,6 +74,10 @@
 - **BREAKING** Prompt and completion text now leaves the instance only under a recorded
   policy: `observability.content_export` in `instance.yaml` (`mode: off | pseudonymized |
   full`, `placement`, `basis`, `approved_by`, `approved_at`, `workloads`).
+  All four consent fields are required: a mode with no basis, no approver, no
+  placement or no usable `approved_at` date is treated as `off` and says so,
+  because an undated approval cannot be told apart from one that predates the
+  configuration it is supposed to cover.
   `AGNES_OTEL_CAPTURE_CONTENT` is now a deprecated alias that no longer enables
   content export on its own — a deployment that relied on it must add the policy
   record to keep exporting content. A mode without a recorded basis is treated as

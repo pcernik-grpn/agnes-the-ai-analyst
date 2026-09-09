@@ -678,7 +678,7 @@ observability:
     placement: operator  # operator | third_party
     basis: ""            # free text: contract clause, DPA reference, "internal dev instance"
     approved_by: ""      # a person, never blank unless off
-    approved_at: ""      # ISO date
+    approved_at: ""      # ISO date — required; an undated approval is `off`
     workloads: []        # allowlist; empty = every workload once mode != off
 ```
 
