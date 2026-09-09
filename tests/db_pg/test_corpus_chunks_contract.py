@@ -625,6 +625,30 @@ def test_reassign_file_corpus_unknown_file_is_zero(repo):
     assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]
 
 
+def test_reassign_file_corpus_expected_corpus_id_only_moves_rows_still_there(repo):
+    """``expected_corpus_id`` makes the write a compare-and-set.
+
+    The move endpoint compensates a failed move by putting the content back,
+    and an unconditional put-back is a race: a concurrent move of the same
+    file that SUCCEEDED would have its content dragged back to the original
+    source, recreating the leak in a request that did nothing wrong. Passing
+    the collection the caller expects the rows to be in makes the
+    compensation touch only the rows still belonging to its own attempt.
+    """
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "contested body"}])
+    repo.reassign_file_corpus(FILE_ID, "col_other_winner")
+
+    # Someone else already moved the rows on: a put-back that expects them
+    # under our own target must be a no-op.
+    assert repo.reassign_file_corpus(FILE_ID, CORPUS_ID, expected_corpus_id="col_our_target") == 0
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == ["col_other_winner"]
+
+    # Matching the actual current collection moves them.
+    assert repo.reassign_file_corpus(FILE_ID, CORPUS_ID, expected_corpus_id="col_other_winner") == 1
+    assert [r["corpus_id"] for r in repo.list_for_file(FILE_ID)] == [CORPUS_ID]
+
+
+
 # ---------------------------------------------------------------------------
 # Stored tsvector (migration 0114_corpus_chunks_tsv, PG-only — the DuckDB
 # sibling neither stores nor ranks, see its docstring)

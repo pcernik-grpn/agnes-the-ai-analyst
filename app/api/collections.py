@@ -1956,27 +1956,52 @@ class MoveFileBody(BaseModel):
     target_collection_id: str = Field(min_length=1)
 
 
-def _undo_content_move(file_id: str, source_corpus_id: str) -> None:
+def _undo_content_move(file_id: str, source_corpus_id: str, attempted_corpus_id: str) -> None:
     """Put a file's chunks (and claims) back under ``source_corpus_id``.
 
     Compensation for a move whose final file-row write failed after the
-    denormalized rows had already been repointed — see ``move_file``. Every
-    failure here is logged and swallowed: the caller is already receiving the
-    original error, and replacing it with a failure from the cleanup would
-    hide what actually broke.
+    denormalized rows had already been repointed — see ``move_file``.
+
+    Conditional on ``attempted_corpus_id``: only rows still sitting under the
+    target THIS attempt moved them to are reverted. An unconditional revert
+    would be a race — a concurrent move of the same file that SUCCEEDED in
+    the meantime would have its content dragged back to our source, leaving
+    the winner's file row in one collection and its body in another, which is
+    the leak this endpoint exists to close, recreated by the cleanup for it.
+
+    Every failure here is logged and swallowed: the caller is already
+    receiving the original error, and replacing it with a failure from the
+    cleanup would hide what actually broke. A cleanup that fails leaves a
+    split the log names in full (file, both collections) so it can be
+    reconciled by hand; it is not silently reported as restored, because the
+    request still fails.
     """
     try:
-        corpus_chunks_repo().reassign_file_corpus(file_id, source_corpus_id)
+        corpus_chunks_repo().reassign_file_corpus(file_id, source_corpus_id, expected_corpus_id=attempted_corpus_id)
     except Exception as e:  # pragma: no cover - defensive
-        logger.error("move_file: could not restore chunks for %s to %s: %s", file_id, source_corpus_id, e)
+        logger.error(
+            "move_file: INCONSISTENT — chunks for file_id=%s may still be under %s while the file row is in %s "
+            "(restore failed: %s)",
+            file_id,
+            attempted_corpus_id,
+            source_corpus_id,
+            e,
+        )
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
 
-        facts_repo().reassign_file_corpus(file_id, source_corpus_id)
+        facts_repo().reassign_file_corpus(file_id, source_corpus_id, expected_corpus_id=attempted_corpus_id)
     except RequiresPostgresBackend:
         pass
     except Exception as e:  # pragma: no cover - defensive
-        logger.warning("move_file: could not restore claims for %s to %s: %s", file_id, source_corpus_id, e)
+        logger.error(
+            "move_file: INCONSISTENT — claims for file_id=%s may still be under %s while the file row is in %s "
+            "(restore failed: %s)",
+            file_id,
+            attempted_corpus_id,
+            source_corpus_id,
+            e,
+        )
 
 
 @router.post("/{collection_id}/files/{file_id}/move")
@@ -2081,10 +2106,10 @@ async def move_file(
     try:
         moved = cf_repo.move_to_corpus(file_id, target_id)
     except Exception:
-        _undo_content_move(file_id, collection_id)
+        _undo_content_move(file_id, collection_id, target_id)
         raise
     if not moved:
-        _undo_content_move(file_id, collection_id)
+        _undo_content_move(file_id, collection_id, target_id)
         raise HTTPException(status_code=404, detail="file_not_found")
 
     source_emptied = False

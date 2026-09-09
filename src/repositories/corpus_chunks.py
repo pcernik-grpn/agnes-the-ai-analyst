@@ -131,7 +131,9 @@ class CorpusChunksRepository:
         """Remove all chunks for the given file (idempotent)."""
         self.conn.execute("DELETE FROM corpus_chunks WHERE file_id = ?", [file_id])
 
-    def reassign_file_corpus(self, file_id: str, target_corpus_id: str) -> int:
+    def reassign_file_corpus(
+        self, file_id: str, target_corpus_id: str, *, expected_corpus_id: Optional[str] = None
+    ) -> int:
         """Repoint one file's chunks at the collection it now lives in; return
         the count.
 
@@ -146,13 +148,22 @@ class CorpusChunksRepository:
         collection-consolidation path re-homes chunks the same way, in bulk.
         Unknown file → 0.
 
+        ``expected_corpus_id`` turns the write into a compare-and-set: only
+        rows currently in that collection move. The move endpoint's
+        compensation path needs it — putting content back unconditionally
+        would drag back rows a CONCURRENT, successful move of the same file
+        has since claimed, recreating the leak in a request that did nothing
+        wrong.
+
         Counted via ``RETURNING`` rather than ``rowcount``: DuckDB's DBAPI
         ``rowcount`` is ``-1`` for DML.
         """
-        moved = self.conn.execute(
-            "UPDATE corpus_chunks SET corpus_id = ? WHERE file_id = ? RETURNING id",
-            [target_corpus_id, file_id],
-        ).fetchall()
+        sql = "UPDATE corpus_chunks SET corpus_id = ? WHERE file_id = ?"
+        params: List[Any] = [target_corpus_id, file_id]
+        if expected_corpus_id is not None:
+            sql += " AND corpus_id = ?"
+            params.append(expected_corpus_id)
+        moved = self.conn.execute(sql + " RETURNING id", params).fetchall()
         return len(moved)
 
     # ------------------------------------------------------------------

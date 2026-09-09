@@ -1177,6 +1177,70 @@ def test_move_file_file_row_failure_puts_the_content_back(seeded_app, monkeypatc
     assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [dst_id]
 
 
+def test_move_file_rollback_never_undoes_a_concurrent_successful_move(seeded_app, monkeypatch):
+    """A failed move's compensation must not drag back content that a
+    concurrent, SUCCESSFUL move of the same file has since claimed.
+
+    Two moves of one file overlap: ours re-homes the content, then its
+    file-row write fails; in that window the other request completes to a
+    different collection. Putting the content back unconditionally would
+    leave the file under the winner with its body under our source — the
+    exact leak this endpoint exists to close, produced by the cleanup for it.
+    The compensation is a compare-and-set: it reverts only rows still under
+    the target of the attempt that failed.
+    """
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    c = seeded_app["client"]
+    admin = _auth(seeded_app["admin_token"])
+    src_id = c.post("/api/collections", json={"name": "Race Src"}, headers=admin).json()["id"]
+    mine_id = c.post("/api/collections", json={"name": "Race Mine"}, headers=admin).json()["id"]
+    winner_id = c.post("/api/collections", json={"name": "Race Winner"}, headers=admin).json()["id"]
+    fid = corpus_files_repo().add(
+        corpus_id=src_id,
+        filename="contested.txt",
+        sha256="s",
+        file_type="txt",
+        size_bytes=1,
+        storage_path=None,
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": src_id, "file_id": fid, "ordinal": 0, "text": "contested body"}])
+
+    real_files_repo = corpus_files_repo
+
+    def _losing_files_repo():
+        repo = real_files_repo()
+
+        class _Boom:
+            def __getattr__(self, name):
+                if name == "move_to_corpus":
+
+                    def _fail(*_a, **_kw):
+                        # The competing request completes while we are here.
+                        corpus_chunks_repo().reassign_file_corpus(fid, winner_id)
+                        repo.move_to_corpus(fid, winner_id)
+                        raise RuntimeError("simulated file-row move failure")
+
+                    return _fail
+                return getattr(repo, name)
+
+        return _Boom()
+
+    monkeypatch.setattr("app.api.collections.corpus_files_repo", _losing_files_repo)
+    with pytest.raises(RuntimeError, match="simulated file-row move failure"):
+        c.post(
+            f"/api/collections/{src_id}/files/{fid}/move",
+            json={"target_collection_id": mine_id},
+            headers=admin,
+        )
+
+    # The winner's move stands whole — file and body together, nothing of it
+    # left under the source our failed attempt started from.
+    assert corpus_files_repo().get(fid)["corpus_id"] == winner_id
+    assert [ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(fid)] == [winner_id]
+    assert corpus_chunks_repo().list_for_corpus(src_id) == []
+
+
 def test_create_collection_non_alphanumeric_name_gets_fallback_slug(seeded_app):
     """A name with no alphanumerics must not yield an empty slug."""
     c = seeded_app["client"]

@@ -129,15 +129,20 @@ class CorpusChunksPgRepository:
                 {"file_id": file_id},
             )
 
-    def reassign_file_corpus(self, file_id: str, target_corpus_id: str) -> int:
+    def reassign_file_corpus(
+        self, file_id: str, target_corpus_id: str, *, expected_corpus_id: Optional[str] = None
+    ) -> int:
         """Repoint one file's chunks at the collection it now lives in; return
-        the count. See the DuckDB twin for why the column must follow the file.
+        the count. See the DuckDB twin for why the column must follow the file,
+        and what ``expected_corpus_id`` (a compare-and-set) is for.
         """
+        sql = "UPDATE corpus_chunks SET corpus_id = :target WHERE file_id = :file_id"
+        params: Dict[str, Any] = {"target": target_corpus_id, "file_id": file_id}
+        if expected_corpus_id is not None:
+            sql += " AND corpus_id = :expected"
+            params["expected"] = expected_corpus_id
         with self._engine.begin() as conn:
-            res = conn.execute(
-                sa.text("UPDATE corpus_chunks SET corpus_id = :target WHERE file_id = :file_id"),
-                {"target": target_corpus_id, "file_id": file_id},
-            )
+            res = conn.execute(sa.text(sql), params)
             return int(res.rowcount or 0)
 
     # ------------------------------------------------------------------
