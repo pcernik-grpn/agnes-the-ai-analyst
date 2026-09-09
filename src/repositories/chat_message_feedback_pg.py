@@ -154,3 +154,43 @@ class ChatMessageFeedbackPgRepository:
         for r in rows:
             out.setdefault(r["session_id"], []).append(dict(r))
         return out
+
+    def session_ids_updated_between(self, since: datetime, until: datetime, *, limit: int = 500) -> list[str]:
+        """Distinct ``session_id``s whose feedback changed in ``[since, until)``
+        -- the conversation-corpus push sink's "late feedback" aux sweep
+        (design 2026-09-08 §3.12, push-sink defect fix): a thumbs-up/down
+        landing after its conversation already settled and was delivered
+        never moves the sink's MAIN watermark (that one tracks
+        ``chat_sessions.last_message_at``, which a feedback write never
+        touches), so this read is what lets a SECOND watermark catch it and
+        re-deliver the record with the feedback included.
+
+        ``updated_at``, not ``created_at``, is the change signal:
+        :meth:`upsert` refreshes ``updated_at`` on BOTH a first submit and a
+        later verdict/comment change, while ``created_at`` only ever
+        reflects the FIRST submit -- a verdict flip after the fact would
+        never surface here on ``created_at`` alone.
+
+        Grouped (not a raw row scan) so one session with several feedback
+        writes in the window still yields ONE id; ordered by each session's
+        latest write ascending so a capped page is deterministic. Capped at
+        ``limit``, not paginated -- the caller advances its own watermark to
+        the window's ``until`` regardless of whether the cap was hit, which
+        is a deliberate simplification (see the caller's docstring) rather
+        than a full resumable walk: this is a bounded aux sweep riding beside
+        the main keyset walk, not a second one.
+        """
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT session_id, MAX(updated_at) AS latest FROM chat_message_feedback "
+                        "WHERE updated_at >= :since AND updated_at < :until "
+                        "GROUP BY session_id ORDER BY latest ASC, session_id ASC LIMIT :limit"
+                    ),
+                    {"since": since, "until": until, "limit": limit},
+                )
+                .mappings()
+                .all()
+            )
+        return [r["session_id"] for r in rows]

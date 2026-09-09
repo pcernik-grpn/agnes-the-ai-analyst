@@ -932,12 +932,32 @@ unset the scheduler has no such row at all. The same content-export policy
 gates it: when the policy is `off`, has no recorded basis, or excludes the
 `chat` workload, the job sends nothing and leaves the watermark alone
 (warned once per process, not once per tick). Audited as
-`conversations.export` with `delivery: "push"`, `count` and
+`conversations.export` with `delivery: "push"`, `count`, `refreshed` and
 `endpoint_host` — never headers, never content. A run that fails
 unexpectedly mid-walk is caught, logged, and audited with
 `result: "failed"` and the exception's class name (never its message) —
 the job itself never raises. On a DuckDB-backed instance the job is a
 clean no-op.
+
+The main watermark only ever advances past a `chat_sessions` row once, so a
+thumbs-up/down (or a comment edit) filed on a turn AFTER its conversation
+was already delivered would otherwise sit in `chat_message_feedback`
+forever with nothing that ever revisits it — the delivered record's
+`feedback_json` would stay empty for good. After the main walk, the same
+run additionally sweeps for the session ids whose feedback changed since
+the last sweep and re-delivers just those records through the identical
+builder/batching/retry path (`refreshed` in the audit row, separate from
+`count`) — the destination already upserts by `thread_id`, so a
+re-delivered record simply replaces the stale one. This aux sweep tracks
+its own, coarser watermark (same `export_watermarks` table, one row per
+delivery configuration, suffixed `:feedback`) and is capped at 500 session
+ids per run rather than paginated, so a burst of feedback wider than that
+in one window leaves stragglers for the window after. A session the main
+walk already delivered in the same run is never swept twice — its feedback
+at query time already rode along in that record. Memory-status changes
+(`agent_memories`) are NOT covered by this sweep: that table has no single
+"last changed" timestamp column to sweep on, only separate
+`created_at`/`activated_at`/`archived_at` markers for each lifecycle step.
 
 ## No telemetry vendor
 

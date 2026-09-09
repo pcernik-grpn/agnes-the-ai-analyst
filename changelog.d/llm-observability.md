@@ -57,7 +57,11 @@
   its host too. A single conversation whose own line exceeds the 8 MiB batch
   cap is still offered to the destination, and only a refusal is stepped
   over and counted, so an outsized transcript is neither dropped unasked nor
-  able to block every conversation behind it. A run that fails mid-walk is audited as
+  able to block every conversation behind it. A thumbs verdict that lands
+  after a conversation was delivered re-sends that record on the next tick
+  (a second, coarser watermark tracks feedback changes; up to 500 sessions a
+  run, counted as `refreshed`), so the corpus's quality signal is not frozen
+  at export time. A run that fails mid-walk is audited as
   failed, never raised into the worker. Migration `0116_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and

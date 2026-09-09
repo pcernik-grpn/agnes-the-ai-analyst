@@ -8,7 +8,7 @@ on-instance from what the instance already keeps (``chat_sessions``,
 ``chat_messages``, ``llm_calls``, ``chat_message_feedback``,
 ``agent_memories``), for "why are the answers bad, at scale".
 
-Three functions, kept pure of any repository/HTTP concern so they are
+Four functions, kept pure of any repository/HTTP concern so they are
 testable without a database:
 
 - :func:`build_conversation_record` — one session's data in, the spec 3.12
@@ -19,6 +19,11 @@ testable without a database:
   per-session record assembly. Takes a :class:`ConversationExportRepoBundle`
   so the caller (the API route) supplies real repos and the tests supply
   fakes.
+- :func:`records_for_session_ids` — the same bulk reads and per-session
+  assembly as :func:`iter_conversations`, but for an explicit list of
+  session ids rather than a ``(since, until)`` keyset page — the push
+  sink's "late feedback" aux sweep uses this to re-export a conversation
+  that already scrolled past the main walk once its feedback changes.
 - :func:`serialize_jsonl` — records to newline-delimited JSON bytes, for
   ``StreamingResponse``.
 
@@ -563,6 +568,77 @@ def iter_conversations(
     return records, next_cursor, keys
 
 
+def records_for_session_ids(
+    repo_bundle: ConversationExportRepoBundle,
+    session_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Records for an explicit list of session ids, built through the exact
+    same bulk reads + :func:`build_conversation_record` call as
+    :func:`iter_conversations`'s per-page loop -- the push sink's "late
+    feedback" aux sweep's read path (design 2026-09-08 §3.12, push-sink
+    defect fix). A session that already scrolled past the main keyset walk
+    still needs to be re-exported when its feedback changes long after it
+    settled, and that has nothing to do with ``chat_sessions.last_message_at``
+    or any keyset position -- so this takes ids directly rather than a
+    ``(since, until)`` window.
+
+    A session id no longer resolvable (e.g. hard-deleted between the aux
+    sweep's query and this read) is skipped rather than raising -- the
+    delivered corpus simply does not carry it, same as it never carried a
+    session deleted before its first export.
+    """
+    ids = list(dict.fromkeys(session_ids))  # de-dup, keep first-seen order
+    if not ids:
+        return []
+
+    sessions_by_id: dict[str, Any] = {}
+    for sid in ids:
+        session = repo_bundle.sessions.get_session(sid)
+        if session is not None:
+            sessions_by_id[sid] = session
+    resolved_ids = list(sessions_by_id.keys())
+    if not resolved_ids:
+        return []
+
+    messages_by_session = repo_bundle.messages.list_for_sessions(resolved_ids)
+    totals_by_session = repo_bundle.calls.totals_for_sessions(resolved_ids)
+    statuses_by_session = repo_bundle.calls.statuses_for_sessions(resolved_ids)
+    feedback_by_session = repo_bundle.feedback.list_for_sessions(resolved_ids)
+    memories_by_session = repo_bundle.memories.list_for_sessions(resolved_ids)
+
+    records: list[dict[str, Any]] = []
+    for sid in resolved_ids:
+        session = sessions_by_id[sid]
+        surface = getattr(session, "surface", None)
+        session_view = {
+            "id": sid,
+            # `.value`: `get_session` returns the `ChatSession` dataclass, whose
+            # `surface` is an `app.chat.types.Surface` (str+Enum) -- `iter_conversations`
+            # instead reads a plain string off a raw SQL row. Both serialize to the
+            # same JSON text either way (Surface IS a str), but normalizing here keeps
+            # this function's output shape identical to that one's, not merely
+            # equal under `==`.
+            "surface": getattr(surface, "value", surface),
+            "agent_id": getattr(session, "agent_id", None),
+            "user_id": _resolve_user_id(repo_bundle, getattr(session, "user_email", None)),
+        }
+        messages = _messages_to_dicts(messages_by_session.get(sid, []))
+        calls = None
+        if sid in totals_by_session:
+            calls = {**totals_by_session[sid], **statuses_by_session.get(sid, {})}
+        record = build_conversation_record(
+            session_view,
+            messages,
+            calls,
+            feedback_by_session.get(sid, []),
+            memories_by_session.get(sid, []),
+            content_mode=repo_bundle.content_mode,
+            anonymizer=repo_bundle.anonymizer,
+        )
+        records.append(record)
+    return records
+
+
 def serialize_jsonl(records: Iterable[Mapping[str, Any]]) -> Iterator[bytes]:
     """Records -> newline-delimited JSON bytes, one line per record — the
     shape ``StreamingResponse`` streams for the default ``format=jsonl``."""
@@ -577,5 +653,6 @@ __all__ = [
     "decode_cursor",
     "encode_cursor",
     "iter_conversations",
+    "records_for_session_ids",
     "serialize_jsonl",
 ]

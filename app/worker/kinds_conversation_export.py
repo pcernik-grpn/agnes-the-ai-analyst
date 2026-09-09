@@ -26,6 +26,33 @@ what makes a run's first page and a run's Nth page (and the FIRST page of
 the NEXT run) all resume identically, and is what stops the trailing
 conversation of a run from being re-sent on every subsequent tick.
 
+**A second, coarser watermark sweeps feedback that lands late.** The main
+keyset walk above only ever advances past a ``chat_sessions`` row once, so
+a thumbs-up/down (or a comment edit) filed AFTER a conversation was already
+delivered would sit in ``chat_message_feedback`` forever with no cursor
+that ever revisits it -- the delivered record's ``feedback_json`` would
+stay empty for good. After the main walk, this job additionally sweeps
+:func:`src.repositories.chat_message_feedback_pg.ChatMessageFeedbackPgRepository.
+session_ids_updated_between` for the ids whose feedback changed since the
+LAST aux sweep, re-builds and re-POSTs just those records (through the
+exact same :func:`src.conversation_export.records_for_session_ids` builder,
+batching and retry path -- the destination already upserts by
+``thread_id``, so a re-delivered record simply replaces the stale one),
+and only then advances a SECOND watermark row
+(:func:`feedback_watermark_name` -- the same ``export_watermarks`` table,
+one row per delivery configuration, suffixed ``:feedback`` so it never
+collides with the main one) to this run's feedback-sweep upper bound. A
+session the main walk already delivered in the SAME run is skipped here --
+its feedback (whatever existed at query time) was already read into that
+record by the same bulk ``feedback.list_for_sessions`` call every record
+build uses. The sweep is capped (:data:`FEEDBACK_SWEEP_LIMIT` ids per run)
+rather than paginated: a burst of feedback wider than the cap in one window
+leaves stragglers for the window after, a deliberate simplification over a
+second full resumable walk. Memory-status changes (``agent_memories``) are
+NOT covered by this sweep: that table has no single ``updated_at`` column
+-- only ``created_at``/``activated_at``/``archived_at`` -- so there is no
+one timestamp to sweep on without a migration, out of scope for this fix.
+
 **``surfaces`` is pushed into the query, not filtered after the fact.**
 ``observability.conversation_export.surfaces`` reaches
 ``list_completed_between``'s own ``surface = ANY(...)`` clause via
@@ -124,7 +151,13 @@ from urllib.parse import urlsplit
 import httpx
 
 from src.audit_helpers import log_safe
-from src.conversation_export import ConversationExportRepoBundle, encode_cursor, iter_conversations, serialize_jsonl
+from src.conversation_export import (
+    ConversationExportRepoBundle,
+    encode_cursor,
+    iter_conversations,
+    records_for_session_ids,
+    serialize_jsonl,
+)
 from src.observability.content_policy import content_export_mode, export_text, load_content_export_policy
 from src.observability.otel import parse_otlp_headers
 
@@ -163,6 +196,12 @@ HTTP_TIMEOUT_S = 30.0
 #: batches once the byte cap is applied).
 PAGE_LIMIT = 200
 
+#: Cap on how many session ids the "late feedback" aux sweep re-exports in
+#: one run — see the module docstring's "second, coarser watermark"
+#: paragraph. Independent of PAGE_LIMIT: this walks `chat_message_feedback`
+#: by change timestamp, never `chat_sessions` by keyset.
+FEEDBACK_SWEEP_LIMIT = 500
+
 #: A watermark-less first run exports every conversation ever held —
 #: deliberate: this is an opt-in feature (an operator must set an
 #: ``endpoint``), so a first run backfilling the whole transcript is the
@@ -183,6 +222,18 @@ def watermark_name(endpoint: str, surfaces: tuple[str, ...]) -> str:
     """
     digest = hashlib.sha256(f"{endpoint}\n{','.join(sorted(surfaces))}".encode()).hexdigest()[:16]
     return f"{WATERMARK_PREFIX}:{digest}"
+
+
+def feedback_watermark_name(endpoint: str, surfaces: tuple[str, ...]) -> str:
+    """The "late feedback" aux sweep's own ``export_watermarks.name`` row --
+    a thin wrapper around :func:`watermark_name` (same endpoint+surfaces
+    identity, same reasoning for why it changes when either does), suffixed
+    ``:feedback`` purely so the two cursors for one delivery configuration
+    never collide in the shared table. Kept as a wrapper -- never a second,
+    independent hash -- so the two names can never drift on how the base
+    identity is derived.
+    """
+    return f"{watermark_name(endpoint, surfaces)}:feedback"
 
 
 #: One warning per process for "policy excludes workload chat" — the
@@ -269,6 +320,13 @@ def _resolve_headers(headers_secret_env: str | None) -> dict[str, str]:
 #: (from the underlying ``chat_sessions`` row) it was built from.
 _RecordAndKey = tuple[dict[str, Any], tuple[datetime, str]]
 
+#: One `_batches` item generically — `Any` (not a `TypeVar`, deliberately:
+#: PEP 695 generic-function syntax needs Python 3.12, this repo still
+#: supports 3.11) so the aux "late feedback" sweep, which has no keyset
+#: position at all, can reuse the exact same record-count/byte-size split
+#: logic with a bare `None` key instead of duplicating it.
+_BatchItem = tuple[dict[str, Any], Any]
+
 
 def _records(
     bundle: ConversationExportRepoBundle,
@@ -299,7 +357,7 @@ def _records(
         cursor = next_cursor
 
 
-def _batches(items: Iterable[_RecordAndKey]) -> Iterator[list[_RecordAndKey]]:
+def _batches(items: Iterable[_BatchItem]) -> Iterator[list[_BatchItem]]:
     """Split an ordered (record, key) stream into outbound batches of at
     most :data:`MAX_BATCH_RECORDS` records or :data:`MAX_BATCH_BYTES`
     (whichever is hit first) — batch boundaries, not page boundaries,
@@ -307,9 +365,12 @@ def _batches(items: Iterable[_RecordAndKey]) -> Iterator[list[_RecordAndKey]]:
     whose own serialized line already exceeds the byte cap is yielded
     alone — spec 3.12 says this export is "complete, never truncated", so
     there is no smaller unit to split it into, and the run loop, not this
-    splitter, decides what to do with an over-contract line.
+    splitter, decides what to do with an over-contract line. The key half of
+    each item is untyped (:data:`_BatchItem`) purely so the aux "late
+    feedback" sweep — which has no keyset position, only a bare record — can
+    reuse this with ``None`` keys rather than duplicating the split logic.
     """
-    batch: list[_RecordAndKey] = []
+    batch: list[_BatchItem] = []
     batch_bytes = 0
     for item in items:
         record, _key = item
@@ -365,6 +426,72 @@ def _post_with_retry(
                 continue
         return response
     return response
+
+
+def _sweep_feedback_updates(
+    *,
+    bundle: ConversationExportRepoBundle,
+    feedback_repo: Any,
+    watermark_repo: Any,
+    endpoint: str,
+    surfaces: tuple[str, ...],
+    exclude: set[str],
+    http_client: httpx.Client,
+    headers: dict[str, str],
+    sleep: Callable[[float], None],
+) -> tuple[int, bool]:
+    """The "late feedback" aux sweep — see the module docstring's "second,
+    coarser watermark" paragraph. Runs AFTER the main keyset walk, in the
+    same job invocation, never as a redesign of it.
+
+    Unlike the main walk's ``until`` (deliberately settle-window-lagged so
+    a session mid-turn is never exported half-done), a feedback row has no
+    such ambiguity — :meth:`ChatMessageFeedbackPgRepository.upsert` commits
+    it in one transaction, never half-written — so this sweeps all the way
+    up to a fresh ``now``, not the main walk's lagged ``until``.
+
+    ``exclude`` is the set of session ids the main walk already delivered
+    in THIS run: their feedback (whatever existed at query time) already
+    rode along in that record via the same bulk ``feedback.list_for_sessions``
+    read every record build uses, so re-sending them here would just be a
+    wasted duplicate POST for the same ``thread_id``.
+
+    Returns ``(refreshed, failed)`` — the count of records actually
+    delivered (for the audit params' ``refreshed`` figure), and whether any
+    batch failed (so the caller can fold it into the run's overall
+    ``result``, the same "partial" outcome a failed MAIN batch produces).
+    """
+    name = feedback_watermark_name(endpoint, surfaces)
+    watermark = watermark_repo.get(name)
+    since = watermark[0] if watermark is not None else _EPOCH
+    until = datetime.now(UTC)
+    if not since < until:
+        return 0, False
+
+    session_ids = [
+        sid
+        for sid in feedback_repo.session_ids_updated_between(since, until, limit=FEEDBACK_SWEEP_LIMIT)
+        if sid not in exclude
+    ]
+    if not session_ids:
+        watermark_repo.set(name, until, "-")
+        return 0, False
+
+    records = records_for_session_ids(bundle, session_ids)
+    refreshed = 0
+    for batch in _batches((record, None) for record in records):
+        body = b"".join(serialize_jsonl(record for record, _key in batch))
+        response = _post_with_retry(http_client, endpoint, headers, body, sleep=sleep)
+        if response is None or not (200 <= response.status_code < 300):
+            logger.warning(
+                "conversation-export: feedback-refresh batch of %d record(s) failed to deliver -- "
+                "aux watermark not advanced, will retry from here next run",
+                len(batch),
+            )
+            return refreshed, True
+        refreshed += len(batch)
+    watermark_repo.set(name, until, "-")
+    return refreshed, False
 
 
 def run_conversation_export_once(
@@ -458,6 +585,9 @@ def run_conversation_export_once(
     batches_sent = 0
     batches_failed = 0
     oversized_skipped = 0
+    refreshed = 0
+    aux_failed = False
+    delivered_this_run: set[str] = set()
     exc_class: str | None = None
     try:
         for batch in _batches(_records(bundle, since=since, until=until, surfaces=surfaces, start_cursor=start_cursor)):
@@ -489,6 +619,11 @@ def run_conversation_export_once(
                 )
                 oversized_skipped += 1
                 watermark_repo.set(name, last_ts, last_id)
+                # Excluded from the aux sweep below for this run too: the
+                # destination just refused this exact record, and offering
+                # it again in the same tick because a thumb arrived on it
+                # would only collect the same refusal.
+                delivered_this_run.add(last_id)
                 continue
             if response is None or not (200 <= response.status_code < 300):
                 logger.warning(
@@ -500,8 +635,26 @@ def run_conversation_export_once(
                 break
             last_ts, last_id = batch[-1][1]
             watermark_repo.set(name, last_ts, last_id)
+            delivered_this_run.update(key[1] for _record, key in batch)
             total_sent += len(batch)
             batches_sent += 1
+
+        # Late-feedback aux sweep -- see the module docstring's "second,
+        # coarser watermark" paragraph. Runs regardless of whether the main
+        # walk above sent anything this tick; only skipped when the main
+        # walk itself raised (the `except` below then marks the whole run
+        # failed, same as before this sweep existed).
+        refreshed, aux_failed = _sweep_feedback_updates(
+            bundle=bundle,
+            feedback_repo=repos["feedback"],
+            watermark_repo=watermark_repo,
+            endpoint=endpoint,
+            surfaces=surfaces,
+            exclude=delivered_this_run,
+            http_client=http_client,
+            headers=headers,
+            sleep=sleep,
+        )
     except Exception as exc:
         exc_class = type(exc).__name__
         logger.exception("conversation-export: unexpected failure mid-walk, run marked failed")
@@ -514,6 +667,7 @@ def run_conversation_export_once(
         "until": until.isoformat(),
         "count": total_sent,
         "oversized_skipped": oversized_skipped,
+        "refreshed": refreshed,
         "content_mode": mode,
         "placement": load_content_export_policy().placement,
         "delivery": "push",
@@ -536,7 +690,7 @@ def run_conversation_export_once(
         action="conversations.export",
         resource="conversations:export",
         params=base_params,
-        result="success" if batches_failed == 0 else "partial",
+        result="success" if batches_failed == 0 and not aux_failed else "partial",
         client_kind="scheduler",
     )
 
@@ -545,6 +699,7 @@ def run_conversation_export_once(
         "batches": batches_sent,
         "batches_failed": batches_failed,
         "oversized_skipped": oversized_skipped,
+        "refreshed": refreshed,
     }
 
 
