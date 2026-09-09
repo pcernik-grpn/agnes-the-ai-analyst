@@ -1190,8 +1190,9 @@ def register_foundation_tools(
         `candidates_capped: true` (present only when true) means more
         readable names matched `q` than the server ranks per call — the
         page holds the best-ranked matches, not all of them, so narrow `q`
-        (a longer or more specific name) or add `type`/`filters` before
-        concluding something is absent; `claims_truncated` (only with
+        (a longer or more specific name) or add `type` before concluding
+        something is absent; `filters` are evaluated AFTER that cap and
+        cannot reach a match it excluded; `claims_truncated` (only with
         `include_claims`) means the inline budget ran out part-way. A search
         that outlives the server's statement timeout errors with the same
         next step (narrow `q`, add `type`, lower `limit`) instead of a raw

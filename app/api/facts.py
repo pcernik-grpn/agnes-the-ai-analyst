@@ -220,7 +220,9 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     additional matches; the additive `candidates_capped: true` (present only
     when true) says more readable names matched `q` than the server ranks
     per call, so the page is the best-ranked matches and the caller should
-    narrow `q`. A search that outlives the server's statement timeout
+    narrow `q` or add `type` (`filters` are evaluated after that cap and
+    cannot reach a match it excluded). A search that outlives the server's
+    statement timeout
     answers `504 {"reason": "facts_search_timeout", "hint": ...}` with the
     next step, never the raw database error.
     """

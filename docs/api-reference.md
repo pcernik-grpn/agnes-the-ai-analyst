@@ -3489,9 +3489,11 @@ similarity ranking; this schema does not enable one). The candidate set a
 `q` search ranks is bounded (500 readable name matches per call, selected
 in rank order so the page is always the best-ranked visible matches); when
 more readable names match than that, the response carries the additive
-`candidates_capped: true` — narrow `q` rather than reading the page as
-complete. `limit_applied` keeps its own meaning (the caller's OWN visible
-set exceeds `limit`). A search that outlives the server's statement
+`candidates_capped: true` — narrow `q` or add `type` rather than reading the
+page as complete; visibility and attribute `filters` are evaluated after the
+cap, so a capped page can be short or empty while matches exist beyond it,
+and `filters` alone cannot widen it. `limit_applied` keeps its own meaning
+(the caller's OWN visible set exceeds `limit`). A search that outlives the server's statement
 timeout answers `504 {"reason": "facts_search_timeout", "hint": ...}` with
 the next step (narrow `q`, add `type`, lower `limit`), never the raw
 database error. All three request models are `extra="forbid"`

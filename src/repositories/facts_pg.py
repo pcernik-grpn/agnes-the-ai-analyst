@@ -2300,7 +2300,13 @@ class FactsPgRepository:
         ranked visible match; only when more readable aliases match than the
         cap admits can lower-ranked visible facts be missing, and that call
         carries the additive ``candidates_capped: true`` so the caller
-        narrows ``q`` rather than reading the page as complete. Both the
+        narrows ``q`` (or adds ``type``, which is applied BEFORE the cap)
+        rather than reading the page as complete. Visibility and the
+        attribute ``filters`` are evaluated on the capped set — deliberately,
+        the visibility gate over ``claims`` is the join that exploded — so a
+        capped page can be shorter than ``limit`` or empty while matches
+        exist beyond the cap; that is exactly the case the flag names, and
+        ``filters`` alone can never widen it. Both the
         match and the cap count READABLE (or revealed) aliases only — the
         same restriction S9 puts on the match itself — so neither can leak
         how many restricted names match. ``limit_applied`` keeps its own

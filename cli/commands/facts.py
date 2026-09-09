@@ -74,6 +74,20 @@ def _format_attrs(attrs: Optional[dict]) -> str:
     return "; ".join(parts)
 
 
+def _echo_candidates_capped_note() -> None:
+    """`candidates_capped: true` — the server ranked only the best N name
+    matches for QUERY (a bounded candidate set, see `FactsPgRepository.search`),
+    so the page is the best-ranked subset, not every match. Visibility and
+    `--filter` are evaluated AFTER that cap, so a filter cannot reach a match
+    the cap excluded — only a narrower QUERY or a different TYPE can."""
+    typer.echo(
+        "(more names match QUERY than the server ranks per call — this is the best-ranked subset, not every "
+        "match; narrow QUERY to a longer or more specific name, or pick a narrower TYPE. --filter is applied "
+        "after that cap and cannot widen it)",
+        err=True,
+    )
+
+
 @facts_app.command("search")
 def search_facts(
     fact_type: str = typer.Argument(..., metavar="TYPE", help="Subject type to search (e.g. 'person', 'engagement')"),
@@ -122,11 +136,18 @@ def search_facts(
         return
 
     subjects = data.get("subjects", [])
+    capped = bool(data.get("candidates_capped"))
     if not subjects:
         typer.echo(f"No facts found for type '{fact_type}'{f' matching {q!r}' if q else ''}.")
-        typer.echo(
-            "Try a different QUERY or --filter, or drop them entirely to see everything of this type you can read."
-        )
+        if capped:
+            # Devin finding on #2377: an empty page is NOT "no matches" when
+            # the server capped the name match — say so here too, never only
+            # on the non-empty branch.
+            _echo_candidates_capped_note()
+        else:
+            typer.echo(
+                "Try a different QUERY or --filter, or drop them entirely to see everything of this type you can read."
+            )
         return
 
     typer.echo(f"{'ID':20s}  {'TYPE':14s}  {'CLAIMS':6s}  {'QUOTES':6s}  ATTRS")
@@ -136,12 +157,8 @@ def search_facts(
             f"{s['id']:20s}  {s['type']:14s}  {s.get('claim_count', 0):<6d}  "
             f"{s.get('quote_count', 0):<6d}  {_format_attrs(s.get('attrs'))}{marker}"
         )
-    if data.get("candidates_capped"):
-        typer.echo(
-            "(more names match QUERY than the server ranks per call — this is the best-ranked subset, "
-            "not every match; narrow QUERY to a longer or more specific name, or add --filter)",
-            err=True,
-        )
+    if capped:
+        _echo_candidates_capped_note()
     if data.get("limit_applied"):
         typer.echo(
             f"(showing the first {limit} of YOUR visible results — raise --limit for more; "
