@@ -658,6 +658,19 @@ class CorpusChunksPgRepository:
             "per_term": per_term,
             **scope_params,
         }
+        # The exclusion belongs INSIDE every bounded leg, not only outside
+        # the union. Every row the all-terms pass already returned also
+        # satisfies these predicates, so a leg that filters afterwards spends
+        # part of its own ``LIMIT`` re-selecting rows the outer clause then
+        # throws away: the top-up comes back short of the window while
+        # unread matches remain, and the caller reads a short result as "the
+        # scan was not capped". Same fail-quiet shape as the under-fill this
+        # leg was added to fix, one level down. (Devin Review on #2420.)
+        exclude_leg_sql = ""
+        if exclude_ids:
+            exclude_leg_sql = " AND id <> ALL(:exclude_ids) "
+            params["exclude_ids"] = exclude_ids
+
         legs = []
         for i, term in enumerate(terms):
             params[f"t{i}"] = term
@@ -665,7 +678,7 @@ class CorpusChunksPgRepository:
                 "(SELECT id, tsv, text FROM corpus_chunks "
                 " WHERE corpus_id = ANY(:corpus_ids) "
                 f"  AND to_tsvector('{_FTS_CONFIG}', text) @@ plainto_tsquery('{_FTS_CONFIG}', :t{i}) "
-                f"  {scope_sql} "
+                f"  {scope_sql} {exclude_leg_sql} "
                 " LIMIT :per_term)"
             )
         or_query = " || ".join(f"plainto_tsquery('{_FTS_CONFIG}', :t{i})" for i in range(len(terms)))
@@ -676,13 +689,15 @@ class CorpusChunksPgRepository:
             "(SELECT id, tsv, text FROM corpus_chunks "
             " WHERE corpus_id = ANY(:corpus_ids) "
             f"  AND to_tsvector('{_FTS_CONFIG}', text) @@ ({or_query}) "
-            f"  {scope_sql} "
+            f"  {scope_sql} {exclude_leg_sql} "
             " LIMIT :limit)"
         )
+        # Kept as defensive de-duplication even though every leg now filters:
+        # cheap, and it means a future leg added without the predicate cannot
+        # leak an already-returned chunk back into the result.
         exclude_sql = ""
         if exclude_ids:
             exclude_sql = "WHERE u.id <> ALL(:exclude_ids) "
-            params["exclude_ids"] = exclude_ids
         rows = (
             conn.execute(
                 sa.text(

@@ -1017,3 +1017,41 @@ def test_search_candidates_fills_its_window_when_only_one_term_matches(repo, mon
         "then report truncated=False and silently omit the rest"
     )
     assert all("alpha" in r["text"] for r in rows)
+
+
+def test_search_candidates_fills_the_window_when_the_all_terms_pass_already_returned_rows(pg_repo, monkeypatch):
+    """The top-up must not spend its window re-selecting excluded rows.
+
+    Every row the all-terms pass returned also satisfies the any-term
+    predicates, so a leg that filtered only AFTER its own `LIMIT` burned
+    part of the window on rows the outer clause then discarded: the result
+    came back short while unread matches remained, and the caller reads a
+    short result as "the scan was not capped". The same fail-quiet shape as
+    the under-fill the fill leg exists to fix, one level down.
+
+    PG-only: this is the Postgres two-pass structure. (Devin Review on
+    #2420.)
+    """
+    import src.repositories.corpus_chunks_pg as m
+
+    monkeypatch.setattr(m, "_RANK_CANDIDATE_FLOOR", 8)
+    monkeypatch.setattr(m, "_RANK_CANDIDATE_MULTIPLIER", 1)
+
+    # One chunk carries BOTH terms, so the all-terms (AND) pass returns it
+    # and it becomes an excluded id for the top-up...
+    pg_repo.add_many(
+        [{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "alpha bravo together"}]
+    )
+    # ...and plenty of single-term chunks remain to fill the rest.
+    pg_repo.add_many(
+        [{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"alpha only {i}"} for i in range(1, 20)]
+    )
+
+    rows = pg_repo.search_candidates([CORPUS_ID], "alpha bravo", limit=6)
+
+    ids = [r["id"] for r in rows]
+    assert len(ids) == 6, (
+        f"under-filled: {len(ids)} of 6 while 20 chunks match — the excluded all-terms "
+        "hit consumed part of the top-up's window"
+    )
+    assert len(set(ids)) == 6, f"the all-terms hit came back twice: {ids}"
