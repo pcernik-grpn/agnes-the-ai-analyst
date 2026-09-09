@@ -1770,7 +1770,7 @@ class TestSkillsToolBudget:
         out = self._get(mod, resp)
         assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
         assert out["truncated"] is True
-        assert "store_read_markdown" in out["truncated_note"]
+        assert "AGNES_MCP_SEARCH_MAX_CHARS" in out["truncated_note"]
 
     def test_small_result_passes_through_unchanged(self):
         mod = _import_mod()

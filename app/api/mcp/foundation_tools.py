@@ -2232,8 +2232,9 @@ def register_foundation_tools(
         skill's full body comes back in one call, so a large marketplace can
         exceed the tool output budget; see ``truncated``/``truncated_note``
         below when that happens (bodies are shortened first, whole skills
-        dropped only if that alone is not enough — read a dropped skill's
-        body with ``store_read_markdown`` instead).
+        dropped only last — there is no per-skill fetch to fall back to, so
+        a dropped skill's full body is unavailable until the instance's
+        marketplace is narrowed or the budget is raised).
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
@@ -2251,8 +2252,8 @@ def register_foundation_tools(
             shortened_note="{shortened} of {total} skills carry a shortened body",
             dropped_note="{dropped} of {total} skills were dropped",
             next_step=(
-                "For a skill whose body was shortened or dropped, read the plugin's SKILL.md directly with "
-                "`store_read_markdown` (entity_id from the marketplace listing)."
+                "There is no per-skill read endpoint — a dropped skill's full body needs an admin to reduce "
+                "this instance's marketplace size, or raise AGNES_MCP_SEARCH_MAX_CHARS."
             ),
             item_noun="skill",
         )
