@@ -27,7 +27,7 @@ _SCRIPTS_DEV = Path(__file__).resolve().parents[1] / "scripts" / "dev"
 if str(_SCRIPTS_DEV) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DEV))
 
-from prompt_phrases import BANNED_PHRASES, REQUIRED_FACTS  # noqa: E402
+from prompt_phrases import BANNED_PHRASES, REQUIRED_FACTS
 
 
 def _assert_clean(text: str, *, label: str) -> None:
@@ -158,7 +158,7 @@ def test_bundled_connector_skills_tier3():
         )
 
 
-def test_the_seed_template_carries_the_same_two_hardenings_as_the_renderer():
+def test_the_seed_template_carries_the_same_hardenings_as_the_renderer():
     """Both install-prompt sources must carry the security-relevant fixes.
 
     There are two, and which one a deployment serves is an operator setting:
@@ -167,18 +167,21 @@ def test_the_seed_template_carries_the_same_two_hardenings_as_the_renderer():
     `app/web/setup_instructions.py`'s renderer (`src/welcome_template.py`).
 
     So a fix applied only to the Python side silently misses every
-    `source_mode='git'` instance. That happened: the renderer gained
-    `--max-redirs 0` and the two-signal token pre-check while this template
-    kept a bare `curl -fsSL -OJ` and the original "an earlier run already
-    saved the credential, so just continue" false positive — which tells the
-    agent to proceed on a machine where `/cli/install.sh` wrote `server:` and
-    nobody ever signed in.
+    `source_mode='git'` instance. That happened more than once: the renderer
+    gained `--max-redirs 0` while this template kept a bare `curl -fsSL -OJ`;
+    later the renderer dropped the bash token pre-check entirely in favor of
+    `agnes onboard`'s own browser-sign-in fallback (see
+    `_preamble_lines`'s docstring) while this template still carried the old
+    "an earlier run already saved the credential, so just continue" false
+    positive AND a `{server_url}/home step 4` reference to a page that no
+    longer hosts that step.
 
     The banned-phrase tiers cannot catch this: they scan for phrases that must
-    be ABSENT, and both gaps are about text that must be PRESENT.
+    be ABSENT, and most of these gaps are about text that must be PRESENT (or,
+    for the retired pre-check, absent from BOTH sources equally).
     """
-    from src.connectors_manifest import bundled_seed_path
     from app.web.setup_instructions import resolve_lines
+    from src.connectors_manifest import bundled_seed_path
 
     tmpl = (bundled_seed_path() / "install-prompt" / "template.md.tmpl").read_text(encoding="utf-8")
     # The renderer is compared on its RENDERED output, not its source: its
@@ -188,7 +191,19 @@ def test_the_seed_template_carries_the_same_two_hardenings_as_the_renderer():
 
     for source, text in (("seed template", tmpl), ("rendered prompt", rendered)):
         assert "--max-redirs 0" in text, f"{source}: wheel download must refuse redirects"
-        assert "test -f ~/.config/agnes/token.json &&" in text, (
-            f"{source}: the token pre-check must require a saved credential, not just a server match"
-        )
         assert "so just continue" not in text, f"{source}: the false-positive wording is back"
+        # The bash token pre-check was retired from BOTH sources — agnes
+        # onboard's own auth resolution (bootstrap file -> saved credential
+        # -> browser sign-in) already covers it, one step later, with a real
+        # fallback instead of a dead end.
+        assert "test -s ~/.agnes/token" not in text, f"{source}: the retired token pre-check is back"
+        assert "test -f ~/.config/agnes/token.json &&" not in text, f"{source}: the retired token pre-check is back"
+        assert "opens your browser to sign in" in text, (
+            f"{source}: must state the agnes onboard browser-sign-in fallback"
+        )
+        assert "{server_url}/home" not in text, f"{source}: /home no longer hosts a sign-in step"
+        # Both numbered steps must say to surface the finished command line
+        # when the agent isn't the one running it (#2380 for step 1; a live
+        # session missing it for step 2 is what prompted adding it there too).
+        assert 'not a reference to "step 1"' in text, f"{source}: step 1 must relay its exact commands"
+        assert 'not a reference to "step 2"' in text, f"{source}: step 2 must relay its exact command"

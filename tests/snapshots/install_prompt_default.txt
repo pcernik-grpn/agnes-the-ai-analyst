@@ -5,9 +5,13 @@ Server: {server_url}
 BRAND is this organization's own deployment of Agnes, served
 from {server_url}, and the command-line tool it installs is named `agnes`.
 
-Your login token is already saved on this machine at ~/.agnes/token
-(written by step 4 of the install guide at {server_url}). The steps below
-use that file path, so there is no need to display its contents.
+Requirements: `uv` (https://docs.astral.sh/uv/) and `curl`, plus network
+access to the server above.
+
+If this machine already has a saved sign-in for {server_url} — a token at
+~/.agnes/token from the install guide, or a previous `agnes auth login` —
+step 2 reuses it; nothing needs to display its contents first. Otherwise
+`agnes onboard` opens your browser to sign in when it gets there.
 
 Every step below is idempotent and safe to re-run: a machine that already
 ran this setup converges instead of reinstalling, so treat "already
@@ -16,17 +20,8 @@ paste the exact error back and stop — and for a TLS error look for the cause
 (corporate proxy, internal CA, clock skew) rather than lowering certificate
 verification.
 
-Before you start, confirm the login token file is in place:
-   test -s ~/.agnes/token && echo "token present" || echo "token missing"
-
-   Present: continue. Missing: an earlier run may have consumed it, but that
-   needs BOTH a saved credential and a matching server — token.json records
-   no server, and the installer writes server: before anyone has signed in:
-      test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml
-   Prints {server_url} → continue. Anything else, including no output →
-   not signed in to {server_url}: stop, send the user to {server_url}/home step 4.
-
 1) Install the CLI:
+   If someone else runs this, copy the commands below into the reply in full — not a reference to "step 1".
    TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)
    (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {server_url}/cli/download)
    WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)
@@ -49,13 +44,16 @@ Before you start, confirm the login token file is in place:
 
 2) Set up the BRAND workspace in the current directory:
 
+   If someone else runs this, copy the exact command (with the agreed folder) into
+   the reply in full — not a reference to "step 2".
+
    agnes onboard --server-url "{server_url}" --workspace .
 
    The CLI checks the directory first: it declines home and system directories,
    and asks before adopting a directory that already holds unrelated files.
    Relay its instructions to the user and follow them — re-run with
    `--accept-dir` only once the user has explicitly agreed to this directory
-   (the install guide suggested ~/Desktop/WORKSPACE).
+   (the install guide suggested ~/WORKSPACE).
    Don't pick or create a folder on your own.
 
    From there `agnes onboard` converges the rest in one run — workspace init,
@@ -72,3 +70,7 @@ Before you start, confirm the login token file is in place:
    - the diagnose status it finished on
    - which connectors are available to set up later — nothing to do now,
      just ask when you want one (e.g. "set up Jira")
+
+   A good first question from here: "What data can I access through
+   BRAND? Give me a brief overview and suggest three useful
+   questions you can answer."
