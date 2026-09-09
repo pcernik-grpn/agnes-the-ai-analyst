@@ -714,3 +714,43 @@ class TestSettleWindow:
 
         assert second == {"sent": 1, "batches": 1, "batches_failed": 0}
         assert len(requests) == 1
+
+
+class TestEndpointHostAllowlist:
+    """Review finding (SSRF): the sink posts a secret header plus customer
+    conversations to an operator-chosen URL. With
+    ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` set -- the repo's one egress
+    control for credentialed outbound requests -- a destination host off
+    the list ends the run before the secret is even resolved."""
+
+    def test_a_host_off_the_allowlist_makes_no_request_and_leaves_no_watermark(self, pg_client, pg_engine, monkeypatch):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+        from src.repositories import export_watermarks_repo
+
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_HOST_ALLOWLIST", "other.example.com")
+        _seed_session(pg_engine, index=1)
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200)
+
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda _s: None)
+        assert result == {"skipped": "endpoint_not_allowlisted"}
+        assert calls == []
+        assert export_watermarks_repo().get(_watermark_name_for()) is None
+
+    def test_a_host_on_the_allowlist_is_delivered(self, pg_client, pg_engine, monkeypatch):
+        from app.worker.kinds_conversation_export import run_conversation_export_once
+
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_HOST_ALLOWLIST", "collector.example.com, other.example.com")
+        _seed_session(pg_engine, index=1)
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200)
+
+        result = run_conversation_export_once(client=_mock_client(handler), sleep=lambda _s: None)
+        assert "skipped" not in result, result
+        assert len(calls) == 1

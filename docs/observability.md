@@ -903,7 +903,13 @@ own line already exceeds 8 MiB is still sent alone, since this export is
 "complete, never truncated") to `endpoint`, with the auth headers parsed
 `OTEL_EXPORTER_OTLP_HEADERS`-style from the environment variable named by
 `headers_secret_env` — the header value itself never sits in
-`instance.yaml`. `surfaces` narrows the underlying query itself, not just
+`instance.yaml`. Because that request carries a secret and customer
+conversations, `endpoint` is held to a narrow shape — an `https://` URL to
+a named host (plain `http://` only to the loopback host, for a local relay)
+with no credentials in it — and, when `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`
+is set, its host must be on that list, the same egress control the
+credentialed remote `ATTACH` uses; anything else leaves the sink off with a
+warning rather than posting anywhere. `surfaces` narrows the underlying query itself, not just
 what gets POSTed, so an excluded surface is never fetched at all. A
 conversation is exported once its last message is at least 5 minutes old;
 a thread that continues later is re-exported with the fuller transcript,

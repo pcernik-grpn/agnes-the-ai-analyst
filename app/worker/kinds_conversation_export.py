@@ -408,6 +408,20 @@ def run_conversation_export_once(
 
     endpoint = config["endpoint"]
     endpoint_host = urlsplit(endpoint).hostname or ""
+    # The same egress control the credentialed remote ATTACH uses (security
+    # playbook: gate credential egress with a host allowlist): with
+    # AGNES_REMOTE_ATTACH_HOST_ALLOWLIST set, the destination host must be on
+    # it, else the run ends here -- before the secret headers are even
+    # resolved. The URL's SHAPE (https to a named host, no credentials) was
+    # already enforced by get_conversation_export_config.
+    from src.orchestrator_security import is_attach_host_allowed
+
+    if not is_attach_host_allowed(endpoint):
+        logger.warning(
+            "conversation-export: endpoint host %r is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST; the push sink stays off",
+            endpoint_host,
+        )
+        return {"skipped": "endpoint_not_allowlisted"}
     headers = {"Content-Type": "application/x-ndjson", **_resolve_headers(config["headers_secret_env"])}
     surfaces = tuple(config["surfaces"]) if config["surfaces"] else ()
     name = watermark_name(endpoint, surfaces)
