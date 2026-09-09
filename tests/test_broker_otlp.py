@@ -84,7 +84,10 @@ def otlp_broker(e2e_env, shared_app, monkeypatch):
 def content_full(monkeypatch):
     """A complete policy record with ``mode: full`` — the only mode in which
     the relay forwards a batch byte-for-byte."""
-    monkeypatch.setattr(cp, "content_export_mode", lambda: "full")
+    # ``workload=None`` default: the relay always calls with ``workload="chat"``
+    # (spec 3.6) — accepting the kwarg here is what makes that call agree with
+    # a real, unfiltered `content_export_mode`.
+    monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "full")
 
 
 def _post(app, tok, signal, body=None, headers=None):
@@ -224,7 +227,7 @@ def test_traces_are_stripped_under_off(otlp_broker):
 
 
 def test_traces_are_pseudonymized_under_that_mode(otlp_broker, monkeypatch):
-    monkeypatch.setattr(cp, "content_export_mode", lambda: "pseudonymized")
+    monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "pseudonymized")
     monkeypatch.setattr(cp, "_pseudonym_key", lambda: b"k")
     tok = ticket_repo().mint("chat_otlp_pseudo", "kai_otlp", ttl_seconds=60)
     assert _post(otlp_broker, tok, "traces", body=_trace_batch()).status_code == 200
@@ -242,6 +245,22 @@ def test_traces_forward_unchanged_under_full(otlp_broker, content_full):
     sent = _FakeCollectorClient.captured
     assert sent["content"] == body
     assert {k.lower(): v for k, v in sent["headers"].items()}["content-encoding"] == "gzip"
+
+
+def test_relay_strips_for_chat_when_the_allowlist_excludes_it(otlp_broker, monkeypatch):
+    """``mode: full, workloads: [builder]`` (spec 3.6): the relay evaluates
+    the policy for workload ``chat`` by definition, so it strips content the
+    same way ``off`` would even though the base mode is ``full``."""
+    monkeypatch.setattr(cp, "content_export_mode", lambda workload=None: "off" if workload == "chat" else "full")
+    tok = ticket_repo().mint("chat_otlp_workload_excluded", "kai_otlp", ttl_seconds=60)
+    r = _post(otlp_broker, tok, "traces", body=_trace_batch())
+    assert r.status_code == 200, r.text
+
+    forwarded = _span(_FakeCollectorClient.captured["content"])
+    attrs = _attrs(forwarded.attributes)
+    assert "gen_ai.prompt" not in attrs
+    assert attrs["agnes.content_stripped"].bool_value is True
+    assert b"jane@example.com" not in _FakeCollectorClient.captured["content"]
 
 
 def test_logs_are_accepted_and_dropped_under_off(otlp_broker):

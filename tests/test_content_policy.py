@@ -57,6 +57,92 @@ def test_yaml_off_parses_as_a_boolean_and_still_means_off(monkeypatch):
     assert p.mode == "off" and p.requested_mode == "off" and p.warnings == ()
 
 
+# ---------------------------------------------------------------------------
+# Per-workload content classes (spec 3.6): `workloads` narrows WHICH
+# workload's content may leave, on top of `mode` saying whether any is.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_workloads_list_allows_every_workload():
+    p = cp.load_content_export_policy(
+        _cfg(mode="full", placement="operator", basis="b", approved_by="a", approved_at="2026-09-01", workloads=[])
+    )
+    assert p.workloads == ()
+    assert p.warnings == ()
+
+
+def test_workloads_allowlist_is_parsed_and_deduplicated():
+    p = cp.load_content_export_policy(
+        _cfg(
+            mode="full",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="2026-09-01",
+            workloads=["builder", "corporate_memory", "builder"],
+        )
+    )
+    assert p.workloads == ("builder", "corporate_memory")
+    assert p.warnings == ()
+
+
+def test_unknown_workload_name_is_dropped_and_warned_about():
+    p = cp.load_content_export_policy(
+        _cfg(
+            mode="full",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="2026-09-01",
+            workloads=["builder", "not_a_real_workload"],
+        )
+    )
+    assert p.workloads == ("builder",)
+    assert any("not_a_real_workload" in w for w in p.warnings)
+
+
+def test_content_export_mode_excludes_a_workload_not_on_the_allowlist(monkeypatch):
+    monkeypatch.setattr(
+        cp,
+        "load_content_export_policy",
+        lambda config=None: cp.ContentExportPolicy(
+            mode="full",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="",
+            requested_mode="full",
+            warnings=(),
+            workloads=("builder",),
+        ),
+    )
+    assert cp.content_export_mode(workload="builder") == "full"
+    assert cp.content_export_mode(workload="chat") == "off"
+    # No workload named: the allowlist has nothing to exclude, so the base
+    # mode passes through unfiltered (the deprecated env-var check, a caller
+    # that already resolved its own gate, the startup log).
+    assert cp.content_export_mode() == "full"
+
+
+def test_content_export_mode_empty_allowlist_excludes_nothing(monkeypatch):
+    monkeypatch.setattr(
+        cp,
+        "load_content_export_policy",
+        lambda config=None: cp.ContentExportPolicy(
+            mode="pseudonymized",
+            placement="operator",
+            basis="b",
+            approved_by="a",
+            approved_at="",
+            requested_mode="pseudonymized",
+            warnings=(),
+            workloads=(),
+        ),
+    )
+    assert cp.content_export_mode(workload="chat") == "pseudonymized"
+    assert cp.content_export_mode(workload="anything") == "pseudonymized"
+
+
 def test_the_env_var_is_a_deprecated_alias_that_never_enables_content(monkeypatch):
     monkeypatch.setenv(cp.DEPRECATED_ENV_VAR, "1")
     p = cp.load_content_export_policy({})

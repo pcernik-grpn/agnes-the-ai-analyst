@@ -131,7 +131,7 @@ class _Capture:
             if texts:
                 self.completion_chars = sum(len(t) for t in texts)
                 self.completion_text = "".join(texts)
-        except Exception:  # noqa: BLE001 - see the class docstring
+        except Exception:
             logger.debug("llm tracing: unreadable anthropic response shape", exc_info=True)
 
     def set_output_from_openai(self, response: Any) -> None:
@@ -147,7 +147,7 @@ class _Capture:
                 self.completion_chars = self._size(content)
                 self.completion_text = content if isinstance(content, str) else None
                 self.stop_reason = getattr(choices[0], "finish_reason", None) or None
-        except Exception:  # noqa: BLE001 - see the class docstring
+        except Exception:
             logger.debug("llm tracing: unreadable openai response shape", exc_info=True)
 
     def usage(self) -> dict[str, int]:
@@ -211,7 +211,7 @@ def trace_generation(
                 span_id=span_id,
                 batch=batch,
             )
-        except Exception:  # noqa: BLE001 - instrumentation never fails the call
+        except Exception:
             logger.debug("llm tracing: could not build the call record", exc_info=True)
         fields: dict[str, Any] = {
             "event": "llm_generation",
@@ -236,7 +236,7 @@ def trace_generation(
             fields["user_id"] = context.user_id
         try:
             logger.info("llm generation", extra=fields)
-        except Exception:  # noqa: BLE001 - instrumentation never fails the call
+        except Exception:
             logger.debug("llm tracing: could not emit the generation record", exc_info=True)
         _otel.end_generation_span(
             span,
@@ -253,6 +253,10 @@ def trace_generation(
             # per the content-export policy; nothing here decides that.
             prompt_text=capture.prompt_text,
             completion_text=capture.completion_text,
+            # This generation's own workload (spec 3.6's per-workload
+            # allowlist) — a builder generation can carry content while a
+            # chat one stays silent under the same base mode.
+            workload=context.workload,
         )
         if record is not None:
             record_call(record)
@@ -303,7 +307,7 @@ def record_generation(
                 raise _RecordedError(error_type)
     except _RecordedError:
         pass
-    except Exception:  # noqa: BLE001 - instrumentation never fails the call
+    except Exception:
         logger.debug("llm tracing: record_generation failed", exc_info=True)
 
 

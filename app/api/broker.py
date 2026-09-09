@@ -1102,7 +1102,11 @@ async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depend
     if len(body) > _OTLP_MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
 
-    mode = _content_policy.content_export_mode()
+    # The relay is workload `chat` by definition (spec 3.6): the engine's
+    # sandbox exports one turn's own spans, so its content obeys the same
+    # `chat` allowlist entry as the broker's own completion spans, never a
+    # different one.
+    mode = _content_policy.content_export_mode(workload="chat")
     encoding: Optional[str] = request.headers.get("content-encoding")
     try:
         if signal == "traces" and mode != "full":
@@ -1566,7 +1570,11 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                     error=exc,
                 )
             if otel_span is not None:
-                _otel.end_completion_span(otel_span, error=exc)
+                _otel.end_completion_span(
+                    otel_span,
+                    error=exc,
+                    workload=completion_context.workload if completion_context is not None else None,
+                )
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1593,7 +1601,11 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                     error=_exc,
                 )
             if otel_span is not None:
-                _otel.end_completion_span(otel_span, error=_exc)
+                _otel.end_completion_span(
+                    otel_span,
+                    error=_exc,
+                    workload=completion_context.workload if completion_context is not None else None,
+                )
             raise
         if resp.status_code not in _RETRYABLE_UPSTREAM_STATUSES or attempt >= _MAX_UPSTREAM_RETRIES:
             break
@@ -1628,7 +1640,11 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                     error=_exc,
                 )
             if otel_span is not None:
-                _otel.end_completion_span(otel_span, error=_exc)
+                _otel.end_completion_span(
+                    otel_span,
+                    error=_exc,
+                    workload=completion_context.workload if completion_context is not None else None,
+                )
             raise
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
@@ -1755,6 +1771,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                         response_truncated=state["overflow"],
                         summary=summary,
                         cost_usd=record.cost_usd if record is not None else None,
+                        workload=completion_context.workload if completion_context is not None else None,
                     )
 
         return StreamingResponse(
@@ -1838,6 +1855,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             content_type=ctype,
             summary=summary,
             cost_usd=record.cost_usd if record is not None else None,
+            workload=completion_context.workload if completion_context is not None else None,
         )
 
     return _to_response(resp, budget_headers)

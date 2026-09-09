@@ -54,10 +54,11 @@ import logging
 import os
 import socket
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import Any, Mapping, Optional
+from typing import Any
 from urllib.parse import unquote
 
 from src.observability.llm_context import LlmCallContext
@@ -120,7 +121,7 @@ def _app_version() -> str:
         return "0.0.0+dev"
 
 
-def _build_resource(role: Optional[str]) -> Any:
+def _build_resource(role: str | None) -> Any:
     from opentelemetry.sdk.resources import OTELResourceDetector, Resource
 
     defaults: dict[str, Any] = {
@@ -161,7 +162,7 @@ def parse_otlp_headers(raw: str) -> dict[str, str]:
     return out
 
 
-def collector() -> Optional[tuple[str, dict[str, str]]]:
+def collector() -> tuple[str, dict[str, str]] | None:
     """The collector a broker route can forward a sandbox's batches to: the
     BASE endpoint (``/v1/<signal>`` appended per call) plus the operator's
     headers — or ``None``.
@@ -181,7 +182,7 @@ def collector() -> Optional[tuple[str, dict[str, str]]]:
     return endpoint, parse_otlp_headers(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
 
 
-def configure_otel(*, role: Optional[str] = None, exporter: Any = None) -> bool:  # noqa: C901
+def configure_otel(*, role: str | None = None, exporter: Any = None) -> bool:
     """Install the process-wide tracer provider. Idempotent; returns whether
     export is on.
 
@@ -215,14 +216,14 @@ def configure_otel(*, role: Optional[str] = None, exporter: Any = None) -> bool:
                 processor = BatchSpanProcessor(OTLPSpanExporter())
             provider = TracerProvider(resource=_build_resource(role))
             provider.add_span_processor(processor)
-        except Exception:  # noqa: BLE001 - tracing setup must never take the process down
+        except Exception:
             logger.exception("otel: exporter setup failed; trace export stays off")
             return False
         _provider = provider
         if not injected:
             try:
                 trace.set_tracer_provider(provider)
-            except Exception:  # noqa: BLE001 - the module-level tracer works without the global
+            except Exception:
                 logger.debug("otel: global tracer provider already set", exc_info=True)
             logger.info(
                 "otel: OTLP trace export enabled",
@@ -244,13 +245,13 @@ class _NoopSpan:
     def set_attribute(self, key: str, value: Any) -> None:
         return None
 
-    def set_status(self, status: Any, description: Optional[str] = None) -> None:
+    def set_status(self, status: Any, description: str | None = None) -> None:
         return None
 
-    def add_event(self, name: str, attributes: Optional[Mapping[str, Any]] = None) -> None:
+    def add_event(self, name: str, attributes: Mapping[str, Any] | None = None) -> None:
         return None
 
-    def end(self, end_time: Optional[int] = None) -> None:
+    def end(self, end_time: int | None = None) -> None:
         return None
 
 
@@ -281,18 +282,23 @@ def shutdown_otel(timeout_ms: int = 5000) -> None:
     try:
         provider.force_flush(timeout_ms)
         provider.shutdown()
-    except Exception:  # noqa: BLE001 - shutdown is best-effort
+    except Exception:
         logger.debug("otel: provider shutdown failed", exc_info=True)
 
 
-def capture_content_enabled() -> bool:
+def capture_content_enabled(workload: str | None = None) -> bool:
     """Content leaves the instance only under a recorded policy
     (``observability.content_export`` — src/observability/content_policy.py:
     mode + placement + basis + approver). ``AGNES_OTEL_CAPTURE_CONTENT`` is a
-    deprecated alias that no longer enables anything on its own."""
+    deprecated alias that no longer enables anything on its own.
+
+    ``workload`` narrows the check to the policy's per-workload allowlist
+    (spec 3.6): a completion or generation span passes its own workload so
+    an operator can export ``builder`` content while keeping ``chat`` off.
+    """
     from src.observability.content_policy import content_export_mode
 
-    return content_export_mode() != "off"
+    return content_export_mode(workload) != "off"
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +313,13 @@ def _clean(attrs: Mapping[str, Any]) -> dict[str, Any]:
 def start_completion_span(
     *,
     upstream: str,
-    model: Optional[str],
+    model: str | None,
     stream: bool,
-    session_id: Optional[str],
-    ticket_scope: Optional[str],
-    user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
-    context: Optional[LlmCallContext] = None,
+    session_id: str | None,
+    ticket_scope: str | None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    context: LlmCallContext | None = None,
     parent_context: Any = None,
 ) -> Any:
     """Open the span for one brokered completion. ``upstream`` names where
@@ -364,12 +370,12 @@ def _open_span(name: str, attrs: Mapping[str, Any], *, kind: Any = None, parent_
             attributes=dict(attrs),
             context=parent_context,
         )
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not open span %s", name, exc_info=True)
         return _NoopSpan()
 
 
-def start_generation_span(*, provider: str, model: str, context: Optional[LlmCallContext] = None) -> Any:
+def start_generation_span(*, provider: str, model: str, context: LlmCallContext | None = None) -> Any:
     """Open the span for one server-side generation (``trace_generation``).
     ``context`` labels it with workload / purpose / identity so a builder
     turn, an extraction and an auto-title stop looking identical."""
@@ -387,14 +393,14 @@ def start_generation_span(*, provider: str, model: str, context: Optional[LlmCal
     return _open_span(f"chat {model}" if model else "chat", attrs)
 
 
-def _set_cost(span: Any, cost_usd: Optional[float]) -> None:
+def _set_cost(span: Any, cost_usd: float | None) -> None:
     """``agnes.cost_usd`` — the price the producer computed, so a collector
     never has to re-implement the price table."""
     if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool):
         span.set_attribute("agnes.cost_usd", float(cost_usd))
 
 
-def _add_generation_content_events(span: Any, prompt_text: Optional[str], completion_text: Optional[str]) -> None:
+def _add_generation_content_events(span: Any, prompt_text: str | None, completion_text: str | None) -> None:
     """The two content events for a server-side generation, in the same GenAI
     message shape (``[{role, parts}]``) the completion spans use, so one
     collector query reads both. Each text goes through the policy's
@@ -420,24 +426,28 @@ def _add_generation_content_events(span: Any, prompt_text: Optional[str], comple
 def end_generation_span(
     span: Any,
     *,
-    input_tokens: Optional[int] = None,
-    output_tokens: Optional[int] = None,
-    cache_read_tokens: Optional[int] = None,
-    cache_creation_tokens: Optional[int] = None,
-    cost_usd: Optional[float] = None,
-    prompt_chars: Optional[int] = None,
-    completion_chars: Optional[int] = None,
-    error_type: Optional[str] = None,
-    user_id: Optional[str] = None,
-    prompt_text: Optional[str] = None,
-    completion_text: Optional[str] = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
+    cost_usd: float | None = None,
+    prompt_chars: int | None = None,
+    completion_chars: int | None = None,
+    error_type: str | None = None,
+    user_id: str | None = None,
+    prompt_text: str | None = None,
+    completion_text: str | None = None,
+    workload: str | None = None,
 ) -> None:
     """Finish a generation span with the counts ``trace_generation`` collected.
 
     Sizes always; the TEXT only under the recorded content-export policy
     (:func:`capture_content_enabled`) and then on the same two events a
     completion span uses — a builder turn and a brokered chat turn answer
-    "what did the model actually see" the same way, or neither does."""
+    "what did the model actually see" the same way, or neither does.
+    ``workload`` is this generation's own (spec 3.6's per-workload
+    allowlist) — a builder generation can carry content while a chat one
+    stays silent under the same base mode."""
     try:
         if not span.is_recording():
             return
@@ -454,14 +464,14 @@ def end_generation_span(
         _set_cost(span, cost_usd)
         if user_id:
             span.set_attribute("agnes.user_id", user_id)
-        if capture_content_enabled():
+        if capture_content_enabled(workload):
             _add_generation_content_events(span, prompt_text, completion_text)
         if error_type:
             span.set_attribute("error.type", error_type)
             span.set_status(StatusCode.ERROR, error_type)
         else:
             span.set_status(StatusCode.OK)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not finish the generation span", exc_info=True)
     finally:
         try:
@@ -470,7 +480,7 @@ def end_generation_span(
             pass
 
 
-def set_usage_attributes(span: Any, usage: Optional[Mapping[str, Any]]) -> None:
+def set_usage_attributes(span: Any, usage: Mapping[str, Any] | None) -> None:
     """Map the broker's normalized usage shape (``parse_usage``) onto the
     GenAI usage attributes. Cache tokens are emitted separately — Anthropic
     reports ``input_tokens`` as the UNCACHED input only, so folding them in
@@ -505,20 +515,20 @@ class CompletionSummary:
     content capture is on.
     """
 
-    model: Optional[str] = None
-    stop_reason: Optional[str] = None
-    prompt_chars: Optional[int] = None
-    completion_chars: Optional[int] = None
-    prompt_json: Optional[str] = None
-    completion_json: Optional[str] = None
-    stream_complete: Optional[bool] = None
-    response_bytes: Optional[int] = None
+    model: str | None = None
+    stop_reason: str | None = None
+    prompt_chars: int | None = None
+    completion_chars: int | None = None
+    prompt_json: str | None = None
+    completion_json: str | None = None
+    stream_complete: bool | None = None
+    response_bytes: int | None = None
 
 
 def describe_completion(
     *,
-    request_body: Optional[bytes],
-    response_body: Optional[bytes],
+    request_body: bytes | None,
+    response_body: bytes | None,
     content_type: str,
     response_truncated: bool = False,
 ) -> CompletionSummary:
@@ -552,23 +562,24 @@ def describe_completion(
         if request_body is not None:
             out.prompt_json = json.dumps(input_messages_from_request(request_body), ensure_ascii=False)
             out.prompt_chars = len(out.prompt_json)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not describe the completion", exc_info=True)
     return out
 
 
-def end_completion_span(  # noqa: C901
+def end_completion_span(
     span: Any,
     *,
-    status_code: Optional[int] = None,
-    usage: Optional[Mapping[str, Any]] = None,
-    request_body: Optional[bytes] = None,
-    response_body: Optional[bytes] = None,
+    status_code: int | None = None,
+    usage: Mapping[str, Any] | None = None,
+    request_body: bytes | None = None,
+    response_body: bytes | None = None,
     content_type: str = "",
-    error: Optional[BaseException] = None,
+    error: BaseException | None = None,
     response_truncated: bool = False,
-    cost_usd: Optional[float] = None,
-    summary: Optional[CompletionSummary] = None,
+    cost_usd: float | None = None,
+    summary: CompletionSummary | None = None,
+    workload: str | None = None,
 ) -> None:
     """Finish a completion span with whatever the forward produced. Never
     raises — the response has already been (or is being) delivered.
@@ -577,6 +588,11 @@ def end_completion_span(  # noqa: C901
     the exchange once and builds its ledger row from the same object); when
     it is absent the parse happens here — but only after the non-recording
     early return, so an instance with export off still pays nothing.
+
+    ``workload`` is this completion's own (the call context's — ``chat`` for
+    an ordinary turn, ``agent_api`` for an agent-bound one): the content
+    events below obey the policy's per-workload allowlist (spec 3.6), not
+    just its base mode.
     """
     try:
         if not span.is_recording():
@@ -605,7 +621,7 @@ def end_completion_span(  # noqa: C901
             span.set_attribute("agnes.prompt_chars", described.prompt_chars)
         if described.completion_chars is not None:
             span.set_attribute("agnes.completion_chars", described.completion_chars)
-        if capture_content_enabled():
+        if capture_content_enabled(workload):
             # Content goes on EVENTS (see the module docstring): the span's
             # attribute object stays small and parseable however long the
             # conversation is, and each side of the exchange is its own
@@ -635,7 +651,7 @@ def end_completion_span(  # noqa: C901
             span.set_status(StatusCode.ERROR, f"upstream {status_code}")
         else:
             span.set_status(StatusCode.OK)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not finish the completion span", exc_info=True)
     finally:
         try:
@@ -650,7 +666,7 @@ def end_completion_span(  # noqa: C901
 # ---------------------------------------------------------------------------
 
 
-def span_ids(span: Any) -> tuple[Optional[str], Optional[str]]:
+def span_ids(span: Any) -> tuple[str | None, str | None]:
     """``(trace_id, span_id)`` as lowercase hex for a recording span — the
     ids a ledger row stores so it can be joined to the exported span.
     ``(None, None)`` for a non-recording span (export off) or any failure."""
@@ -663,7 +679,7 @@ def span_ids(span: Any) -> tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def remote_parent_context(trace_id_hex: Optional[str], span_id_hex: Optional[str]) -> Any:
+def remote_parent_context(trace_id_hex: str | None, span_id_hex: str | None) -> Any:
     """An OTel ``Context`` whose current span is a remote, sampled
     ``NonRecordingSpan`` — the parent a completion span opens under when the
     turn span lives in another process. ``None`` on bad input."""
@@ -679,7 +695,7 @@ def remote_parent_context(trace_id_hex: Optional[str], span_id_hex: Optional[str
             trace_flags=TraceFlags(TraceFlags.SAMPLED),
         )
         return trace.set_span_in_context(NonRecordingSpan(sc))
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not build a remote parent context", exc_info=True)
         return None
 
@@ -781,18 +797,18 @@ def summarize_completion(body: bytes, content_type: str) -> dict[str, Any]:
             "stop_reason": data.get("stop_reason"),
             "blocks": data.get("content") if isinstance(data.get("content"), list) else [],
         }
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("otel: unreadable completion body", exc_info=True)
         return {}
 
 
 def _summarize_sse(body: bytes) -> dict[str, Any]:
     text = body.decode("utf-8", errors="replace")
-    model: Optional[str] = None
-    stop_reason: Optional[str] = None
+    model: str | None = None
+    stop_reason: str | None = None
     blocks: dict[int, dict[str, Any]] = {}
     partial_json: dict[int, list[str]] = {}
-    event_type: Optional[str] = None
+    event_type: str | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -881,12 +897,12 @@ def child_context(span: Any) -> Any:
 
 def start_turn_span(
     *,
-    session_id: Optional[str],
-    turn_id: Optional[str],
-    user_id: Optional[str],
-    agent_id: Optional[str],
-    surface: Optional[str],
-    workload: Optional[str],
+    session_id: str | None,
+    turn_id: str | None,
+    user_id: str | None,
+    agent_id: str | None,
+    surface: str | None,
+    workload: str | None,
 ) -> Any:
     """Open the span for one chat turn. Labels only — no message text."""
     attrs = _clean(
@@ -907,9 +923,9 @@ def end_turn_span(
     span: Any,
     *,
     tool_calls: int,
-    usage: Optional[Mapping[str, Any]] = None,
-    cost_usd: Optional[float] = None,
-    error_kind: Optional[str] = None,
+    usage: Mapping[str, Any] | None = None,
+    cost_usd: float | None = None,
+    error_kind: str | None = None,
 ) -> None:
     """Finish a turn span with what the turn cost: how many tools it ran, the
     tokens it burned and the price of them. ``error_kind`` is the ``kind`` of
@@ -926,7 +942,7 @@ def end_turn_span(
             span.set_status(StatusCode.ERROR, str(error_kind)[:200])
         else:
             span.set_status(StatusCode.OK)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not finish the turn span", exc_info=True)
     finally:
         try:
@@ -935,7 +951,7 @@ def end_turn_span(
             pass
 
 
-def start_tool_span(*, tool: Optional[str], args_hash: Optional[str], parent: Any) -> Any:
+def start_tool_span(*, tool: str | None, args_hash: str | None, parent: Any) -> Any:
     """Open the span for one tool call of a turn. ``args_hash`` is the same
     digest the ``chat.tool_call`` audit record carries — enough to tell two
     calls of one tool apart, never enough to read what they did."""
@@ -955,7 +971,7 @@ def end_tool_span(span: Any, *, is_error: bool) -> None:
             return
         span.set_attribute("agnes.is_error", bool(is_error))
         span.set_status(StatusCode.ERROR if is_error else StatusCode.OK)
-    except Exception:  # noqa: BLE001 - see the module docstring
+    except Exception:
         logger.debug("otel: could not finish the tool span", exc_info=True)
     finally:
         try:
@@ -967,9 +983,9 @@ def end_tool_span(span: Any, *, is_error: bool) -> None:
 __all__ = [
     "CAPTURE_CONTENT_VAR",
     "COMPLETION_EVENT",
-    "PROMPT_EVENT",
     "ENDPOINT_VAR",
     "MAX_CONTENT_CHARS",
+    "PROMPT_EVENT",
     "CompletionSummary",
     "capture_content_enabled",
     "child_context",
