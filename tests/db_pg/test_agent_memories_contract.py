@@ -147,3 +147,37 @@ def test_delete_for_agent(repo):
 def test_delete_for_agent_with_no_rows_is_a_noop(repo):
     repo.delete_for_agent("no-such-agent")
     assert repo.list_for_agent("no-such-agent") == []
+
+
+def test_create_accepts_turn_provenance_on_both_backends(repo):
+    """Memory provenance (design 2026-09-08 §3.5, migration 0113): the PG
+    side stores ``source_turn_id``/``source_message_id``, the frozen DuckDB
+    side accepts and silently drops both — the same accept-and-drop pattern
+    as the chat_messages cache columns (migration 0092)."""
+    repo.create(
+        id="m1",
+        agent_id="a1",
+        owner_user_id="u1",
+        content="x",
+        source_session_id="c1",
+        source_turn_id="t1",
+        source_message_id="msg_1",
+    )
+    row = repo.get("m1")
+    assert row["source_session_id"] == "c1"
+    assert row.get("source_turn_id") in ("t1", None) and row.get("source_message_id") in ("msg_1", None)
+
+
+def test_pg_stores_turn_provenance(repo):
+    if not hasattr(repo, "_engine"):
+        pytest.skip("PG side only")
+    repo.create(
+        id="m2",
+        agent_id="a1",
+        owner_user_id="u1",
+        content="x",
+        source_session_id="c1",
+        source_turn_id="t1",
+        source_message_id="msg_1",
+    )
+    assert repo.get("m2")["source_turn_id"] == "t1"

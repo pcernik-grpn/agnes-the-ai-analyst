@@ -52,7 +52,7 @@ from src.models.knowledge import (
     VerificationEvidence,
 )
 from src.models.knowledge_digests import KnowledgeDigest
-from src.models.memory_detection_runs import MemoryDetectionRun
+from src.models.llm_observability import ChatMessageFeedback, LlmCall
 from src.models.lookup import (
     BqMetadataCache,
     ColumnMetadata,
@@ -70,6 +70,7 @@ from src.models.mcp import (
     ToolGrant,
     ToolRegistry,
 )
+from src.models.memory_detection_runs import MemoryDetectionRun
 from src.models.misc import (
     NewsTemplate,
     PendingCode,
@@ -134,6 +135,7 @@ __all__ = [
     "BqMetadataCache",
     "ChatBrokerTicket",
     "ChatMessage",
+    "ChatMessageFeedback",
     "ChatSession",
     "Claim",
     "ColumnMetadata",
@@ -172,6 +174,7 @@ __all__ = [
     "KnowledgeItemRelation",
     "KnowledgeItemUserDismissed",
     "KnowledgeVote",
+    "LlmCall",
     "LlmUsage",
     "MCPOAuthFlow",
     "MCPSecret",
@@ -201,11 +204,11 @@ __all__ = [
     "SemanticHealthMute",
     "SemanticModel",
     "SemanticSource",
+    "SessionProcessorState",
+    "SetupToken",
     "ShareRequest",
     "SharepointConnectionState",
     "SharepointCrawlItem",
-    "SessionProcessorState",
-    "SetupToken",
     "SourceConnection",
     "SsoConfig",
     "StoreEntity",

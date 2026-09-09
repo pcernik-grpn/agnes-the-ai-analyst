@@ -58,6 +58,7 @@ class ChatMessagePgRepository:
         cache_creation_tokens: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> ChatMessage:
         msg_id = _gen_id("msg")
         now = datetime.now(timezone.utc)
@@ -67,11 +68,11 @@ class ChatMessagePgRepository:
                     "INSERT INTO chat_messages "
                     "(id, session_id, role, content, tool_calls, parts, tokens_in, "
                     "tokens_out, cache_read_tokens, cache_creation_tokens, "
-                    "model, sender_email, created_at) "
+                    "model, sender_email, turn_id, created_at) "
                     "VALUES (:id, :session_id, :role, :content, "
                     "CAST(:tool_calls AS JSONB), CAST(:parts AS JSONB), "
                     ":tokens_in, :tokens_out, :cache_read_tokens, :cache_creation_tokens, "
-                    ":model, :sender_email, :created_at)"
+                    ":model, :sender_email, :turn_id, :created_at)"
                 ),
                 {
                     "id": msg_id,
@@ -86,6 +87,7 @@ class ChatMessagePgRepository:
                     "cache_creation_tokens": cache_creation_tokens,
                     "model": model,
                     "sender_email": sender_email,
+                    "turn_id": turn_id,
                     "created_at": now,
                 },
             )
@@ -111,6 +113,7 @@ class ChatMessagePgRepository:
             cache_creation_tokens=cache_creation_tokens,
             model=model,
             sender_email=sender_email,
+            turn_id=turn_id,
             created_at=now,
         )
 
@@ -125,7 +128,7 @@ class ChatMessagePgRepository:
             sql = (
                 "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                 "tokens_out, cache_read_tokens, cache_creation_tokens, "
-                "model, sender_email, created_at FROM chat_messages "
+                "model, sender_email, turn_id, created_at FROM chat_messages "
                 "WHERE session_id = :session_id"
             )
             params: dict = {"session_id": session_id}
@@ -149,6 +152,7 @@ class ChatMessagePgRepository:
                 cache_creation_tokens=r["cache_creation_tokens"],
                 model=r["model"],
                 sender_email=r["sender_email"],
+                turn_id=r["turn_id"],
                 created_at=r["created_at"],
             )
             for r in rows
@@ -168,7 +172,7 @@ class ChatMessagePgRepository:
                     sa.text(
                         "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                         "tokens_out, cache_read_tokens, cache_creation_tokens, "
-                        "model, sender_email, created_at FROM chat_messages "
+                        "model, sender_email, turn_id, created_at FROM chat_messages "
                         "WHERE session_id = :session_id ORDER BY created_at DESC LIMIT :limit"
                     ),
                     {"session_id": session_id, "limit": limit},
@@ -190,6 +194,7 @@ class ChatMessagePgRepository:
                 cache_creation_tokens=r["cache_creation_tokens"],
                 model=r["model"],
                 sender_email=r["sender_email"],
+                turn_id=r["turn_id"],
                 created_at=r["created_at"],
             )
             for r in rows

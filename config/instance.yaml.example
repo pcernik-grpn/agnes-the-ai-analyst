@@ -450,6 +450,7 @@ auth:
 #                                      # touches sync_state (current per-table
 #                                      # state, not a trail).
 #   llm_usage_days: 0                 # llm_usage rows (per-call token ledger), by created_at.
+#   llm_calls_days: 0                 # llm_calls rows (the LLM observability ledger), by created_at.
 #   agent_scope_snapshots_days: 0     # agent_scope_snapshots rows, by created_at.
 #                                      # Never touches the live agents table.
 #   usage_events_days: 0              # usage_events rows, by occurred_at. The

@@ -2868,6 +2868,7 @@ class ChatManager:
                     cache_read_tokens=frame.get("cache_read_tokens"),
                     cache_creation_tokens=frame.get("cache_creation_tokens"),
                     model=frame.get("model"),
+                    turn_id=live.turn_id,
                 )
                 # Feed the turn's token delta into the shared daily-spend
                 # counters _daily_token_totals checks in send_user_message.

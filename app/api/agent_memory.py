@@ -49,6 +49,7 @@ from pydantic import BaseModel, field_validator
 from app.api.agent_sessions import SessionRuntimePrincipal, require_session_principal
 from app.auth.access import require_agent_profiles_enabled
 from app.chat.config import ChatConfig
+from app.chat.turn_context import read_turn
 from src.repositories import agent_memories_repo, audit_repo
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,12 @@ async def remember(
 
     status = "active" if mode == "auto" else "pending"
     memory_id = str(uuid4())
+    # Memory provenance (design 2026-09-08 §3.5): fill the source turn/
+    # message from the session's live chat turn, when one is currently
+    # published. Absent on an agent-api call with no chat turn in flight
+    # (e.g. no coordination backend, or a call outside any turn) — a memory
+    # is still worth writing without it.
+    turn = read_turn(session_id)
     repo.create(
         id=memory_id,
         agent_id=agent["id"],
@@ -207,6 +214,8 @@ async def remember(
         content=body.content,
         source_session_id=session_id,
         status=status,
+        source_turn_id=turn.turn_id if turn else None,
+        source_message_id=turn.message_id if turn else None,
     )
     _audit(
         action="agent.memory.write",
@@ -215,6 +224,11 @@ async def remember(
         agent_id=agent["id"],
         session_id=session_id,
         # content length only — never the content itself.
-        extra={"memory_id": memory_id, "status": status, "content_length": len(body.content)},
+        extra={
+            "memory_id": memory_id,
+            "status": status,
+            "content_length": len(body.content),
+            "turn_id": turn.turn_id if turn else None,
+        },
     )
     return {"id": memory_id, "status": status}

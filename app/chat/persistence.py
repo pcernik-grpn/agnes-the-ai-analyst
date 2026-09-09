@@ -574,6 +574,7 @@ class ChatRepository:
         cache_creation_tokens: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> ChatMessage:
         if self._messages_pg is not None:
             return self._messages_pg.append_message(
@@ -588,14 +589,16 @@ class ChatRepository:
                 cache_creation_tokens=cache_creation_tokens,
                 model=model,
                 sender_email=sender_email,
+                turn_id=turn_id,
             )
-        # DuckDB app-state path: the two prompt-cache columns exist only on
-        # Postgres (migration 0092 — the DuckDB ladder is frozen at
-        # FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step, A3). The
-        # figures are accepted and dropped rather than refused: recording a
-        # turn is the caller's actual job here, and losing an accounting
-        # detail must not fail a chat. `cost_breakdown` below reports the
-        # gap explicitly instead of serving zeros as if they were measured.
+        # DuckDB app-state path: the two prompt-cache columns AND `turn_id`
+        # exist only on Postgres (migrations 0092, 0113 — the DuckDB ladder
+        # is frozen at FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step,
+        # A3). The figures are accepted and dropped rather than refused:
+        # recording a turn is the caller's actual job here, and losing an
+        # accounting detail must not fail a chat. `cost_breakdown` below
+        # reports the gap explicitly instead of serving zeros as if they
+        # were measured.
         msg_id = _gen_id("msg")
         now = datetime.now(timezone.utc)
         # DuckDB 1.5.3 bug: updating a column that is part of a secondary

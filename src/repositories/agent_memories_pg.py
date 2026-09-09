@@ -28,6 +28,8 @@ class AgentMemoriesPgRepository:
         content: str,
         source_session_id: Optional[str],
         status: str = "pending",
+        source_turn_id: Optional[str] = None,
+        source_message_id: Optional[str] = None,
     ) -> None:
         now = datetime.now(timezone.utc)
         activated_at = now if status == "active" else None
@@ -36,9 +38,11 @@ class AgentMemoriesPgRepository:
                 sa.text(
                     """
                     INSERT INTO agent_memories
-                      (id, agent_id, owner_user_id, content, source_session_id, status, created_at, activated_at)
+                      (id, agent_id, owner_user_id, content, source_session_id, status, created_at, activated_at,
+                       source_turn_id, source_message_id)
                     VALUES
-                      (:id, :agent_id, :owner_user_id, :content, :source_session_id, :status, :created_at, :activated_at)
+                      (:id, :agent_id, :owner_user_id, :content, :source_session_id, :status, :created_at, :activated_at,
+                       :source_turn_id, :source_message_id)
                     """
                 ),
                 {
@@ -50,6 +54,8 @@ class AgentMemoriesPgRepository:
                     "status": status,
                     "created_at": now,
                     "activated_at": activated_at,
+                    "source_turn_id": source_turn_id,
+                    "source_message_id": source_message_id,
                 },
             )
 
