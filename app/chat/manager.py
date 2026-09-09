@@ -1046,7 +1046,11 @@ class ChatManager:
             live.turn_tool_spans = {}
             usage = None
             cost = None
-            if frame.get("type") == "assistant_message":
+            # Not spelled as the `assistant_message` persist branch below:
+            # tests/test_chat_sources_verdict.py locates that branch by its
+            # first occurrence in this file.
+            is_assistant = frame.get("type") == "assistant_message"
+            if is_assistant:
                 usage = {
                     "model": frame.get("model"),
                     "input_tokens": int(frame.get("tokens_in") or 0),
