@@ -268,6 +268,55 @@ def test_by_group_shows_the_non_admin_view_and_marks_admin_bypass():
     assert "g_all" not in by_group
 
 
+def test_everyone_sourced_reach_is_marked_people_only():
+    """An everyone-scoped grant reaches PEOPLE (the grant reader applies it to
+    human users only), while a group may hold service accounts too. A group
+    entry reached only through Everyone therefore describes the group's
+    people, not every member; a direct grant covers every member."""
+    result, _ = _call()
+
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    applies = {p["id"]: p["applies_to"] for p in fin["packages"]}
+    assert applies == {"pkg_rev": "all_members", "pkg_mkt": "people_only"}
+
+    everyone = next(g for g in result["by_group"] if g["group_id"] == "everyone")
+    assert {p["applies_to"] for p in everyone["packages"]} == {"people_only"}
+
+    admin = next(g for g in result["by_group"] if g["group_id"] == "g_admin")
+    assert {p["applies_to"] for p in admin["packages"]} == {"all_members"}
+    assert any("service account" in n for n in result["notes"])
+
+
+def test_a_direct_grant_beside_an_everyone_grant_covers_all_members():
+    overview = {
+        **_OVERVIEW,
+        "grants": _OVERVIEW["grants"]
+        + [
+            {
+                "id": "gr6",
+                "group_id": "g_fin",
+                "resource_type": "data_package",
+                "resource_id": "pkg_mkt",
+                "requirement": "available",
+                "audience": "g_fin",
+                "scope": None,
+            }
+        ],
+    }
+
+    def dispatch(url: str, **_kwargs):
+        if "/api/admin/access-overview" in url:
+            return _mock_resp(overview)
+        return _dispatch(url)
+
+    result, _ = _call(dispatch=dispatch)
+
+    fin = next(g for g in result["by_group"] if g["group_id"] == "g_fin")
+    mkt = next(p for p in fin["packages"] if p["id"] == "pkg_mkt")
+    assert mkt["via"] == ["everyone", "group"]
+    assert mkt["applies_to"] == "all_members"
+
+
 def test_packages_carry_their_lifecycle_visibility():
     result, _ = _call()
 
@@ -328,15 +377,31 @@ def test_unpackaged_list_is_capped_with_an_honest_total(monkeypatch):
     assert unreachable["tables_in_no_package_truncated"] is True
 
 
-def test_a_full_package_page_is_reported_as_truncated(monkeypatch):
+def test_an_over_limit_inventory_is_reported_as_truncated_and_cut_to_the_limit(monkeypatch):
+    """The tool asks for one row MORE than it carries: a page that comes back
+    with that extra row proves more exist, and the extra row is dropped so the
+    picture never carries more than the documented limit."""
     import app.api.mcp.foundation_tools as ft
 
-    monkeypatch.setattr(ft, "_ACCESS_PICTURE_PACKAGE_LIMIT", len(_PACKAGES))
+    monkeypatch.setattr(ft, "_ACCESS_PICTURE_PACKAGE_LIMIT", len(_PACKAGES) - 1)
     result, mock_get = _call()
 
     assert result["packages_truncated"] is True
+    assert len(result["packages"]) == len(_PACKAGES) - 1
     pkg_call = next(c for c in mock_get.call_args_list if c.args[0].endswith("/api/admin/data-packages"))
     assert pkg_call.kwargs["params"] == {"include_table_ids": "true", "limit": str(len(_PACKAGES))}
+
+
+def test_an_inventory_exactly_at_the_limit_is_complete_not_truncated(monkeypatch):
+    """`len >= limit` cannot tell a complete inventory of exactly `limit`
+    packages from a truncated one; the extra-row request can."""
+    import app.api.mcp.foundation_tools as ft
+
+    monkeypatch.setattr(ft, "_ACCESS_PICTURE_PACKAGE_LIMIT", len(_PACKAGES))
+    result, _ = _call()
+
+    assert result["packages_truncated"] is False
+    assert len(result["packages"]) == len(_PACKAGES)
 
 
 def test_a_short_package_page_is_not_truncated():

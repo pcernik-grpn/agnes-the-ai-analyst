@@ -107,12 +107,14 @@ SERVER_INSTRUCTIONS = (
 )
 
 
-#: How many packages `admin_access_picture` asks `GET /api/admin/data-packages`
-#: for. The route's default page is 200 and used to be its ceiling too, so a
-#: composed reader lost every package past the 200th and misclassified their
-#: tables as unpackaged; the route now takes `?limit=` up to this value and the
-#: tool reports `packages_truncated` when a page comes back full.
-_ACCESS_PICTURE_PACKAGE_LIMIT = 5000
+#: How many packages `admin_access_picture` CARRIES. The route's default page
+#: is 200 and used to be its ceiling too, so a composed reader lost every
+#: package past the 200th and misclassified their tables as unpackaged; the
+#: route now takes `?limit=` up to 5000. The tool asks for ONE ROW MORE than
+#: this: a page that comes back with the extra row proves more exist (and is
+#: cut back to the limit), while an inventory of exactly this many packages is
+#: complete -- `len >= limit` could not tell the two apart.
+_ACCESS_PICTURE_PACKAGE_LIMIT = 4999
 
 #: Longest list the picture carries for unpackaged tables. `include_tables=False`
 #: is the first narrowing step, but an instance with thousands of orphans would
@@ -302,6 +304,10 @@ def _compose_access_picture(
         out = []
         for e in by_id.values():
             e["via"] = sorted(e["via"])
+            # An everyone-scoped grant reaches PEOPLE only (the grant reader
+            # applies it to human users), while a group may hold service
+            # accounts too. Only a direct (or admin) grant covers every member.
+            e["applies_to"] = "all_members" if any(v in ("group", "admin") for v in e["via"]) else "people_only"
             out.append(e)
         return out
 
@@ -335,7 +341,14 @@ def _compose_access_picture(
         is_admin = g["is_system"] and g["name"] == SYSTEM_ADMIN_GROUP
         if is_admin:
             reach = [
-                {"id": p["id"], "name": p["name"], "requirement": None, "via": ["admin"], "in_stack": "always"}
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "requirement": None,
+                    "via": ["admin"],
+                    "in_stack": "always",
+                    "applies_to": "all_members",
+                }
                 for p in pkgs_out
             ]
         else:
@@ -374,6 +387,10 @@ def _compose_access_picture(
             "every person, so its member_count is account_total."
         ),
         (
+            "Everyone-scoped grants reach people only: a service account in a group reaches just the "
+            "group's direct grants -- by_group entries say so with applies_to=all_members | people_only."
+        ),
+        (
             "tables_in_no_package lists distributable tables only (query_mode blank/local/materialized): "
             "remote tables answer server-side without a package and internal rows have no parquet to pull."
         ),
@@ -397,12 +414,14 @@ def _compose_access_picture(
     ]
     if packages_truncated:
         notes.append(
-            f"packages_truncated=true: the package inventory filled a {_ACCESS_PICTURE_PACKAGE_LIMIT}-row page, "
-            "so packages and by_group are incomplete; tables_in_no_package stays complete because the registry "
-            "stamps packaging from a bulk read over every package."
+            f"packages_truncated=true: more than {_ACCESS_PICTURE_PACKAGE_LIMIT} packages exist and only the first "
+            f"{_ACCESS_PICTURE_PACKAGE_LIMIT} (by name) are carried, so packages and by_group are incomplete; "
+            "tables_in_no_package stays complete because the registry stamps packaging from a bulk read over "
+            "every package."
             if registry_knows_packaging
-            else f"packages_truncated=true: the package inventory filled a {_ACCESS_PICTURE_PACKAGE_LIMIT}-row page, "
-            "so packages, by_group AND tables_in_no_package are incomplete."
+            else f"packages_truncated=true: more than {_ACCESS_PICTURE_PACKAGE_LIMIT} packages exist and only the "
+            f"first {_ACCESS_PICTURE_PACKAGE_LIMIT} (by name) are carried, so packages, by_group AND "
+            "tables_in_no_package are incomplete."
         )
     if not packaged_read_ok:
         notes.append(
@@ -2866,7 +2885,9 @@ def register_foundation_tools(
 
         Composes three admin-wide reads -- ``GET /api/admin/access-overview``
         (groups, grants, people total), ``GET /api/admin/data-packages
-        ?include_table_ids=true&limit=5000`` and ``GET /api/admin/registry``
+        ?include_table_ids=true&limit=5000`` (one row more than the 4,999
+        the picture carries, so a full page proves more exist while an
+        inventory of exactly 4,999 is complete) and ``GET /api/admin/registry``
         (every registered table, each stamped ``packaged``) -- with the fold
         rules the ``/admin`` gap cards and the stack resolver use, so the
         answer is theirs, not a second opinion. Requires an admin identity: a
@@ -2909,14 +2930,17 @@ def register_foundation_tools(
           false for a coming-soon package (the stack resolver's two lifecycle
           axes). ``audience`` is ``"everyone"`` for an everyone-scoped grant
           (``member_count`` is then the people total) and ``"group"``
-          otherwise. ``packages_truncated`` is true when the 5000-row page
-          came back full -- the package half is then incomplete.
+          otherwise. ``packages_truncated`` is true when more than 4,999
+          packages exist -- the package half is then the first 4,999 by name.
         - ``by_group``: what a member of each group can reach -- an
           ``everyone`` baseline entry first, then every group with its direct
           grants merged with that baseline, one entry per package keeping the
           strongest grant (``via`` lists every source: ``group`` /
           ``everyone`` / ``admin``; ``requirement`` is ``required`` if any
-          source is). Drafts and coming-soon packages are excluded exactly as
+          source is; ``applies_to`` is ``people_only`` when the ONLY source
+          is an everyone-scoped grant, which reaches human users and not a
+          service account the group may also hold, else ``all_members``).
+          Drafts and coming-soon packages are excluded exactly as
           ``StackResolver.stack`` excludes them; ``bypasses_grants`` is true
           for the Admin group, which reaches everything regardless. This is
           the "what would a non-admin see" answer: pick the group, read its
@@ -2943,21 +2967,22 @@ def register_foundation_tools(
             pk = await c.get(
                 f"{base_url}/api/admin/data-packages",
                 headers=headers_fn(),
-                params={"include_table_ids": "true", "limit": str(limit)},
+                # One row more than the picture carries: see _ACCESS_PICTURE_PACKAGE_LIMIT.
+                params={"include_table_ids": "true", "limit": str(limit + 1)},
                 timeout=30,
             )
             _raise_for_status_with_detail(pk)
             rg = await c.get(f"{base_url}/api/admin/registry", headers=headers_fn(), timeout=60)
             _raise_for_status_with_detail(rg)
-        packages = pk.json() or []
+        rows = pk.json() or []
         return ensure_output_size(
             _compose_access_picture(
                 ov.json(),
-                packages,
+                rows[:limit],
                 rg.json(),
                 include_tables=include_tables,
                 auto_membership=_stack_auto_membership(),
-                packages_truncated=len(packages) >= limit,
+                packages_truncated=len(rows) > limit,
                 section=section,
             ),
             "admin_access_picture",
