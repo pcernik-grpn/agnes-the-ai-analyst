@@ -81,16 +81,38 @@ def test_backfill_skips_a_null_text_row_instead_of_rewriting_or_looping_on_it(pg
     assert stored["ck_a"] == "'alpha':1" and stored["ck_c"] == "'gamma':1"
 
 
-def test_backfill_rejects_a_non_positive_batch_size(pg_engine_with_schema):
+def test_backfill_rejects_a_non_positive_batch_size_and_a_negative_sleep(pg_engine_with_schema):
     import pytest
 
     with pytest.raises(ValueError):
         backfill(pg_engine_with_schema, batch_size=0)
+    with pytest.raises(ValueError):
+        backfill(pg_engine_with_schema, sleep_seconds=-1)
 
 
-def test_main_refuses_to_run_without_a_postgres_url(monkeypatch, caplog):
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("AGNES_DB_URL", raising=False)
+def test_main_reports_an_unconfigured_postgres_and_exits_2(monkeypatch, caplog):
+    """The script resolves the database the way the app does (instance.yaml
+    first, then the env vars — ``src.db_pg._resolve_url``), so it must not
+    gate on the env vars itself; when nothing is configured it relays the
+    resolver's own message and exits 2."""
+    from src import db_pg
+
+    def _unset():
+        raise RuntimeError("Postgres URL is unset: set instance.yaml::database.url ... or set DATABASE_URL env var")
+
+    monkeypatch.setattr(db_pg, "get_engine", _unset)
     with caplog.at_level(logging.ERROR):
         assert main([]) == 2
-    assert "Postgres" in caplog.text
+    assert "Postgres URL is unset" in caplog.text
+
+
+def test_main_rejects_bad_operator_input_before_touching_the_database(monkeypatch):
+    import pytest
+
+    from src import db_pg
+
+    monkeypatch.setattr(db_pg, "get_engine", lambda: (_ for _ in ()).throw(AssertionError("must not be called")))
+    with pytest.raises(SystemExit):
+        main(["--sleep", "-1"])
+    with pytest.raises(SystemExit):
+        main(["--batch-size", "0"])

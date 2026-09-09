@@ -2,9 +2,10 @@
 ranking reads (migration ``0114_corpus_chunks_tsv``) — on an instance whose
 table was too large for the migration to populate in place.
 
-Postgres only. Run it once, off-peak, from inside the app container (where
-the database URL — ``DATABASE_URL`` or the legacy ``AGNES_DB_URL`` — is
-set)::
+Postgres only. Run it once, off-peak, from inside the app container, where
+the database URL is configured the same way the app resolves it
+(``instance.yaml::database.url``, else ``DATABASE_URL``, else the legacy
+``AGNES_DB_URL`` — ``src.db_pg._resolve_url``)::
 
     python scripts/backfill_corpus_chunks_tsv.py [--batch-size 5000] [--sleep 0.0]
 
@@ -23,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 import time
 
@@ -58,6 +58,8 @@ def backfill(engine: Engine, *, batch_size: int = DEFAULT_BATCH_SIZE, sleep_seco
     already-visited rows."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if sleep_seconds < 0:
+        raise ValueError("sleep_seconds must not be negative")
     after = ""
     total = 0
     batches = 0
@@ -96,16 +98,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sleep", type=float, default=0.0, help="seconds to pause between batches")
     args = parser.parse_args(argv)
 
-    if not (os.environ.get("DATABASE_URL") or os.environ.get("AGNES_DB_URL")):
-        log.error(
-            "no Postgres URL in the environment (DATABASE_URL / AGNES_DB_URL) — "
-            "this backfill applies to the Postgres app-state backend only"
-        )
-        return 2
+    if args.batch_size <= 0 or args.sleep < 0:
+        parser.error("--batch-size must be positive and --sleep must not be negative")
 
+    # The same resolution the app uses (instance.yaml first, then the env
+    # vars) — a deployment configured only through instance.yaml must be
+    # able to run this; ``_resolve_url`` raises a RuntimeError naming every
+    # source when none is set.
     from src.db_pg import get_engine
 
-    backfill(get_engine(), batch_size=args.batch_size, sleep_seconds=args.sleep)
+    try:
+        engine = get_engine()
+    except RuntimeError as exc:
+        log.error("%s — this backfill applies to the Postgres app-state backend only", exc)
+        return 2
+
+    backfill(engine, batch_size=args.batch_size, sleep_seconds=args.sleep)
     return 0
 
 
