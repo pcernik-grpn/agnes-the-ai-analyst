@@ -313,3 +313,87 @@ class TestEStringLiterals:
         masked = _mask_sql_for_guard(sql, mask_comments=False)
         assert "case_e" in masked, "the identifier must stay visible to the guards"
         assert "'x'" not in masked
+
+
+# ---------------------------------------------------------------------------
+# #2424 follow-up (production finding 2026-09-09): a caller who trips the
+# blocklist used to get ONE generic "Only single SELECT queries are allowed"
+# string regardless of which token matched -- false for every class below
+# except the genuine multi-statement one. `_assert_select_only` now raises a
+# message naming the REASON CLASS that matched, same standard the neighbouring
+# file-path-table-source branch in the same function already meets.
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedTokenClassMessages:
+    def test_dml_ddl_keyword_names_its_class(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_select_only("drop table customers")
+        detail = str(exc.value.detail)
+        assert exc.value.status_code == 400
+        assert "DDL" in detail or "data-modification" in detail
+        # Must not claim the caller's real mistake is a different class.
+        assert "catalog" not in detail.lower()
+        assert "url" not in detail.lower()
+
+    def test_file_access_function_names_its_class(self):
+        # The real incident that motivated #160: a plain single SELECT
+        # calling bigquery_query() used to 400 with "not a single SELECT",
+        # which is false -- it IS one.
+        with pytest.raises(HTTPException) as exc:
+            _assert_select_only("select * from bigquery_query('proj', 'select 1')")
+        detail = str(exc.value.detail)
+        assert "read_parquet" in detail or "file" in detail.lower()
+        assert "bigquery_query" in detail
+
+    def test_url_scheme_alone_names_its_class(self):
+        # A URL scheme literal INSIDE a real string value (not a table
+        # source) is masked away before the blocklist scan and legitimately
+        # passes -- see TestLiteralFalsePositivesFixed above. Comments are
+        # scanned on purpose though (so `-- drop this` still gets caught,
+        # see `_assert_select_only`'s docstring), so a scheme mentioned in a
+        # comment is the one reachable way to trip ONLY this class with no
+        # file-access token alongside it.
+        with pytest.raises(HTTPException) as exc:
+            _assert_select_only("select 1 as x -- fetch data from https://example.com/x\n from my_view")
+        detail = str(exc.value.detail)
+        assert "https://" in detail or "URL" in detail or "scheme" in detail.lower()
+
+    def test_catalog_metadata_names_its_class_and_hints_schema_and_catalog(self):
+        # The 2026-09-09 production finding, reproduced verbatim: a caller
+        # ran a genuine single SELECT against information_schema and was
+        # told "Only single SELECT queries are allowed" -- false, and no
+        # next step. The class message must name the next step: `schema`
+        # and `catalog`.
+        with pytest.raises(HTTPException) as exc:
+            _assert_select_only(
+                "select column_name, data_type from information_schema.columns "
+                "where table_name in ('a','b','c') order by table_name, ordinal_position"
+            )
+        detail = str(exc.value.detail)
+        assert exc.value.status_code == 400
+        assert "single SELECT" not in detail, "the statement IS a single SELECT -- the refusal must not claim otherwise"
+        assert "information_schema" in detail or "catalog" in detail.lower()
+        assert "schema" in detail
+        assert "catalog" in detail
+        # Must not dump the rest of the blocklist alongside the class name.
+        assert "duckdb_tables" not in detail
+        assert "sqlite_master" not in detail
+        assert "read_parquet" not in detail
+
+    def test_duckdb_catalog_view_also_names_the_metadata_class(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_select_only("select * from duckdb_tables()")
+        detail = str(exc.value.detail)
+        assert "schema" in detail
+        assert "catalog" in detail
+
+    def test_genuine_multi_statement_still_says_so(self):
+        # Pin: a REAL multi-statement input keeps the accurate "not a single
+        # SELECT" wording -- this is the one class for which that claim is
+        # actually true.
+        with pytest.raises(HTTPException) as exc:
+            _assert_select_only("select 1; drop table x")
+        detail = str(exc.value.detail)
+        assert exc.value.status_code == 400
+        assert "single SELECT" in detail

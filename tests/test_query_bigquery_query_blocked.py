@@ -9,7 +9,14 @@ Internal wrap views (created by the BQ extractor) use bigquery_query()
 inside their CREATE VIEW body — those run via DuckDB's view resolution at
 query time, NOT via user-submitted SQL, so the blocklist doesn't break
 them. Closes part of #160.
+
+#2424 follow-up (2026-09-09 production finding): `SELECT * FROM
+bigquery_query(...)` IS a single SELECT, so the blocklist's old one-size
+"Only single SELECT queries are allowed" detail was false for this case.
+The guard now names the reason class it actually matched (file-access /
+remote-query functions) instead.
 """
+
 from __future__ import annotations
 
 
@@ -19,8 +26,9 @@ def _auth(token: str) -> dict:
 
 def test_bigquery_query_function_call_rejected(seeded_app):
     """Plain `SELECT * FROM bigquery_query(...)` is blocked at the
-    keyword-blocklist layer with the canonical "Only single SELECT
-    queries are allowed" detail."""
+    keyword-blocklist layer with the file-access/remote-query class detail,
+    naming the actual function rather than falsely claiming this isn't a
+    single SELECT."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     sql = "SELECT * FROM bigquery_query('proj', 'SELECT 1 AS x')"
@@ -31,10 +39,10 @@ def test_bigquery_query_function_call_rejected(seeded_app):
     )
     assert r.status_code == 400, f"expected 400; got {r.status_code} body={r.json()}"
     detail = str(r.json().get("detail", ""))
-    # The canonical blocklist message proves this was rejected by the
-    # blocklist (not by some other path like master-view-forbidden).
-    assert "single SELECT" in detail, \
-        f"expected canonical blocklist message; got detail={detail!r}"
+    assert "bigquery_query" in detail, f"expected the matched function named; got detail={detail!r}"
+    assert "single SELECT" not in detail, (
+        f"this IS a single SELECT — the refusal must not claim otherwise; got detail={detail!r}"
+    )
 
 
 def test_bigquery_query_mixed_case_rejected(seeded_app):
@@ -49,8 +57,7 @@ def test_bigquery_query_mixed_case_rejected(seeded_app):
     )
     assert r.status_code == 400, r.json()
     detail = str(r.json().get("detail", ""))
-    assert "single SELECT" in detail, \
-        f"expected canonical blocklist message; got detail={detail!r}"
+    assert "bigquery_query" in detail, f"expected the matched function named; got detail={detail!r}"
 
 
 def test_bigquery_query_with_whitespace_before_paren_rejected(seeded_app):
@@ -64,5 +71,4 @@ def test_bigquery_query_with_whitespace_before_paren_rejected(seeded_app):
     )
     assert r.status_code == 400, r.json()
     detail = str(r.json().get("detail", ""))
-    assert "single SELECT" in detail, \
-        f"expected canonical blocklist message; got detail={detail!r}"
+    assert "bigquery_query" in detail, f"expected the matched function named; got detail={detail!r}"

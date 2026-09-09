@@ -1376,7 +1376,18 @@ def _first_table_from_sql(sql: str) -> str | None:
 # by `execute_query` (the /api/query handler) and `run_remote_select_to_arrow`
 # (the snapshot `from_query` materialize path) so the two surfaces can never
 # drift on what counts as a safe single-SELECT.
-_BLOCKED_SQL_TOKENS = [
+#
+# Grouped into REASON CLASSES (#2424 follow-up, 2026-09-09 production
+# finding): a caller who tripped ANY of these used to get back the one
+# generic "Only single SELECT queries are allowed" string — false for every
+# class below except the last, and useless for recovery. The reported case:
+# `SELECT column_name, data_type FROM information_schema.columns WHERE
+# table_name IN (...)  ORDER BY ...` IS a single SELECT; the caller had no
+# way to learn it was refused for touching a blocked catalog view, not for
+# being multi-statement or non-SELECT. `_assert_select_only` below raises
+# the MATCHED CLASS's own message — naming the class already implied by the
+# caller's own statement, never the rest of the blocklist.
+_BLOCKED_DML_DDL_TOKENS: tuple[str, ...] = (
     "drop ",
     "delete ",
     "insert ",
@@ -1392,7 +1403,20 @@ _BLOCKED_SQL_TOKENS = [
     "import ",
     "pragma ",
     "call ",
-    # File access functions
+)
+_DML_DDL_MESSAGE = (
+    "Only read-only SELECT/WITH statements are allowed; this statement "
+    "contains a data-modification, DDL, or administrative keyword (e.g. "
+    "DROP, CREATE, INSERT, ATTACH, PRAGMA). Query registered views by name "
+    "instead."
+)
+
+# File-reading / file-writing / remote-query-execution functions, plus a
+# literal quoted path — DuckDB resolves a quoted string in table position as
+# a file-replacement scan with no function call at all (see
+# `_has_file_table_source` below for the precise sqlglot-based version of
+# this same check; these substring tokens are the fast first-pass reject).
+_BLOCKED_FILE_ACCESS_TOKENS: tuple[str, ...] = (
     "read_csv",
     "read_json",
     "read_parquet",
@@ -1419,11 +1443,38 @@ _BLOCKED_SQL_TOKENS = [
     "list_files",
     "'/",
     '"/',
+    # Relative path traversal
+    "'../",
+    '"../',
+)
+_FILE_ACCESS_MESSAGE = (
+    "File-access and remote-query functions (read_csv, read_parquet, "
+    "write_parquet, bigquery_query, …) and literal file paths are not "
+    "allowed in a query; query registered views by name instead."
+)
+
+# URL / remote-storage scheme literals — reachable inside a SQL comment
+# (never masked, so a hidden keyword can't be smuggled through one either)
+# even when no blocked function name is present.
+_BLOCKED_URL_SCHEME_TOKENS: tuple[str, ...] = (
     "http://",
     "https://",
     "s3://",
     "gcs://",
-    # DuckDB metadata (leaks schema info regardless of RBAC)
+)
+_URL_SCHEME_MESSAGE = (
+    "URL and remote-storage scheme references (http://, https://, s3://, "
+    "gcs://) are not allowed in a query; query registered views by name "
+    "instead."
+)
+
+# DuckDB/SQLite catalog & metadata views — leak schema info regardless of
+# RBAC. `SELECT sql FROM sqlite_master` returns every view's full CREATE VIEW
+# body — which for the orchestrator's master views is `... AS SELECT * FROM
+# read_parquet('/data/extracts/...')`, disclosing absolute on-disk parquet
+# paths; `duckdb_external_file_cache` leaks the same paths directly; the rest
+# expose table/column/schema names a caller's RBAC would otherwise filter.
+_BLOCKED_CATALOG_METADATA_TOKENS: tuple[str, ...] = (
     "information_schema",
     "duckdb_tables",
     "duckdb_columns",
@@ -1433,27 +1484,63 @@ _BLOCKED_SQL_TOKENS = [
     "duckdb_views",
     "duckdb_indexes",
     "duckdb_schemas",
-    # DuckDB's SQLite-compat catalog views. `SELECT sql FROM sqlite_master`
-    # returns every view's full CREATE VIEW body — which for the orchestrator's
-    # master views is `... AS SELECT * FROM read_parquet('/data/extracts/...')`,
-    # disclosing absolute on-disk parquet paths. Same class as duckdb_views
-    # above; the `duckdb_*` names just didn't cover the `sqlite_*` aliases
-    # (sqlite_master / sqlite_schema / sqlite_temp_master / sqlite_temp_schema —
-    # all four resolve in DuckDB).
+    # DuckDB's SQLite-compat catalog view aliases (sqlite_master /
+    # sqlite_schema / sqlite_temp_master / sqlite_temp_schema all resolve).
     "sqlite_master",
     "sqlite_schema",
     "sqlite_temp_master",
     "sqlite_temp_schema",
-    # Leaks cached external file paths (absolute parquet paths) directly.
     "duckdb_external_file_cache",
     "pragma_table_info",
     "pragma_storage_info",
-    # Relative path traversal
-    "'../",
-    '"../',
-    # Multiple statements
-    ";",
-]
+)
+_CATALOG_METADATA_MESSAGE = (
+    "Catalog/metadata views (information_schema, duckdb_*, sqlite_*) are "
+    "not allowed — they disclose schema details regardless of access "
+    "rules. Use the `schema` tool (or `agnes schema <table>`) to inspect a "
+    "table's columns, and `catalog` (or `agnes catalog`) to list what's "
+    "registered."
+)
+
+# A genuine second statement — the ONE class for which "Only single SELECT
+# queries are allowed" is actually true, so it keeps that wording. Checked
+# FIRST below: a statement carrying both a `;` and, say, a DROP after it is
+# reported as multi-statement, since that is the more fundamental problem.
+_BLOCKED_MULTI_STATEMENT_TOKENS: tuple[str, ...] = (";",)
+_MULTI_STATEMENT_MESSAGE = (
+    "Only single SELECT queries are allowed; this statement contains more than one (a `;` outside of a string literal)."
+)
+
+# Checked in this order — a statement matching more than one class (rare) is
+# reported under whichever comes first here.
+_BLOCKED_TOKEN_CLASSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (_MULTI_STATEMENT_MESSAGE, _BLOCKED_MULTI_STATEMENT_TOKENS),
+    (_DML_DDL_MESSAGE, _BLOCKED_DML_DDL_TOKENS),
+    (_FILE_ACCESS_MESSAGE, _BLOCKED_FILE_ACCESS_TOKENS),
+    (_URL_SCHEME_MESSAGE, _BLOCKED_URL_SCHEME_TOKENS),
+    (_CATALOG_METADATA_MESSAGE, _BLOCKED_CATALOG_METADATA_TOKENS),
+)
+
+# Flat view of every token across all classes above — `query_table` and
+# `bigquery_query` (referenced from `_SQL_STRING_TABLE_FUNCTIONS` below) are
+# still "on `_BLOCKED_SQL_TOKENS`" in that sense, and this is kept as the one
+# list a future audit can diff against DuckDB's own function catalog without
+# needing to care which class a token belongs to.
+_BLOCKED_SQL_TOKENS: tuple[str, ...] = tuple(token for _, tokens in _BLOCKED_TOKEN_CLASSES for token in tokens)
+
+
+def _blocked_token_message(masked_body: str) -> str | None:
+    """The reason-class message for the first blocked token found in
+    ``masked_body``, or ``None`` if none match.
+
+    Naming the CLASS — never the full blocklist, and never more of it than
+    the one class the caller's own statement already triggered — is what
+    turns "Only single SELECT queries are allowed" (false for every class
+    but the last) into an actionable refusal."""
+    for message, tokens in _BLOCKED_TOKEN_CLASSES:
+        if any(token in masked_body for token in tokens):
+            return message
+    return None
 
 
 # Security audit F8: DuckDB resolves a quoted string in table position as a
@@ -1636,8 +1723,9 @@ def _assert_select_only(sql_lower: str) -> None:
     # docstring — this blocklist is the only boundary for DML/DDL keywords,
     # so `-- drop this table` must still be caught.
     masked_body = _mask_sql_for_guard(body, mask_comments=False)
-    if any(keyword in masked_body for keyword in _BLOCKED_SQL_TOKENS):
-        raise HTTPException(status_code=400, detail="Only single SELECT queries are allowed")
+    _blocked_message = _blocked_token_message(masked_body)
+    if _blocked_message is not None:
+        raise HTTPException(status_code=400, detail=_blocked_message)
     # File-path table source anywhere in the FROM graph (direct / comma-list /
     # glob), detected precisely via sqlglot — the position regex is used only as
     # the parse-failure fallback inside _has_file_table_source, so functional
