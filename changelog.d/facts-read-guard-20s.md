@@ -1,0 +1,2 @@
+### Changed
+- The facts read guard (`statement_timeout` on fact search, neighbours, claims, edges and the collection facts summary) is 20 s instead of 5 s. On a production-sized graph a well-formed read finishes well under a second once its plan is right, so the guard only has to stop a runaway walk; at 5 s it was cutting off ordinary lookups under concurrent load and blanking the Library Facts section on large collections.

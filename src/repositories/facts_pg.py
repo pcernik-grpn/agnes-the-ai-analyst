@@ -175,7 +175,15 @@ CHUNK_JOIN_SEPARATOR = "\n\n"
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
 # repo, not an operator switch — the caps above are the primary defense.
-_STATEMENT_TIMEOUT_MS = 5_000
+# 20 s, not 5 s: on a production-sized graph (~800k facts / ~4M claims) a
+# well-formed read finishes well under a second once its plan is right
+# (`search`'s bounded candidate set, the collection summary's UNION legs),
+# so the guard only has to stop the pathological walk — and at 5 s it was
+# cutting off ordinary lookups under concurrent load and blanking the
+# Library Facts section on a large collection. Stays under the 30 s HTTP
+# timeout the MCP foundation tools use, so the statement dies before the
+# tool call does.
+_STATEMENT_TIMEOUT_MS = 20_000
 
 # `sweep_orphans()`'s grace period (live finding, 2026-09 — see
 # migrations/versions/0100_facts_created_at.py for the incident numbers): a
