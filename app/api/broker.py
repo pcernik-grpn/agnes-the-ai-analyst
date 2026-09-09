@@ -1344,7 +1344,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     caller_user_id: str | None = None
     budget_headers: dict[str, str] = {}
     if is_completion:
-        # Off the event loop, and reusing `otel_session` when the `llm`-scope
+        # Off the event loop, and reusing `llm_scope_session` when the `llm`-scope
         # check above already read that row (issue #2246): this is 1-3
         # synchronous repo round-trips per completion, and on a single-worker
         # uvicorn every one of them blocks every other in-flight request while
@@ -1352,7 +1352,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         # calls and costs no CPU, which is exactly the shape of the
         # concurrency-ramp latency that made sandbox egress calls miss their
         # caller's deadline. Same rule the `llm`-scope read above states.
-        agent_row, caller_user_id = await asyncio.to_thread(_agent_and_caller_for_ticket, row, otel_session)
+        agent_row, caller_user_id = await asyncio.to_thread(_agent_and_caller_for_ticket, row, llm_scope_session)
     if agent_row is not None:
         utility_models = getattr(chat_cfg, "agent_api_utility_models", []) or []
         budget_ttl_s = getattr(chat_cfg, "agent_api_budget_cache_ttl_s", 60)
