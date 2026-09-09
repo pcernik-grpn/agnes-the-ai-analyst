@@ -163,3 +163,32 @@ class TestTheLegacyBaseCarriesTheDialogToo:
         legacy, _ = self._sources()
         assert "css/issue_dialog.css" in legacy
         assert "css/drawer.css" in legacy
+
+
+class TestTheDialogIsExcludedFromTheCaptureNotHidden:
+    """Saving must not make the window blink.
+
+    The capture used to hide the dialog and restore it just before closing,
+    so a reporter saw the form vanish, come back, and vanish again — and the
+    "Capturing…" label, which lives on the dialog's own button, was invisible
+    for exactly the seconds it had something to say. The dialog now stays on
+    screen and is dropped from the picture by the capture filter instead.
+    """
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "issue_report.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_capture_filter_drops_the_dialog(self):
+        src = self._source()
+        assert "if (node === dlg) return true;" in src
+
+    def test_visibility_is_only_touched_by_open_and_close(self):
+        """Exactly two writes to the `is-open` class: `open()` adds it and
+        `close()` removes it. A third would be the flicker coming back."""
+        src = self._source()
+        assert src.count('classList.add("is-open")') == 1
+        assert src.count('classList.remove("is-open")') == 1

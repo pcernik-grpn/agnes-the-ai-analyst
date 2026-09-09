@@ -138,6 +138,13 @@
 
   function _skipForScreenshot(node) {
     if (!node || node.nodeType !== 1) return false;
+    // The dialog is excluded from the capture rather than hidden during it.
+    // Hiding made the window blink twice on every save — once when the
+    // capture started, once when it was restored just before closing — and
+    // it also hid the "Capturing…" label, which lives on the dialog's own
+    // button, exactly while there was something to report. Dropping the
+    // node here keeps the form on screen and out of the picture.
+    if (node === dlg) return true;
     var tag = (node.tagName || "").toUpperCase();
     if (tag === "SCRIPT" || tag === "NOSCRIPT") return true;
     if (tag === "SVG" && node.querySelectorAll("symbol").length > 20) return true;
@@ -146,9 +153,9 @@
   }
 
   function screenshotBlob() {
-    // Hide the dialog itself before capturing — a screenshot of the report
-    // form asking for a screenshot is never what the reporter meant.
-    dlg.classList.remove("is-open");
+    // The dialog stays on screen throughout — `_skipForScreenshot` drops it
+    // from the capture, so the reporter never gets a picture of the form
+    // asking for a picture, and never sees the window flicker either.
     var capture = loadHtmlToImage().then(function (lib) {
       return lib.toBlob(document.body, {
         pixelRatio: 1,
@@ -168,9 +175,6 @@
       .then(function (blob) {
         if (!blob) throw new Error("empty screenshot");
         return blob;
-      })
-      .finally(function () {
-        dlg.classList.add("is-open");
       });
   }
 
