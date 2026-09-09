@@ -207,7 +207,9 @@ def test_unresolved_call_is_still_recorded_at_turn_end_without_a_duration(manage
         rows = _tool_rows(audit_rows)
         assert len(rows) == 1
         assert rows[0]["details"]["tool"] == "Bash"
-        assert rows[0].get("duration_ms") is None
+        # Explicit None, not merely absent: the repository autofills an
+        # ABSENT duration from the request context a pump task can inherit.
+        assert "duration_ms" in rows[0] and rows[0]["duration_ms"] is None
         assert rows[0].get("result") is None
 
     asyncio.run(_run())
@@ -230,7 +232,7 @@ def test_call_without_a_pairing_id_is_written_immediately(manager, audit_rows):
         await _with_pump(manager, live, _body)
         row = _tool_rows(audit_rows)[0]
         assert row["details"]["tool"] == "Bash"
-        assert row.get("duration_ms") is None
+        assert "duration_ms" in row and row["duration_ms"] is None
 
     asyncio.run(_run())
 

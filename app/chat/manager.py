@@ -2811,7 +2811,9 @@ class ChatManager:
         }
         tool_use_id = str(frame.get("tool_use_id") or "")
         if not tool_use_id:
-            write_audit(user_email=live.user_email, action="chat.tool_call", details=details)
+            # Explicit None: nothing was measured, and the repository must
+            # not autofill a request age this pump task may have inherited.
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details, duration_ms=None)
             return
         live.pending_tool_audits[tool_use_id] = (arrived, _producer_stamp(frame), details)
 
@@ -2857,7 +2859,11 @@ class ChatManager:
         if not live.pending_tool_audits:
             return
         for _arrived, _stamp, details in live.pending_tool_audits.values():
-            write_audit(user_email=live.user_email, action="chat.tool_call", details=details)
+            # ``duration_ms=None`` on purpose (a real NULL, never the
+            # autofill): this task may have been created inside the HTTP
+            # request that spawned the session, and an unfinished call
+            # flushed later must not be stamped with that request's age.
+            write_audit(user_email=live.user_email, action="chat.tool_call", details=details, duration_ms=None)
         live.pending_tool_audits.clear()
 
     # ------------------------------------------------------------------

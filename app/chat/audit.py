@@ -6,9 +6,15 @@ import logging
 import time
 from typing import Any
 
+from src.audit_context import run_without_request_timing
 from src.audit_helpers import hash_args  # noqa: F401 — re-exported, see below
 
 logger = logging.getLogger(__name__)
+
+#: Default for ``write_audit(duration_ms=...)``: leave the value to the
+#: repository's request-context autofill. Distinct from ``None``, which is
+#: an explicit "unmeasured" and is stored as NULL — see ``write_audit``.
+AUTOFILL_DURATION: Any = object()
 
 # email → (users.id, monotonic-stamp). Chat emits an audit row per tool call,
 # so the resolution result is cached briefly instead of hitting the users
@@ -38,7 +44,7 @@ def write_audit(
     action: str,
     details: dict[str, Any],
     user_id: str | None = None,
-    duration_ms: int | None = None,
+    duration_ms: int | None | Any = AUTOFILL_DURATION,
     result: str | None = None,
 ) -> None:
     """Best-effort insert into audit_log; failure is logged, not raised.
@@ -49,11 +55,19 @@ def write_audit(
                     stored as-is rather than dropping the row
       action      → action
       params      → details dict
-      duration_ms → the event's own measured wall time, when the caller has
-                    one (``chat.tool_call`` times call→result). Chat frames
-                    arrive outside any HTTP request, so the repository's
-                    request-start autofill has nothing to fall back on and
-                    ``None`` here is stored as NULL — "not measured".
+      duration_ms → three intents. An ``int`` is the event's own measured
+                    wall time (``chat.tool_call`` times call→result).
+                    ``None`` is "explicitly unmeasured" and is stored as a
+                    real NULL whatever context the caller runs in — the
+                    repositories would otherwise autofill it from the
+                    request context, and a chat pump task inherits the
+                    context of the HTTP handler that created it, so an
+                    unfinished tool call flushed much later would carry an
+                    unrelated request's age (``src.audit_context.
+                    run_without_request_timing``). Leaving the default
+                    keeps the repository autofill, which is right for the
+                    chat events written from inside their own request
+                    (approval decisions, kills, ...).
       result      → ``success`` / ``error…`` per ``src.audit_helpers.
                     RESULT_CLASS_CASE_SQL``; ``None`` when no verdict exists
 
@@ -66,12 +80,17 @@ def write_audit(
     try:
         from src.repositories import audit_repo
 
-        audit_repo().log(
+        kwargs = dict(
             user_id=user_id if user_id is not None else _resolve_user_id(user_email),
             action=action,
             params=details,
             result=result,
-            duration_ms=duration_ms,
         )
+        if duration_ms is AUTOFILL_DURATION:
+            audit_repo().log(**kwargs)
+        elif duration_ms is None:
+            run_without_request_timing(audit_repo().log, duration_ms=None, **kwargs)
+        else:
+            audit_repo().log(duration_ms=duration_ms, **kwargs)
     except Exception:
         logger.exception("audit_log write failed: action=%s", action)
