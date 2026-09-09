@@ -15,7 +15,7 @@
   completion now records its wall time (request start → last upstream byte) and
   time-to-first-byte next to its token usage; the chat manager sums them per turn onto
   the assistant message as `llm_calls` / `llm_duration_ms` / `llm_ttfb_ms` (Postgres
-  app-state only — Alembic revision `0114_chat_messages_llm_timing`, no DuckDB schema
+  app-state only — Alembic revision `0115_chat_messages_llm_timing`, no DuckDB schema
   step). `GET /api/admin/telemetry/chat-cost` and `agnes admin usage chat-cost` expose
   them per session with per-call averages and a `timing_accounting` marker, so "how
   long does the model take per call" is read from the record rather than inferred from

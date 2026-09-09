@@ -476,7 +476,7 @@ def chat_cost(
     ``llm_ttfb_ms`` (request start → first upstream byte, summed), as the
     secret broker measured them per completion — with the per-call
     averages derived here and ``timing_accounting`` playing the same
-    honesty role for them (migration 0114: NULL is unknown, not instant).
+    honesty role for them (migration 0115: NULL is unknown, not instant).
     """
     if window not in _CHAT_COST_WINDOWS:
         raise HTTPException(status_code=400, detail=f"window must be one of {sorted(_CHAT_COST_WINDOWS)}")
@@ -594,7 +594,7 @@ def chat_cost(
     if totals["messages"] and totals["timing_recorded_messages"] < totals["messages"]:
         notes.append(
             f"{totals['messages'] - totals['timing_recorded_messages']} of {totals['messages']} assistant "
-            "messages carry no completion timing (written before migration 0114, or by a turn whose "
+            "messages carry no completion timing (written before migration 0115, or by a turn whose "
             "completions never transited the broker). Their LLM latency is unknown, NOT zero; the "
             "averages describe only the timed messages."
         )

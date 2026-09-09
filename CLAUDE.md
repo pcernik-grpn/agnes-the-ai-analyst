@@ -482,7 +482,7 @@ measurement rather than a model — see
 [`docs/observability.md`](docs/observability.md) → *Chat cost*. The same
 message row carries the turn's LLM latency as the secret broker measured
 it per completion (`llm_calls` / `llm_duration_ms` / `llm_ttfb_ms`, PG-only,
-migration `0114`), summed per turn through `app/chat/turn_usage.py`. The daily
+migration `0115`), summed per turn through `app/chat/turn_usage.py`. The daily
 spend cap remains deliberately coarser (a two-bucket counter with no model
 attached) and says so.
 

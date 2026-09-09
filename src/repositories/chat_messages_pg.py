@@ -303,7 +303,7 @@ class ChatMessagePgRepository:
         ``llm_calls`` / ``llm_duration_ms`` / ``llm_ttfb_ms`` summed over its
         assistant messages — with ``timing_recorded_messages`` playing the
         role ``cache_recorded_messages`` plays for the cache figures: a
-        message written before migration 0114, or by a turn whose
+        message written before migration 0115, or by a turn whose
         completions never transited the broker, has no timing, and that is
         "unknown", not "instant".
         """

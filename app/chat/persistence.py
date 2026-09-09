@@ -596,7 +596,7 @@ class ChatRepository:
                 sender_email=sender_email,
             )
         # DuckDB app-state path: the two prompt-cache columns (migration
-        # 0092) and the three completion-timing columns (migration 0114)
+        # 0092) and the three completion-timing columns (migration 0115)
         # exist only on Postgres — the DuckDB ladder is frozen at
         # FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step, A3. The
         # figures are accepted and dropped rather than refused: recording a
@@ -1039,7 +1039,7 @@ class ChatRepository:
 
         Postgres-only: the two prompt-cache columns the readout exists to
         expose have no DuckDB sibling (migration 0092, A3 freeze), and
-        neither do the completion-timing columns (0114). Raises
+        neither do the completion-timing columns (0115). Raises
         ``RequiresPostgresBackend`` on the DuckDB backend so the route
         answers a typed ``501`` rather than serving cache-blind zeros that
         would read as a measured "this workload used no cache".

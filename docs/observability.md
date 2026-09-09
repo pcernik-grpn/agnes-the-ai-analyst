@@ -160,12 +160,12 @@ byte) and their summed time-to-first-byte, exactly as the secret broker
 measured each completion on its way through; `avg_completion_ms` /
 `avg_ttfb_ms` are derived per row and for the window. `timing_accounting`
 is the honesty marker for them — a message written before the timing columns
-existed (migration `0114_*`), or by a turn whose completions never transited
+existed (migration `0115_*`), or by a turn whose completions never transited
 the broker, has no figures, and that is *unknown*, not *instant*. The CLI
 table shows the per-session average as `llm/call`.
 
 The prompt-cache and completion-timing columns are Postgres-only
-(`migrations/versions/0092_*` and `0114_*`, A3 freeze), so on the frozen
+(`migrations/versions/0092_*` and `0115_*`, A3 freeze), so on the frozen
 DuckDB app-state backend this route answers a typed
 `501 requires_postgres_backend` rather than serving zeros.
 

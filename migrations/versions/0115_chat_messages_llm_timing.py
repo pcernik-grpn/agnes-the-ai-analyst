@@ -21,8 +21,8 @@ PG-first ratchet (A3): a schema CHANGE on an existing PG-only repository
 table (``src/repositories/chat_messages_pg.py``) — Alembic-only, no matching
 DuckDB ``_vN_to_v(N+1)`` step.
 
-Revision ID: 0114_chat_messages_llm_timing
-Revises: 0113_data_apps_data_identity
+Revision ID: 0115_chat_messages_llm_timing
+Revises: 0114_corpus_chunks_tsv
 Create Date: 2026-09-08
 """
 
@@ -33,8 +33,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0114_chat_messages_llm_timing"
-down_revision: Union[str, None] = "0113_data_apps_data_identity"
+revision: str = "0115_chat_messages_llm_timing"
+down_revision: Union[str, None] = "0114_corpus_chunks_tsv"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
