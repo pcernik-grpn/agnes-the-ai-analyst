@@ -20,9 +20,11 @@ progress), the chat's greeting, and the empty-Stack question that recommends
 data packages. Those answer a user's question rather than narrating over it.
 """
 
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -302,3 +304,67 @@ def test_the_flag_is_stamped_from_the_shared_partial():
         assert "_app_scripts.html" in Path(base).read_text(encoding="utf-8"), (
             f"{base} must include the partial that stamps the flag"
         )
+
+
+# ── the operator-facing inventory ───────────────────────────────────────────
+# A switch that only the web UI can see is half a switch: `agnes admin` and the
+# operator MCP tools read `/api/admin/config-surface`, which builds its `knobs`
+# array from `_KNOB_CATALOGUE` alone and resolves each row by looking its
+# `resolver` up on `app.instance_config`. A switch with no resolver there is
+# absent from that inventory, so automation cannot discover its value or where
+# the value came from (Devin Review on this PR). Nothing guards this coupling —
+# it is not a sync-map row — so these tests are the guard.
+
+
+def _knob(client, token):
+    resp = client.get("/api/admin/config-surface", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    knobs = resp.json()["knobs"]
+    return next((k for k in knobs if k["resolver"] == "get_onboarding_enabled"), None)
+
+
+def test_the_switch_appears_in_the_config_surface(seeded_app):
+    knob = _knob(seeded_app["client"], seeded_app["admin_token"])
+    assert knob is not None, "the onboarding switch is missing from /api/admin/config-surface"
+    assert knob["env_var"] == "AGNES_ONBOARDING_ENABLED"
+    assert knob["yaml_path"] == "features.onboarding_enabled"
+    assert knob["default"] is True
+
+
+def test_on_a_clean_instance_it_reports_source_default(seeded_app):
+    """The catalogued `default` has to be what the resolver actually returns
+    with nothing configured. `_source_for` infers `yaml` from `current_value
+    != default`, so a stale default here would report onboarding nobody
+    touched as deliberately set."""
+    env_clean = {k: v for k, v in os.environ.items() if k != "AGNES_ONBOARDING_ENABLED"}
+    with patch.dict("os.environ", env_clean, clear=True):
+        knob = _knob(seeded_app["client"], seeded_app["admin_token"])
+    assert knob is not None
+    assert knob["current_value"] == knob["default"] is True
+    assert knob["source"] == "default"
+
+
+def test_an_env_override_is_reported_as_env_sourced(seeded_app):
+    """The case the finding named: with the switch off in the environment, the
+    UI hides onboarding, and automation has to be able to see that — the value
+    AND that it came from `env` rather than a config file."""
+    with patch.dict("os.environ", {"AGNES_ONBOARDING_ENABLED": "0"}):
+        knob = _knob(seeded_app["client"], seeded_app["admin_token"])
+    assert knob is not None
+    assert knob["current_value"] is False
+    assert knob["source"] == "env"
+
+
+def test_the_page_and_the_inventory_share_one_read(seeded_app):
+    """One resolver, not two. The Jinja global the rail gates on delegates to
+    `get_onboarding_enabled`, which is the function the config surface
+    resolves — so the pages and the operator inventory cannot disagree about
+    whether onboarding is on."""
+    import app.web.router as _router
+    from app.instance_config import get_onboarding_enabled
+
+    with patch.object(_router, "get_onboarding_enabled", lambda: False) as _:
+        assert _router._onboarding_enabled() is False
+    with patch.dict("os.environ", {"AGNES_ONBOARDING_ENABLED": "0"}):
+        assert get_onboarding_enabled() is False
+        assert _router._onboarding_enabled() is False

@@ -53,6 +53,7 @@ from app.instance_config import (
     get_knowledge_digests_ui_enabled,
     get_mcp_connector_ui_enabled,
     get_news_enabled,
+    get_onboarding_enabled,
     get_privacy_policy_url,
     get_store_moderation_enabled,
     get_studio_enabled,
@@ -390,6 +391,11 @@ def _onboarding_enabled() -> bool:
     disabled: `/api/chat/journey` keeps recording steps, so flipping the switch
     back on resumes each user where they were.
 
+    Delegates to `instance_config.get_onboarding_enabled` rather than reading
+    the switch itself: `/api/admin/config-surface` resolves the same knob
+    through that function, and a second read path here is how the pages and
+    the operator-facing inventory come to disagree.
+
     Re-read per call (not cached at import) so an admin flipping it in
     /admin/server-config takes effect without a process restart — and so the
     env-var override the tests set applies immediately.
@@ -398,9 +404,7 @@ def _onboarding_enabled() -> bool:
     read that throws must not silently retire a surface every instance has.
     """
     try:
-        from app.switches import switch_value
-
-        return bool(switch_value("onboarding"))
+        return get_onboarding_enabled()
     except Exception:
         logger.warning("rail: onboarding switch unreadable — leaving onboarding on", exc_info=True)
         return True

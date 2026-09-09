@@ -180,6 +180,17 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "default": False,
     },
     {
+        # `default` is True and must stay in step with the switch's own
+        # default: `_source_for` infers `yaml` from `current != default`, so a
+        # mismatch here would report onboarding nobody configured as
+        # deliberately set (the trap documented on `studio_enabled` above).
+        "key": "onboarding_enabled",
+        "resolver": "get_onboarding_enabled",
+        "env_var": "AGNES_ONBOARDING_ENABLED",
+        "yaml_path": "features.onboarding_enabled",
+        "default": True,
+    },
+    {
         "key": "agent_profiles_enabled",
         "resolver": "get_agent_profiles_enabled",
         "env_var": "AGNES_AGENT_PROFILES_ENABLED",

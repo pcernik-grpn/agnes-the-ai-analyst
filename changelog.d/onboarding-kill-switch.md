@@ -16,8 +16,13 @@
   user's question rather than narrating over it. Enforced at one seam per
   layer — `tour.js`'s three exported entry points and `chat_onboarding.js`'s
   two — so a new call site cannot escape the switch; a missing flag reads as ON,
-  so only an explicit `false` disables. See
-  [`docs/feature-flags.md`](docs/feature-flags.md).
+  so only an explicit `false` disables. The switch is visible to operator
+  tooling as well as the web UI: it resolves through
+  `instance_config.get_onboarding_enabled()`, which is the single read behind
+  both the pages and `GET /api/admin/config-surface`, so `agnes admin` and the
+  operator MCP tools report its effective value and whether it came from `env`,
+  `yaml` or the default. See [`docs/feature-flags.md`](docs/feature-flags.md)
+  and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
 ### Internal
 - The design-system reference's accent vocabulary named `--ds-kai-*`, a token
