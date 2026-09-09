@@ -316,6 +316,53 @@ def test_egress_proxy_declares_a_liveness_probe():
     assert health.get("start_period"), "without start_period the first probes race the proxy's own boot"
 
 
+def test_egress_profile_is_coupled_to_the_configured_mode():
+    """The healthcheck above only reports on a container compose MANAGES — and
+    the proxy sits behind a profile (#1250).
+
+    With ``chat-docker-egress`` inactive, ``docker compose up -d`` neither
+    creates, recreates nor health-checks the sidecar, so a deployment could
+    configure ``chat.docker_egress_mode: allowlist`` and simply never run the
+    process that enforces it — and a proxy container that had already exited
+    just sat there, outside compose's view. The profile therefore may not be a
+    documented step an operator remembers; it must be DERIVED from the
+    configured mode, in every place that brings the stack up:
+
+    * the host scripts (VM boot + the 5-minute upgrade tick) activate it from
+      ``chat.docker_egress_mode`` in the state overlay, through the one shared
+      resolver every other compose decision already goes through;
+    * the app refuses to spawn the ChatManager when the mode says allowlist and
+      the proxy is unreachable, naming this exact profile.
+
+    Asserted against the profile name read out of compose so a rename cannot
+    leave three enforcers pointing at a profile that no longer exists.
+    """
+    root = Path(__file__).resolve().parents[1]
+    svc = yaml.safe_load(COMPOSE.read_text())["services"]["egress-proxy"]
+
+    profiles = svc.get("profiles") or []
+    assert len(profiles) == 1, f"expected exactly one profile on egress-proxy, got {profiles}"
+    profile = profiles[0]
+
+    app_main = (root / "app" / "main.py").read_text()
+    assert f"--profile {profile}" in app_main, (
+        f"app/main.py's allowlist boot gate must name the {profile!r} profile in its refusal — "
+        "an operator cannot act on 'the proxy is unreachable' without being told what starts it"
+    )
+
+    for path in ("infra/modules/customer-instance/startup-script.sh.tpl", "scripts/ops/agnes-auto-upgrade.sh"):
+        body = (root / path).read_text()
+        assert f"--profile {profile}" in body, f"{path} never activates the {profile!r} profile"
+        assert "agnes_chat_egress_allowlist_active" in body, (
+            f"{path} must derive the profile from the configured egress mode, "
+            "through scripts/ops/agnes-compose-file.sh's shared gate"
+        )
+
+    helper = (root / "scripts" / "ops" / "agnes-compose-file.sh").read_text()
+    assert "agnes_chat_egress_allowlist_active()" in helper
+    assert "docker_egress_mode" in helper
+
+
 def test_dockerfile_default_build_target_is_still_app():
     """``docker build .`` with no ``--target`` builds whichever stage is
     LAST in the Dockerfile — that is how both CI

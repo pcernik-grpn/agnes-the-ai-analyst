@@ -611,6 +611,34 @@ proxy env is the enforcing copy), and start the stack with
 (`AGNES_INTERNAL_URL=http://app:8000`) keeps working — the provider adds
 it to `NO_PROXY` automatically.
 
+**The mode and the proxy are coupled, not independent.** A dead or unstarted
+proxy is fail-closed (the sandbox network has no other route out), but it used
+to be *silent*: sessions came up with no egress at all, and with the profile
+inactive `docker compose up -d` did not even manage the container, so one that
+had exited stayed exited and unnoticed (#1250). So:
+
+- **Agnes refuses to start chat** when the mode is `allowlist` and nothing
+  answers on `chat.docker_egress_proxy_url` — every `/chat` route returns 503
+  `chat_disabled`, and the log line carries the `docker compose --profile
+  chat-docker-egress up -d egress-proxy` command that fixes it. Start the
+  proxy (or point `chat.docker_egress_proxy_url` at an address the Agnes
+  process itself can reach) and restart. `open` and the `none` default never
+  probe anything.
+- **A provisioned VM derives the profile from the mode.** The
+  `customer-instance` module's boot script and its 5-minute `agnes-auto-upgrade`
+  tick both read `chat.docker_egress_mode` from the same `instance.yaml` the app
+  reads, activate `--profile chat-docker-egress`, and restart the proxy on any
+  tick it is found down — no per-VM Terraform flag to keep in sync, and no
+  hand-run compose command that a VM recreate would forget. Switching a live VM
+  to `allowlist` (an `instance.yaml` edit, which needs a restart anyway) brings
+  the sidecar up within one tick; `docker compose --profile chat-docker-egress
+  up -d egress-proxy` does it immediately.
+- **The list itself is still the sidecar's `EGRESS_ALLOW_HOSTS`** — only the
+  profile is derived, not the hosts. Set it in the deployment's env file next to
+  `chat.docker_egress_allow_hosts`; a proxy that starts with an empty list is
+  reachable but denies every request (`allowlist: <empty — deny all>` in its
+  startup log), which is `none` with extra steps.
+
 The in-workspace PreToolUse hook still applies in all modes as
 defense-in-depth (advisory only — see the Security model above).
 

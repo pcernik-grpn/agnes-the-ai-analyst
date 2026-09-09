@@ -1118,6 +1118,12 @@ chat:
   #        connection re-checked post-DNS against link-local/metadata/private
   #        ranges (DNS-rebinding protection). Ignoring the proxy is not a
   #        bypass — the internal network has no other route out.
+  #        This mode REQUIRES that sidecar to be running: without it sandboxes
+  #        have no egress at all, so Agnes refuses to start chat (503 on every
+  #        /chat route) and logs the `docker compose --profile
+  #        chat-docker-egress up -d egress-proxy` command. A provisioned VM
+  #        activates that profile from this very key, so setting it here is
+  #        enough there.
   # docker_egress_mode: none
   # Hostnames reachable in allowlist mode (exact or *.suffix wildcards).
   # Cloud metadata endpoints stay blocked even if listed.

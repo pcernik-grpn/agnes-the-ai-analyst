@@ -60,6 +60,47 @@ agnes_tls_active() {
         && [ -s "$_acf_cdir/Caddyfile" ]
 }
 
+# agnes_chat_egress_allowlist_active <state_dir>
+#
+# True (exit 0) when this instance is configured for
+# `chat.docker_egress_mode: allowlist`, i.e. when the `chat-docker-egress`
+# compose profile MUST be active.
+#
+# In allowlist mode chat sandboxes join an `internal: true` network with no
+# route off the host and the services/egress_proxy sidecar is their only way
+# out. That sidecar sits behind a compose profile, so before this gate the
+# profile was a step an operator had to remember: a deployment could configure
+# allowlist mode and simply never run the process enforcing it. Worse, with the
+# profile inactive `docker compose up -d` does not create, recreate, restart or
+# health-check the proxy at all — a container that had already exited just sat
+# there outside compose's view, which is how one stayed down for five days with
+# nothing surfacing it (#1250).
+#
+# So the profile is DERIVED from the configured mode, here, once, for every
+# caller that brings the stack up (the boot startup script and the 5-minute
+# auto-upgrade tick) — exactly like agnes_resolve_compose_file derives the
+# postgres overlays from database.backend, and read from the same file: the
+# applier-owned <state_dir>/instance.yaml is what app/main.py loads its
+# ChatConfig from, so the profile and the app's own mode cannot disagree. Never
+# from .env, which the boot script rewrites and no admin edit ever touches.
+#
+# Both directions of a wrong answer here fail safe: a false positive starts a
+# proxy nothing uses, and a false negative leaves the app's own boot gate to
+# refuse chat loudly (app/main.py::_chat_docker_egress_proxy_ok) rather than
+# serve sessions with no egress.
+agnes_chat_egress_allowlist_active() {
+    _acf_sdir=$1
+    [ -f "$_acf_sdir/instance.yaml" ] || return 1
+    # Same sed idiom as the database.backend read below: an indented key, so a
+    # commented-out `# docker_egress_mode:` (the shape config/
+    # instance.yaml.example ships) configures nothing, as it should.
+    _acf_egress=$(sed -n 's/^[[:space:]]*docker_egress_mode:[[:space:]]*//p' \
+        "$_acf_sdir/instance.yaml" 2>/dev/null | tr -d '"' | tr -d "'" | head -1)
+    # Trim trailing whitespace a hand edit may leave behind.
+    _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]*$//')
+    [ "$_acf_egress" = "allowlist" ]
+}
+
 # agnes_gcp_logging_active <compose_dir>
 #
 # True (exit 0) when the GCP Cloud Logging overlay
