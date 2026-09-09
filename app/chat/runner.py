@@ -2009,6 +2009,14 @@ async def _consume_turn(
                 "tool_use_id": block.tool_use_id,
                 "tool": block.tool_use_id,
                 "result": result,
+                # Pairing clock for the manager's `chat.tool_call` duration:
+                # the difference between this and the call frame's stamp is
+                # the tool's real wall time, measured HERE where both frames
+                # are born, so nothing the manager does in between (a slow
+                # sink, a busy pump) can leak into it. Monotonic, this
+                # process only — meaningless on its own, never compared
+                # across processes.
+                "emitted_at": time.monotonic(),
                 # The SDK already knows whether the tool failed; forwarding it
                 # spares the client a guess. Without this the UI fell back to
                 # sniffing the payload for a leading "error"/"traceback", so a
@@ -2218,6 +2226,7 @@ async def _consume_turn(
                             "tool_use_id": block.id,
                             "tool": block.name,
                             "args": block.input,
+                            "emitted_at": time.monotonic(),
                         }
                     )
                     tool_calls_this_turn += 1

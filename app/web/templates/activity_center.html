@@ -369,7 +369,15 @@
   }
   function buildTimelineUrl(cursor) {
     const p = filterParams();
-    if (cursor) { p.set('cursor_ts', cursor.ts); p.set('cursor_id', cursor.id); }
+    if (cursor) {
+      p.set('cursor_ts', cursor.ts);
+      p.set('cursor_id', cursor.id);
+      // Pin the window to the floor the FIRST page computed. since_minutes
+      // above is recomputed fresh on every request, so without this a page
+      // fetched minutes after the first can silently drop a row that sat
+      // near the edge of the original window.
+      if (cursor.since_ts) p.set('since_ts', cursor.since_ts);
+    }
     p.set('limit', '50');
     return '/api/admin/activity?' + p.toString();
   }

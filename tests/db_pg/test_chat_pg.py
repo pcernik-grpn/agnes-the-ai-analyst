@@ -279,6 +279,68 @@ def test_cost_breakdown_groups_by_session_and_model(sessions, messages):
     assert {r["session_id"] for r in only_a} == {s1.id}
 
 
+def test_llm_timing_round_trip(sessions, messages):
+    """The completion-timing columns: written, read back, and NULL when the
+    caller had nothing to record — a turn with no measured completions is
+    "unknown", never a measured zero."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    messages.append_message(
+        session_id=s.id,
+        role="assistant",
+        content="hello",
+        tokens_in=10,
+        tokens_out=20,
+        llm_calls=3,
+        llm_duration_ms=4500,
+        llm_ttfb_ms=900,
+        model="claude-sonnet-5",
+    )
+    messages.append_message(session_id=s.id, role="assistant", content="untimed")
+
+    timed, untimed = sorted(messages.list_messages(s.id), key=lambda m: m.content != "hello")
+    assert (timed.llm_calls, timed.llm_duration_ms, timed.llm_ttfb_ms) == (3, 4500, 900)
+    assert (untimed.llm_calls, untimed.llm_duration_ms, untimed.llm_ttfb_ms) == (None, None, None)
+    newest_first = messages.list_recent_messages(s.id, limit=1)
+    assert newest_first[0].llm_calls is None
+
+
+def test_cost_breakdown_sums_completion_timing(sessions, messages):
+    """Timing sums ride the same per-(session, model) row as the tokens, and
+    ``timing_recorded_messages`` keeps "no completions measured" apart from
+    "measured as fast"."""
+    s = sessions.create_session(user_email="t@x.com", surface=Surface.WEB)
+    messages.append_message(
+        session_id=s.id,
+        role="assistant",
+        content="a",
+        tokens_in=1,
+        tokens_out=1,
+        llm_calls=2,
+        llm_duration_ms=3000,
+        llm_ttfb_ms=800,
+        model="claude-sonnet-5",
+    )
+    messages.append_message(
+        session_id=s.id,
+        role="assistant",
+        content="b",
+        tokens_in=1,
+        tokens_out=1,
+        llm_calls=1,
+        llm_duration_ms=1000,
+        llm_ttfb_ms=200,
+        model="claude-sonnet-5",
+    )
+    messages.append_message(session_id=s.id, role="assistant", content="c", tokens_in=1, model="claude-sonnet-5")
+
+    (row,) = messages.cost_breakdown(user_email="t@x.com")
+    assert row["llm_calls"] == 3
+    assert row["llm_duration_ms"] == 4000
+    assert row["llm_ttfb_ms"] == 1000
+    assert row["timing_recorded_messages"] == 2
+    assert row["messages"] == 3
+
+
 def test_list_messages_and_after_id(sessions, messages):
     s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
     m1 = messages.append_message(session_id=s.id, role="user", content="one")

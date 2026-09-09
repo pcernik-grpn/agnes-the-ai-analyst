@@ -410,3 +410,87 @@ def test_coordination_down_leaves_engine_frame_unrecorded(manager: ChatManager, 
         assert not live.turn_in_flight
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Completion timing: the broker's per-completion wall time / first-byte
+# figures reach the persisted assistant message the same way the tokens do.
+# ---------------------------------------------------------------------------
+
+
+def test_engine_frame_is_hydrated_with_completion_timing(manager: ChatManager, monkeypatch):
+    """Two completions in one turn → the turn's message carries their count,
+    summed wall time and summed time-to-first-byte."""
+    from unittest.mock import patch
+
+    from app.chat.turn_usage import add_turn_timing, drain_turn_timing
+
+    turns = _RecordingTurnsRepo()
+    _use_postgres(monkeypatch, turns)
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        add_turn_usage(s.id, {"model": "claude-sonnet-5", "input_tokens": 11, "output_tokens": 22})
+        add_turn_timing(s.id, duration_ms=1500, ttfb_ms=400)
+        add_turn_timing(s.id, duration_ms=500, ttfb_ms=100)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+        with patch.object(manager._repo, "append_message", wraps=manager._repo.append_message) as spy:
+            await _pump_one_turn(manager, live, dict(_ENGINE_FRAME))
+        kwargs = spy.call_args.kwargs
+        assert kwargs["llm_calls"] == 2
+        assert kwargs["llm_duration_ms"] == 2000
+        assert kwargs["llm_ttfb_ms"] == 500
+        assert kwargs["tokens_in"] == 11, "token hydration is unchanged"
+        assert drain_turn_timing(s.id) is None, "hydration must consume the timing counters"
+
+    asyncio.run(_run())
+
+
+def test_timing_is_hydrated_even_when_the_frame_carries_its_own_usage(manager: ChatManager, monkeypatch):
+    """The native runner reports its own tokens but never timing — only the
+    broker sees the completions' wall time — so the frame's usage wins for
+    tokens while timing still comes from the counters. No double count is
+    possible: nothing else ever writes timing."""
+    from unittest.mock import patch
+
+    from app.chat.turn_usage import add_turn_timing
+
+    turns = _RecordingTurnsRepo()
+    _use_postgres(monkeypatch, turns)
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        add_turn_usage(s.id, {"model": "other", "input_tokens": 999})
+        add_turn_timing(s.id, duration_ms=700, ttfb_ms=200)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+        with patch.object(manager._repo, "append_message", wraps=manager._repo.append_message) as spy:
+            await _pump_one_turn(manager, live, dict(_FULL_FRAME))
+        kwargs = spy.call_args.kwargs
+        assert kwargs["tokens_in"] == 11, "the frame's own tokens win"
+        assert kwargs["llm_calls"] == 1 and kwargs["llm_duration_ms"] == 700 and kwargs["llm_ttfb_ms"] == 200
+
+    asyncio.run(_run())
+
+
+def test_turn_without_completions_records_no_timing(manager: ChatManager, monkeypatch):
+    """No counters → the message says nothing about timing (NULL), never a
+    measured zero."""
+    from unittest.mock import patch
+
+    turns = _RecordingTurnsRepo()
+    _use_postgres(monkeypatch, turns)
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+        with patch.object(manager._repo, "append_message", wraps=manager._repo.append_message) as spy:
+            await _pump_one_turn(manager, live, dict(_FULL_FRAME))
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get("llm_calls") is None
+        assert kwargs.get("llm_duration_ms") is None
+        assert kwargs.get("llm_ttfb_ms") is None
+
+    asyncio.run(_run())

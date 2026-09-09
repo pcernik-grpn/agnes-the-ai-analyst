@@ -1288,6 +1288,114 @@ class TestActivityTool:
         params = get_mock.call_args.kwargs["params"]
         assert set(params) == {"since_minutes", "limit"}
 
+    def test_forwards_cursor_when_both_parts_present(self):
+        """The endpoint requires cursor_ts AND cursor_id together
+        (app/api/activity.py:105) — the tool must forward both or neither."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00", cursor_id="abc-123"))
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["cursor_ts"] == "2026-09-09T10:00:00+00:00"
+        assert params["cursor_id"] == "abc-123"
+
+    def test_half_cursor_cursor_id_missing_raises(self):
+        """A partial cursor (only cursor_ts) used to be silently dropped —
+        the tool forwarded neither half and the caller got an unlabeled
+        page-one restart with no signal anything was wrong (PR #2400
+        review, Finding A). It must raise instead, naming the missing half,
+        and never reach the server."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            with pytest.raises(ValueError, match="cursor_id"):
+                _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00"))
+            get_mock.assert_not_called()
+
+    def test_half_cursor_cursor_ts_missing_raises(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            with pytest.raises(ValueError, match="cursor_ts"):
+                _run(mod.activity(cursor_id="abc-123"))
+            get_mock.assert_not_called()
+
+    def test_standalone_since_ts_without_cursor_raises(self):
+        """since_ts is continuation-only (PR #2400 review round 2, Finding
+        A) — setting it on a fresh (uncursored) read must raise locally,
+        never silently reach the server as an unbounded read, and never
+        reach the server at all."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            with pytest.raises(ValueError, match="since_ts"):
+                _run(mod.activity(since_ts="2026-09-09T09:00:00+00:00"))
+            get_mock.assert_not_called()
+
+    def test_forwards_since_ts_alongside_full_cursor(self):
+        """since_ts pins the pagination floor a prior page computed
+        (PR #2400 review, Finding B) — forwarded verbatim when present."""
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            get_mock = AsyncMock(return_value=_mock_resp({"rows": [], "next_cursor": None}))
+            MC.return_value.__aenter__.return_value.get = get_mock
+            _run(
+                mod.activity(
+                    cursor_ts="2026-09-09T10:00:00+00:00",
+                    cursor_id="abc-123",
+                    since_ts="2026-09-09T09:00:00+00:00",
+                )
+            )
+
+        params = get_mock.call_args.kwargs["params"]
+        assert params["since_ts"] == "2026-09-09T09:00:00+00:00"
+
+    def test_whitespace_only_cursor_id_is_forwarded_and_the_servers_400_propagates(self):
+        """`bool(cursor_id)` only catches an EXACTLY-empty cursor_id — a
+        whitespace-only one ("   ") is truthy in Python, so it passes the
+        tool's own `bool(cursor_ts) != bool(cursor_id)` check and gets
+        forwarded like any real id (PR #2400 follow-up: verified, not
+        assumed, that this layer cannot silently reproduce the row-loss
+        defect). The server's own guard (app/api/activity.py) is what
+        actually rejects it — this tool has no local check for it — and
+        that 400 must surface here as a loud error, never a silently
+        accepted page."""
+        import httpx
+
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp({"detail": "cursor_id must not be empty or whitespace-only."}, status=400)
+            resp.text = "cursor_id must not be empty or whitespace-only."
+            resp.reason_phrase = "Bad Request"
+            resp.request = httpx.Request("GET", "http://server/api/admin/activity")
+            get_mock = AsyncMock(return_value=resp)
+            MC.return_value.__aenter__.return_value.get = get_mock
+
+            with pytest.raises(httpx.HTTPStatusError, match="cursor_id"):
+                _run(mod.activity(cursor_ts="2026-09-09T10:00:00+00:00", cursor_id="   "))
+
+        # It really was forwarded, not silently dropped — confirms the
+        # server-side guard is the layer actually doing the rejecting.
+        params = get_mock.call_args.kwargs["params"]
+        assert params["cursor_id"] == "   "
+
 
 # ── my_secret_test tool ──────────────────────────────────────────────────────
 

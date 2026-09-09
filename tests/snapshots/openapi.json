@@ -18735,6 +18735,25 @@
             }
           },
           {
+            "description": "Pagination continuation floor \u2014 required together with a complete cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to 'now', which drifts forward between calls \u2014 passing the pinned since_ts back keeps a multi-page read over the same window the first call saw, so a row near the window's edge cannot fall out between pages. Bounded to at most since_minutes before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond what since_minutes already allows. The server computes the floor from since_minutes on a fresh call and returns it in next_cursor.since_ts for the caller to carry forward on the next page.",
+            "in": "query",
+            "name": "since_ts",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Pagination continuation floor \u2014 required together with a complete cursor_ts + cursor_id, carried verbatim from a prior page's next_cursor.since_ts. Rejected on a fresh (uncursored) read. since_minutes computes a floor relative to 'now', which drifts forward between calls \u2014 passing the pinned since_ts back keeps a multi-page read over the same window the first call saw, so a row near the window's edge cannot fall out between pages. Bounded to at most since_minutes before cursor_ts, so a hand-built cursor cannot widen a single read's scan beyond what since_minutes already allows. The server computes the floor from since_minutes on a fresh call and returns it in next_cursor.since_ts for the caller to carry forward on the next page.",
+              "title": "Since Ts"
+            }
+          },
+          {
             "in": "query",
             "name": "limit",
             "required": false,
@@ -39377,7 +39396,7 @@
     },
     "/api/admin/telemetry/chat-cost": {
       "get": {
-        "description": "Measured cost of chat sessions, split by cached vs uncached tokens.\n\nThe point of this route is that it MEASURES rather than models. A cost\ncomparison between two agent workflows (say, one that loads business\ndefinitions from a governed semantic layer once per session against one\nthat carries them by hand) turns almost entirely on how a re-read of a\nlarge cached prefix is priced: at the full input rate it dominates the\nbill, at the real cached rate (~0.1x) it nearly vanishes. Both figures\ncome from ``chat_messages`` here, per model, so nobody has to guess.\n\n``cache_accounting`` per row, and ``notes`` overall, say out loud when a\nzero is not a measurement: rows written before migration 0092 carry no\ncache figures at all, and a \"0 cached tokens\" that means \"unrecorded\" is\nexactly the mistake this route exists to stop.",
+        "description": "Measured cost of chat sessions, split by cached vs uncached tokens.\n\nThe point of this route is that it MEASURES rather than models. A cost\ncomparison between two agent workflows (say, one that loads business\ndefinitions from a governed semantic layer once per session against one\nthat carries them by hand) turns almost entirely on how a re-read of a\nlarge cached prefix is priced: at the full input rate it dominates the\nbill, at the real cached rate (~0.1x) it nearly vanishes. Both figures\ncome from ``chat_messages`` here, per model, so nobody has to guess.\n\n``cache_accounting`` per row, and ``notes`` overall, say out loud when a\nzero is not a measurement: rows written before migration 0092 carry no\ncache figures at all, and a \"0 cached tokens\" that means \"unrecorded\" is\nexactly the mistake this route exists to stop.\n\nThe same rows carry the session's measured LLM latency \u2014 ``llm_calls``,\n``llm_duration_ms`` (request start \u2192 last upstream byte, summed) and\n``llm_ttfb_ms`` (request start \u2192 first upstream byte, summed), as the\nsecret broker measured them per completion \u2014 with the per-call\naverages derived here and ``timing_accounting`` playing the same\nhonesty role for them (migration 0115: NULL is unknown, not instant).",
         "operationId": "chat_cost_api_admin_telemetry_chat_cost_get",
         "parameters": [
           {
@@ -44788,7 +44807,7 @@
     },
     "/api/collections/{collection_id}/files/{file_id}/preview": {
       "get": {
-        "description": "What to show for this file, and how \u2014 the modal's single fetch.\n\nReturns a `kind` the client renders directly:\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url`` and let the browser draw it.\n* ``text`` \u2014 ``text`` holds the preview (source for textual uploads, the\n  ingested text for formats whose bytes aren't readable), ``truncated``\n  says a glance is all this is.\n* ``none`` \u2014 nothing to show yet; ``reason`` says why, in the words the\n  modal shows the caller.\n\nDeliberately one endpoint for every format: the client should not have to\nknow which extensions are streamable, which are text and which are only\npreviewable once ingestion has run.",
+        "description": "What to show for this file, and how \u2014 the modal's single fetch.\n\nReturns a `kind` the client renders directly:\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url`` and let the browser draw it.\n* ``text`` \u2014 ``text`` holds the preview (source for textual uploads, the\n  ingested text for formats whose bytes aren't readable), ``truncated``\n  says this response is not the end of the text.\n* ``none`` \u2014 nothing to show yet; ``reason`` says why, in the words the\n  modal shows the caller.\n\nThe text is paged. ``offset`` (characters, default ``0``) and ``limit``\n(default and maximum ``_PREVIEW_MAX_CHARS``; both clamped, never a 422)\nselect one page; the response echoes the ``offset`` it used and adds\n``next_offset`` (``null`` when the page reaches the end) and\n``total_chars``. A caller wanting the whole file chains\n``offset=next_offset`` until it is ``null``. The modal sends no\nparameters and gets the first page, exactly as before. For a textual\nupload the text is what fits in ``_PREVIEW_READ_MAX_BYTES`` of the\nfile: ``total_chars`` counts that window and, when the file continues\npast it, the last page is still ``truncated: true`` with no\n``next_offset`` \u2014 the byte cap is reported, never hidden by paging.\n\nDeliberately one endpoint for every format: the client should not have to\nknow which extensions are streamable, which are text and which are only\npreviewable once ingestion has run.",
         "operationId": "preview_file_api_collections__collection_id__files__file_id__preview_get",
         "parameters": [
           {
@@ -44807,6 +44826,26 @@
             "schema": {
               "title": "File Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20000,
+              "title": "Limit",
+              "type": "integer"
             }
           },
           {

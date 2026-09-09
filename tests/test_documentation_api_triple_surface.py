@@ -474,9 +474,9 @@ _LIBRARY_RAW_REASON = (
     "content has `collection_file_read` / `agnes collections cat`, which read "
     "the sibling `…/preview` endpoint. That endpoint is NOT exempt: it carries "
     "the triple-surface contract in _COHORT above, so removing either surface "
-    "fails this test rather than passing silently. `…/preview` is capped "
-    "(_PREVIEW_MAX_CHARS) and says so via `truncated`; an uncapped paginated "
-    "whole-file reader would still be its own feature."
+    "fails this test rather than passing silently. `…/preview` returns one "
+    "page (_PREVIEW_MAX_CHARS) at a time and pages via `offset` / "
+    "`next_offset`, so both readers reach the whole file through it."
 )
 _ISSUE_SCREENSHOT_REASON = (
     "the issue screenshot is a raw PNG body: PUT uploads bytes the browser captured, GET streams "

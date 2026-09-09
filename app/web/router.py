@@ -1667,7 +1667,16 @@ async def me_connections_page(
         connected_source=connected,
         connected_name=connected_name,
         connect_error=CONNECT_ERROR_MESSAGES.get(error_code, CONNECT_ERROR_FALLBACK) if error_code else "",
-        retry_source=retry,
+        # `retry` (the authorize URL) is useless for this one code — the
+        # authorize call would just 303 right back with the same error, since
+        # nothing about retrying changes whether a client is registered. An
+        # admin gets a link to the fix instead; a non-admin already has the
+        # fixed "contact your admin" message and no action of their own to
+        # take, so no link renders for them.
+        connect_error_admin_fix_source=(
+            retry if error_code == "client_registration_missing" and caller_is_admin else ""
+        ),
+        retry_source=retry if error_code != "client_registration_missing" else "",
     )
     return templates.TemplateResponse(request, "me_connections.html", ctx)
 

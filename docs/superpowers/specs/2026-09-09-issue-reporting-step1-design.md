@@ -64,7 +64,7 @@ Out (later steps, named so nobody builds them here):
 
 ## Data model (Postgres-only, A3 ratchet)
 
-Alembic revision `0115_issue_reports` (revises `0114_corpus_chunks_tsv`;
+Alembic revision `0116_issue_reports` (revises `0115_chat_messages_llm_timing`;
 re-check the head before writing). SQLAlchemy models in
 `src/models/issue_reports.py`, imported from `src/models/__init__.py`. No
 `src/db.py` step, no DuckDB repository.

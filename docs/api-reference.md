@@ -3541,6 +3541,19 @@ the column but leaves populating existing rows to
 see `docs/migrations.md`), and until then those rows rank through a per-row
 fallback — slower, identical results.
 
+`…/files/{file_id}/preview` returns one file's text a page at a time.
+Optional `offset` (characters, default `0`) and `limit` (default and maximum
+20 000; both clamped, never a `422`) select the page; the response echoes the
+`offset` it used and adds `next_offset` (`null` when the page reaches the end
+of the text) and `total_chars`, while `truncated` means "this response is not
+the end of the text". Chain `offset=next_offset` until it is `null` to read
+the whole file — that is what `agnes collections cat` and the
+`collection_file_read` MCP tool do. The per-call cap is the guarantee that one
+read cannot flood a context window; paging is how the rest is reached. A
+plain-text upload is read from disk up to 512 KiB: `total_chars` counts that
+window, and when the file continues past it the last page still says
+`truncated: true` with no `next_offset`.
+
 - /api/collections
 - /api/collections/search
 - /api/collections/{collection_id}

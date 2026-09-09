@@ -34,23 +34,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import duckdb
-from sqlalchemy import exc as sa_exc
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import exc as sa_exc
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
-from src.identifier_validation import is_safe_identifier
-
-from src.repositories.mcp_source_oauth_clients import KEEP_STORED
 from app.secrets_vault import (
     VaultKeyNotConfiguredError,
     can_store_secrets,
 )
 from connectors.mcp import classifier as mcp_classifier
+from src.identifier_validation import is_safe_identifier
+from src.mcp_tool_shape import is_write_shaped, required_arguments, tool_name
 
 # ``connectors.mcp.extractor`` (pulls in pandas) and ``connectors.mcp.client``
 # (pulls in the full ``mcp`` SDK) are import-time heavy — ~280ms / ~190ms
@@ -70,12 +69,12 @@ from src.repositories import (
     shared_secrets_repo,
     tool_registry_repo,
 )
+from src.repositories.mcp_source_oauth_clients import KEEP_STORED
 from src.repositories.mcp_sources import (  # noqa: F401  # MCPSourceRepository kept for type-only imports + tests that monkeypatch the symbol
     MCPSourceRepository,
     validate_oauth_scope_coupling,
     validate_source_fields,
 )
-from src.mcp_tool_shape import is_write_shaped, required_arguments, tool_name
 from src.repositories.tool_registry import (
     MATERIALIZE,
     PASSTHROUGH,
@@ -117,7 +116,7 @@ def _validate_mode(v: str) -> str:
 _VALID_SCOPES = ("shared", "per_user")
 
 
-def _validate_scope(v: Optional[str]) -> str:
+def _validate_scope(v: str | None) -> str:
     if v is None:
         return "shared"
     v = (v or "").strip().lower()
@@ -126,7 +125,7 @@ def _validate_scope(v: Optional[str]) -> str:
     return v
 
 
-def _validate_auth_method(v: Optional[str]) -> Optional[str]:
+def _validate_auth_method(v: str | None) -> str | None:
     """Normalize ``auth_method`` at the API boundary, like ``transport`` and
     ``scope`` already are.
 
@@ -156,15 +155,15 @@ _validate_oauth_scope_coupling = validate_oauth_scope_coupling
 class CreateMCPSourceRequest(BaseModel):
     name: str
     transport: str
-    command: Optional[str] = None
-    args: Optional[List[str]] = None
-    env: Optional[Dict[str, str]] = None
-    url: Optional[str] = None
-    auth_method: Optional[str] = None
-    auth_secret_env: Optional[str] = None
+    command: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    url: str | None = None
+    auth_method: str | None = None
+    auth_secret_env: str | None = None
     enabled: bool = True
-    scope: Optional[str] = None  # 'shared' (default) | 'per_user'
-    connect_hint: Optional[str] = None
+    scope: str | None = None  # 'shared' (default) | 'per_user'
+    connect_hint: str | None = None
 
     @field_validator("transport")
     @classmethod
@@ -173,16 +172,16 @@ class CreateMCPSourceRequest(BaseModel):
 
     @field_validator("scope")
     @classmethod
-    def _check_scope(cls, v: Optional[str]) -> Optional[str]:
+    def _check_scope(cls, v: str | None) -> str | None:
         return _validate_scope(v) if v is not None else None
 
     @field_validator("auth_method")
     @classmethod
-    def _check_auth_method(cls, v: Optional[str]) -> Optional[str]:
+    def _check_auth_method(cls, v: str | None) -> str | None:
         return _validate_auth_method(v)
 
     @model_validator(mode="after")
-    def _check_oauth_scope_coupling(self) -> "CreateMCPSourceRequest":
+    def _check_oauth_scope_coupling(self) -> CreateMCPSourceRequest:
         _validate_oauth_scope_coupling(self.auth_method, self.transport, self.scope or "shared")
         return self
 
@@ -195,37 +194,37 @@ class UpdateMCPSourceRequest(BaseModel):
     handler before calling ``upsert``.
     """
 
-    name: Optional[str] = None
-    transport: Optional[str] = None
-    command: Optional[str] = None
-    args: Optional[List[str]] = None
-    env: Optional[Dict[str, str]] = None
-    url: Optional[str] = None
-    auth_method: Optional[str] = None
-    auth_secret_env: Optional[str] = None
-    enabled: Optional[bool] = None
-    scope: Optional[str] = None
-    connect_hint: Optional[str] = None
+    name: str | None = None
+    transport: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    url: str | None = None
+    auth_method: str | None = None
+    auth_secret_env: str | None = None
+    enabled: bool | None = None
+    scope: str | None = None
+    connect_hint: str | None = None
 
     @field_validator("transport")
     @classmethod
-    def _check_transport(cls, v: Optional[str]) -> Optional[str]:
+    def _check_transport(cls, v: str | None) -> str | None:
         if v is None:
             return None
         return _validate_transport(v)
 
     @field_validator("scope")
     @classmethod
-    def _check_scope(cls, v: Optional[str]) -> Optional[str]:
+    def _check_scope(cls, v: str | None) -> str | None:
         return _validate_scope(v) if v is not None else None
 
     @field_validator("auth_method")
     @classmethod
-    def _check_auth_method(cls, v: Optional[str]) -> Optional[str]:
+    def _check_auth_method(cls, v: str | None) -> str | None:
         return _validate_auth_method(v)
 
 
-def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
+def _lister_refusal(tool: dict[str, Any] | None) -> str | None:
     """Why ``tool`` cannot be the data-app lister — ``None`` when it can.
 
     The client already ranks candidates and will not nominate a write tool
@@ -268,7 +267,7 @@ def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
 
 
 class MaterializeRequest(BaseModel):
-    tool_id: Optional[str] = None
+    tool_id: str | None = None
     # Linked data apps: ONLY when the caller explicitly designates the
     # targeted tool as the data-app lister (the /admin/linked-apps wizard
     # does) is its output table projected into `data_apps`. Without this,
@@ -284,18 +283,18 @@ class MaterializeRequest(BaseModel):
 
 
 class CreateToolRequest(BaseModel):
-    tool_id: Optional[str] = None  # auto-generated when omitted
+    tool_id: str | None = None  # auto-generated when omitted
     source_id: str
     original_name: str
     exposed_name: str
     mode: str
-    table_id: Optional[str] = None
-    input_schema: Optional[Dict[str, Any]] = None
-    description: Optional[str] = None
+    table_id: str | None = None
+    input_schema: dict[str, Any] | None = None
+    description: str | None = None
     mutating: bool = False
-    pii_fields: Optional[List[str]] = None
-    rate_limit_pm: Optional[int] = None
-    schedule: Optional[str] = None
+    pii_fields: list[str] | None = None
+    rate_limit_pm: int | None = None
+    schedule: str | None = None
     enabled: bool = True
 
     @field_validator("mode")
@@ -307,22 +306,22 @@ class CreateToolRequest(BaseModel):
 class UpdateToolRequest(BaseModel):
     """Partial update — merge against existing row before re-upsert."""
 
-    source_id: Optional[str] = None
-    original_name: Optional[str] = None
-    exposed_name: Optional[str] = None
-    mode: Optional[str] = None
-    table_id: Optional[str] = None
-    input_schema: Optional[Dict[str, Any]] = None
-    description: Optional[str] = None
-    mutating: Optional[bool] = None
-    pii_fields: Optional[List[str]] = None
-    rate_limit_pm: Optional[int] = None
-    schedule: Optional[str] = None
-    enabled: Optional[bool] = None
+    source_id: str | None = None
+    original_name: str | None = None
+    exposed_name: str | None = None
+    mode: str | None = None
+    table_id: str | None = None
+    input_schema: dict[str, Any] | None = None
+    description: str | None = None
+    mutating: bool | None = None
+    pii_fields: list[str] | None = None
+    rate_limit_pm: int | None = None
+    schedule: str | None = None
+    enabled: bool | None = None
 
     @field_validator("mode")
     @classmethod
-    def _check_mode(cls, v: Optional[str]) -> Optional[str]:
+    def _check_mode(cls, v: str | None) -> str | None:
         if v is None:
             return None
         return _validate_mode(v)
@@ -337,7 +336,7 @@ class AddGrantRequest(BaseModel):
     # source-wide bulk grant is deliberately read-only (opting a group into
     # every write tool of an upstream in one action is too coarse an act to
     # be one flag away).
-    allow_mutating: Optional[bool] = None
+    allow_mutating: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +351,7 @@ class OAuthRegisterRequest(BaseModel):
     from the source's own ``url``; ``scopes`` is the one admin override the
     spec calls out (default empty — AS/resource defaults apply)."""
 
-    scopes: Optional[str] = None
+    scopes: str | None = None
 
 
 class OAuthClientConfigRequest(BaseModel):
@@ -367,11 +366,11 @@ class OAuthClientConfigRequest(BaseModel):
     when the issuer differs from the endpoint host."""
 
     client_id: str
-    client_secret: Optional[str] = None
+    client_secret: str | None = None
     authorization_endpoint: str
     token_endpoint: str
-    issuer: Optional[str] = None
-    scopes: Optional[str] = None
+    issuer: str | None = None
+    scopes: str | None = None
 
 
 #: The tuple a stored user token is bound to. A token minted by one
@@ -381,7 +380,7 @@ class OAuthClientConfigRequest(BaseModel):
 _OAUTH_IDENTITY_FIELDS = ("issuer", "authorization_endpoint", "token_endpoint", "client_id")
 
 
-def _oauth_identity_changed(existing: Dict[str, Any], **written: Optional[str]) -> bool:
+def _oauth_identity_changed(existing: dict[str, Any], **written: str | None) -> bool:
     """True when the about-to-be-written client row addresses a different
     authorization-server identity than the stored one.
 
@@ -393,7 +392,7 @@ def _oauth_identity_changed(existing: Dict[str, Any], **written: Optional[str]) 
     return any((existing.get(k) or "") != (written.get(k) or "") for k in _OAUTH_IDENTITY_FIELDS)
 
 
-def _serialize_oauth_client(row: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize_oauth_client(row: dict[str, Any]) -> dict[str, Any]:
     """Project an ``mcp_source_oauth_clients`` row to the API shape.
 
     Write-only fields (``client_secret``, ``registration_access_token``) are
@@ -428,8 +427,8 @@ def _audit(
     actor_id: str,
     action: str,
     resource: str,
-    params: Optional[Dict[str, Any]] = None,
-    params_before: Optional[Dict[str, Any]] = None,
+    params: dict[str, Any] | None = None,
+    params_before: dict[str, Any] | None = None,
 ) -> None:
     """Best-effort audit row. Mirrors ``app/api/data_packages._audit``."""
     try:
@@ -444,7 +443,7 @@ def _audit(
         logger.warning("audit log failed for %s/%s", action, resource)
 
 
-def _url_policy_report(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _url_policy_report(row: dict[str, Any]) -> dict[str, Any] | None:
     """A per-row url-policy verdict, DNS-free (#1216 part 1: the sweep/report).
 
     ``check_source_url`` gates a source's ``url`` at CONFIGURATION time only
@@ -486,11 +485,11 @@ def _url_policy_report(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _serialize_source(
-    row: Dict[str, Any],
+    row: dict[str, Any],
     *,
     has_vault_secret: bool = False,
-    vault_secret_updated_at: Optional[str] = None,
-) -> Dict[str, Any]:
+    vault_secret_updated_at: str | None = None,
+) -> dict[str, Any]:
     """Project a ``mcp_sources`` row to the API shape (timestamps as ISO).
 
     ``has_vault_secret`` is a write-only-secret status flag — True iff a
@@ -521,7 +520,7 @@ def _serialize_source(
     }
 
 
-def _serialize_tool(row: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize_tool(row: dict[str, Any]) -> dict[str, Any]:
     """Project a ``tool_registry`` row to the API shape."""
     return {
         "tool_id": row.get("tool_id"),
@@ -543,7 +542,7 @@ def _serialize_tool(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _per_user_secret_coverage(source_id: str) -> List[Dict[str, Any]]:
+def _per_user_secret_coverage(source_id: str) -> list[dict[str, Any]]:
     """Who has connected their OWN credential for ``source_id``, and when.
 
     Read-only admin diagnostic for the detail page — never returns a secret
@@ -576,7 +575,7 @@ def _per_user_secret_coverage(source_id: str) -> List[Dict[str, Any]]:
     ]
 
 
-def _merge_source_patch(existing: Dict[str, Any], patch: UpdateMCPSourceRequest) -> Dict[str, Any]:
+def _merge_source_patch(existing: dict[str, Any], patch: UpdateMCPSourceRequest) -> dict[str, Any]:
     """Merge a partial source patch onto the existing row.
 
     Returns the kwargs dict to pass to ``MCPSourceRepository.upsert``.
@@ -640,7 +639,7 @@ def _merge_source_patch(existing: Dict[str, Any], patch: UpdateMCPSourceRequest)
     return merged
 
 
-def _merge_tool_patch(existing: Dict[str, Any], patch: UpdateToolRequest) -> Dict[str, Any]:
+def _merge_tool_patch(existing: dict[str, Any], patch: UpdateToolRequest) -> dict[str, Any]:
     """Merge a partial tool patch onto the existing row → upsert kwargs."""
     data = patch.model_dump(exclude_unset=True)
     return {
@@ -666,7 +665,7 @@ def _merge_tool_patch(existing: Dict[str, Any], patch: UpdateToolRequest) -> Dic
     }
 
 
-def _probe_caller_user_id(src: Dict[str, Any], user: dict) -> Optional[str]:
+def _probe_caller_user_id(src: dict[str, Any], user: dict) -> str | None:
     """Caller identity for the admin connect probes (introspect/classify/test).
 
     A ``per_user``-scoped source is probed under the calling admin's own
@@ -899,6 +898,16 @@ async def get_mcp_source(
     )
     out["tools"] = [_serialize_tool(t) for t in tools]
     out["per_user_secrets"] = _per_user_secret_coverage(source_id)
+    # Whether an OAuth client is already registered for this source — the
+    # detail page's register-vs-connect gate reads this instead of making a
+    # second round trip. `None` for a non-oauth source (nothing to show).
+    if (src.get("auth_method") or "").lower() == "oauth":
+        from src.repositories import mcp_source_oauth_clients_repo
+
+        client_row = mcp_source_oauth_clients_repo().get(source_id)
+        out["oauth_client"] = _serialize_oauth_client(client_row) if client_row else None
+    else:
+        out["oauth_client"] = None
     # Which groups this source is granted to, in the same units the grant and
     # revoke endpoints work in ("every tool of this source"). Derived here
     # because grants live per tool: an editing surface that wanted to show
@@ -1084,7 +1093,7 @@ async def update_mcp_source(
     # `url_repointed` False, so the row said nothing was purged while an
     # operator hunting "why did everyone lose access" saw an ordinary field
     # edit (Devin Review on #1124).
-    purged: List[str] = []
+    purged: list[str] = []
     if url_repointed:
         # Per-user secrets go through the factory — a raw repo would write to
         # the always-DuckDB connection and orphan rows on a PG instance.
@@ -1279,7 +1288,7 @@ def _url_origin(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def _require_oauth_source(src: Dict[str, Any]) -> None:
+def _require_oauth_source(src: dict[str, Any]) -> None:
     if (src.get("auth_method") or "").lower() != "oauth":
         raise HTTPException(
             status_code=400,
@@ -1305,7 +1314,7 @@ def _oauth_redirect_uri() -> str:
 @router.post("/mcp-sources/{source_id}/oauth/register")
 async def register_oauth_client(
     source_id: str,
-    payload: Optional[OAuthRegisterRequest] = None,
+    payload: OAuthRegisterRequest | None = None,
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -1314,6 +1323,9 @@ async def register_oauth_client(
     server. Idempotent — a second call replaces the row, best-effort
     revoking the OLD registration first (spec §2 step 5).
     """
+    import httpx
+
+    from connectors.mcp.client import exc_summary as _exc_summary
     from connectors.mcp.oauth_client import (
         OAuthDiscoveryError,
         best_effort_revoke_registration,
@@ -1325,10 +1337,6 @@ async def register_oauth_client(
         require_pkce_s256,
         resolve_issuer,
     )
-
-    import httpx
-
-    from connectors.mcp.client import exc_summary as _exc_summary
     from src.net.ssrf_safe_client import SSRFRejected
     from src.repositories import mcp_source_oauth_clients_repo
 
@@ -1696,12 +1704,12 @@ class PreviewIntrospectRequest(BaseModel):
     """A connection the admin has typed but not yet registered."""
 
     transport: str
-    url: Optional[str] = None
-    command: Optional[str] = None
-    args: Optional[List[str]] = None
-    env: Optional[Dict[str, str]] = None
-    auth_method: Optional[str] = None
-    auth_secret_env: Optional[str] = None
+    url: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    auth_method: str | None = None
+    auth_secret_env: str | None = None
 
     @field_validator("transport")
     @classmethod
@@ -1710,7 +1718,7 @@ class PreviewIntrospectRequest(BaseModel):
 
     @field_validator("auth_method")
     @classmethod
-    def _check_auth_method(cls, v: Optional[str]) -> Optional[str]:
+    def _check_auth_method(cls, v: str | None) -> str | None:
         return _validate_auth_method(v) if v is not None else None
 
 
@@ -1925,7 +1933,7 @@ async def test_mcp_source(
 @router.post("/mcp-sources/{source_id}/materialize")
 async def materialize_mcp_source(
     source_id: str,
-    payload: Optional[MaterializeRequest] = None,
+    payload: MaterializeRequest | None = None,
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -2119,7 +2127,7 @@ async def create_mcp_tool(
 
 @router.get("/mcp-tools")
 async def list_mcp_tools(
-    source_id: Optional[str] = None,
+    source_id: str | None = None,
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -2200,7 +2208,7 @@ class ProjectionMapRequest(BaseModel):
     does not wipe it).
     """
 
-    projection_map: Optional[Dict[str, str]] = None
+    projection_map: dict[str, str] | None = None
 
 
 @router.put("/mcp-tools/{tool_id}/projection-map")

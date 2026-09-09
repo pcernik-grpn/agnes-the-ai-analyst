@@ -4,8 +4,8 @@ PG-ONLY (A3 PG-first ratchet): this table pair landed after the DuckDB
 app-state backend was frozen, so there is no ``src/db.py`` ladder step and
 no DuckDB repository. ``SCHEMA_VERSION`` does not move.
 
-Revision ID: 0115_issue_reports
-Revises: 0114_corpus_chunks_tsv
+Revision ID: 0116_issue_reports
+Revises: 0115_chat_messages_llm_timing
 Create Date: 2026-09-09
 """
 
@@ -17,8 +17,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0115_issue_reports"
-down_revision: str | None = "0114_corpus_chunks_tsv"
+revision: str = "0116_issue_reports"
+down_revision: str | None = "0115_chat_messages_llm_timing"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
