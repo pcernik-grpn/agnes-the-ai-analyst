@@ -459,6 +459,59 @@ class ChatRepository:
         ).fetchall()
         return [_row_to_session(r) for r in rows]
 
+    def list_completed_between(
+        self,
+        since: datetime,
+        until: datetime,
+        *,
+        surfaces: Optional[tuple[str, ...]] = None,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        after: Optional[tuple[datetime, str]] = None,
+    ) -> list[dict]:
+        """See ``ChatSessionPgRepository.list_completed_between``'s
+        docstring -- same page shape (lean id/surface/agent_id/user_email/
+        last_message_at dicts), same "completed by last_message_at falling
+        in [since, until)" rule, same ``(last_message_at, id)`` ascending
+        keyset.
+
+        DuckDB has no stored ``last_message_at`` (see module docstring): a
+        CTE derives it the same way ``_SESSION_SELECT`` does, and every
+        filter/keyset clause below reads that derived column rather than a
+        table one.
+        """
+        if self._sessions_pg is not None:
+            return self._sessions_pg.list_completed_between(
+                since, until, surfaces=surfaces, agent_id=agent_id, limit=limit, after=after
+            )
+        clauses = ["last_message_at IS NOT NULL", "last_message_at >= ?", "last_message_at < ?"]
+        params: list = [since, until]
+        if surfaces:
+            clauses.append("surface = ANY(?)")
+            params.append(list(surfaces))
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if after is not None:
+            after_ts, after_id = after
+            clauses.append("(last_message_at, id) > (?, ?)")
+            params.extend([after_ts, after_id])
+        query = (
+            "WITH agg AS ("
+            "SELECT s.id AS id, s.surface AS surface, s.agent_id AS agent_id, "
+            "s.user_email AS user_email, MAX(m.created_at) AS last_message_at "
+            "FROM chat_sessions s LEFT JOIN chat_messages m ON m.session_id = s.id "
+            "GROUP BY s.id, s.surface, s.agent_id, s.user_email"
+            ") SELECT id, surface, agent_id, user_email, last_message_at FROM agg WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY last_message_at ASC, id ASC LIMIT ?"
+        )
+        params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [
+            {"id": r[0], "surface": r[1], "agent_id": r[2], "user_email": r[3], "last_message_at": r[4]} for r in rows
+        ]
+
     def get_first_user_message(self, chat_id: str) -> Optional[str]:
         """First user-role message content in a session (oldest by
         ``created_at``), or ``None`` if the session has no user turns yet.
@@ -686,6 +739,47 @@ class ChatRepository:
             )
             for r in rows
         ]
+
+    def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[ChatMessage]]:
+        """See ``ChatMessagePgRepository.list_for_sessions``'s docstring --
+        same bulk-by-session-id shape (the conversation-corpus export's
+        page read, design 2026-09-08 §3.12): one query for a whole page of
+        sessions rather than one ``list_messages`` call per session. A
+        session with no messages is not a key in the returned dict.
+
+        ``cache_read_tokens`` / ``cache_creation_tokens`` / ``turn_id`` have
+        no DuckDB column (A3 freeze) and are left at the ``ChatMessage``
+        default of ``None`` -- the same accept-and-drop precedent as
+        ``append_message`` above.
+        """
+        if self._messages_pg is not None:
+            return self._messages_pg.list_for_sessions(session_ids)
+        if not session_ids:
+            return {}
+        rows = self._conn.execute(
+            "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, "
+            "model, sender_email, created_at FROM chat_messages WHERE session_id = ANY(?) "
+            "ORDER BY session_id ASC, created_at ASC",
+            [list(session_ids)],
+        ).fetchall()
+        out: dict[str, list[ChatMessage]] = {}
+        for r in rows:
+            out.setdefault(r[1], []).append(
+                ChatMessage(
+                    id=r[0],
+                    session_id=r[1],
+                    role=r[2],
+                    content=r[3],
+                    tool_calls=json.loads(r[4]) if r[4] else None,
+                    parts=json.loads(r[5]) if r[5] else None,
+                    tokens_in=r[6],
+                    tokens_out=r[7],
+                    model=r[8],
+                    sender_email=r[9],
+                    created_at=r[10],
+                )
+            )
+        return out
 
     def list_recent_messages(self, session_id: str, *, limit: int = 500) -> list[ChatMessage]:
         """Newest-first slice of the conversation — the counterpart to
