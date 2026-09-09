@@ -3944,6 +3944,15 @@ KNOWN_UNTESTED = {
     # in the list, and agreement with the sync manifest for the same
     # caller); not duplicated here.
     "GET /api/knowledge/digests",
+    # Conversation corpus export (design 2026-09-08 §3.12) — admin-gated,
+    # Postgres-only, keyset-paginated jsonl/json stream: not
+    # parameter-free-GET shaped for this smoke sweep (`since` is required,
+    # `format`/`cursor` vary the response shape). Covered instead by
+    # tests/test_conversation_export.py (pure record builder), tests/
+    # test_conversation_export_api.py (admin gate + DuckDB typed 501), and
+    # tests/db_pg/test_conversation_export_pg.py (admin gate, policy gate,
+    # cursor pagination across pages, format=json, audit row).
+    "GET /api/admin/conversations/export",
 }
 
 

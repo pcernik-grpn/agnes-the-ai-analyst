@@ -2094,6 +2094,20 @@ _EXEMPT: dict[str, str] = {
         "plan) — system-to-system, X-Runner-Token authenticated; no user-facing "
         "CLI subcommand or MCP analogue"
     ),
+    # Conversation corpus export (design 2026-09-08 §3.12) — CLI-covered
+    # (`agnes admin conversations export`), MCP-exempt by design: it is a
+    # bulk, admin-only pull of OTHER users' full conversation content (every
+    # message, every tool call, feedback, memory writes) meant to leave the
+    # instance via a deliberate admin action under the content-export
+    # policy, not a tool a live chat/agent-api turn could reach for on its
+    # own — a different risk than an admin's own scoped queries.
+    "/api/admin/conversations/export": (
+        "the evaluation-corpus pull (design 2026-09-08 §3.12) — CLI-covered "
+        "(`agnes admin conversations export`); no MCP tool by design — handing "
+        "a live agent a tool that reads back the whole corpus (other users' "
+        "conversations, tool call bodies) under the content-export policy is a "
+        "bulk admin export, not an agent-facing query"
+    ),
 }
 
 

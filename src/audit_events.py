@@ -1530,6 +1530,14 @@ CATALOG: dict[str, AuditEvent] = {
         "system",
         "The instance's effective content-export policy (mode, placement, approver) at startup.",
     ),
+    # -- 2026-09-08 LLM observability design §3.12 -- the evaluation-corpus
+    # export (pull). One row per request: window, count, content_mode,
+    # placement and delivery -- never the exported content itself.
+    "conversations.export": AuditEvent(
+        "conversations.export",
+        "read",
+        "A conversation-corpus export was read (admin pull, under the content-export policy).",
+    ),
 }
 
 

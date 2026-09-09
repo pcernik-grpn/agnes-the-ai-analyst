@@ -564,6 +564,79 @@ the reverse: clear the URL, then the app.
 
 Not exported by anything: HTTP request spans and database calls.
 
+## Conversation corpus export — for evaluation, under the content policy
+
+Telemetry (above) is one span/row per LLM call, content capped, for "what did
+this cost and where does it burn". The corpus export is a different product:
+one COMPLETE record per chat session, every surface (web, Slack, Telegram,
+agent API), built on-instance from what the instance already keeps
+(`chat_sessions`, `chat_messages`, `llm_calls`, `chat_message_feedback`,
+`agent_memories`) — for "why are the answers bad, at scale".
+
+### Shape
+
+One record per session:
+
+| field | source |
+|---|---|
+| `thread_id` | `chat_sessions.id` |
+| `source` | literal `agnes` |
+| `surface`, `agent_id`, `user_id` | the session — **never the email** |
+| `deployment_environment` | the instance label the logs and spans carry |
+| `conversation_start`, `conversation_end`, `duration_seconds` | first and last message timestamps |
+| `turn_count`, `message_count`, `tool_call_count`, `tool_calls_sequence` | derived from messages and parts |
+| `llm_run_count`, `total_prompt_tokens`, `total_completion_tokens`, `llm_cache_read_tokens`, `llm_cache_creation_tokens`, `total_cost`, `primary_model`, `provider` | summed from the session's `llm_calls` rows; fallback to `chat_messages` token columns when no `llm_calls` row exists |
+| `cost_status` | `ledger` (measured from `llm_calls`), `transcript` (priced from `chat_messages` token columns), or `unavailable` (zeros, never a silent zero) |
+| `messages_json` | `[{role, content, turn_id, created_at, parts}]` — complete, tool_use and tool_result blocks included, in order |
+| `tool_calls_json` | `[{turn_id, tool_name, input, output, is_error, started_at}]` |
+| `first_user_message`, `last_message_role`, `final_assistant_message_complete` | derived |
+| `last_run_status`, `has_error`, `error_types` | the session's `llm_calls` statuses and error frames |
+| `feedback_json` | `[{turn_id, user_id, verdict, comment, created_at}]` |
+| `memory_writes_json` | `[{memory_id, turn_id, status, content_length}]` — the memory's own content is never included, only its length |
+| `content_mode` | `full` or `pseudonymized` — what this record's text went through |
+| `exported_at` | |
+
+### Under the content policy
+
+Both the field table's content-bearing fields and the export as a whole are
+gated by the same `observability.content_export` policy the OTel export
+above obeys (mode/placement/basis/approved_by/workloads — see *Per-workload
+content classes* above). A pull refuses `403 content_export_disabled` —
+with a `reason` of `mode_off`, `no_basis` or `workload_excluded` — when the
+policy is off, has no recorded basis, or its `workloads` allowlist excludes
+`chat`. Under `mode: pseudonymized`, `messages_json`, `tool_calls_json` and
+`first_user_message` go through the same instance anonymizer the OTel path
+uses, once at export time (never per span, unlike the telemetry above);
+under `full` they export verbatim. `content_mode` on every record says
+which happened, so a downstream consumer never has to guess. No new
+retention: the export reads what `chat_messages` already keeps.
+
+### Pulling it
+
+`GET /api/admin/conversations/export?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+— admin-only, Postgres-only (a DuckDB-backed instance answers a typed
+`501`), newline-delimited JSON by default, `limit` at most 500, a keyset
+cursor on `(last_message_at, id)` returned as both the `X-Next-Cursor`
+header and `next_cursor` in the JSON body (`format=json`). `since` is
+required — a bare call is a `400 since_required`, not an unbounded scan of
+every conversation the instance has ever held.
+
+```bash
+curl -s -H "Authorization: Bearer $PAT" \
+  "$SERVER/api/admin/conversations/export?since=2026-01-01&limit=200" \
+  | tee conversations.jsonl
+```
+
+`agnes admin conversations export --since 2026-01-01 --out conversations.jsonl`
+mirrors it from the terminal, following the cursor across pages until
+exhausted (`--json` writes one array instead). A data platform pulls this
+with a generic HTTP extractor and a personal access token — the format is
+deliberately transport-neutral, no vendor-specific client required.
+
+Every pull writes one `conversations.export` audit row (`since`, `until`,
+`surface`, `agent_id`, `count`, `content_mode`, `placement`, `delivery:
+"pull"` — never the exported content itself).
+
 ## No telemetry vendor
 
 Agnes sends nothing to a third-party analytics or error-tracking service, and

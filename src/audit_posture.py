@@ -1067,6 +1067,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/connectors/manifest": "exempt:ui_support",
     "GET /api/connectors/params": "exempt:ui_support",
     "GET /api/connectors/{slug}/prompt": "exempt:ui_support",
+    # -- app.api.conversations_export (design 2026-09-08 §3.12) --
+    # The evaluation-corpus pull. Real content (messages, tool calls), so a
+    # cataloged action rather than exempt -- same reasoning as
+    # `catalog.sample` / `collection.file_preview` above.
+    "GET /api/admin/conversations/export": "conversations.export",
     # -- app.api.cowork_bundle --
     "GET /api/user/setup-tokens": "exempt:self",
     # -- app.api.data --

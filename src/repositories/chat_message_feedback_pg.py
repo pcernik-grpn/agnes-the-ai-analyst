@@ -130,3 +130,27 @@ class ChatMessageFeedbackPgRepository:
                 sa.text("DELETE FROM chat_message_feedback WHERE created_at < :cutoff"), {"cutoff": cutoff}
             )
         return result.rowcount or 0
+
+    def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Every feedback row for ``session_ids``, grouped by session and
+        ordered oldest-first -- the conversation-corpus export's bulk read
+        (design 2026-09-08 §3.12), one query for a whole page of sessions.
+        """
+        if not session_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT * FROM chat_message_feedback "
+                        "WHERE session_id = ANY(:session_ids) ORDER BY session_id ASC, created_at ASC"
+                    ),
+                    {"session_ids": list(session_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["session_id"], []).append(dict(r))
+        return out

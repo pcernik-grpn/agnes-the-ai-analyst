@@ -360,3 +360,49 @@ class ChatSessionPgRepository:
                 .all()
             )
         return [_row_to_session(r) for r in rows]
+
+    def list_completed_between(
+        self,
+        since: datetime,
+        until: datetime,
+        *,
+        surface: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        after: Optional[tuple[datetime, str]] = None,
+    ) -> list[dict]:
+        """One page of sessions "completed" in ``[since, until)`` -- the
+        conversation-corpus export's cursor source (design 2026-09-08 §3.12).
+
+        A session counts as completed for the window purely by
+        ``last_message_at`` falling in it, regardless of ``archived``: the
+        export reads what happened, not what is still open in a sidebar.
+        Ordered ``(last_message_at, id)`` ascending -- deterministic
+        regardless of how many sessions share a timestamp -- and ``after``
+        (from a prior page's last row) resumes strictly past that position,
+        the same keyset shape ``corpus_file_events_pg.py::list_for_corpus_ids``
+        uses. Returns lean rows (id/surface/agent_id/user_email/
+        last_message_at), not a full :class:`ChatSession` -- the export never
+        needs the other columns and a ``SELECT *`` would carry them for
+        nothing.
+        """
+        clauses = ["last_message_at IS NOT NULL", "last_message_at >= :since", "last_message_at < :until"]
+        params: dict = {"since": since, "until": until, "limit": limit}
+        if surface is not None:
+            clauses.append("surface = :surface")
+            params["surface"] = surface
+        if agent_id is not None:
+            clauses.append("agent_id = :agent_id")
+            params["agent_id"] = agent_id
+        if after is not None:
+            after_ts, after_id = after
+            clauses.append("(last_message_at, id) > (:after_ts, :after_id)")
+            params["after_ts"] = after_ts
+            params["after_id"] = after_id
+        query = (
+            "SELECT id, surface, agent_id, user_email, last_message_at FROM chat_sessions "
+            "WHERE " + " AND ".join(clauses) + " ORDER BY last_message_at ASC, id ASC LIMIT :limit"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(query), params).mappings().all()
+        return [dict(r) for r in rows]

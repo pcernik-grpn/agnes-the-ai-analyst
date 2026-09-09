@@ -1282,6 +1282,23 @@ authoring-suggestions queue (never an admin-direct write).
   three are admin-only, Postgres-backed only (typed `501
   requires_postgres_backend` on the frozen DuckDB app-state backend), and
   mirrored by `agnes admin usage llm-cost|llm-calls|feedback`.
+### `/api/admin/conversations/export` — Conversation corpus export (evaluation, design 2026-09-08 §3.12)
+
+One COMPLETE record per chat session (every surface), for an evaluation pipeline —
+the opposite shape from the telemetry above, which is one row per LLM call with
+content capped. See [`observability.md`](observability.md) → *Conversation corpus
+export* for the full field table, the content-export policy gate, and a pull example.
+
+`GET /api/admin/conversations/export?since=&until=&surface=&agent_id=&format=jsonl|json&limit=&cursor=`
+— admin-only, Postgres-only (typed `501` on the frozen DuckDB backend), `since` required
+(`400 since_required` without it), refuses `403 content_export_disabled` when the
+instance's `observability.content_export` policy is off/basis-less/excludes workload
+`chat`. Newline-delimited JSON by default (`format=json` for one array); keyset
+cursor on `(last_message_at, id)`, `limit` at most 500, `X-Next-Cursor` header +
+`next_cursor` in the JSON body. CLI: `agnes admin conversations export --since …
+--out <file> [--json]`, following the cursor until exhausted. Audit action
+`conversations.export` (read; params: window, count, `content_mode`, `placement`,
+`delivery` — never content).
 
 ### `/api/admin/sessions` — Session management (admin)
 
