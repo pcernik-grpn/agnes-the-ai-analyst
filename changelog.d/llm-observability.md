@@ -21,6 +21,11 @@
   `/admin/telemetry`, and the `agnes_llm_calls` table in the `agnes-usage`
   package. `retention.llm_calls_days` prunes it (default 0 = forever). See
   `docs/observability.md` → *LLM call ledger*.
+- A turn record now says when its turn closed, so a completion that finishes
+  after the next turn started, and a memory written outside any turn, record
+  no turn rather than the wrong one. An interrupted answer and a forwarded
+  (role-split) turn carry the same `turn_id` and message id as the user
+  message that started them.
 - **A real trace per chat turn.** ChatManager mints a `turn_id` per user message,
   opens an `agnes.chat.turn` span with one `agnes.chat.tool <tool>` child per tool
   call, and the broker parents its completion spans under it via a coordination
