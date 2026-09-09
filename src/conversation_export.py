@@ -306,11 +306,23 @@ def _fold_cancelled_marker(totals: dict[str, Any], cancelled: bool) -> dict[str,
     is a different fact from a turn the system lost, and an evaluation
     pipeline reading "the answer was incomplete" needs to know which. Unlike
     an interruption it is NOT an error -- nothing went wrong.
+
+    Which is also why ``has_error`` has to be recomputed rather than left
+    alone: cancelling cuts the stream, so the broker records that call as
+    ``incomplete``, and the session-wide ``has_error`` would then report the
+    cancel itself as a failure. Exactly ONE incomplete row is explained by
+    the cancel; a real ``error`` row, or a SECOND incomplete one from an
+    earlier turn, still counts (#2365 review).
     """
     if not cancelled:
         return totals
     folded = dict(totals)
     folded["last_run_status"] = "cancelled"
+    error_count = int(folded.get("error_count") or 0)
+    incomplete_count = int(folded.get("incomplete_count") or 0)
+    folded["has_error"] = error_count > 0 or incomplete_count > 1
+    if not folded["has_error"]:
+        folded["error_types"] = [t for t in (folded.get("error_types") or []) if t != "stream_incomplete"]
     return folded
 
 
@@ -356,6 +368,11 @@ def _totals(calls: Mapping[str, Any] | None, messages: Sequence[Mapping[str, Any
                 "last_run_status": calls.get("last_run_status"),
                 "has_error": bool(calls.get("has_error")),
                 "error_types": list(calls.get("error_types") or []),
+                # Carried for the cancel fold below, which has to tell the
+                # cancelled turn's own cut stream apart from a real failure.
+                # Not exported: they are working figures, not record fields.
+                "error_count": int(calls.get("error_count") or 0),
+                "incomplete_count": int(calls.get("incomplete_count") or 0),
             },
             "ledger",
         )

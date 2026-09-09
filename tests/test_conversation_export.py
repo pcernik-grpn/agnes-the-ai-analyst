@@ -315,6 +315,78 @@ class TestLegacyAndCancelledTranscripts:
         assert record["last_run_status"] == "cancelled"
         assert record["has_error"] is False, "a person pressing stop is not an error"
 
+    def test_a_cancel_does_not_turn_its_own_cut_stream_into_an_error(self):
+        """Cancelling cuts the stream, so the broker files that call as
+        `incomplete` -- and the session-wide has_error would then report the
+        cancel itself as a failure (#2365 review)."""
+        messages = [
+            _msg(role="user", content="question", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                parts=None,
+                tool_calls=[{"cancelled": True}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+            ),
+        ]
+        statuses = {
+            "last_run_status": "incomplete",
+            "has_error": True,
+            "error_types": ["stream_incomplete"],
+            "error_count": 0,
+            "incomplete_count": 1,
+        }
+        record = build_conversation_record(_session(), messages, statuses, [], [], content_mode="full")
+        assert record["has_error"] is False
+        assert record["last_run_status"] == "cancelled"
+        assert record["error_types"] == []
+
+    def test_a_real_error_earlier_in_the_session_survives_the_cancel(self):
+        messages = [
+            _msg(role="user", content="question", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                parts=None,
+                tool_calls=[{"cancelled": True}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+            ),
+        ]
+        statuses = {
+            "last_run_status": "incomplete",
+            "has_error": True,
+            "error_types": ["429", "stream_incomplete"],
+            "error_count": 1,
+            "incomplete_count": 1,
+        }
+        record = build_conversation_record(_session(), messages, statuses, [], [], content_mode="full")
+        assert record["has_error"] is True, "an unrelated earlier failure must not be cleared by a cancel"
+        assert "429" in record["error_types"]
+
+    def test_a_second_incomplete_call_is_not_explained_by_the_cancel(self):
+        messages = [
+            _msg(role="user", content="question", turn_id="t1", created_at=_dt("2026-01-01T10:00:00")),
+            _msg(
+                role="assistant",
+                content="",
+                parts=None,
+                tool_calls=[{"cancelled": True}],
+                turn_id="t1",
+                created_at=_dt("2026-01-01T10:00:05"),
+            ),
+        ]
+        statuses = {
+            "last_run_status": "incomplete",
+            "has_error": True,
+            "error_types": ["stream_incomplete"],
+            "error_count": 0,
+            "incomplete_count": 2,
+        }
+        record = build_conversation_record(_session(), messages, statuses, [], [], content_mode="full")
+        assert record["has_error"] is True
+
     def test_an_interrupted_answer_still_wins_over_the_cancel_status(self):
         messages = [
             _msg(

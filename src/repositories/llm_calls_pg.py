@@ -369,6 +369,13 @@ class LlmCallsPgRepository:
         and an ``incomplete`` one (a stream the model never finished) are
         both answers something went wrong with, which is the question the
         corpus's ``has_error`` exists to answer.
+
+        ``error_count`` and ``incomplete_count`` come back beside it because
+        one caller has to tell the two apart: a CANCELLED conversation ends
+        with an incomplete call BY CONSTRUCTION (the person stopped the
+        stream), and calling that an error would file every cancel as a
+        failure -- while a real error earlier in the same session still has
+        to survive (#2365 review).
         """
         if not session_ids:
             return {}
@@ -376,6 +383,8 @@ class LlmCallsPgRepository:
             SELECT session_id,
                    (array_agg(status ORDER BY created_at DESC))[1] AS last_run_status,
                    bool_or(status <> 'ok') AS has_error,
+                   COUNT(*) FILTER (WHERE status = 'error') AS error_count,
+                   COUNT(*) FILTER (WHERE status = 'incomplete') AS incomplete_count,
                    array_remove(array_agg(DISTINCT error_type), NULL) AS error_types
             FROM llm_calls
             WHERE session_id = ANY(:session_ids)
@@ -387,6 +396,8 @@ class LlmCallsPgRepository:
             r["session_id"]: {
                 "last_run_status": r["last_run_status"],
                 "has_error": bool(r["has_error"]),
+                "error_count": int(r["error_count"] or 0),
+                "incomplete_count": int(r["incomplete_count"] or 0),
                 "error_types": sorted(r["error_types"] or []),
             }
             for r in rows
