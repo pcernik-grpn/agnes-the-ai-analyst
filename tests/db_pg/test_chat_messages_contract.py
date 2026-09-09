@@ -55,6 +55,9 @@ class _PgChatFacade:
     def list_for_sessions(self, session_ids):
         return self._messages.list_for_sessions(session_ids)
 
+    def has_turn(self, session_id, turn_id):
+        return self._messages.has_turn(session_id, turn_id)
+
 
 def _make_pg_repo(pg_engine):
     from alembic import command
@@ -102,3 +105,23 @@ def test_list_for_sessions_empty_input_returns_empty_dict(repo):
     repo.append_message(session_id=s1.id, role="user", content="hi")
 
     assert repo.list_for_sessions([]) == {}
+
+
+def test_has_turn_vouches_only_for_the_sessions_own_turns(repo, request):
+    """``has_turn`` is the feedback endpoint's ownership check. Postgres
+    answers from ``chat_messages.turn_id``; the frozen DuckDB backend has no
+    such column (``append_message`` drops ``turn_id``) and therefore answers
+    ``False`` for every turn -- fail closed, never "cannot check, so allow".
+    """
+    from app.chat.types import Surface
+
+    mine = repo.create_session(user_email="a@test.com", surface=Surface.WEB)
+    other = repo.create_session(user_email="b@test.com", surface=Surface.WEB)
+    repo.append_message(session_id=mine.id, role="user", content="hello", turn_id="t-mine")
+    repo.append_message(session_id=other.id, role="user", content="hi", turn_id="t-other")
+
+    assert repo.has_turn(mine.id, "t-other") is False
+    assert repo.has_turn(mine.id, "t-nowhere") is False
+    assert repo.has_turn("", "t-mine") is False
+    on_postgres = request.node.callspec.params["repo"] == "pg"
+    assert repo.has_turn(mine.id, "t-mine") is on_postgres

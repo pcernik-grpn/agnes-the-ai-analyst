@@ -441,16 +441,22 @@ async def submit_feedback(
     after the frame is broadcast. One row per ``(turn_id, user_id)`` — a second
     submit for the same turn UPDATEs it rather than piling up a second opinion.
     Gated like the session's other routes (owner or a live participant, 404
-    for a stranger — never 403, matching the sibling routes above). The
-    feedback repo is resolved as a FastAPI dependency so a DuckDB-backed
-    instance answers the typed 501 before the body is even validated.
-    Audited as ``chat.feedback`` with the verdict, never the comment.
+    for a stranger — never 403, matching the sibling routes above), and the
+    turn itself must be one of THIS session's turns (a message of the
+    session carries it) — a caller-supplied ``turn_id`` from some other
+    session is a 404 too, so being allowed to rate one conversation never
+    lets anyone attach feedback to another's turns. The feedback repo is
+    resolved as a FastAPI dependency so a DuckDB-backed instance answers
+    the typed 501 before the body is even validated. Audited as
+    ``chat.feedback`` with the verdict, never the comment.
     """
     _reject_restricted_principal(user, "rate an answer")
     repo = _get_repo(request)
     s = repo.get_session(chat_id)
     if s is None or not _can_rate(repo, s, user):
         raise HTTPException(404)
+    if not repo.has_turn(chat_id, body.turn_id):
+        raise HTTPException(404, detail="turn not found in this session")
     comment = (body.comment or "").strip() or None
     row = feedback_repo.upsert(
         session_id=chat_id,

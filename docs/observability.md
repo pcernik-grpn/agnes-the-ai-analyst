@@ -247,7 +247,9 @@ was.
 
 `POST /api/chat/sessions/{chat_id}/feedback` (`{turn_id, verdict: "up"|
 "down", comment?}`, gated like the session's other routes — owner or a live
-participant) writes one `chat_message_feedback` row per `(turn_id,
+participant — and only for a turn the session's own messages carry, so a
+caller cannot key feedback on another session's turn) writes one
+`chat_message_feedback` row per `(turn_id,
 user_id)` — a second submit updates it rather than piling up a second
 opinion. Audited as `chat.feedback` (session, turn, verdict — never the
 comment). The web chat renders thumbs on every completed assistant bubble

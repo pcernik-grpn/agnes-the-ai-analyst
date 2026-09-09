@@ -319,6 +319,22 @@ class ChatMessagePgRepository:
             )
         return [dict(r) for r in rows]
 
+    def has_turn(self, session_id: str, turn_id: str) -> bool:
+        """Whether ``turn_id`` is a turn of ``session_id`` -- i.e. at least
+        one of the session's own messages carries it. The feedback endpoint
+        asks this before keying a thumbs row on a caller-supplied turn id,
+        so a participant of one session cannot attach feedback to a turn
+        that belongs to another (design 2026-09-08 §3.5; review finding).
+        """
+        if not session_id or not turn_id:
+            return False
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT 1 FROM chat_messages WHERE session_id = :session_id AND turn_id = :turn_id LIMIT 1"),
+                {"session_id": session_id, "turn_id": turn_id},
+            ).first()
+        return row is not None
+
     def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[ChatMessage]]:
         """Every message for ``session_ids``, grouped by session and ordered
         oldest-first within each -- the conversation-corpus export's bulk

@@ -87,10 +87,35 @@ def client(engine, monkeypatch) -> TestClient:
     return TestClient(app)
 
 
-def _create_session(client: TestClient) -> str:
+def _create_session(client: TestClient, *, turn_id: str | None = "t1") -> str:
+    """A session that already has one turn (a user message carrying
+    ``turn_id``) -- the feedback endpoint only accepts a turn the session's
+    own messages carry, so a bare session would 404 every rating."""
     r = client.post("/api/chat/sessions", json={"surface": "web"})
     assert r.status_code == 201, r.text
-    return r.json()["id"]
+    chat_id = r.json()["id"]
+    if turn_id is not None:
+        client.app.state.chat_repo.append_message(session_id=chat_id, role="user", content="hello", turn_id=turn_id)
+    return chat_id
+
+
+def test_feedback_404_for_a_turn_of_another_session_and_writes_nothing(client: TestClient):
+    """Review finding: the turn id is caller-supplied. Being allowed to rate
+    session A must not let the caller key a feedback row on a turn that
+    belongs to session B (or on a turn that exists nowhere)."""
+    from src.repositories import chat_message_feedback_repo
+
+    mine = _create_session(client, turn_id="t-mine")
+    _create_session(client, turn_id="t-theirs")  # a second session owning the other turn
+
+    foreign = client.post(f"/api/chat/sessions/{mine}/feedback", json={"turn_id": "t-theirs", "verdict": "up"})
+    assert foreign.status_code == 404, foreign.text
+    nowhere = client.post(f"/api/chat/sessions/{mine}/feedback", json={"turn_id": "t-nowhere", "verdict": "up"})
+    assert nowhere.status_code == 404, nowhere.text
+    assert chat_message_feedback_repo().list_feedback() == []
+
+    own = client.post(f"/api/chat/sessions/{mine}/feedback", json={"turn_id": "t-mine", "verdict": "up"})
+    assert own.status_code == 200, own.text
 
 
 def test_two_posts_for_one_turn_upsert_a_single_row_and_the_second_verdict_wins(client: TestClient):

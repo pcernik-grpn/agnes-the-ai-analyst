@@ -4229,7 +4229,10 @@ the other.
 `POST /api/chat/sessions/{chat_id}/feedback` records a thumbs up/down on one
 completed chat turn (`{turn_id, verdict: "up"|"down", comment?}`) — the LLM
 observability design's quality signal (§3.5). Gated like the session's other
-routes: the owner or a live participant, 404 for a stranger (never 403). One
+routes: the owner or a live participant, 404 for a stranger (never 403), and
+the turn must be one of THIS session's turns — one the session's own
+messages carry — else 404 as well, so rating one conversation never lets a
+caller attach feedback to another's turns. One
 row per `(turn_id, user_id)` — resubmitting for the same turn UPDATEs it
 rather than adding a second opinion. Postgres-only (A3 ratchet): the feedback
 repository is resolved as a dependency, so a DuckDB-backed instance answers

@@ -740,6 +740,18 @@ class ChatRepository:
             for r in rows
         ]
 
+    def has_turn(self, session_id: str, turn_id: str) -> bool:
+        """See ``ChatMessagePgRepository.has_turn``. ``turn_id`` has no
+        DuckDB column (A3 freeze -- ``append_message`` drops it), so the
+        frozen backend cannot vouch for any turn and answers ``False``:
+        fail closed, never "cannot check, so allow". The one caller (the
+        chat feedback endpoint) is Postgres-only anyway and answers a typed
+        501 on this backend before it ever asks.
+        """
+        if self._messages_pg is not None:
+            return self._messages_pg.has_turn(session_id, turn_id)
+        return False
+
     def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[ChatMessage]]:
         """See ``ChatMessagePgRepository.list_for_sessions``'s docstring --
         same bulk-by-session-id shape (the conversation-corpus export's

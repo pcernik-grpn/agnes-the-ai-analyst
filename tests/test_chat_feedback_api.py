@@ -130,12 +130,42 @@ def test_feedback_501_precedes_body_validation(client: TestClient):
 
 
 @pytest.fixture
-def fake_repo(client: TestClient) -> _RecordingRepo:
+def fake_repo(client: TestClient, monkeypatch) -> _RecordingRepo:
+    """Fake the two Postgres-only pieces the handler needs past the 501
+    gate: the feedback repo, and the session repo's ``has_turn`` (the
+    frozen DuckDB backend has no ``turn_id`` column and answers ``False``
+    for every turn -- fail closed -- which would 404 every request here).
+    A test that wants the real "unknown turn" path patches it back."""
     from app.api.chat import _feedback_repo
+    from app.chat.persistence import ChatRepository
 
     fake = _RecordingRepo()
     client.app.dependency_overrides[_feedback_repo] = lambda: fake
+    monkeypatch.setattr(ChatRepository, "has_turn", lambda self, session_id, turn_id: turn_id == "t1")
     return fake
+
+
+def test_feedback_404_for_a_turn_that_is_not_the_sessions(client: TestClient, fake_repo: _RecordingRepo):
+    """A caller allowed to rate THIS session must not be able to key a
+    feedback row on a turn id from some other session (or a made-up one):
+    the turn has to be one the session's own messages carry, else 404 --
+    and nothing is written."""
+    chat_id = _create_session(client)
+    r = client.post(f"/api/chat/sessions/{chat_id}/feedback", json={"turn_id": "t-elsewhere", "verdict": "up"})
+    assert r.status_code == 404, r.text
+    assert fake_repo.calls == []
+
+
+def test_feedback_on_the_frozen_backend_never_vouches_for_a_turn(client: TestClient, monkeypatch):
+    """``ChatRepository.has_turn`` on a DuckDB-backed repo is ``False`` for
+    every turn -- the column does not exist there, so the check fails
+    closed rather than open."""
+    from app.chat.persistence import ChatRepository
+
+    repo = client.app.state.chat_repo
+    assert isinstance(repo, ChatRepository)
+    chat_id = _create_session(client)
+    assert repo.has_turn(chat_id, "t1") is False
 
 
 def test_feedback_upserts_and_audits(client: TestClient, fake_repo: _RecordingRepo, monkeypatch):
