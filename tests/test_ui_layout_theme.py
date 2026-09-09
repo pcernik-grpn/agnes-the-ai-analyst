@@ -755,7 +755,16 @@ class TestRailChatHistory:
         import app.web.router as _router
 
         monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
-        _router.templates.env.globals["admin_setup_rail"] = lambda: None
+        # setitem, not a raw assignment: the Jinja global is process-wide, so an
+        # unrestored stub outlives this test and every later test in the worker
+        # reads `lambda: None` from it. That is not hypothetical — it is what
+        # turned `test_the_chain_is_wired_end_to_end_without_a_stub` red in CI
+        # while every local run passed: in FILE order a later test happens to
+        # repair the global in its own `finally` before that one reads it, and
+        # under xdist's load distribution that repair lands on another worker,
+        # or after it. Every other stub of this global in this file restores;
+        # these two were the pair that did not.
+        monkeypatch.setitem(_router.templates.env.globals, "admin_setup_rail", lambda: None)
         resp = web_client.get("/library", cookies=admin_cookie)
         assert resp.status_code == 200
         # Asserted against the rail chrome slice, not the whole document — the
@@ -1529,7 +1538,16 @@ class TestRailChatsDestination:
         import app.web.router as _router
 
         monkeypatch.setattr(_router, "_admin_setup_rail", lambda: None)
-        _router.templates.env.globals["admin_setup_rail"] = lambda: None
+        # setitem, not a raw assignment: the Jinja global is process-wide, so an
+        # unrestored stub outlives this test and every later test in the worker
+        # reads `lambda: None` from it. That is not hypothetical — it is what
+        # turned `test_the_chain_is_wired_end_to_end_without_a_stub` red in CI
+        # while every local run passed: in FILE order a later test happens to
+        # repair the global in its own `finally` before that one reads it, and
+        # under xdist's load distribution that repair lands on another worker,
+        # or after it. Every other stub of this global in this file restores;
+        # these two were the pair that did not.
+        monkeypatch.setitem(_router.templates.env.globals, "admin_setup_rail", lambda: None)
         admin_rail = self._rail(web_client, admin_cookie, "/admin/users")
         assert 'id="railGetStarted"' not in admin_rail
         assert "rail-getstarted" not in admin_rail
