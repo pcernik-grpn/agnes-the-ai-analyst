@@ -120,6 +120,18 @@
        include is one more thing to forget. #}
     <link rel="stylesheet" href="{{ static_url('css/view_as.css') }}">
 
+    {# "Report a problem" dialog (_issue_dialog.html, included below, inside
+       the same gate). drawer.css supplies the ds.drawer_field/drawer_select/
+       drawer_checkbox chrome the dialog's fields reuse; issue_dialog.css is
+       the dialog's own page-local styling (kinds strip, chips, fallback
+       textarea). Gated like the partial itself — issue reports are
+       Postgres-only (A3 PG-first ratchet), so neither loads on a DuckDB
+       instance that never renders the button. #}
+    {% if can_report_issue %}
+    <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+    <link rel="stylesheet" href="{{ static_url('css/issue_dialog.css') }}">
+    {% endif %}
+
     {% block head_extra %}{% endblock %}
     {% include '_theme.html' ignore missing %}
     {# Operator-injected scripts (placement=head_end, the default) —
@@ -145,6 +157,13 @@
        (`_app_header.html`) was retired in Wave 0 (2026-08); rail is the
        only layout now. #}
     {% include '_app_rail.html' %}
+
+    {# "Report a problem" dialog — hidden by default, opened by
+       #rail-report-issue / #rail-report-issue-menu (issue_report.js). Same
+       gate as the rail entries and the <head> stylesheets above. #}
+    {% if can_report_issue %}
+    {% include '_issue_dialog.html' %}
+    {% endif %}
 
     {# Hero block — full-width, sits OUTSIDE the .container so hero
        gradients can bleed to the viewport edges. Most pages leave it

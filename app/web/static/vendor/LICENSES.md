@@ -47,6 +47,19 @@ web UI works on a fresh deployment without an offline asset pipeline.
   single-file vendoring cannot serve. This build ends with
   `globalThis["mermaid"] = …`, so a plain script tag is enough.
 
+## html2canvas.min.js
+
+- **Project:** [html2canvas](https://github.com/niklasvh/html2canvas) — DOM-to-canvas screenshot renderer
+- **Version:** 1.4.1
+- **License:** MIT
+- **Source:** https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
+- **Used in:** `app/web/static/js/issue_report.js` (the "Report a problem"
+  dialog's optional screenshot). Lazy-loaded — only fetched the first time a
+  report is filed with the screenshot checkbox on, via
+  `window._agHtml2CanvasUrl` (stamped in `_app_scripts.html`, same
+  cache-buster pattern as `_agMermaidUrl`), same reasoning as mermaid.min.js
+  below: a caller who never attaches a screenshot never downloads it.
+
 ## lucide-sprite.svg
 
 - **Project:** [Lucide](https://lucide.dev) — icon set
@@ -78,6 +91,7 @@ curl -sSL -o marked.min.js  https://cdn.jsdelivr.net/npm/marked@<VER>/marked.min
 curl -sSL -o highlight.min.js  https://cdnjs.cloudflare.com/ajax/libs/highlight.js/<VER>/highlight.min.js
 curl -sSL -o highlight.min.css https://cdnjs.cloudflare.com/ajax/libs/highlight.js/<VER>/styles/github.min.css
 curl -sSL -o mermaid.min.js https://cdn.jsdelivr.net/npm/mermaid@<VER>/dist/mermaid.min.js
+curl -sSL -o html2canvas.min.js https://cdnjs.cloudflare.com/ajax/libs/html2canvas/<VER>/html2canvas.min.js
 ```
 
 Then update the version numbers above in the same commit.

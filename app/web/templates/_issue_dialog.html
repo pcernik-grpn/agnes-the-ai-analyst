@@ -1,0 +1,68 @@
+{#
+  "Report a problem" dialog (#issue-dialog).
+
+  Included once, from base_ds.html, inside the `can_report_issue` gate —
+  issue reports (issue_reports/issue_comments) are a Postgres-only table
+  pair (A3 PG-first ratchet); a DuckDB-backed instance renders no button and
+  no dialog rather than one that answers 501 (see
+  app/web/router.py::_issue_reporting_available).
+
+  Structure reuses the shared .modal-backdrop / .modal-card / .modal-actions
+  classes (style-custom.css) — the same building blocks modal.js's own
+  confirm/alert/prompt dialogs render — so the dialog looks and sizes like
+  every other modal in the app. It ALSO carries `.modal-overlay`: the global
+  Escape handler in _app_scripts.html only inspects
+  `.modal-overlay, [id$="Modal"], .modal.is-open` (see agents.html's own
+  note on the same gap for a static, non-modal.js-built dialog), and this id
+  cannot end in "Modal" — `#issue-dialog` is pinned by
+  tests/test_issue_dialog_template.py and DOM contract in issue_report.js.
+  Visibility is the existing `.modal-backdrop.is-open { display: flex; }`
+  rule (style-custom.css); issue_report.js owns opening/closing.
+
+  Fields use the shared drawer macros (ds.drawer_field / ds.drawer_checkbox,
+  drawer.css) for the same input chrome every admin drawer already renders.
+  drawer.css is loaded from base_ds.html's <head> inside the same gate.
+
+  Behaviour + auto-attached context: app/web/static/js/issue_report.js.
+  Content and privacy notes: docs/issue-reporting.md.
+#}
+<div id="issue-dialog" class="modal-backdrop modal-overlay" role="dialog"
+     aria-modal="true" aria-labelledby="issue-dialog-title">
+  <div class="modal-card issue-dialog__card" data-preserve-newlines="1">
+    <h3 id="issue-dialog-title">Report a problem</h3>
+    <p class="sub">We attach where you are. Just say what's wrong.</p>
+
+    <div class="issue-dialog__kinds" role="radiogroup" aria-label="Kind">
+      <label class="issue-dialog__kind"><input type="radio" name="issue-kind" value="bug" checked> Bug</label>
+      <label class="issue-dialog__kind"><input type="radio" name="issue-kind" value="wrong_answer"> Wrong answer</label>
+      <label class="issue-dialog__kind"><input type="radio" name="issue-kind" value="request"> Missing</label>
+      <label class="issue-dialog__kind"><input type="radio" name="issue-kind" value="question"> Unclear</label>
+    </div>
+
+    {{ ds.drawer_field(id="issue-title", label="Title",
+                        placeholder="One line: what is wrong",
+                        attrs='maxlength="200" required') }}
+    {{ ds.drawer_field(id="issue-body", label="What happened", type="textarea",
+                        placeholder="What were you doing, what did you expect, what happened instead?",
+                        optional=True, attrs='maxlength="8000" rows="4"') }}
+
+    <div class="issue-dialog__attached">
+      <p class="issue-dialog__attached-label">Attached automatically</p>
+      <div id="issue-context-chips" class="issue-dialog__chips"></div>
+    </div>
+
+    {{ ds.drawer_checkbox(id="issue-screenshot", label="Include a screenshot of this page",
+                           checked=True,
+                           hint="The screenshot shows this page as you see it now.") }}
+
+    <div id="issue-fallback" class="issue-dialog__fallback" hidden>
+      <p>Couldn't send. Copy the text below and try again later.</p>
+      <textarea id="issue-fallback-text" rows="5" readonly></textarea>
+    </div>
+
+    <div class="modal-actions">
+      {{ ds.button('Cancel', variant='secondary', id='issue-cancel') }}
+      {{ ds.button('Report', variant='primary', id='issue-submit') }}
+    </div>
+  </div>
+</div>

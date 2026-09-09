@@ -7,6 +7,7 @@ None of them previously existed on disk — the chat page would throw
 tests pin the vendored files in place so a future "clean the static dir"
 sweep fails fast.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -62,6 +63,7 @@ def logged_in_user():
 # Disk presence + size sanity
 # ---------------------------------------------------------------------------
 
+
 def test_marked_present_and_substantial():
     p = _VENDOR / "marked.min.js"
     assert p.exists(), "marked.min.js missing — re-vendor per LICENSES.md"
@@ -85,12 +87,21 @@ def test_highlight_css_present():
     assert p.stat().st_size > 1_000
 
 
+def test_html2canvas_present_and_substantial():
+    p = _VENDOR / "html2canvas.min.js"
+    assert p.exists(), "html2canvas.min.js missing — re-vendor per LICENSES.md"
+    assert p.stat().st_size > 100_000, "html2canvas.min.js suspiciously small"
+    head = p.read_bytes()[:200]
+    assert b"html2canvas" in head.lower()
+
+
 def test_vendor_licenses_documented():
     p = _VENDOR / "LICENSES.md"
     assert p.exists(), "LICENSES.md must document vendored sources/versions"
     text = p.read_text(encoding="utf-8")
     assert "marked" in text.lower()
     assert "highlight" in text.lower()
+    assert "html2canvas" in text.lower()
     assert "MIT" in text  # marked
     assert "BSD-3" in text  # highlight.js
 
@@ -104,6 +115,7 @@ def test_admin_css_present():
 # ---------------------------------------------------------------------------
 # Template integration — references resolve to real files
 # ---------------------------------------------------------------------------
+
 
 def test_chat_html_references_resolve(api_client: TestClient, logged_in_user):
     """Every /static/... href in /chat must exist on disk.
