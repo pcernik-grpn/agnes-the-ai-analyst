@@ -325,6 +325,19 @@ class TestBranding:
         assert check["status"] == "error"
         assert "operator identity" in check["detail"]
 
+    def test_product_word_plus_generic_filler_is_still_an_error(self, seeded_app, monkeypatch):
+        """ "Agnes Portal" is no more attributed than bare "Agnes" — "Portal"
+        is generic filler any deployment could carry, so it supplies no
+        operator identity either. Distinguishes this from the legitimate
+        "Acme Agnes Portal" case above, where "Acme" is the identity."""
+        import app.web.router as web_router
+
+        monkeypatch.setattr(web_router, "get_instance_name", lambda: "Agnes Portal")
+        report = _run(seeded_app["client"], seeded_app["admin_token"])
+        check = _check(report, "branding")
+        assert check["status"] == "error"
+        assert "operator identity" in check["detail"]
+
 
 class TestProbeProviders:
     """The provider probe helper this doctor rides on (app/auth/provider_registry)."""

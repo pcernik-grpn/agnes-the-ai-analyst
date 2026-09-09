@@ -55,6 +55,31 @@ _DEFAULT_SENDER = "noreply@example.com"
 
 CHECK_NAMES = ("login-door", "email-delivery", "chat-grant", "agent-scope", "app-state-backend", "branding")
 
+# Generic words a login-page title could carry regardless of who operates the
+# instance — stripped before check_branding() decides whether anything
+# operator-specific is actually left in a customized instance.name.
+_BRANDING_FILLER_WORDS = frozenset(
+    {
+        "login",
+        "agnes",
+        "portal",
+        "analyst",
+        "analytics",
+        "ai",
+        "data",
+        "instance",
+        "app",
+        "dashboard",
+        "prod",
+        "production",
+        "dev",
+        "staging",
+        "test",
+        "workspace",
+        "harness",
+    }
+)
+
 
 def _row(name: str, status: str, detail: str) -> dict:
     return {"name": name, "status": status, "audience": "operator", "detail": detail}
@@ -282,13 +307,17 @@ async def check_branding(app) -> dict:
     match = re.search(r"<title>(.*?)</title>", resp.text, re.DOTALL)
     title = match.group(1).strip() if match else ""
     leaked = [d for d in ("AI Harness", "Data Analyst Portal") if d in title]
-    # Bare product name only — "Login - Agnes" ties to nothing but the OSS
-    # product itself, the same impersonation risk as the two defaults above.
-    # A `\bAgnes\b` substring match would also fire on a legitimately
-    # customized name that merely contains the word ("Acme Agnes Portal"),
-    # where "Acme" already supplies the operator identity this check exists
-    # to require — so only the exact bare title counts as unattributed.
-    if title == "Login - Agnes":
+    # Beyond the two known defaults: strip the product word "Agnes" and a
+    # short stoplist of generic filler words (the kind of word every
+    # deployment's title could plausibly carry regardless of who operates
+    # it), and see if anything operator-specific is left. Neither a bare
+    # "Agnes" nor "Agnes Portal" leaves anything — both are the same
+    # unattributed-impersonation-risk state as the two defaults above,
+    # despite the second one technically being a "customized" instance.name.
+    # "Acme Agnes Portal" leaves "Acme", which is exactly the identity this
+    # check exists to require, so it passes.
+    remainder = [w for w in re.findall(r"[A-Za-z0-9]+", title) if w.lower() not in _BRANDING_FILLER_WORDS]
+    if not remainder:
         leaked.append("Agnes")
     if leaked or not title:
         return _row(
