@@ -267,6 +267,22 @@ def ensure_internal_package_seeded(*, newly_registered: Collection[str] | None =
     direction: a caller with no information adds no members rather than
     resurrecting removed ones.
 
+    **The package's PROSE is written once, at creation, and then drifts.**
+    Membership reconciles; ``description`` / ``long_description`` / tags /
+    example questions do not. An instance created before a release that adds
+    an internal table gains the table as a member but keeps the older wording,
+    so its description can under-count the tables it now carries (raised by
+    Devin review on #2402 for ``agnes_issues``/``agnes_issue_comments``).
+
+    That is deliberate, and it is the fifth "never" of the four above: those
+    fields are admin-editable (``PATCH /api/admin/data-packages/{id}``), so a
+    refresh on every boot would silently overwrite whatever an admin wrote.
+    Fixing it properly needs a way to tell "still the text we shipped" from
+    "an admin rewrote this" — provenance this table does not record today.
+    Until it does, the accurate wording ships to new instances and existing
+    ones keep theirs; the table LIST an agent sees is always correct because
+    it comes from membership, never from the prose.
+
     Never fatal: any failure is logged and startup continues without the
     package (the tables stay registered, only ungranted).
     """
