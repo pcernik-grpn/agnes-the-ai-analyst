@@ -436,3 +436,197 @@ def test_the_admitted_route_set_is_pinned(client, shared_app):
         f"these routes are no longer reachable: {sorted(missing)} — if a route moved or "
         "was renamed, hosted apps calling it now fail with a silent 401"
     )
+
+
+# --------------------------------------------------------------------------
+# Viewer data token (`data-app-viewer:<slug>`, typ="data_app_viewer")
+# --------------------------------------------------------------------------
+
+
+class _FakeDataAppsRepo:
+    """The resolver reads the app row through the factory; the DuckDB test
+    backend has no PG-only `data_identity` column, so stand the row up here
+    exactly as a Postgres row would look."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def get_by_slug(self, slug):
+        return dict(self.row) if self.row and self.row["slug"] == slug else None
+
+
+def _viewer_app_row(**over):
+    row = {
+        "id": "app_demo1",
+        "slug": "demo",
+        "owner_user_id": "u1",
+        "repo_mode": "internal",
+        "state": "running",
+        "service_token_id": "svc-1",
+        "data_identity": "viewer",
+    }
+    row.update(over)
+    return row
+
+
+def _mint_viewer_token(sub="u1", email="owner@test.com", slug="demo", app_id="app_demo1", typ="data_app_viewer", scope=None):
+    from datetime import timedelta
+
+    return create_access_token(
+        user_id=sub,
+        email=email,
+        expires_delta=timedelta(seconds=600),
+        typ=typ,
+        extra_claims={"scope": scope if scope is not None else f"data-app-viewer:{slug}", "slug": slug, "app_id": app_id},
+    )
+
+
+@pytest.fixture
+def viewer_env(client, monkeypatch):
+    """`client` seeds owner u1; add a second user with no grant on the app and
+    route the resolver's repo lookups at the fake row."""
+    import src.repositories as repos
+    from src.repositories.users import UserRepository
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    UserRepository(conn).create(id="u2", email="viewer@test.com", name="Viewer")
+    conn.close()
+
+    state = {"row": _viewer_app_row()}
+    monkeypatch.setattr(repos, "data_apps_repo", lambda: _FakeDataAppsRepo(state["row"]))
+    return state
+
+
+def _resolve_viewer(token, path="/api/query"):
+    from app.auth.pat_resolver import resolve_token_to_user
+
+    return resolve_token_to_user(None, token, _FakeRequest(path))
+
+
+def test_viewer_scope_prefix_does_not_collide_with_the_service_scope():
+    """Load-bearing: `"data-app-viewer:x"` must NOT start with `"data-app:"`
+    (`-` vs `:` at index 8) or a viewer token would be reclassified as a
+    service token and skip its own resolver branch."""
+    from app.auth.pat_resolver import DATA_APP_SERVICE_SCOPE_PREFIX, DATA_APP_VIEWER_SCOPE_PREFIX
+
+    assert not (DATA_APP_VIEWER_SCOPE_PREFIX + "x").startswith(DATA_APP_SERVICE_SCOPE_PREFIX)
+    assert not (DATA_APP_SERVICE_SCOPE_PREFIX + "x").startswith(DATA_APP_VIEWER_SCOPE_PREFIX)
+
+
+def test_viewer_token_resolves_to_a_restricted_principal_not_a_user_dict(viewer_env):
+    from app.auth.session_principal import PRINCIPAL_TYPES, DataAppViewerPrincipal
+
+    principal, reason = _resolve_viewer(_mint_viewer_token())
+    assert reason is None
+    assert isinstance(principal, DataAppViewerPrincipal)
+    assert isinstance(principal, PRINCIPAL_TYPES)
+    assert not isinstance(principal, dict)
+    assert principal.slug == "demo"
+    assert principal.app_id == "app_demo1"
+    assert principal.owner_user_id == "u1" and principal.viewer_user_id == "u1"
+    assert principal.viewer_email == "owner@test.com"
+
+
+def test_viewer_principal_is_denied_admin(viewer_env):
+    """`require_admin` hard-denies every restricted principal BEFORE looking
+    at the underlying user — even when the viewer (or owner) is an Admin."""
+    from fastapi import HTTPException
+
+    from app.auth.access import require_admin
+
+    principal, _ = _resolve_viewer(_mint_viewer_token())
+    with pytest.raises(HTTPException) as exc:
+        require_admin(user=principal, conn=None)
+    assert exc.value.status_code == 403
+
+
+def test_viewer_token_refused_off_surface(viewer_env):
+    """Same fail-closed data surface as the owner's service token."""
+    for path in ["/api/admin/users", "/auth/tokens", "/api/data-apps/demo/deploy", "/api/query/hybrid", "/api/sharing/groups"]:
+        principal, reason = _resolve_viewer(_mint_viewer_token(), path=path)
+        assert principal is None, path
+        assert reason == "pat_scope_forbidden", (path, reason)
+    # And no request at all (git smart-HTTP, MCP-over-HTTP) -> refused.
+    from app.auth.pat_resolver import resolve_token_to_user
+
+    principal, reason = resolve_token_to_user(None, _mint_viewer_token(), None)
+    assert principal is None and reason == "pat_scope_forbidden"
+
+
+def test_viewer_token_refused_when_app_is_back_in_owner_mode(viewer_env):
+    """Flipping `data_identity` back kills outstanding tokens on the next
+    request — the token bakes in no authority."""
+    viewer_env["row"] = _viewer_app_row(data_identity="owner")
+    principal, reason = _resolve_viewer(_mint_viewer_token())
+    assert principal is None and reason == "pat_scope_forbidden"
+    viewer_env["row"] = _viewer_app_row()
+    del viewer_env["row"]["data_identity"]  # a DuckDB-shaped row: no column at all
+    principal, reason = _resolve_viewer(_mint_viewer_token())
+    assert principal is None and reason == "pat_scope_forbidden"
+
+
+def test_viewer_token_refused_for_a_recreated_or_missing_or_linked_app(viewer_env):
+    # slug reused by a NEW row after delete+recreate: app_id no longer matches
+    viewer_env["row"] = _viewer_app_row(id="app_other")
+    assert _resolve_viewer(_mint_viewer_token()) == (None, "invalid_token")
+    # gone
+    viewer_env["row"] = None
+    assert _resolve_viewer(_mint_viewer_token()) == (None, "invalid_token")
+    # linked (externally hosted) apps have no container and never viewer mode
+    viewer_env["row"] = _viewer_app_row(repo_mode="linked")
+    assert _resolve_viewer(_mint_viewer_token()) == (None, "invalid_token")
+
+
+def test_viewer_token_refused_when_the_viewer_lost_the_grant(viewer_env):
+    """u2 is a real user with no grant on the app (and not its owner) — a
+    token minted for them (e.g. before an admin revoked their group's grant)
+    is refused live, not at `exp`."""
+    principal, reason = _resolve_viewer(_mint_viewer_token(sub="u2", email="viewer@test.com"))
+    assert principal is None and reason == "pat_scope_forbidden"
+
+
+def test_viewer_token_refused_for_a_deactivated_or_unknown_viewer(viewer_env):
+    from src.db import get_system_db
+
+    assert _resolve_viewer(_mint_viewer_token(sub="ghost", email="g@test.com")) == (None, "user_not_found")
+    conn = get_system_db()
+    conn.execute("UPDATE users SET active = false WHERE id = 'u2'")
+    conn.close()
+    assert _resolve_viewer(_mint_viewer_token(sub="u2", email="viewer@test.com")) == (None, "deactivated")
+
+
+def test_viewer_typ_with_a_foreign_scope_never_yields_a_user_dict(viewer_env):
+    """Either signal alone lands in the viewer branch; the branch then
+    requires both. A `typ=data_app_viewer` token wearing some other scope
+    must not fall through to the generic path and come back as a user."""
+    principal, reason = _resolve_viewer(_mint_viewer_token(scope="cli-login"))
+    assert principal is None and reason == "invalid_token"
+    principal, reason = _resolve_viewer(_mint_viewer_token(typ="pat"))  # viewer scope, wrong typ
+    assert principal is None and reason == "invalid_token"
+
+
+def test_viewer_principal_binds_row_policies_and_audit_to_the_viewer(viewer_env):
+    """The two seams that used to read `owner_user_id` off every principal."""
+    from app.api.query import _identity_for_audit
+    from src.access_policy import _resolve_identity
+    from src.audit_helpers import identity_for_audit
+
+    # Viewer u2 needs a grant to resolve — grant via the owner-equals-viewer
+    # shortcut instead: u1 is both. The seams are then checked on a
+    # hand-built principal with DISTINCT owner/viewer to prove which side wins.
+    from app.auth.session_principal import DataAppViewerPrincipal
+
+    p = DataAppViewerPrincipal(
+        slug="demo",
+        app_id="app_demo1",
+        owner_user_id="u1",
+        owner_email="owner@test.com",
+        viewer_user_id="u2",
+        viewer_email="viewer@test.com",
+        intersection={},
+    )
+    uid, email, _groups = _resolve_identity(p, table_id="t")
+    assert (uid, email) == ("u2", "viewer@test.com")
+    assert identity_for_audit(p) == ("u2", "viewer@test.com")
+    assert _identity_for_audit(p) == ("u2", "viewer@test.com")

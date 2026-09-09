@@ -334,6 +334,15 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # override on a managed/linked app. Triple-surface with
     # PATCH /api/data-apps/{slug} + `agnes app set-description`.
     "data_app_set_description",
+    # Owner-scoped sharing for the `data_app` resource type (TCRD-291) —
+    # triple-surface with GET/PUT /api/sharing/data_app/{slug} +
+    # GET /api/sharing/groups and `agnes app share`.
+    "data_app_share_get",
+    "data_app_share",
+    # Which identity a data app's own server-side data calls run as (owner or
+    # the viewer currently loading it) — PG-only (A3 ratchet). Triple-surface
+    # with PATCH /api/data-apps/{slug} + `agnes app set-identity`.
+    "data_app_set_data_identity",
     # Wave 3C in-chat preview loop (Task 4/5) — chat-surface-ONLY render
     # directives for the split-pane preview iframe (spec §7/§9): no REST/CLI
     # analogue exists or is planned (the fixed render-directive JSON these
@@ -369,6 +378,9 @@ DATA_APP_TOOL_NAMES: tuple[str, ...] = (
     "data_app_delete_draft",
     "data_app_git_credential",
     "data_app_set_description",
+    "data_app_share_get",
+    "data_app_share",
+    "data_app_set_data_identity",
     "agnes_data_app_preview",
     "agnes_data_app_refresh",
     "agnes_data_app_close",
@@ -473,6 +485,41 @@ def feature_hidden_tool_names() -> frozenset[str]:
     if feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
         return frozenset()
     return FACT_TOOL_NAMES
+
+
+def _resolve_share_group_ids(names: list[str], available: list[dict]) -> list[str]:
+    """Resolve each ``groups``-style value (raw id or case-insensitive name)
+    to a group id — mirrors ``cli/commands/data_apps.py::_resolve_group_ids``
+    and ``cli/mcp/server.py``'s stdio twin. Raises ``ValueError`` (not a bare
+    mismatch) so an unknown name surfaces as a tool error the caller can act
+    on."""
+    by_id = {g["id"] for g in available}
+    by_name = {g["name"].lower(): g["id"] for g in available}
+    resolved: list[str] = []
+    unknown: list[str] = []
+    for raw in names:
+        if raw in by_id:
+            resolved.append(raw)
+        elif raw.lower() in by_name:
+            resolved.append(by_name[raw.lower()])
+        else:
+            unknown.append(raw)
+    if unknown:
+        known = ", ".join(sorted(g["name"] for g in available))
+        raise ValueError(f"unknown group(s) {unknown}; available: {known}")
+    return resolved
+
+
+def _share_state_dict(state: dict, available: list[dict]) -> dict:
+    names_by_id = {g["id"]: g["name"] for g in available}
+    group_ids = state.get("group_ids") or []
+    return {
+        "visibility": state.get("visibility"),
+        "group_ids": group_ids,
+        "groups": [{"id": gid, "name": names_by_id.get(gid, gid)} for gid in group_ids],
+        "pending_group_ids": state.get("pending_group_ids") or [],
+        "available_groups": available,
+    }
 
 
 def register_foundation_tools(
@@ -4011,6 +4058,99 @@ def register_foundation_tools(
             r = await c.patch(
                 f"{base_url}/api/data-apps/{slug}",
                 json={"description": description},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    async def _fetch_share_groups() -> list[dict]:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{base_url}/api/sharing/groups", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def data_app_share_get(slug: str) -> dict:
+        """Show a hosted data app's sharing state — app owner or Admin only.
+
+        Args:
+            slug: The app's slug.
+
+        Returns ``{"visibility", "group_ids", "groups": [{"id", "name"}],
+        "pending_group_ids", "available_groups": [{"id", "name", "is_everyone"}]}``
+        — ``groups`` resolves ``group_ids`` to names via ``available_groups``
+        (a group id not found there is left as-is rather than guessed).
+        Mirrors ``GET /api/sharing/data_app/{slug}`` + ``GET /api/sharing/groups``
+        and ``agnes app share <slug>``.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{base_url}/api/sharing/data_app/{slug}", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(r)
+            state = r.json()
+        available = await _fetch_share_groups()
+        return _share_state_dict(state, available)
+
+    # `data_app_share` is a bare noun on its own — the auto-derived title
+    # would name no action (test_every_tool_title_says_what_calling_it_does),
+    # so this pins one explicitly rather than adding a TITLE_OVERRIDES entry.
+    @tool(read_only=False, idempotent=True, title="Update Data App Sharing")
+    async def data_app_share(slug: str, groups: list[str] | None = None, everyone: bool = False) -> dict:
+        """Set which groups a hosted data app is shared with — app owner or Admin only.
+
+        Sets the DESIRED END STATE: replaces the whole audience list rather
+        than adding to it, so the default (``groups`` empty, ``everyone=False``)
+        makes the app private.
+
+        Args:
+            slug:     The app's slug.
+            groups:   Group names (case-insensitive) or ids from
+                      ``data_app_share_get``'s ``available_groups``.
+                      Empty/omitted (default) shares with no named group.
+            everyone: Share with the whole workspace in addition to ``groups``.
+
+        Returns the same shape as ``data_app_share_get``. Mirrors
+        ``PUT /api/sharing/data_app/{slug}`` and ``agnes app share <slug>
+        --group ... [--everyone] [--private]``.
+        """
+        available = await _fetch_share_groups()
+        group_ids = _resolve_share_group_ids(groups or [], available)
+        if everyone and "everyone" not in group_ids:
+            group_ids.append("everyone")
+        async with httpx.AsyncClient() as c:
+            r = await c.put(
+                f"{base_url}/api/sharing/data_app/{slug}",
+                json={"group_ids": group_ids},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            state = r.json()
+        return _share_state_dict(state, available)
+
+    @tool(read_only=False, idempotent=True)
+    async def data_app_set_data_identity(slug: str, data_identity: Literal["owner", "viewer"]) -> dict:
+        """Set which identity a hosted data app's own data calls run as — app owner or Admin only.
+
+        ``"owner"`` (today's default) runs the app's server-side data calls as
+        its creator; ``"viewer"`` narrows that to the caller currently loading
+        the app, so a shared app's data access follows the viewer rather than
+        always the creator. Redeploys the app when it's already running.
+
+        Args:
+            slug:          The app's slug.
+            data_identity: ``"owner"`` or ``"viewer"``.
+
+        Returns the updated app dict plus
+        ``{"redeploy": {"triggered": bool, "ok"?: bool, "detail"?: str}}``.
+        Mirrors ``PATCH /api/data-apps/{slug}`` and ``agnes app set-identity``.
+        Postgres-backed instances only (A3 PG-first ratchet) — a DuckDB-backed
+        instance answers ``501 requires_postgres_backend``.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.patch(
+                f"{base_url}/api/data-apps/{slug}",
+                json={"data_identity": data_identity},
                 headers=headers_fn(),
                 timeout=30,
             )

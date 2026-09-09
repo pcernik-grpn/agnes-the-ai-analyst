@@ -18,10 +18,13 @@ calls, via ``src.data_apps.git_repos.read_tree``.
 v1 scope, deliberately narrow (revisit once the false-positive rate is
 known from real deploys):
 
-- DA005 only ever matches the literal ``AGNES_TOKEN`` — per-app secret
-  names are NOT scanned (arbitrary secret values are far noisier to match
-  safely). ``secret_names`` is still accepted on both entry points so a v2
-  that does scan them is an additive change to the rule body only.
+- DA005 matches only the PLATFORM-injected credential names
+  (``_DA005_SECRET_NAMES``: ``AGNES_TOKEN``, ``AGNES_VIEWER_SECRET``,
+  ``AGNES_VIEWER_TOKEN``) plus the ``X-Agnes-Viewer-Token`` request header —
+  per-app secret names are NOT scanned (arbitrary secret values are far
+  noisier to match safely). ``secret_names`` is still accepted on both entry
+  points so a v2 that does scan them is an additive change to the rule body
+  only.
 - No persistence of findings, no admin/UI surface, no schema/migration —
   a finding lives for exactly one deploy request's response + audit row.
 """
@@ -373,8 +376,17 @@ def _check_da004(path: str, lines: list[str]) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
-# DA005 — injected-credential echo (v1: AGNES_TOKEN only, see module docstring)
+# DA005 — injected-credential echo (platform names only, see module docstring)
 # ---------------------------------------------------------------------------
+
+# The credentials the platform hands a container: its owner-scoped service
+# token, the per-app key it verifies the proxy's viewer assertion with, and
+# the per-request viewer data token (arrives as a request header, so the
+# header NAME is matched too, case-insensitively — Express reads it as
+# `req.header("x-agnes-viewer-token")`). Echoing any of them hands a live
+# credential to whoever can open the app.
+_DA005_SECRET_NAMES: tuple[str, ...] = ("AGNES_TOKEN", "AGNES_VIEWER_SECRET", "AGNES_VIEWER_TOKEN")
+_DA005_HEADER_RE = re.compile(r"x-agnes-viewer-token", re.IGNORECASE)
 
 # JS/Python sinks are kept separate rather than one combined alternation:
 # `return {` is Flask's bare-dict-response idiom (`return {...}, 200`) — in
@@ -390,13 +402,18 @@ def _check_da005(path: str, lines: list[str]) -> list[Finding]:
     sink_re = _DA005_JS_SINK_RE if _ext(path) in _JS_EXTS else _DA005_PY_SINK_RE
     findings: list[Finding] = []
     for lineno, line in enumerate(lines, start=1):
-        if "AGNES_TOKEN" in line and sink_re.search(line):
+        if not sink_re.search(line):
+            continue
+        hit = next((n for n in _DA005_SECRET_NAMES if n in line), None)
+        if hit is None and _DA005_HEADER_RE.search(line):
+            hit = "X-Agnes-Viewer-Token"
+        if hit is not None:
             findings.append(
                 _finding(
                     "DA005",
                     "warn",
-                    "AGNES_TOKEN appears on a line with a response call — verify the injected "
-                    "service token is never echoed back to a caller.",
+                    f"{hit} appears on a line with a response call — verify the injected "
+                    "credential is never echoed back to a caller.",
                     path=path,
                     lineno=lineno,
                     line=line,
@@ -462,7 +479,7 @@ def check_tree(files: Mapping[str, str], *, secret_names: Sequence[str] = ()) ->
     `secret_names` is accepted (v2 additivity, see module docstring) and
     currently unused by every rule.
     """
-    del secret_names  # v1: DA005 only ever matches the literal AGNES_TOKEN
+    del secret_names  # v1: DA005 matches only the platform names in _DA005_SECRET_NAMES
     try:
         findings: list[Finding] = []
         files_scanned = 0

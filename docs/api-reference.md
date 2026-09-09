@@ -3286,9 +3286,22 @@ the prompt. With no AI credential configured the endpoint answers
 The owner-scoped counterpart to `/api/access` (which is admin-only): the creator
 of a Library item may share it with groups they belong to, plus `Everyone`
 (workspace-wide). Writes the same `resource_grants` rows as the admin layer.
-Shareable resource types are `collection` and `agent` — skills are excluded
-because an approved store entity is already readable by every authenticated
-user.
+Shareable resource types are `collection`, `corpus_file`, `agent`, and
+`data_app` (the resource id is the app's slug) — skills are excluded because
+an approved store entity is already readable by every authenticated user.
+
+**CLI/MCP (`data_app` resource type only, TCRD-291).** `agnes app share
+<slug>` with no flags prints the current state (visibility + resolved group
+names); `--group NAME [--group NAME ...] [--everyone] [--private]` sets the
+desired END STATE, replacing the whole audience rather than adding to it —
+`--group` accepts a group name (case-insensitive) or id, `--everyone` adds
+the `"everyone"` sentinel, `--private` clears sharing (`group_ids: []`) and
+is mutually exclusive with `--group`/`--everyone`. MCP: `data_app_share_get`
+(read) and `data_app_share(slug, groups, everyone)` (write) mirror the same
+two calls — `data_app_share_get` additionally resolves `GET /api/sharing/groups`
+so its `groups`/`available_groups` fields carry names, not just ids. Other
+resource types (`collection`, `corpus_file`, `agent`) stay REST/web-only —
+see the reasoning in `tests/test_documentation_api_triple_surface.py`.
 
 **Track C6 — agent-sharing needs admin approval (Postgres-backed instances).**
 A user may build agents freely, but when a NON-ADMIN actor shares an `agent`
@@ -3679,12 +3692,33 @@ Admin, or a group holding a `resource_grants` row on `(data_app, <slug>)`
 may view; only owner or Admin may mutate. Gated behind
 `data_apps.enabled` in `instance.yaml` (404 `data_apps_disabled` when off).
 CLI: `agnes app list/show/create/deploy/stop/delete/logs/git-credential`
-plus `agnes app draft create/delete`. MCP tools (list/show/deploy/logs plus
-the wave 3B AI-authoring flow, matching the view-vs-mutate RBAC split
-above): `data_apps_list`, `data_app_get`, `data_app_deploy`,
-`data_app_logs`, `data_app_create_draft`, `data_app_delete_draft`,
-`data_app_git_credential` — no MCP analogue for
-create/stop/delete/secrets/reap-idle.
+plus `agnes app draft create/delete`, `agnes app share` (see `/api/sharing`
+above), and `agnes app set-identity` (below). MCP tools (list/show/deploy/logs
+plus the wave 3B AI-authoring flow,
+matching the view-vs-mutate RBAC split above): `data_apps_list`,
+`data_app_get`, `data_app_deploy`, `data_app_logs`, `data_app_create_draft`,
+`data_app_delete_draft`, `data_app_git_credential`,
+`data_app_share_get`/`data_app_share`, `data_app_set_data_identity` — no MCP
+analogue for create/stop/delete/secrets/reap-idle.
+
+**Data identity (TCRD-291, Postgres-backed instances only).** `data_identity`
+on the app row is `"owner"` (default — the app's server-side data calls run
+as its creator) or `"viewer"` (narrowed to whoever is currently loading the
+app, so a shared app's data access follows the viewer rather than always the
+creator). `PATCH /{slug}` accepts `{"data_identity": "owner"|"viewer"}`
+(alongside/instead of `description`; `400 nothing_to_update` if the body has
+neither) and `GET /{slug}` echoes the current value. A successful PATCH also
+returns `{"redeploy": {"triggered": bool, "ok"?: bool, "detail"?: str}}` —
+`triggered` is `true` only when the app was already deployed (a data-identity
+change takes effect on the running container only after a fresh deploy);
+`ok`/`detail` are present only when `triggered` is `true` and mirror the same
+runner-outcome pair `POST /{slug}/deploy` reports. PG-only (A3 ratchet): a
+DuckDB-backed instance answers `501 requires_postgres_backend` for a PATCH
+that includes `data_identity` — a `description`-only PATCH is unaffected.
+CLI: `agnes app set-identity <slug> owner|viewer` prints
+`Data identity: <value>` plus a `Redeploy: …` line; the friendly PG-only
+message is `Requires the Postgres app-state backend…`. MCP:
+`data_app_set_data_identity(slug, data_identity)`.
 
 **Linked (externally-hosted) apps (v108):** a `repo_mode='linked'` row points at
 an app running elsewhere (e.g. a Keboola-platform data app ingested via an MCP

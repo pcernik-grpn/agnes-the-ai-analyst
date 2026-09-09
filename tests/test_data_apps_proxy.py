@@ -1714,3 +1714,226 @@ def test_reachable_states_matches_what_the_proxy_actually_serves(client_granted,
     r = client_granted.get(f"/apps/{slug}/", headers={"accept": "application/json"})
     refused = r.status_code == 409 and r.json().get("detail") in ("app_not_running", "app_error")
     assert refused is (state not in REACHABLE_STATES)
+
+
+# ---------------------------------------------------------------------------
+# Viewer identity — `X-Agnes-Viewer` assertion + (viewer mode) `X-Agnes-Viewer-Token`
+# ---------------------------------------------------------------------------
+
+
+def _set_service_token(slug: str, token_id: str = "svc-tok-1") -> dict:
+    """A running app always has one (redeploy_current wrote it before the
+    container came up); `_create_app_row` does not, so set it explicitly."""
+    from src.repositories import data_apps_repo
+
+    repo = data_apps_repo()
+    row = repo.get_by_slug(slug)
+    repo.update(row["id"], service_token_id=token_id)
+    return repo.get_by_slug(slug)
+
+
+def _decode_assertion(token: str, slug: str, service_token_id: str) -> dict:
+    import jwt
+
+    from app.auth.data_app_viewer import derive_viewer_secret
+    from app.auth.jwt import ALGORITHM
+
+    return jwt.decode(
+        token,
+        derive_viewer_secret(slug, service_token_id),
+        algorithms=[ALGORITHM],
+        audience=f"data-app:{slug}",
+    )
+
+
+def test_proxy_adds_viewer_assertion_signed_with_derived_secret(
+    client_granted, fake_runner, respx_upstream, running_app
+):
+    from app.auth.data_app_viewer import VIEWER_HEADER, VIEWER_TOKEN_HEADER
+
+    row = _set_service_token("s")
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200, r.text
+    sent = respx_upstream.calls[0].request.headers
+    claims = _decode_assertion(sent[VIEWER_HEADER], "s", row["service_token_id"])
+    assert claims["sub"] == "owner1"
+    assert claims["email"] == "owner@test.local"
+    assert claims["name"] == "Owner"
+    assert claims["typ"] == "data_app_viewer_assertion"
+    assert claims["via"] == "pat"  # the test client authenticates with a PAT
+    assert isinstance(claims["groups"], list)
+    assert claims["exp"] - claims["iat"] == 300
+    # Owner mode (the default): no viewer data token rides along.
+    assert VIEWER_TOKEN_HEADER.lower() not in {k.lower() for k in sent.keys()}
+
+
+def test_viewer_assertion_is_not_a_server_signed_credential(client_granted, fake_runner, respx_upstream, running_app):
+    """The assertion verifies ONLY under the per-app derived secret. Fed to
+    `verify_token` (server key) it is nothing — it must never be mistaken for
+    an Agnes credential by anything that reads bearer tokens."""
+    from app.auth.data_app_viewer import VIEWER_HEADER
+    from app.auth.jwt import verify_token
+
+    _set_service_token("s")
+    client_granted.get("/apps/s/hello")
+    assertion = respx_upstream.calls[0].request.headers[VIEWER_HEADER]
+    assert verify_token(assertion) is None
+
+
+def test_viewer_assertion_rotates_with_the_service_token(client_granted, fake_runner, respx_upstream, running_app):
+    import jwt
+
+    from app.auth.data_app_viewer import VIEWER_HEADER, derive_viewer_secret
+    from app.auth.jwt import ALGORITHM
+
+    _set_service_token("s", "tok-A")
+    client_granted.get("/apps/s/hello")
+    signed_under_a = respx_upstream.calls[0].request.headers[VIEWER_HEADER]
+    _set_service_token("s", "tok-B")
+    client_granted.get("/apps/s/hello")
+    signed_under_b = respx_upstream.calls[1].request.headers[VIEWER_HEADER]
+    # Each verifies under its own id's secret and NOT under the other's.
+    assert jwt.decode(signed_under_b, derive_viewer_secret("s", "tok-B"), algorithms=[ALGORITHM], audience="data-app:s")
+    with pytest.raises(jwt.InvalidSignatureError):
+        jwt.decode(signed_under_a, derive_viewer_secret("s", "tok-B"), algorithms=[ALGORITHM], audience="data-app:s")
+
+
+def test_inbound_x_agnes_viewer_headers_are_stripped(client_granted, fake_runner, respx_upstream, running_app):
+    """A caller cannot smuggle a forged identity past the proxy — every
+    inbound `x-agnes-viewer*` header (any casing) is dropped BEFORE ours is
+    added, so the container sees exactly one, and it is the proxy's."""
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    r = client_granted.get(
+        "/apps/s/hello",
+        headers={
+            "X-AGNES-VIEWER": "forged.forged.forged",
+            "x-agnes-viewer-token": "forged-token",
+            "X-Agnes-Viewer-Email": "ceo@example.com",
+        },
+    )
+    assert r.status_code == 200
+    raw = respx_upstream.calls[0].request.headers.raw  # every (name, value) pair, duplicates included
+    viewer_pairs = [(k.decode().lower(), v.decode()) for k, v in raw if k.decode().lower().startswith("x-agnes-viewer")]
+    assert [k for k, _ in viewer_pairs] == ["x-agnes-viewer"], viewer_pairs
+    assert viewer_pairs[0][1] != "forged.forged.forged"
+    assert _decode_assertion(respx_upstream.calls[0].request.headers[VIEWER_HEADER], "s", row["service_token_id"])["sub"] == "owner1"
+
+
+def test_viewer_assertion_via_preview_token(proxy_client, fake_runner, respx_upstream, running_app, mint_preview):
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    tok = mint_preview("s", ttl_s=1800)
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": tok.cookie})
+    assert r.status_code == 200, r.text
+    claims = _decode_assertion(respx_upstream.calls[0].request.headers[VIEWER_HEADER], "s", row["service_token_id"])
+    assert claims["via"] == "preview"
+    assert claims["sub"] == "owner1"  # the preview grant was minted for the owner
+
+
+def test_viewer_assertion_via_session_cookie(proxy_client, fake_runner, respx_upstream, running_app):
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": _session_cookie()})
+    assert r.status_code == 200, r.text
+    claims = _decode_assertion(respx_upstream.calls[0].request.headers[VIEWER_HEADER], "s", row["service_token_id"])
+    assert claims["via"] == "session"
+
+
+def _force_viewer_mode(monkeypatch, slug="s"):
+    """The proxy env is DuckDB-backed, where the PG-only `data_identity`
+    column does not exist — inject it on the row the proxy reads, exactly as
+    a Postgres row would carry it."""
+    import app.api.data_apps_proxy as proxy_api
+
+    real = proxy_api._get_row_or_404
+
+    def _viewer_row(s):
+        row = real(s)
+        return {**row, "data_identity": "viewer"} if s == slug else row
+
+    monkeypatch.setattr(proxy_api, "_get_row_or_404", _viewer_row)
+
+
+def test_viewer_token_added_in_viewer_mode_and_resolves_to_a_viewer_principal(
+    monkeypatch, client_granted, fake_runner, respx_upstream, running_app
+):
+    from app.auth.data_app_viewer import VIEWER_TOKEN_HEADER
+    from app.auth.jwt import verify_token
+
+    _set_service_token("s")
+    _force_viewer_mode(monkeypatch)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200, r.text
+    token = respx_upstream.calls[0].request.headers[VIEWER_TOKEN_HEADER]
+    payload = verify_token(token)  # SERVER-signed, unlike the assertion
+    assert payload is not None
+    assert payload["typ"] == "data_app_viewer"
+    assert payload["scope"] == "data-app-viewer:s"
+    assert payload["sub"] == "owner1"
+    assert payload["slug"] == "s"
+    assert payload["exp"] - payload["iat"] == 600
+
+
+def test_holding_page_mints_nothing(monkeypatch, client_granted, fake_runner, sleeping_app):
+    """A viewer who reaches the waking page has passed RBAC, but nothing is
+    served from the container yet — no identity is minted for a page WE
+    render. (Ordering invariant: mint only inside the `running` branch.)"""
+    import app.api.data_apps_proxy as proxy_api
+
+    def _boom(*a, **kw):
+        raise AssertionError("build_viewer_headers must not run for a holding page")
+
+    monkeypatch.setattr(proxy_api, "build_viewer_headers", _boom)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 503  # the waking holding page
+
+
+def test_ws_handshake_carries_viewer_headers(monkeypatch, client_granted, fake_runner, running_app):
+    """The WS bridge forwards no CALLER headers, but it does add the proxy's
+    own viewer headers to the upstream handshake — same identity contract as
+    the HTTP path, so a Streamlit/Dash app learns its viewer too."""
+    import websockets
+
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    captured: dict = {}
+
+    class _FakeUpstream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def send(self, _msg):
+            pass
+
+        async def close(self):
+            pass
+
+    def _fake_connect(url, **kw):
+        captured["url"] = url
+        captured.update(kw)
+        return _FakeUpstream()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    try:
+        with client_granted.websocket_connect("/apps/s/ws", headers={"x-agnes-viewer": "forged"}):
+            pass
+    except WebSocketDisconnect:
+        pass  # the empty fake upstream closes the bridge immediately — fine
+    assert captured["url"] == "ws://agnes-dataapp-s:8888/ws"
+    headers = captured["additional_headers"]
+    assert set(headers) == {VIEWER_HEADER}  # only ours; the caller's forged one never reaches upstream
+    assert _decode_assertion(headers[VIEWER_HEADER], "s", row["service_token_id"])["sub"] == "owner1"

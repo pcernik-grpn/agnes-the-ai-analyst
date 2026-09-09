@@ -189,6 +189,54 @@ def test_agnes_api_replay_uses_live_rbac(broker_app, broker_session):
     assert replayed.json() == direct.json()
 
 
+def test_broker_main_scope_replays_sharing_state(broker_app, e2e_env):
+    """`/api/sharing/*` is not `require_admin`-gated, so a `main`-scoped
+    ticket (the plain CLI's replay leg) already reaches it through the
+    ordinary `agnes-api` route — no `_DATA_APPS_PATH_PREFIX`-style widening
+    needed (TCRD-291, see the comment in app/api/broker.py)."""
+    from src.repositories import data_apps_repo
+
+    conn = get_system_db()
+    UserRepository(conn).create(id="broker_share_owner1", email="broker_share_owner@test.com", name="Owner")
+    conn.close()
+    data_apps_repo().create(slug="broker-share-app", name="Broker Share App", owner_user_id="broker_share_owner1")
+
+    session = chat_session_repo().create_session(user_email="broker_share_owner@test.com", surface=Surface.WEB)
+    tok = ticket_repo().mint(session.id, "main")
+
+    r = _replay_via_broker(broker_app, tok, "GET", "/api/sharing/data_app/broker-share-app")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["visibility"] == "private"
+    assert body["group_ids"] == []
+
+
+def test_broker_mcp_scope_replays_sharing_groups(broker_app, e2e_env):
+    """The narrower `mcp`-scoped ticket (the MCP subprocess's replay leg)
+    reaches the SAME non-admin `/api/sharing/*` surface — unlike the
+    admin-read allowance above, this needs no scope-specific carve-out at
+    all, since the route was never admin-gated in the first place."""
+    conn = get_system_db()
+    UserRepository(conn).create(id="broker_share_mcp1", email="broker_share_mcp@test.com", name="MCP User")
+    conn.close()
+    session = chat_session_repo().create_session(user_email="broker_share_mcp@test.com", surface=Surface.WEB)
+    tok = ticket_repo().mint(session.id, "mcp")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/agnes-mcp",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"method": "GET", "path": "/api/sharing/groups", "body": None},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+    groups = r.json()
+    assert any(g["id"] == "everyone" for g in groups)
+
+
 def test_admin_route_off_admin_prefix_rejected(broker_app, e2e_env):
     """A require_admin route that is NOT under /api/admin/ (here /api/sync/trigger)
     must be rejected by the broker's route-introspection gate — even when the

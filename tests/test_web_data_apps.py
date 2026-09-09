@@ -264,6 +264,112 @@ def test_detail_page_renders_for_admin_with_deploy_button(web_env):
 
 
 # ---------------------------------------------------------------------------
+# Sharing + data identity (TCRD-291) — the Library's reusable Share dialog,
+# wired onto the data-app detail page, plus the owner/viewer data-identity
+# toggle. `data_identity` is a sibling change to `_serialize()`; these tests
+# also pin that the page renders correctly while that field is still absent
+# from the serialized row.
+# ---------------------------------------------------------------------------
+
+
+def _grant_data_app(slug: str, user_id: str, group_name: str) -> None:
+    """Grant ``user_id`` view access to data app ``slug`` via a fresh group,
+    mirroring ``test_detail_page_for_granted_non_owner_hides_deploy_and_logs``
+    above."""
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    try:
+        gid = UserGroupsRepository(conn).create(name=group_name, description="d")["id"]
+        UserGroupMembersRepository(conn).add_member(user_id, gid, source="admin")
+        ResourceGrantsRepository(conn).create(group_id=gid, resource_type="data_app", resource_id=slug)
+    finally:
+        conn.close()
+
+
+def test_detail_page_owner_sees_share_chip_and_identity_toggle(web_env):
+    """The owner is a manager: the Sharing chip is an interactive control
+    (``data-share-open``) and the hosted, non-draft app offers the data
+    identity toggle."""
+    _create_app_row(slug="ownershare", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/ownershare", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert 'id="dda-vis"' in resp.text
+    assert "data-share-open" in resp.text
+    assert 'data-share-type="data_app"' in resp.text
+    assert 'data-share-id="ownershare"' in resp.text
+    assert 'id="dda-identity"' in resp.text
+    assert 'id="dda-identity-save"' in resp.text
+    # share_dialog.js's assets ride along only when the caller may re-share.
+    assert "share_dialog.js" in resp.text
+
+
+def test_detail_page_granted_viewer_sees_readonly_chip_and_no_toggle(web_env):
+    """A granted non-owner, non-admin viewer sees the visibility chip as a
+    read-out only — no ``data-share-open`` control, and no data-identity
+    toggle (owner/Admin-only)."""
+    _create_app_row(slug="grantedshare", owner_id="owner1", state="running")
+    _grant_data_app("grantedshare", "other1", "dda-share-viewers")
+
+    c = web_env["client"]
+    resp = c.get("/apps/detail/grantedshare", headers=_auth(web_env["other_pat"]))
+    assert resp.status_code == 200
+    assert 'id="dda-vis"' in resp.text
+    assert "data-share-open" not in resp.text
+    assert 'id="dda-identity"' not in resp.text
+    assert 'id="dda-identity-save"' not in resp.text
+    # No control for this caller, so the dialog's own assets are not shipped.
+    assert "share_dialog.js" not in resp.text
+
+
+def test_detail_page_owner_mode_shows_publishing_warning(web_env):
+    """A hosted app defaults to owner-mode data identity (absent field ==
+    ``owner``): the note warns that sharing publishes what the owner's own
+    grants can fetch."""
+    _create_app_row(slug="ownermode", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/ownermode", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert "Sharing this app publishes what it fetches." in resp.text
+    assert "Each viewer sees only what their own grants allow" not in resp.text
+
+
+def test_detail_linked_app_share_control_is_admin_only(web_env):
+    """A linked row's synthetic ``system`` owner never matches a real
+    visitor, so a granted non-admin viewer gets the read-only chip while an
+    admin gets the real control -- mirrors the sharing-REST contract."""
+    _create_linked_row(slug="kbc-identity-linked", name="Linked")
+    _grant_data_app("kbc-identity-linked", "other1", "dda-linked-viewers")
+
+    c = web_env["client"]
+    admin_resp = c.get("/apps/detail/kbc-identity-linked", headers=_auth(web_env["admin_pat"]))
+    assert admin_resp.status_code == 200
+    assert "data-share-open" in admin_resp.text
+
+    viewer_resp = c.get("/apps/detail/kbc-identity-linked", headers=_auth(web_env["other_pat"]))
+    assert viewer_resp.status_code == 200
+    assert "data-share-open" not in viewer_resp.text
+    # Linked apps have no hosted lifecycle, so no identity toggle either way.
+    assert 'id="dda-identity"' not in admin_resp.text
+
+
+def test_detail_page_renders_when_data_identity_absent_from_serialized_row(web_env):
+    """`_serialize()` does not (yet) return `data_identity` in this worktree
+    -- the router must default it to 'owner' rather than erroring, and the
+    toggle must reflect that default."""
+    _create_app_row(slug="noidentity", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/noidentity", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert 'id="dda-identity"' in resp.text
+    assert '<option value="owner" selected>' in resp.text
+
+
+# ---------------------------------------------------------------------------
 # Route-collision regression: /apps/detail/{slug} must hit the web detail
 # page, NOT the ingress proxy's `/apps/{slug}/{path:path}` catch-all.
 # ---------------------------------------------------------------------------

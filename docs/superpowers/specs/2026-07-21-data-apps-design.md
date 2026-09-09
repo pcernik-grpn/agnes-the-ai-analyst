@@ -359,6 +359,11 @@ This is a deliberate, documented divergence from upstream (`input` section in
 `config.json` is ignored/absent on Agnes). The AI-authoring skill teaches the
 Agnes idiom.
 
+Owner-inherited access is now the *default* rather than the only mode: the
+proxy hands every app a signed viewer identity, and an app switched to
+`data_identity=viewer` queries as **owner ∩ viewer** — see
+[`2026-09-09-data-app-viewer-identity-and-sharing-design.md`](2026-09-09-data-app-viewer-identity-and-sharing-design.md).
+
 ## 9. AI authoring — the primary flow
 
 The requirement: the Agnes chat agent must be able to create these apps with

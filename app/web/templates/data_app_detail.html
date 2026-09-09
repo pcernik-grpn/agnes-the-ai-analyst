@@ -16,6 +16,10 @@
 {% block head_extra %}
 {% import "macros/_detail.html" as detail with context %}
 {{ detail.styles() }}
+{# The Sharing chip below IS the sharing control for a caller who may
+   re-share this app — ship the dialog behind it, exactly as the Library's
+   collection detail page does. #}
+{% if can_share %}{{ detail.share_assets() }}{% endif %}
 <style>
   /* ── Page-local: the facts card, actions row, logs pane ── */
   .dda-facts {
@@ -54,6 +58,18 @@
   .dda-desc-form input:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: 1px; }
   .dda-grant-note { color: var(--ds-text-secondary); font-size: 13px; }
   .dda-grant-note code { background: var(--ds-surface-sunken); padding: 1px 6px; border-radius: 5px; }
+  /* Data identity — the note explaining the current mode, and (managers
+     only) the owner/viewer toggle that changes it. */
+  .dda-identity-note { color: var(--ds-text-secondary); font-size: 13px; margin: 0 0 18px; }
+  .dda-identity-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .dda-identity-form select {
+    border: 1px solid var(--ds-border); border-radius: 8px;
+    padding: 7px 10px; font-size: 13px;
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .dda-identity-form select:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: 1px; }
+  .dda-identity-result { font-size: 13px; color: var(--ds-text-secondary); margin: 0 0 18px; }
+  .dda-identity-result.is-error { color: var(--ds-accent-danger-ink); }
 </style>
 {% endblock %}
 
@@ -126,7 +142,38 @@
         {% endif %}
       </span>
     </div>
+    {# The chip IS the control for a caller who may re-share this app (the
+       dialog re-renders it in place after a save); for anyone else it is a
+       plain read-out of the same `visibility` — `share=None` is what makes
+       `detail.visibility_chip` render a non-interactive span. #}
+    <div class="dda-fact">
+      <span class="label">Sharing</span>
+      <span class="value">{{ detail.visibility_chip(visibility, id='dda-vis',
+             share=({'type': 'data_app', 'id': app.slug, 'title': app.name} if can_share else None)) }}</span>
+    </div>
   </div>
+
+  {% if app.kind == 'hosted' %}
+  <p class="dda-identity-note">
+    {% if app.data_identity == 'viewer' %}
+    Each viewer sees only what their own grants allow (admins included).
+    {% else %}
+    Viewers see data under YOUR grants. Sharing this app publishes what it fetches.
+    {% endif %}
+  </p>
+  {% endif %}
+
+  {% if can_manage and app.kind == 'hosted' and not app.is_draft %}
+  <form id="dda-identity-form" class="dda-identity-form">
+    <label for="dda-identity">Data identity</label>
+    <select id="dda-identity">
+      <option value="owner"{% if app.data_identity != 'viewer' %} selected{% endif %}>Owner — runs under your grants</option>
+      <option value="viewer"{% if app.data_identity == 'viewer' %} selected{% endif %}>Viewer — runs under each viewer's own grants</option>
+    </select>
+    {{ ds.button('Save', variant='primary', id='dda-identity-save', type='submit') }}
+  </form>
+  <p class="dda-identity-result" id="dda-identity-result" hidden></p>
+  {% endif %}
 
   {% if can_manage and app.kind == 'hosted' %}
   <div class="dda-actions">
@@ -151,9 +198,13 @@
   </div>
   {% endif %}
 
+  {# Replaces the old unconditional "grant them data_app:<slug> in
+     /admin/access" hint: the chip is the actual control now (for a manager)
+     or a plain read-out (for a granted viewer) — the /admin/access route
+     still works, but it is no longer the only door. #}
   <p class="dda-grant-note">
-    To give another user or group access to this app, grant them
-    <code>data_app:{{ app.slug }}</code> in the <a href="/admin/access">Access workspace</a>.
+    {{ detail.visibility_chip(visibility, id='dda-vis-bottom',
+           share=({'type': 'data_app', 'id': app.slug, 'title': app.name} if can_share else None)) }}
   </p>
 </div>
 {# Closes the `.detail` wrapper `detail.hero()` opens — the macro only closes
@@ -164,6 +215,60 @@
    `--kind` / `detail--panels` rules. #}
 </div>
 
+{% if can_manage and app.kind == 'hosted' and not app.is_draft %}
+<script>
+(function () {
+  const slug = {{ app.slug | tojson }};
+  const form = document.getElementById("dda-identity-form");
+  const select = document.getElementById("dda-identity");
+  const resultEl = document.getElementById("dda-identity-result");
+  const btn = document.getElementById("dda-identity-save");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    resultEl.hidden = true;
+    resultEl.classList.remove("is-error");
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/api/data-apps/${encodeURIComponent(slug)}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data_identity: select.value }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.status === 501) {
+        await alertModal(
+          body.error === "requires_postgres_backend"
+            ? "Requires the Postgres app-state backend"
+            : "Failed: " + r.status
+        );
+        return;
+      }
+      if (!r.ok) {
+        await alertModal("Failed: " + (body.detail || r.status));
+        return;
+      }
+      const redeploy = body.redeploy || {};
+      let msg;
+      if (!redeploy.triggered) {
+        msg = "Saved. No redeploy was needed.";
+      } else if (redeploy.ok) {
+        msg = "Saved — redeploy triggered.";
+      } else {
+        msg = "Saved, but the redeploy failed" + (redeploy.detail ? ": " + redeploy.detail : ".");
+        resultEl.classList.add("is-error");
+      }
+      resultEl.textContent = msg;
+      resultEl.hidden = false;
+    } catch (e) {
+      await alertModal("Network error: " + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+})();
+</script>
+{% endif %}
 {% if can_manage and app.kind == 'linked' %}
 <script>
 (function () {
