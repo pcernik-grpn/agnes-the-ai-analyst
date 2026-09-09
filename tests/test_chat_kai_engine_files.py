@@ -61,6 +61,8 @@ def _make_client(
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     handler,
+    *,
+    chat_id: str = CHAT_ID,
 ) -> TestClient:
     os.environ["DATA_DIR"] = str(data_dir)
 
@@ -70,7 +72,7 @@ def _make_client(
 
     app = FastAPI()
     app.include_router(mod.router)
-    app.state.chat_repo = _FakeChatRepo({CHAT_ID: TEST_USER["email"]})
+    app.state.chat_repo = _FakeChatRepo({chat_id: TEST_USER["email"]})
     app.state.chat_config = KAI_CONFIG
     app.dependency_overrides[mod.require_chat_access] = lambda: TEST_USER
     return TestClient(app)
@@ -158,6 +160,25 @@ def test_listing_engine_404_degrades_to_unsupported(
     assert body == {"files": [], "truncated": False, "source": "engine", "supported": False}
 
 
+def test_listing_engine_400_degrades_to_unsupported_not_a_502(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 400 means "this chat cannot be served" (observed live: a session
+    minted before the instance's provider switched TO kai-agent — its
+    `chat_<hex>` id cannot key the engine's uuid-typed chat table, so the
+    engine rejects it before an existence check ever runs, answering 400
+    rather than the 404 an unknown-but-well-formed id gets). Same honest
+    supported=false a 404 gives, not the outage a raw >=400 used to mean —
+    and no traceback, because this is not a failure to warn about."""
+    client = _make_client(data_dir, monkeypatch, lambda request: httpx.Response(400, json={"error": {}}))
+    with caplog.at_level("WARNING"):
+        resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"files": [], "truncated": False, "source": "engine", "supported": False}
+    assert not any(r.exc_info for r in caplog.records)
+
+
 @pytest.mark.parametrize("body", [b"", b"not json", b"<html>gateway</html>"])
 def test_listing_engine_malformed_body_maps_to_502(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict, body: bytes
@@ -187,6 +208,29 @@ def test_listing_engine_unreachable_maps_to_502(data_dir: Path, monkeypatch: pyt
     client = _make_client(data_dir, monkeypatch, handler)
     resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files")
     assert resp.status_code == 502
+
+
+def test_listing_failure_traceback_logged_once_per_session_not_every_poll(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Files panel polls a live session every few seconds; a genuine
+    engine outage that lasts minutes used to write one full traceback PER
+    POLL — observed live as 8 and 3 identical tracebacks across two sessions
+    in one evening, for a call chain that never changes. Only the first
+    occurrence for a given chat id needs the traceback; later polls of the
+    SAME outage still warn, just without repeating it."""
+    poll_chat_id = "9c111111-2222-3333-4444-555555555555"
+    client = _make_client(data_dir, monkeypatch, lambda request: httpx.Response(500), chat_id=poll_chat_id)
+    with caplog.at_level("WARNING"):
+        first = client.get(f"/api/chat/sessions/{poll_chat_id}/files")
+        second = client.get(f"/api/chat/sessions/{poll_chat_id}/files")
+    assert first.status_code == 502
+    assert second.status_code == 502
+    listing_records = [r for r in caplog.records if "engine listing unavailable" in r.message]
+    assert len(listing_records) == 2
+    assert listing_records[0].exc_info
+    assert not listing_records[1].exc_info
+    assert "repeat poll" in listing_records[1].message
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -285,6 +329,16 @@ def test_download_active_content_pinned_to_octet_stream(
 def test_download_unknown_path_404(data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict) -> None:
     client = _make_client(data_dir, monkeypatch, _download_handler({}))
     resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files/download", params={"path": "nope.txt"})
+    assert resp.status_code == 404
+
+
+def test_download_engine_400_is_a_404_not_a_502(data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict) -> None:
+    """Same id-cannot-be-served signal as the listing (see
+    test_listing_engine_400_degrades_to_unsupported_not_a_502) — the
+    download route has no harvested fallback to offer here, so the honest
+    answer is the same 404 an unknown path gets, not an outage."""
+    client = _make_client(data_dir, monkeypatch, lambda request: httpx.Response(400))
+    resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files/download", params={"path": "report.docx"})
     assert resp.status_code == 404
 
 
@@ -456,9 +510,7 @@ def test_preview_reads_a_deck_out_of_the_engine_sandbox(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
 ) -> None:
     client = _make_client(data_dir, monkeypatch, _download_handler({"outputs/deck.pptx": _deck_bytes()}))
-    body = client.get(
-        f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "outputs/deck.pptx"}
-    ).json()
+    body = client.get(f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "outputs/deck.pptx"}).json()
     assert body["kind"] == "slides"
     assert body["slides"][0]["title"] == "Rapid vs Full"
     assert body["slides"][0]["lines"] == ["Side-by-side comparison"]

@@ -66,6 +66,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,31 @@ from src.repositories import agent_artifacts_repo
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+#: Chat ids whose engine-listing failure has already logged a full
+#: traceback this process. The Files panel polls a live session every few
+#: seconds, so an outage lasting minutes used to write one full traceback
+#: PER POLL for the identical stack (observed live: 8 and 3 occurrences
+#: across two sessions in one evening) — the stack carries no new
+#: information on the second poll onward, so only the first occurrence for
+#: a given chat id gets one; later polls still warn, just without repeating
+#: it. Bounded FIFO (oldest-inserted evicted first) so a long-running
+#: process accumulating many distinct failing sessions cannot grow this
+#: without limit.
+_ENGINE_LISTING_FAILURE_LOGGED: OrderedDict[str, None] = OrderedDict()
+_ENGINE_LISTING_FAILURE_LOGGED_MAX = 512
+
+
+def _first_engine_listing_failure(chat_id: str) -> bool:
+    """``True`` the first time this chat id's listing failure is seen this
+    process, ``False`` for every later call with the same id."""
+    first = chat_id not in _ENGINE_LISTING_FAILURE_LOGGED
+    _ENGINE_LISTING_FAILURE_LOGGED[chat_id] = None
+    _ENGINE_LISTING_FAILURE_LOGGED.move_to_end(chat_id)
+    while len(_ENGINE_LISTING_FAILURE_LOGGED) > _ENGINE_LISTING_FAILURE_LOGGED_MAX:
+        _ENGINE_LISTING_FAILURE_LOGGED.popitem(last=False)
+    return first
+
 
 # Same resource gate as the rest of the chat API (app/api/chat.py): the caller
 # must have the "Cloud chat" feature grant (or be an Admin).
@@ -623,7 +649,7 @@ async def _harvested_preview_bytes(chat_id: str, rel: str) -> bytes | None:
     return await _harvested_bytes(row)
 
 
-def _merge_harvested(live: "SessionFilesResponse", harvested: list[dict]) -> "SessionFilesResponse":
+def _merge_harvested(live: SessionFilesResponse, harvested: list[dict]) -> SessionFilesResponse:
     """Live listing + the harvested files it does not already contain.
 
     The live sandbox wins on collision: it has the fresher bytes for a file
@@ -683,15 +709,26 @@ async def list_session_files(
         try:
             live = await _list_engine_files(user, chat_id, cfg)
         except EngineFilesUnavailable:
+            # The traceback is identical every poll of the same outage, so
+            # only the first one for this chat id is worth its weight in
+            # the log — see _first_engine_listing_failure.
+            loud = _first_engine_listing_failure(chat_id)
+            repeat_note = "" if loud else " (repeat poll, traceback suppressed — see the first occurrence)"
             if not harvested:
                 # Nothing of our own to serve — the outage IS the answer.
-                logger.warning("chat_session_files: engine listing unavailable for session %s", chat_id, exc_info=True)
+                logger.warning(
+                    "chat_session_files: engine listing unavailable for session %s%s",
+                    chat_id,
+                    repeat_note,
+                    exc_info=loud,
+                )
                 raise _engine_unavailable_502() from None
             logger.warning(
-                "chat_session_files: engine listing unavailable for session %s — serving %d harvested artifact(s)",
+                "chat_session_files: engine listing unavailable for session %s — serving %d harvested artifact(s)%s",
                 chat_id,
                 len(harvested),
-                exc_info=True,
+                repeat_note,
+                exc_info=loud,
             )
             live = SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
         return _merge_harvested(live, harvested)

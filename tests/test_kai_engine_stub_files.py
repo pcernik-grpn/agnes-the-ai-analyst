@@ -79,7 +79,13 @@ def stub_env(monkeypatch: pytest.MonkeyPatch):
     stub._session_files.clear()
 
 
-def _agnes_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub) -> TestClient:
+def _agnes_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub,
+    *,
+    chat_id: str = CHAT_ID,
+) -> TestClient:
     """The real Agnes routes, engine transport bound to the real stub app,
     mint stubbed to a locally signed (but contract-true) session JWT."""
     os.environ["DATA_DIR"] = str(tmp_path / "data")
@@ -96,7 +102,7 @@ def _agnes_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub) -> Test
 
     agnes = FastAPI()
     agnes.include_router(mod.router)
-    agnes.state.chat_repo = _FakeChatRepo({CHAT_ID: TEST_USER["email"]})
+    agnes.state.chat_repo = _FakeChatRepo({chat_id: TEST_USER["email"]})
     agnes.state.chat_config = SimpleNamespace(provider="kai-agent", kai_agent_url="http://kai-agent:3000")
     agnes.dependency_overrides[mod.require_chat_access] = lambda: TEST_USER
     return TestClient(agnes)
@@ -149,6 +155,26 @@ def test_unknown_chat_degrades_to_unsupported(tmp_path: Path, monkeypatch: pytes
     client = _agnes_client(tmp_path, monkeypatch, stub_env)
     body = client.get(f"/api/chat/sessions/{CHAT_ID}/files").json()
     assert body == {"files": [], "truncated": False, "source": "engine", "supported": False}
+
+
+def test_pre_provider_switch_chat_id_degrades_to_unsupported_not_502(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_env
+) -> None:
+    """A session minted before this instance's ``chat.provider`` was
+    switched TO kai-agent keeps its older ``chat_<hex>`` id, which cannot
+    key the engine's uuid-typed chat table — the stub (mirroring the real
+    engine) 400s it rather than 404ing it. This must read exactly like the
+    unknown-chat 404 above, not like an outage, over the real wire contract
+    end to end."""
+    legacy_chat_id = "chat_legacy0123456789ab"
+    client = _agnes_client(tmp_path, monkeypatch, stub_env, chat_id=legacy_chat_id)
+
+    resp = client.get(f"/api/chat/sessions/{legacy_chat_id}/files")
+    assert resp.status_code == 200
+    assert resp.json() == {"files": [], "truncated": False, "source": "engine", "supported": False}
+
+    dl = client.get(f"/api/chat/sessions/{legacy_chat_id}/files/download", params={"path": "a.txt"})
+    assert dl.status_code == 404
 
 
 def test_files_routes_knob_simulates_old_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_env) -> None:

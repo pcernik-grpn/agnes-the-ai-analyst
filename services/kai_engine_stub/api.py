@@ -61,6 +61,7 @@ import hmac
 import json
 import os
 import time
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -732,6 +733,17 @@ def _sandbox_files_or_404(chat_id: str, claims: dict) -> dict[str, bytes]:
         # Simulate an engine build that predates the sandbox file routes:
         # the framework-level 404 the proxy must read as "no files channel".
         raise HTTPException(status_code=404, detail="not_found")
+    try:
+        uuid.UUID(chat_id)
+    except ValueError as exc:
+        # The real engine's chat table is a Postgres `uuid` column: a
+        # malformed id (e.g. a session minted before an instance's
+        # chat.provider was switched TO kai-agent, which keeps its older
+        # `chat_<hex>` id) fails at the DB layer before any existence check
+        # ever runs, so the real engine answers 400 here — never the 404 an
+        # unknown-but-well-formed id gets below. Mirrored so this stub stays
+        # the executable form of the wire contract (app/chat/kai_engine_files.py).
+        raise HTTPException(status_code=400, detail="invalid_chat_id") from exc
     # The real engine binds the session token to its chat (scope_id ==
     # chat id) for host-JWT callers — a token minted for chat A must not
     # browse chat B's sandbox. Enforced here so the Agnes-side contract
