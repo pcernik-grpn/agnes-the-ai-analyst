@@ -108,12 +108,36 @@ markitdown's full in-memory parse entirely and is read directly with openpyxl
 in ``read_only=True`` streaming mode (:func:`_read_xlsx_as_text`, the same
 reader the CSV rescue rung reuses) — see that function's docstring for why a
 221-file, 15 MB-average live finding motivated it.
+
+Embedded pictures (disclosure, not OCR)
+----------------------------------------
+markitdown drops the CONTENT of an embedded picture on every route through
+this module — this file never builds an image-understanding pipeline, and
+that stays true after this paragraph — but on two routes it left behind a
+placeholder that misled a reader instead of informing one (live finding
+2026-09-09): a ``.docx`` picture (mammoth's default image handler) came back
+as ``![alt](data:image/png;base64...)``, markitdown's own truncation of a
+base64 payload it never keeps either, and a ``.pptx`` picture came back as
+``![alt](PictureN.jpg)`` — a name python-pptx derives from PowerPoint's own
+per-SHAPE name, which repeats across slides and, worse, across two entirely
+unrelated documents, reading like a stable, fetchable filename when it is
+neither. :func:`_disclose_image_placeholders` rewrites both, for the
+markitdown-family engines only (:data:`_IMAGE_DISCLOSURE_ENGINES` — Docling's
+own picture marker is a different, opt-in surface this slice does not touch),
+into ``[image N of TOTAL in this document — not indexed, LOCATION]``: an
+ordinal scoped to THIS conversion (never collides with another document, and
+never looks like a filename anything could fetch), plus the nearest
+preceding slide number or section heading markitdown already emitted in the
+surrounding text — read here, never invented. :attr:`ConvertResult.
+image_count` carries the same total so a caller can act on it (e.g. an
+indexed-file's ``processing_detail``) without re-scanning the markdown.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -481,11 +505,21 @@ class ConvertResult:
     ``"csv_fallback"``, or ``"pdf_fallback"``. Empty for every route that
     never goes through the rescue chain (passthrough, PDF, plain markitdown,
     the ordinary legacy-office resave, the streaming route's happy path).
+
+    ``image_count`` is how many embedded pictures markitdown found in this
+    document and could not index (see :func:`_disclose_image_placeholders`)
+    — ``0`` for every document with none, and always ``0`` for a route that
+    never runs the disclosure rewrite (Docling's own picture markers are a
+    separate, opt-in surface not covered by this slice; the CSV/PDF rescue
+    rungs and the PDF/streaming routes have no picture markdown to begin
+    with). A reader must never infer "no images" from ``image_count == 0``
+    on one of those routes — it means "not counted here", not "none found".
     """
 
     markdown: str
     engine: str
     rescue: str = ""
+    image_count: int = 0
 
 
 def docling_capability() -> bool:
@@ -515,7 +549,7 @@ def docling_markdown(path: Path) -> str | None:
         return None
     try:
         from docling.document_converter import DocumentConverter  # type: ignore[import-not-found]
-    except Exception:
+    except Exception:  # noqa: BLE001 — an unimportable docling means "not this engine", same as the convert failure below
         return None
     try:
         result = DocumentConverter().convert(str(path))
@@ -523,6 +557,100 @@ def docling_markdown(path: Path) -> str | None:
     except Exception as exc:  # noqa: BLE001 — any backend failure means "not this engine"
         logger.warning("docling could not convert %s (%s); trying the next engine", path.name, type(exc).__name__)
         return None
+
+
+# --------------------------------------------------------- image disclosure
+
+#: Engines whose OUTPUT this module rewrites for embedded-picture disclosure
+#: (see the module docstring's "Embedded pictures" section). Every one of
+#: them is a markitdown call somewhere in its route — the base64/filename
+#: placeholder shapes :data:`_IMAGE_MARKER_RE` matches are markitdown's own,
+#: emitted the identical way regardless of which rung of the rescue chain
+#: reached it. Deliberately excludes: :data:`ENGINE_DOCLING` (a different,
+#: opt-in extra with its own picture-marker convention, not this slice's
+#: concern — see the module docstring); :data:`ENGINE_CSV_FALLBACK` /
+#: :data:`ENGINE_PDF_FALLBACK` / :data:`ENGINE_XLSX_STREAMING` (openpyxl or
+#: this module's own PDF route — no markitdown image markdown ever reaches
+#: them); :data:`ENGINE_PASSTHROUGH` / :data:`ENGINE_PYPDFIUM2` /
+#: :data:`ENGINE_OCR` (never markitdown at all).
+_IMAGE_DISCLOSURE_ENGINES = frozenset({ENGINE_MARKITDOWN, ENGINE_LIBREOFFICE_MARKITDOWN, ENGINE_LIBREOFFICE_RESCUE})
+
+#: markitdown's two image-loss shapes, matched alongside the slide/heading
+#: markers that locate them — one linear pass, one compiled pattern. Every
+#: alternative starts on a distinct literal (``<!--``, a line-leading ``#``,
+#: or ``![``) and every repeated group is bounded by a delimiter the group
+#: itself excludes (``[^\]]*`` cannot consume the ``]`` that ends it; ``.+``
+#: is anchored to end-of-line by ``re.MULTILINE``'s ``$``) — no ambiguous
+#: overlap between branches and no nested quantifiers, so this stays
+#: linear-time over arbitrarily large converted text regardless of input
+#: shape (see ``.claude/skills/agnes-conventions/references/security.md``
+#: §5). The pptx branch matches only ``.jpg`` — not a speculative "any image
+#: extension" — because that suffix is hard-coded in markitdown's own
+#: ``_pptx_converter.py`` (``filename = re.sub(r"\W", "", shape.name) +
+#: ".jpg"``, verified against the installed version); matching what the
+#: pinned dependency actually emits, not what it theoretically could.
+_IMAGE_MARKER_RE = re.compile(
+    r"<!--\s*Slide number:\s*(?P<slide>\d+)\s*-->"
+    r"|^#{1,6}[ \t]+(?P<heading>[^\n]+)$"
+    r"|!\[[^\]]*\]\((?:data:[\w./+-]*;base64\.\.\.|\w+\.jpg)\)",
+    re.MULTILINE,
+)
+
+#: A section heading can be arbitrarily long; a disclosure line stays a
+#: one-line pointer, not a second copy of the document's outline.
+_MAX_LOCATION_HEADING_CHARS = 80
+
+
+def _disclose_image_placeholders(text: str) -> tuple[str, int]:
+    """Rewrite markitdown's image-loss placeholders into an honest,
+    per-document, located disclosure. Never OCR, never a vision call — see
+    the module docstring's "Embedded pictures" section for the two shapes
+    replaced and why.
+
+    Walks :data:`_IMAGE_MARKER_RE`'s matches in document order exactly once,
+    tracking the MOST RECENTLY seen slide number (pptx) or heading (docx) as
+    a single "current location" — the same slide-number comments and heading
+    lines markitdown already emitted in ``text``, never a second parse of the
+    source document. Recency, not a fixed slide-over-heading priority: a
+    pptx slide's own title becomes a ``#`` heading in markitdown's output
+    too, and that heading always follows the SAME slide's own number
+    comment, so "most recent" already picks the slide (the more precise
+    pointer) for every image on it without special-casing the two shapes
+    against each other. An image before the first slide/heading marker gets
+    no location clause at all — still a stable, document-scoped ordinal,
+    just without a "where" to add.
+
+    Returns ``(rewritten_text, image_count)``. ``image_count`` is ``0`` and
+    ``text`` is returned UNCHANGED (not even copied) when there is nothing to
+    rewrite — the common case, and every document with no embedded pictures.
+    """
+    matches = list(_IMAGE_MARKER_RE.finditer(text))
+    total = sum(1 for m in matches if m.group("slide") is None and m.group("heading") is None)
+    if total == 0:
+        return text, 0
+
+    out: list[str] = []
+    last_end = 0
+    current_location: str | None = None
+    ordinal = 0
+    for m in matches:
+        out.append(text[last_end : m.start()])
+        last_end = m.end()
+        if m.group("slide") is not None:
+            current_location = f"slide {m.group('slide')}"
+            out.append(m.group(0))
+            continue
+        if m.group("heading") is not None:
+            heading_text = m.group("heading").strip()[:_MAX_LOCATION_HEADING_CHARS].replace("[", "(").replace("]", ")")
+            current_location = f'in section "{heading_text}"'
+            out.append(m.group(0))
+            continue
+        # An image marker: neither the slide nor the heading branch matched.
+        ordinal += 1
+        location = f", {current_location}" if current_location else ""
+        out.append(f"[image {ordinal} of {total} in this document — not indexed{location}]")
+    out.append(text[last_end:])
+    return "".join(out), total
 
 
 def convert_to_markdown(
@@ -617,7 +745,11 @@ def convert_to_markdown(
         # pass. This module never calls a model.
         return ConvertResult(markdown="", engine=ENGINE_EMPTY, rescue=rescue)
 
-    return ConvertResult(markdown=_truncate(text, max_chars), engine=engine, rescue=rescue)
+    image_count = 0
+    if engine in _IMAGE_DISCLOSURE_ENGINES:
+        text, image_count = _disclose_image_placeholders(text)
+
+    return ConvertResult(markdown=_truncate(text, max_chars), engine=engine, rescue=rescue, image_count=image_count)
 
 
 # --------------------------------------------------------------- passthrough
@@ -1246,15 +1378,11 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 __all__ = [
-    "ConversionError",
-    "ConvertResult",
-    "MissingConversionDependency",
-    "UnsupportedConversionFormat",
-    "convert_to_markdown",
-    "conversion_budget_seconds",
-    "docling_capability",
-    "docling_markdown",
+    "CONVERSION_BUDGET_BASE_SECONDS",
+    "CONVERSION_BUDGET_MAX_SECONDS",
+    "CONVERSION_BUDGET_PER_MB_SECONDS",
     "DEFAULT_MAX_CHARS",
+    "DETERMINISTIC_ERROR_CLASSES",
     "DOCLING_SUFFIXES",
     "ENGINE_DOCLING",
     "ENGINE_EMPTY",
@@ -1262,25 +1390,29 @@ __all__ = [
     "ENGINE_OCR",
     "ENGINE_PASSTHROUGH",
     "ENGINE_PYPDFIUM2",
-    "PAGE_BREAK",
-    "PASSTHROUGH_SUFFIXES",
+    "ERROR_CLASS_DOWNLOAD_ERROR",
+    "ERROR_CLASS_INGEST_ERROR",
+    "ERROR_CLASS_LIBREOFFICE_NO_OUTPUT",
+    "ERROR_CLASS_MARKITDOWN_REJECT",
+    "ERROR_CLASS_MEMORY_KILL",
+    "ERROR_CLASS_OTHER",
+    "ERROR_CLASS_PDFIUM_ERROR",
+    "ERROR_CLASS_TIMEOUT",
+    "ERROR_CLASS_WORKER_CRASH",
+    "LARGE_XLSX_STREAMING_THRESHOLD_BYTES",
     "LEGACY_OFFICE_SUFFIXES",
     "LEGACY_OFFICE_TARGETS",
     "LIBREOFFICE_TIMEOUT_SECONDS",
-    "RESCUE_RESAVE_TARGETS",
+    "PAGE_BREAK",
+    "PASSTHROUGH_SUFFIXES",
     "RESCUE_FALLBACK_KIND",
-    "LARGE_XLSX_STREAMING_THRESHOLD_BYTES",
-    "CONVERSION_BUDGET_BASE_SECONDS",
-    "CONVERSION_BUDGET_PER_MB_SECONDS",
-    "CONVERSION_BUDGET_MAX_SECONDS",
-    "ERROR_CLASS_MARKITDOWN_REJECT",
-    "ERROR_CLASS_LIBREOFFICE_NO_OUTPUT",
-    "ERROR_CLASS_PDFIUM_ERROR",
-    "ERROR_CLASS_TIMEOUT",
-    "ERROR_CLASS_MEMORY_KILL",
-    "ERROR_CLASS_WORKER_CRASH",
-    "ERROR_CLASS_INGEST_ERROR",
-    "ERROR_CLASS_DOWNLOAD_ERROR",
-    "ERROR_CLASS_OTHER",
-    "DETERMINISTIC_ERROR_CLASSES",
+    "RESCUE_RESAVE_TARGETS",
+    "ConversionError",
+    "ConvertResult",
+    "MissingConversionDependency",
+    "UnsupportedConversionFormat",
+    "conversion_budget_seconds",
+    "convert_to_markdown",
+    "docling_capability",
+    "docling_markdown",
 ]

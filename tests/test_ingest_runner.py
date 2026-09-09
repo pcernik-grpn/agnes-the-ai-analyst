@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 def _new_corpus(slug: str) -> str:
     from src.repositories import file_corpora_repo
@@ -132,7 +134,7 @@ def test_ingest_uses_preloaded_text_and_skips_the_disk_re_read(e2e_env, tmp_path
 
 
 def test_ingest_image_stays_pending_for_vision_slice(e2e_env, tmp_path, monkeypatch):
-    import src.ingest.vision as vision
+    from src.ingest import vision
 
     # Force vision off for determinism (a dev with ANTHROPIC_API_KEY set would
     # otherwise make a real API call here).
@@ -349,3 +351,59 @@ def test_chunks_land_in_the_collection_the_file_is_in_when_they_are_written(e2e_
     written = {ch["corpus_id"] for ch in corpus_chunks_repo().list_for_file(file_id)}
     assert written == {dst_id}
     assert corpus_chunks_repo().list_for_corpus(src_id) == []
+
+
+def _write_pptx_with_one_picture(path: Path) -> Path:
+    """A real ``.pptx`` (python-pptx — an existing markitdown dependency,
+    never a new one) with a single embedded picture on its one slide."""
+    import io
+    import struct
+    import zlib
+
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+        + _chunk(b"IEND", b"")
+    )
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.shapes.add_picture(io.BytesIO(png), Inches(1), Inches(1))
+    presentation.save(str(path))
+    return path
+
+
+def test_ingest_pptx_with_embedded_picture_discloses_it_in_the_chunk_and_the_detail(e2e_env, tmp_path):
+    """The live finding this pins (2026-09-09): a reader asked about content
+    that lives in a slide's picture and got an answer assembled from prose
+    instead, with no indication the picture existed at all. The indexed
+    chunk must carry an honest, located disclosure instead of a bare
+    ``PictureN.jpg`` placeholder (a name that collides across documents —
+    see ``src/ingest/convert.py``'s module docstring), and the file's own
+    ``processing_detail`` must carry the count so an admin/agent can act on
+    it without re-scanning every chunk.
+    """
+    pytest.importorskip("markitdown", reason="extraction extra not installed")
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    corpus_id = _new_corpus("ing-pptx-image")
+    deck = _write_pptx_with_one_picture(tmp_path / "architecture.pptx")
+    file_id = _add_file(corpus_id, "architecture.pptx", "pptx", str(deck))
+
+    assert ingest_file(file_id) == "indexed"
+
+    row = corpus_files_repo().get(file_id)
+    assert row["processing_detail"]["image_count"] == 1
+
+    chunks = corpus_chunks_repo().list_for_file(file_id)
+    full_text = "\n".join(c["text"] for c in chunks)
+    assert ".jpg" not in full_text
+    assert "[image 1 of 1 in this document — not indexed, slide 1]" in full_text

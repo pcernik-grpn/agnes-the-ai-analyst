@@ -24,7 +24,6 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
 from urllib.parse import unquote
 
 from src.ingest.convert import (
@@ -96,11 +95,11 @@ _EPUB_DOC_SUFFIXES = (".xhtml", ".html", ".htm")
 # ``id`` does not match inside ``data-id``.
 _ELEM = r"<(?:[\w.-]+:)?%s\b"
 _ATTR = r"""(?:^|\s)%s\s*=\s*(["'])([^"']*)\1"""
-_RE_ROOTFILE = re.compile(_ELEM % "rootfile" + r"[^>]*" + _ATTR % "full-path", re.I)
-_RE_ITEM = re.compile(_ELEM % "item" + r"[^>]*>", re.I)
-_RE_ITEMREF = re.compile(_ELEM % "itemref" + r"[^>]*" + _ATTR % "idref", re.I)
-_RE_ATTR_ID = re.compile(_ATTR % "id", re.I)
-_RE_ATTR_HREF = re.compile(_ATTR % "href", re.I)
+_RE_ROOTFILE = re.compile(_ELEM % "rootfile" + r"[^>]*" + _ATTR % "full-path", re.IGNORECASE)
+_RE_ITEM = re.compile(_ELEM % "item" + r"[^>]*>", re.IGNORECASE)
+_RE_ITEMREF = re.compile(_ELEM % "itemref" + r"[^>]*" + _ATTR % "idref", re.IGNORECASE)
+_RE_ATTR_ID = re.compile(_ATTR % "id", re.IGNORECASE)
+_RE_ATTR_HREF = re.compile(_ATTR % "href", re.IGNORECASE)
 
 
 @dataclass
@@ -109,17 +108,27 @@ class ExtractResult:
 
     ``elements`` is an optional list of ``(section_path, text)`` pairs when the
     extractor recovers structure (e.g. Docling); ``full_text`` is always set.
+
+    ``image_count`` carries :attr:`src.ingest.convert.ConvertResult.
+    image_count` through for the office branch (the only one that can ever
+    embed a picture markitdown drops) — ``0`` for every other reader in this
+    module, which never see picture markup at all. The caller
+    (``src/ingest/runner.py``) folds it into the indexed file's
+    ``processing_detail`` so a reader — or an admin looking at the file —
+    learns a document's own text was incomplete without re-scanning it for
+    the in-band ``[image N of TOTAL …]`` disclosure.
     """
 
     full_text: str
-    elements: List[Tuple[Optional[str], str]] = field(default_factory=list)
+    elements: list[tuple[str | None, str]] = field(default_factory=list)
+    image_count: int = 0
 
 
 class UnsupportedDocument(Exception):
     """Raised when no available extractor can read the document."""
 
 
-def _ext_of(path: str, file_type: Optional[str]) -> str:
+def _ext_of(path: str, file_type: str | None) -> str:
     if file_type and "/" not in file_type:
         return file_type.lower().lstrip(".")
     if "." in path:
@@ -135,7 +144,7 @@ def _read_text(path: str) -> str:
 class _HTMLTextExtractor(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self._parts: List[str] = []
+        self._parts: list[str] = []
         self._skip = 0
 
     def handle_starttag(self, tag: str, attrs: object) -> None:
@@ -160,7 +169,7 @@ def _strip_html(raw: str) -> str:
     return parser.text()
 
 
-def _try_docling(path: str) -> Optional[ExtractResult]:
+def _try_docling(path: str) -> ExtractResult | None:
     """Docling for the formats this module still reads itself.
 
     Returns ``None`` when the extra is absent or Docling refuses the file, so
@@ -199,7 +208,7 @@ def _extract_office(path: str, ext: str) -> ExtractResult:
             f"this '.{ext}' could not be read ({exc}). The file was stored; the archive itself is "
             "the problem, and no extra or image variant changes this."
         ) from exc
-    return ExtractResult(full_text=converted.markdown)
+    return ExtractResult(full_text=converted.markdown, image_count=converted.image_count)
 
 
 def _read_email(path: str) -> str:
@@ -266,7 +275,7 @@ def _epub_member_bytes(zf: zipfile.ZipFile, name: str, budget: int) -> bytes:
         return b""
 
 
-def _epub_spine_order(zf: zipfile.ZipFile) -> List[str]:
+def _epub_spine_order(zf: zipfile.ZipFile) -> list[str]:
     """Member names in spine (reading) order, or ``[]`` when unusable.
 
     File names inside an EPUB are arbitrary, so the spine is the only thing
@@ -297,7 +306,7 @@ def _epub_spine_order(zf: zipfile.ZipFile) -> List[str]:
         if item_id and href:
             href_by_id[item_id.group(2)] = href.group(2)
 
-    ordered: List[str] = []
+    ordered: list[str] = []
     for ref in _RE_ITEMREF.finditer(opf):
         href = href_by_id.get(ref.group(2))
         if not href:
@@ -310,7 +319,7 @@ def _epub_spine_order(zf: zipfile.ZipFile) -> List[str]:
     return ordered
 
 
-def _try_epub(path: str) -> Optional[str]:
+def _try_epub(path: str) -> str | None:
     """Extract text from an EPUB with the stdlib. ``None`` when unreadable.
 
     An EPUB is a zip of XHTML documents, so this needs no dependency — the
@@ -325,7 +334,7 @@ def _try_epub(path: str) -> Optional[str]:
                 # it is real text — better than rejecting a file we can read.
                 members = [n for n in zf.namelist() if n.lower().endswith(_EPUB_DOC_SUFFIXES)]
 
-            parts: List[str] = []
+            parts: list[str] = []
             consumed = 0
             truncated = False
             for name in members[:_EPUB_MAX_MEMBERS]:
@@ -357,7 +366,7 @@ def _try_epub(path: str) -> Optional[str]:
     return "\n\n".join(parts).strip() or None
 
 
-def _try_pdf(path: str) -> Optional[str]:
+def _try_pdf(path: str) -> str | None:
     """Extract PDF text with pypdf if importable; None when unavailable."""
     try:
         from pypdf import PdfReader  # type: ignore
@@ -370,7 +379,7 @@ def _try_pdf(path: str) -> Optional[str]:
         return None
 
 
-def extract_text(path: str, file_type: Optional[str] = None) -> ExtractResult:
+def extract_text(path: str, file_type: str | None = None) -> ExtractResult:
     """Extract text from a prose document.
 
     Office formats go to the shared converter (Docling → markitdown). For the
