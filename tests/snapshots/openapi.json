@@ -20235,6 +20235,174 @@
         ]
       }
     },
+    "/api/admin/conversations/export": {
+      "get": {
+        "description": "The evaluation-corpus pull (spec 3.12). Admin-only, Postgres-only,\ncontent-export-policy-gated. ``since`` is required \u2014 a caller that omits\nit gets a typed 400, not an unbounded scan of every conversation ever\nheld.",
+        "operationId": "export_conversations_api_admin_conversations_export_get",
+        "parameters": [
+          {
+            "description": "ISO date/datetime, inclusive lower bound. Required.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO date/datetime, inclusive lower bound. Required.",
+              "title": "Since"
+            }
+          },
+          {
+            "description": "ISO date/datetime, exclusive upper bound. Default: now.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO date/datetime, exclusive upper bound. Default: now.",
+              "title": "Until"
+            }
+          },
+          {
+            "description": "Filter to one chat surface (web, slack_dm, api, ...).",
+            "in": "query",
+            "name": "surface",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to one chat surface (web, slack_dm, api, ...).",
+              "title": "Surface"
+            }
+          },
+          {
+            "description": "Filter to one shared agent's sessions.",
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to one shared agent's sessions.",
+              "title": "Agent Id"
+            }
+          },
+          {
+            "description": "jsonl (default, streamed) or json (one array).",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "jsonl",
+              "description": "jsonl (default, streamed) or json (one array).",
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Records per page, at most 500.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "description": "Records per page, at most 500.",
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque token from a prior page's next_cursor / X-Next-Cursor.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque token from a prior page's next_cursor / X-Next-Cursor.",
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Conversations",
+        "tags": [
+          "admin-conversations-export"
+        ]
+      }
+    },
     "/api/admin/dashboard/signals": {
       "get": {
         "description": "Signals in the \"Needs fixing\" zone that currently have something to say.\n\nClear signals are omitted entirely rather than returned with ``count: 0``\n\u2014 an empty ``signals`` list IS the healthy state, and the page renders it\nas such. A signal whose resolver raised is returned with ``failed: true``\nso the page can say \"couldn't check\" instead of implying all-clear.",

@@ -11,13 +11,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
-from src.duckdb_conn import _open_duckdb
 import pytest
 
 from app.chat.persistence import ChatRepository
 from app.chat.types import Surface
 from src.db import _ensure_schema
+from src.duckdb_conn import _open_duckdb
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
