@@ -645,7 +645,7 @@ class ChatRepository:
                 turn_id=turn_id,
             )
         # DuckDB app-state path: the two prompt-cache columns AND `turn_id`
-        # exist only on Postgres (migrations 0092, 0114 — the DuckDB ladder
+        # exist only on Postgres (migrations 0092, 0115 — the DuckDB ladder
         # is frozen at FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step,
         # A3). The figures are accepted and dropped rather than refused:
         # recording a turn is the caller's actual job here, and losing an

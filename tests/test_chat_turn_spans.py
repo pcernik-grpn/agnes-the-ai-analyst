@@ -309,7 +309,7 @@ def test_usage_turns_row_uses_the_turn_id(manager: ChatManager, monkeypatch):
 
 
 def test_assistant_persist_passes_the_turn_id_to_append_message(manager: ChatManager):
-    """The PG-only ``chat_messages.turn_id`` column (migration 0114): the
+    """The PG-only ``chat_messages.turn_id`` column (migration 0115): the
     assistant persist call at the ``assistant_message`` frame branch must
     carry ``turn_id=live.turn_id``. A recording fake stands in for
     ``_messages_pg`` (the DuckDB path silently drops the kwarg — there is no

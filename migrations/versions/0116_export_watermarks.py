@@ -12,8 +12,8 @@ This is a brand-new table landing after the DuckDB app-state backend was
 frozen: no ``src/db.py`` step, no DuckDB repository sibling, registered
 ``PG``-only in ``src.repositories._REGISTRY``.
 
-Revision ID: 0115_export_watermarks
-Revises: 0114_llm_observability
+Revision ID: 0116_export_watermarks
+Revises: 0115_llm_observability
 Create Date: 2026-09-09
 """
 
@@ -24,8 +24,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0115_export_watermarks"
-down_revision: str | None = "0114_llm_observability"
+revision: str = "0116_export_watermarks"
+down_revision: str | None = "0115_llm_observability"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 #: ``extraction_runs`` (Alembic ``0094_extraction_runs``) and
 #: ``facts_ingest_runs`` (Alembic ``0078_facts_ingest_runs``) are the same
 #: story — both are PG-only app-state tables added after the freeze.
-#: ``llm_calls`` (Alembic ``0114_llm_observability``, design 2026-09-08) is
+#: ``llm_calls`` (Alembic ``0115_llm_observability``, design 2026-09-08) is
 #: the same story too — the LLM observability ledger.
 PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset(
     {"agnes_turns", "agnes_extraction_runs", "agnes_facts_ingest_runs", "agnes_llm_calls"}

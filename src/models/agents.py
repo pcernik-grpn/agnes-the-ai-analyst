@@ -234,7 +234,7 @@ class AgentMemory(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     #: The chat turn / message this memory was written from (migration
-    #: 0114, design 2026-09-08 §3.5) — filled by `remember` from
+    #: 0115, design 2026-09-08 §3.5) — filled by `remember` from
     #: `chat:turn:{session_id}` at write time. Postgres-only (A3): the
     #: frozen DuckDB backend has no matching columns and drops both values.
     source_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)

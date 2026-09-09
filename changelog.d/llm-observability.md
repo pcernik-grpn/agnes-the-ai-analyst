@@ -42,7 +42,7 @@
   error, never on a 4xx), advancing a Postgres-persisted keyset watermark
   (`last_message_at`, session id) only after a 2xx, under the same
   content-export policy as the pull. A run that fails mid-walk is audited as
-  failed, never raised into the worker. Migration `0115_export_watermarks`.
+  failed, never raised into the worker. Migration `0116_export_watermarks`.
 - Generation spans now carry prompt-cache tokens, `agnes.cost_usd`,
   `agnes.workload`, `agnes.purpose`, `agnes.turn_id`, `agnes.job_id` and
   `agnes.subject_id`; the `llm_generation` log line gains `workload`, `purpose`
@@ -86,7 +86,7 @@
   `gcp.vertex_ai` everywhere, matching the chat broker.
 - The worker runtime binds `job_id` into the LLM call context so every
   generation inside a background job is attributed without per-handler code.
-- New Alembic migration `0114_llm_observability` (`llm_calls`,
+- New Alembic migration `0115_llm_observability` (`llm_calls`,
   `chat_message_feedback`, `chat_messages.turn_id`,
   `agent_memories.source_turn_id`/`source_message_id`) — Postgres-only, A3
   ratchet; the frozen DuckDB app-state backend keeps answering a typed `501`
