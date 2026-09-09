@@ -2479,7 +2479,16 @@ class ChatManager:
         author = getattr(last, "sender_email", None) or live.user_email
         if live.participant_emails and author not in set(live.participant_emails):
             return  # SR-11
-        await self._deliver_local_user_message(live, last.content)
+        # Reuse the persisted row's turn_id/id (#2365 review) so the
+        # redelivered question joins the SAME turn as the answer that
+        # follows it -- exactly like every other delivery path this PR
+        # touched (the direct send, the role-split producer, the
+        # interrupted _partial_save). A legacy row written before the
+        # turn_id column existed, and every row on the frozen DuckDB
+        # backend (which drops the column on write, A3), carries
+        # turn_id=None -- _deliver_local_user_message mints a fresh one in
+        # that case exactly as it always has.
+        await self._deliver_local_user_message(live, last.content, turn_id=last.turn_id, message_id=last.id)
 
     async def _spawn_runner(self, session: ChatSession, session_dir: Path):
         from app.auth.access import mint_co_session_jwt, mint_session_jwt
