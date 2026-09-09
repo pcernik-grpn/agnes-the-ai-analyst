@@ -122,7 +122,7 @@ SHORT_Q_TOKEN_PREFIX_LENGTH = 4
 # left the planner with no selectivity estimate, it sized the candidate CTE
 # at ~416k rows (actual 122) on an ~830k-fact graph and chose full scans of
 # `claims` (3.9M rows) and `fact_aliases` (841k) over 122 index probes —
-# 5.3 s, i.e. `_STATEMENT_TIMEOUT_MS`, for a three-letter name. Selecting
+# 5.3 s, i.e. past the 5 s guard of the time, for a three-letter name. Selecting
 # candidates as a MATERIALIZED, ranked, LIMIT-ed CTE hands the planner a
 # cardinality ceiling it trusts (same query, same instance: 309 ms). The
 # effective cap is `max(limit * 4, SEARCH_CANDIDATE_CAP)`; at
@@ -175,15 +175,26 @@ CHUNK_JOIN_SEPARATOR = "\n\n"
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
 # repo, not an operator switch — the caps above are the primary defense.
-# 20 s, not 5 s: on a production-sized graph (~800k facts / ~4M claims) a
-# well-formed read finishes well under a second once its plan is right
-# (`search`'s bounded candidate set, the collection summary's UNION legs),
-# so the guard only has to stop the pathological walk — and at 5 s it was
-# cutting off ordinary lookups under concurrent load and blanking the
-# Library Facts section on a large collection. Stays under the 30 s HTTP
-# timeout the MCP foundation tools use, so the statement dies before the
-# tool call does.
+# 20 s, not 5 s, for the INTERACTIVE reads (`search`, `neighbors`, `claims`,
+# `edges`, `collection_facts_summary`): on a graph of hundreds of thousands
+# of facts and millions of claims a well-formed read finishes well under a
+# second once its plan is right (`search`'s bounded candidate set, the
+# collection summary's UNION legs), so the guard only has to stop the
+# pathological walk — and at 5 s it was cutting off ordinary lookups under
+# concurrent load and blanking the Library Facts section on a large
+# collection. Stays under the 30 s HTTP timeout the MCP foundation tools
+# use, so the statement dies before the tool call does.
 _STATEMENT_TIMEOUT_MS = 20_000
+
+# The AGGREGATE reads keep the original 5 s: `approximate_counts_for_
+# collections` and `facet_top_values_for_collections` run once per page view
+# over EVERY collection a caller can see, and their fallback legs can scan
+# all claims — the exact shape that once starved the shared Postgres pool
+# for minutes (see `approximate_counts_for_collections`'s docstring and the
+# 5 s contract `app/api/admin_sharepoint.py` documents). A per-page-view
+# read that is slow must fail fast, not hold a pooled connection four times
+# longer; the interactive guard above is deliberately NOT shared with them.
+_AGGREGATE_STATEMENT_TIMEOUT_MS = 5_000
 
 # `sweep_orphans()`'s grace period (live finding, 2026-09 — see
 # migrations/versions/0100_facts_created_at.py for the incident numbers): a
@@ -3985,7 +3996,7 @@ class FactsPgRepository:
         )
         out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
         with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_AGGREGATE_STATEMENT_TIMEOUT_MS}"))
             for r in conn.execute(sql, params).mappings():
                 out.setdefault(r["type"], []).append(
                     {"fact_id": r["fact_id"], "label": r["label"], "document_count": int(r["n"])}
@@ -4274,7 +4285,7 @@ class FactsPgRepository:
             """
         )
         with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_AGGREGATE_STATEMENT_TIMEOUT_MS}"))
             rows = conn.execute(sql, {"ids": list(corpus_ids)}).mappings().all()
         for r in rows:
             out[r["corpus_id"]] = {"facts": int(r["facts"]), "edges": int(r["edges"])}

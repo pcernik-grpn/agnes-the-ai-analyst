@@ -1123,6 +1123,47 @@ def test_search_statement_timeout_is_a_typed_hinted_error(pg_env, repo, monkeypa
     assert excinfo.value.reason == "facts_search_timeout"
 
 
+def test_aggregate_reads_keep_their_own_fail_fast_guard(pg_env, repo, monkeypatch):
+    """The per-page-view aggregate reads (`approximate_counts_for_collections`,
+    `facet_top_values_for_collections`) run under `_AGGREGATE_STATEMENT_
+    TIMEOUT_MS`, NOT the interactive `_STATEMENT_TIMEOUT_MS` — raising the
+    interactive guard must never let an aggregate scan hold a pooled
+    connection longer (the pool-starvation incident their docstrings
+    record). Proven behaviourally: with the interactive guard left long and
+    only the aggregate guard shortened, a blocked aggregate read is
+    cancelled at the aggregate bound."""
+    import time
+
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+
+    assert facts_pg._AGGREGATE_STATEMENT_TIMEOUT_MS < facts_pg._STATEMENT_TIMEOUT_MS
+
+    _seed_full_fixture()
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 60_000)
+    monkeypatch.setattr(facts_pg, "_AGGREGATE_STATEMENT_TIMEOUT_MS", 200)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts, claims, fact_collection_stats IN ACCESS EXCLUSIVE MODE"))
+        for call in (
+            lambda: repo.approximate_counts_for_collections([CORPUS_A]),
+            lambda: repo.facet_top_values_for_collections([CORPUS_A], types=["organization"]),
+        ):
+            started = time.monotonic()
+            with pytest.raises(Exception) as excinfo:
+                call()
+            elapsed = time.monotonic() - started
+            assert "canceling statement" in str(excinfo.value) or isinstance(
+                excinfo.value, facts_pg.FactsQueryTimeout
+            ), excinfo.value
+            assert elapsed < 5.0, f"aggregate read waited {elapsed:.1f}s — ran under the interactive guard"
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
 # ---------------------------------------------------------------------------
 # S8 (read side) — corrections enforced at read time.
 # ---------------------------------------------------------------------------
