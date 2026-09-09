@@ -297,3 +297,28 @@ def test_reappearing_linked_app_relinks_losslessly(repo):
     assert row["state"] == "linked"
     assert row["description_override"] == "kept"
     assert {r["slug"] for r in repo.list_linked()} == {"r1"}
+
+
+def test_data_identity_default_and_set(repo, backend):
+    """`data_identity` is a Postgres-only column (A3: revision 0113, no DuckDB
+    ladder step). Both backends READ as 'owner' by default through the
+    shared helper; only Postgres can WRITE it, DuckDB refuses typed."""
+    from src.data_apps.identity import data_identity_of
+    from src.repository_errors import RequiresPostgresBackend
+
+    repo.create(slug="ident", name="I", owner_user_id="u1")
+    assert data_identity_of(repo.get_by_slug("ident")) == "owner"
+
+    if backend == "pg":
+        assert repo.get_by_slug("ident")["data_identity"] == "owner"  # the column itself, with its default
+        assert repo.set_data_identity("ident", "viewer") is True
+        assert repo.get_by_slug("ident")["data_identity"] == "viewer"
+        assert data_identity_of(repo.get_by_slug("ident")) == "viewer"
+        assert repo.set_data_identity("nope", "viewer") is False
+        with pytest.raises(ValueError):
+            repo.set_data_identity("ident", "everyone")
+    else:
+        assert "data_identity" not in repo.get_by_slug("ident")
+        with pytest.raises(RequiresPostgresBackend) as exc:
+            repo.set_data_identity("ident", "viewer")
+        assert exc.value.feature == "data_app.data_identity"

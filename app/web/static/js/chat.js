@@ -3520,6 +3520,12 @@ function handleFrame(frame) {
       if (_isPreviewTool(frame.tool)) {
         if (frame.tool_use_id) _previewToolCallIds.set(frame.tool_use_id, _bareToolName(frame.tool));
         clearThinkingPlaceholder();
+        // No card, but still an inline block boundary: the text streamed
+        // before this call is finished, and whatever the agent says after it
+        // (or the credentials block its result renders) belongs below. Without
+        // the seal the next delta landed mid-paragraph — "Let me refresh
+        // it:The preview should be refreshing now."
+        _sealStreamingSegment();
         break;
       }
       if (frame.tool === "AskUserQuestion") {
@@ -3534,15 +3540,14 @@ function handleFrame(frame) {
     case "tool_result": {
       // MCP tool results arrive as a list of text blocks that the runner
       // collapses into a joined string (runner._emit_tool_result), so the
-      // directive is often a JSON *string*, not a parsed object — parse it.
-      let result = frame.result;
-      if (typeof result === "string") {
-        try {
-          result = JSON.parse(result);
-        } catch (_e) {
-          /* not JSON — leave as the original string */
-        }
-      }
+      // directive is often a JSON *string*, not a parsed object — and the
+      // engine provider forwards kai-agent's raw MCP envelope
+      // ({content:[{type:"text",text:"<json>"}]}) json.dumps'd, which puts
+      // the directive one level down. Resolve every shape before the check:
+      // an enveloped directive used to miss it and render the "Preview
+      // unavailable." fallback — twice per turn (refresh + credentials),
+      // with the shareable URL dropped on the floor.
+      const result = _unwrapPreviewToolResult(frame.result);
       if (_isPreviewDirective(result)) {
         handlePreviewDirective(result);
         if (frame.tool_use_id) _previewToolCallIds.delete(frame.tool_use_id);
@@ -6796,6 +6801,25 @@ function _isPreviewDirective(result) {
   );
 }
 
+/** Resolve a preview tool's `tool_result.result` to the payload the directive
+ *  check and the error copy read. Three wire shapes reach here: the native
+ *  runner's joined JSON STRING (it collapses the MCP text blocks server-side),
+ *  an already-parsed object, and the engine provider's json.dumps of the raw
+ *  MCP envelope `{content:[{type:"text",text:"<json>"}]}`, where the payload
+ *  is one level down. A string that is not JSON — a raised tool's error text —
+ *  comes back as it arrived, so the reader can be shown it. */
+function _unwrapPreviewToolResult(raw) {
+  let result = raw;
+  if (typeof result === "string") {
+    try {
+      result = JSON.parse(result);
+    } catch (_e) {
+      return result;
+    }
+  }
+  return _unwrapMcpEnvelope(result);
+}
+
 function handlePreviewDirective(directive) {
   clearThinkingPlaceholder();
   switch (directive.render) {
@@ -6902,11 +6926,21 @@ async function _installPreviewCookie(slug) {
   }
 }
 
+//: A raised tool's error text is the diagnosis; past this it is a wall.
+const _PREVIEW_ERROR_MAX_CHARS = 600;
+
 /** Extract a human message from a preview tool's non-directive result (the
- *  friendly `data_apps_disabled` payload, or a raised error). */
+ *  friendly `data_apps_disabled` payload, or a raised error). The error's own
+ *  text wins when there is one — "agnes_data_app_credentials(x) failed (HTTP
+ *  404): …" tells the reader what to do; the constant below is for a result
+ *  that says nothing at all, not a stand-in for one that does. */
 function _previewErrorMessage(result) {
   if (result && typeof result === "object") {
     return result.message || (result.error ? String(result.error) : "Preview unavailable.");
+  }
+  if (typeof result === "string" && result.trim()) {
+    const text = result.trim();
+    return text.length > _PREVIEW_ERROR_MAX_CHARS ? text.slice(0, _PREVIEW_ERROR_MAX_CHARS) + "…" : text;
   }
   return "Preview unavailable.";
 }

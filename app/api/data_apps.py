@@ -56,7 +56,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -65,7 +65,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
-from app.auth.access import can_access, is_user_admin, require_admin
+from app.auth.access import is_user_admin, require_admin
+from app.auth.data_app_viewer import can_view_data_app, derive_viewer_secret
 from app.auth.dependencies import (
     _get_db,
     get_current_user,
@@ -75,11 +76,11 @@ from app.auth.dependencies import (
 from app.auth.jwt import create_access_token
 from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX, PARENT_TOKEN_ID_CLAIM
 from app.instance_config import feature_enabled, get_data_apps_config, get_public_url
-from app.resource_types import ResourceType
 from app.secrets_vault import VaultKeyNotConfiguredError, decrypt_secret, encrypt_secret
 from src.audit_helpers import log_safe
 from src.data_apps.deploy_check import CheckReport, check_git_ref, skipped_report
 from src.data_apps.git_repos import fast_forward_live, init_app_repo, resolve_ref
+from src.data_apps.identity import data_identity_of
 from src.data_apps.runner_client import RunnerClient, RunnerError, RunnerUnavailable, up_timeout
 from src.data_apps.spec import AGNES_INTERNAL_URL, RESERVED_SLUGS, SLUG_RE, build_config_json, build_container_spec
 from src.repositories import access_token_repo, audit_repo, data_apps_repo, users_repo
@@ -381,21 +382,42 @@ def same_origin_serving_allowed() -> bool:
     return bool(switch_value("data_apps_allow_same_origin"))
 
 
+def hosted_serving_possible() -> bool:
+    """Whether this deployment can serve a hosted app to a browser AT ALL,
+    independent of any one app's state.
+
+    ``data_apps_proxy._same_origin_serving_refused`` runs BEFORE the per-state
+    branches, so with neither an isolated origin nor the operator's same-origin
+    opt-in it refuses a ``running`` app exactly as readily as a sleeping one:
+    every request lands on the main origin and gets the 403 "cannot be served
+    here" page. An instance with ``subdomain_base`` set is fine, because that is
+    the host ``_app_url`` then hands out — the click arrives on the subdomain.
+
+    (The proxy also lets a ``data-app-preview:<slug>`` token through, but that
+    is the in-chat preview iframe minting its own short-TTL token, not anything
+    a link on a page can carry — so it has no bearing on whether offering that
+    link is honest.)
+
+    Two callers, one definition: :func:`same_origin_serving_warning` reports
+    this at startup, and ``_serialize``'s ``reachable`` uses it so the UI never
+    offers a link the gate would refuse (Devin Review on #2336).
+    """
+    if same_origin_serving_allowed():
+        return True
+    return bool((_effective_config().get("subdomain_base") or "").strip())
+
+
 def same_origin_serving_warning() -> Optional[str]:
     """A startup warning when hosted apps are enabled but will be refused at
     serve time for lack of an isolated origin, else ``None``.
 
-    Fires when ``data_apps.enabled`` is on, ``allow_same_origin`` is off, and
-    no ``subdomain_base`` is configured — the deployment has no way to serve a
-    hosted app (every request lands on the main origin and is refused by
-    ``data_apps_proxy._same_origin_serving_refused``). Kept pure so it is
-    unit-testable; the app lifespan logs it (`app/main.py`).
+    Fires when ``data_apps.enabled`` is on and :func:`hosted_serving_possible`
+    is false. Kept pure so it is unit-testable; the app lifespan logs it
+    (`app/main.py`).
     """
     if not feature_enabled("data_apps", "enabled", env_var="AGNES_DATA_APPS_ENABLED", default=False):
         return None
-    if same_origin_serving_allowed():
-        return None
-    if (_effective_config().get("subdomain_base") or "").strip():
+    if hosted_serving_possible():
         return None
     return (
         "data_apps.enabled is on but hosted apps will NOT be served: same-origin "
@@ -426,11 +448,10 @@ def _feature_gate() -> None:
 
 
 def _can_view(user: dict, row: dict) -> bool:
-    if user["id"] == row["owner_user_id"]:
-        return True
-    if is_user_admin(user["id"]):
-        return True
-    return can_access(user["id"], ResourceType.DATA_APP.value, row["slug"])
+    """Owner | Admin | group grant — delegates to the one shared definition
+    (``app.auth.data_app_viewer.can_view_data_app``) so the viewer-token
+    resolver's live re-check and this control plane can never drift."""
+    return can_view_data_app(user["id"], row)
 
 
 def _require_owner_or_admin(user: dict, row: dict) -> None:
@@ -482,6 +503,23 @@ def _app_url(slug: str, cfg: dict) -> str:
     return f"/apps/{slug}/"
 
 
+#: App states the ingress proxy will actually serve a viewer from — straight
+#: through (``running``) or via the holding page while the container comes up
+#: (``sleeping`` wakes on request, ``deploying`` is already on its way). Every
+#: other state answers 409 there and can only be left by a redeploy, which is
+#: owner/Admin-only — so a viewer offered a link to one has nothing to click
+#: and no way to fix it.
+#:
+#: Mirrors the branch table in ``app/api/data_apps_proxy.py::proxy_app``, and
+#: is pinned against it by
+#: ``tests/test_data_apps_proxy.py::test_reachable_states_matches_what_the_proxy_actually_serves``.
+#: The UI reads this through ``_serialize``'s ``reachable`` rather than
+#: restating it: both app templates used to test ``state == 'running'`` alone,
+#: so a sleeping app — the one non-running state a viewer CAN wake — rendered a
+#: dead ``<code>`` instead of a link.
+REACHABLE_STATES: frozenset[str] = frozenset({"running", "sleeping", "deploying"})
+
+
 def _serialize(row: dict, cfg: Optional[dict] = None) -> dict:
     cfg = cfg if cfg is not None else _effective_config()
     out = {k: v for k, v in row.items() if k not in ("secrets_enc", "service_token_id")}
@@ -492,6 +530,20 @@ def _serialize(row: dict, cfg: Optional[dict] = None) -> dict:
     # override the synced description without the next sync clobbering it.
     out["url"] = (row.get("external_url") or "") if kind == "linked" else _app_url(row["slug"], cfg)
     out["effective_description"] = row.get("description_override") or row.get("description") or ""
+    # Whether offering this app's URL as a link is honest. A linked app opens at
+    # its external URL and is never proxied by us, so its reachability is not
+    # ours to judge. A hosted app has to clear BOTH of the proxy's gates: the
+    # deployment must be able to serve hosted apps at all
+    # (`hosted_serving_possible`, checked first there and state-independent),
+    # and this app's own state must be one the proxy serves from
+    # (REACHABLE_STATES).
+    out["reachable"] = (
+        True if kind == "linked" else (row.get("state") in REACHABLE_STATES and hosted_serving_possible())
+    )
+    # Whose grants the app reads data with: 'owner' (default) | 'viewer'. A
+    # DuckDB-backed row lacks the PG-only column; the helper reads that as
+    # 'owner' so the API never shows an absent field.
+    out["data_identity"] = data_identity_of(row)
     return out
 
 
@@ -1169,6 +1221,10 @@ def redeploy_current(row: dict) -> None:
             # the app calls the Agnes API with, and a git-scoped token is
             # refused by every data endpoint. (Devin Review on this PR.)
             service_token=jwt_token,
+            # The per-app key the container verifies the proxy's viewer
+            # assertion with — derived from the SAME `new_token_id` the row
+            # now carries, which is what the proxy derives from per request.
+            viewer_secret=derive_viewer_secret(slug, new_token_id),
         )
         spec = build_container_spec(row, defaults=_effective_config(), data_dir=os.environ.get("DATA_DIR", "/data"))
     except ValueError:
@@ -1228,8 +1284,16 @@ class CreateDraftRequest(BaseModel):
     branch: str = "init"
 
 
-class SetDescriptionRequest(BaseModel):
-    description: str = ""
+class PatchDataAppRequest(BaseModel):
+    """Body of ``PATCH /{slug}``. Both fields optional; an empty body is a
+    400 ``nothing_to_update`` rather than a silent no-op (or, as before this
+    model grew a second field, a silent description WIPE — ``description``
+    used to default to ``""``)."""
+
+    description: Optional[str] = None
+    # Whose grants the app reads Agnes data with — see
+    # ``src/data_apps/identity.py`` / ``app/auth/data_app_viewer.py``.
+    data_identity: Optional[Literal["owner", "viewer"]] = None
 
 
 def _draft_slug(parent_slug: str, branch: str) -> str:
@@ -1296,39 +1360,131 @@ async def list_data_apps(
     return out
 
 
+async def _redeploy_for_data_identity_locked(row: dict) -> dict:
+    """Re-bake the container after a ``data_identity`` flip. The CALLER holds
+    the per-slug op lease (``require_op_lease``) around both the column write
+    and this call — see ``patch_data_app`` — so a concurrent deploy/stop/wake
+    is refused with 409 BEFORE anything is written, never after.
+
+    ``AGNES_DATA_IDENTITY`` and the viewer secret are baked into the
+    container at ``build_container_spec``/``build_config_json`` time, so a
+    running (or sleeping — a paused container resumes as-is) app would keep
+    serving the OLD mode after the row changed: owner→viewer stale means
+    viewers see owner data under a "viewer" label; viewer→owner stale means
+    the app keeps demanding a token the proxy no longer sends. So a reachable
+    app is redeployed synchronously, minus the git fast-forward —
+    ``redeploy_current`` serves whatever ``agnes-live`` already points at.
+
+    Returns the ``redeploy`` sub-object the caller puts on the response:
+    ``{"triggered": False}`` for an app with no container to re-bake (its
+    next deploy/wake builds the new spec), ``{"triggered": True, "ok":
+    True}`` on success, ``{"triggered": True, "ok": False, "detail": ...}``
+    when the redeploy failed — the setting stays persisted (the row is the
+    source of truth) and the app is left in ``error`` so the proxy answers
+    409 instead of serving a container whose mode contradicts the registry.
+    """
+    repo = data_apps_repo()
+    if row.get("state") not in REACHABLE_STATES:
+        return {"triggered": False}
+    try:
+        await run_in_threadpool(redeploy_current, row)
+    except (RunnerUnavailable, RunnerError) as exc:
+        # `redeploy_current` already recorded state=error via
+        # `_handle_runner_failure`.
+        return {"triggered": True, "ok": False, "detail": f"runner_error: {exc}"}
+    except (OwnerNotFoundError, DraftParentMissingError, ValueError) as exc:
+        # These leave the row's state untouched — but a container still
+        # running the old mode IS the failure here, so record it.
+        repo.set_state(row["id"], "error", f"data_identity redeploy failed: {exc}")
+        return {"triggered": True, "ok": False, "detail": str(exc)}
+    repo.set_state(row["id"], "running")
+    return {"triggered": True, "ok": True}
+
+
 @router.patch("/{slug}")
-async def set_data_app_description(
+async def patch_data_app(
     slug: str,
-    payload: SetDescriptionRequest,
+    payload: PatchDataAppRequest,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Set an app's description — hosted or linked.
+    """Update an app's description and/or its data identity — owner or Admin.
 
-    For a **linked** app the stored ``description`` is refreshed by the ingest
-    sync, and this writes an override the sync won't clobber. For a **hosted**
-    app there is no sync, so the same column simply holds its current
-    description: ``POST /api/data-apps`` seeds one at create time and this is
-    the only way to change it afterwards. (Hosted rows were refused here with
-    ``409 not_managed`` until this release, which made the description
-    write-once — a typo could only be fixed by recreating the app.)
+    **description** (hosted or linked): for a **linked** app the stored
+    ``description`` is refreshed by the ingest sync, and this writes an
+    override the sync won't clobber. For a **hosted** app there is no sync,
+    so the same column simply holds its current description: ``POST
+    /api/data-apps`` seeds one at create time and this is the only way to
+    change it afterwards. One column serves both because every data-app
+    reader already resolves through ``effective_description``
+    (``description_override or description``).
 
-    One column serves both because every data-app reader already resolves
-    through ``effective_description`` (``description_override or description``)
-    — ``_serialize`` here, and the library/RBAC projection in
-    ``app/resource_types.py``. The column keeps its ``_override`` name, which
-    reads oddly for a hosted app with nothing to override; renaming it is a
-    migration for no behavioural gain, and the API surface exposes
-    ``effective_description`` rather than either raw column.
-
-    Owner or Admin only, both cases.
+    **data_identity** (hosted, non-draft only): ``'owner'`` (default — the
+    app reads data with its owner's grants, "sharing is publication") or
+    ``'viewer'`` (the proxy hands the container a per-request viewer token
+    and reads are authorized as ``owner ∩ viewer``, row policies bound to
+    the viewer — ``app/auth/data_app_viewer.py``). The owner may flip it
+    themselves. Postgres-backed instances only: the column is PG-only (A3),
+    so on DuckDB the repo raises ``RequiresPostgresBackend`` → 501 before
+    anything else is touched. A reachable app is redeployed synchronously
+    (see ``_redeploy_for_data_identity_locked``); the response carries the outcome
+    under ``redeploy``. Drafts stay ``owner`` (400 ``draft_has_no_data_
+    identity``); linked apps have no container (400, after authz so the
+    distinct code never leaks an app's kind to a caller who'd get 403).
     """
     _feature_gate()
     row = _get_row_or_404(slug)
     _require_owner_or_admin(user, row)
-    data_apps_repo().set_description_override(slug, payload.description)
-    _audit(conn, user["id"], "data_app.set_description", f"data_app:{slug}", {})
-    return _serialize(_get_row_or_404(slug))
+    if payload.description is None and payload.data_identity is None:
+        raise HTTPException(status_code=400, detail="nothing_to_update")
+
+    repo = data_apps_repo()
+    redeploy: Optional[dict] = None
+    # Identity FIRST: its DuckDB refusal (501) must land before the
+    # description write, or a mixed body would half-apply.
+    if payload.data_identity is not None:
+        _reject_linked(row)
+        if row.get("is_draft"):
+            raise HTTPException(status_code=400, detail="draft_has_no_data_identity")
+        # The column is Postgres-only. Refuse HERE, before the no-op check
+        # below: on DuckDB a request for `'owner'` matches the implicit
+        # default and would otherwise skip `set_data_identity` (the only
+        # other place the backend is checked) and report success for a
+        # setting this instance cannot hold at all (Devin Review on #2383).
+        from src.repositories import RequiresPostgresBackend, use_pg
+
+        if not use_pg():
+            raise RequiresPostgresBackend("data_app.data_identity")
+        previous = data_identity_of(row)
+        if payload.data_identity != previous:
+            # The op lease is taken BEFORE the column write, so a concurrent
+            # deploy/stop/wake answers 409 `operation_in_progress` with
+            # nothing changed — never a flipped row whose container was not
+            # re-baked and whose audit row was lost to the exception path.
+            holder = require_op_lease(slug)
+            try:
+                repo.set_data_identity(slug, payload.data_identity)  # RequiresPostgresBackend -> 501 on DuckDB
+                redeploy = await _redeploy_for_data_identity_locked(repo.get_by_slug(slug) or row)
+                _audit(
+                    conn,
+                    user["id"],
+                    "data_app.data_identity_changed",
+                    f"data_app:{slug}",
+                    {"from": previous, "to": payload.data_identity, "redeploy": redeploy},
+                )
+            finally:
+                release_op_lease(slug, holder)
+        else:
+            redeploy = {"triggered": False}
+
+    if payload.description is not None:
+        repo.set_description_override(slug, payload.description)
+        _audit(conn, user["id"], "data_app.set_description", f"data_app:{slug}", {})
+
+    out = _serialize(_get_row_or_404(slug))
+    if redeploy is not None:
+        out["redeploy"] = redeploy
+    return out
 
 
 @router.post("", status_code=201, dependencies=[Depends(reject_keboola_header_credential)])

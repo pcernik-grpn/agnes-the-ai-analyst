@@ -296,6 +296,13 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/facts/neighbors": ("facts neighbors", "fact_neighbors"),
     "/api/facts/edges": ("facts edges", "fact_edges"),
     "/api/facts/{subject_id}/claims": ("facts claims", "fact_claims"),
+    # Owner-scoped sharing (TCRD-291) — was _EXEMPT (a web-only affordance on
+    # /library) until `agnes app share` / `data_app_share_get` / `data_app_share`
+    # landed for the `data_app` resource type. `GET /api/sharing/groups` is
+    # shared plumbing (the audience picker), so it's asserted against the
+    # `share` command rather than a bespoke one.
+    "/api/sharing/groups": ("app share", "data_app_share_get"),
+    "/api/sharing/{resource_type}/{resource_id}": ("app share", "data_app_share"),
 }
 
 
@@ -457,9 +464,9 @@ _LIBRARY_RAW_REASON = (
     "content has `collection_file_read` / `agnes collections cat`, which read "
     "the sibling `…/preview` endpoint. That endpoint is NOT exempt: it carries "
     "the triple-surface contract in _COHORT above, so removing either surface "
-    "fails this test rather than passing silently. `…/preview` is capped "
-    "(_PREVIEW_MAX_CHARS) and says so via `truncated`; an uncapped paginated "
-    "whole-file reader would still be its own feature."
+    "fails this test rather than passing silently. `…/preview` returns one "
+    "page (_PREVIEW_MAX_CHARS) at a time and pages via `offset` / "
+    "`next_offset`, so both readers reach the whole file through it."
 )
 
 
@@ -766,24 +773,18 @@ _AGENTS_BUILDER_TURN_REASON = (
     "`/api/agents` by the agent-core consolidation (remediation Track C)."
 )
 
-_LIBRARY_SHARING_REASON = (
-    "Owner-initiated sharing of Library items — a web affordance on /library "
-    "(share dialog). The equivalent grant writing already has analyst-facing "
-    "surfaces on the ADMIN side (`agnes admin grant …`); this endpoint only "
-    "narrows those same `resource_grants` writes to what an item's owner may do, "
-    "so a second CLI/MCP vocabulary for it would duplicate the admin one."
-)
-
 _SHARE_REQUESTS_ADMIN_REASON = (
-    "Track C6 agent-sharing approval queue — web-only, same reasoning as "
-    "_LIBRARY_SHARING_REASON above: the underlying write is the exact same "
-    "`resource_grants` row the admin `agnes admin grant …` CLI already "
-    "mints, so approve/reject here only decides a QUEUED instance of that "
-    "same grant. The queue itself has no analyst-facing use — it exists "
-    "purely so an admin can review a non-admin owner's agent-share request, "
-    "a decision made from the admin moderation hub (`/admin/store`), never "
-    "scripted. No CLI/MCP vocabulary is warranted for either the list or "
-    "the approve/reject verbs."
+    "Track C6 agent-sharing approval queue — web-only. The underlying write "
+    "is the exact same `resource_grants` row `PUT /api/sharing/{resource_type}/"
+    "{resource_id}` writes directly for an admin actor (or once a queued "
+    "request is approved) — THAT endpoint's own CLI/MCP surface landed via "
+    "`agnes app share` / `data_app_share` for the `data_app` resource type "
+    "(TCRD-291), so approve/reject here only decides a QUEUED instance of a "
+    "write that already has a CLI/MCP path elsewhere. The queue itself has no "
+    "analyst-facing use — it exists purely so an admin can review a "
+    "non-admin owner's agent-share request, a decision made from the admin "
+    "moderation hub (`/admin/store`), never scripted. No CLI/MCP vocabulary "
+    "is warranted for either the list or the approve/reject verbs."
 )
 
 _DATA_APPS_PREVIEW_GRANT_REASON = (
@@ -1070,8 +1071,6 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/mcp-sources/builder/turn": _MCP_BUILDER_TURN_REASON,
     "/api/semantic-models/builder/turn": _SEMANTIC_MODEL_BUILDER_TURN_REASON,
     "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
-    "/api/sharing/groups": _LIBRARY_SHARING_REASON,
-    "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/admin/share-requests": _SHARE_REQUESTS_ADMIN_REASON,
     "/api/admin/share-requests/{request_id}": _SHARE_REQUESTS_ADMIN_REASON,
     "/api/me/elevation": (

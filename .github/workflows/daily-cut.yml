@@ -72,6 +72,17 @@ jobs:
           echo "noop=$(jq -r .noop /tmp/plan.json)" >> "$GITHUB_OUTPUT"
           echo "version=$(jq -r .version /tmp/plan.json)" >> "$GITHUB_OUTPUT"
 
+      - uses: astral-sh/setup-uv@v7
+        if: steps.existing.outputs.count == '0' && steps.plan.outputs.noop == 'false'
+      - name: Re-lock after the version bump
+        # uv.lock records the project's own version, and the image installs from
+        # the lock behind CI's blocking `lock-check` — a cut that bumped
+        # pyproject.toml without re-locking would fail its own PR's checks (and
+        # did leave the lock six releases behind before this step existed).
+        # `uv lock` here re-resolves only the project's metadata; third-party
+        # pins move only in dependency PRs.
+        if: steps.existing.outputs.count == '0' && steps.plan.outputs.noop == 'false'
+        run: uv lock
       - name: Open the release-cut PR
         if: steps.existing.outputs.count == '0' && steps.plan.outputs.noop == 'false'
         env:
@@ -85,6 +96,7 @@ jobs:
           git checkout -b "$BRANCH"
           git add CHANGELOG.md pyproject.toml
           if [ -f server.json ]; then git add server.json; fi
+          if [ -f uv.lock ]; then git add uv.lock; fi
           # The cut folded every changelog.d/ fragment into CHANGELOG.md and
           # deleted the files — stage those deletions too.
           if [ -d changelog.d ]; then git add -A changelog.d; fi

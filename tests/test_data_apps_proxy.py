@@ -365,6 +365,165 @@ def test_sleeping_app_returns_holding_page_and_wakes(client_granted, fake_runner
     assert fake_runner.up_calls  # wake fired exactly once
 
 
+def _grace_ms_in(page: str) -> int:
+    """The give-up horizon the holding page was actually handed, in seconds."""
+    import re as _re
+
+    m = _re.search(r"const GRACE_MS = (\d+) \* 1000;", page)
+    assert m, f"holding page carries no GRACE_MS: {page[:300]}"
+    return int(m.group(1))
+
+
+def test_holding_page_hands_a_late_viewer_only_the_remaining_grace(client_granted, fake_runner, monkeypatch):
+    """The server's start grace runs from the deploy; the page's used to run
+    from its own load, so every new viewer restarted the deadline and a late
+    arrival could sit through a second full window (Devin Review on #2336).
+
+    A deploy already most of the way through its window now hands over only
+    what is left of it.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import app.api.data_apps_proxy as proxy_api
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    monkeypatch.setattr(proxy_api, "_START_GRACE_SECONDS", 400)
+    conn = get_system_db()
+    try:
+        repo = DataAppsRepository(conn)
+        app_id = repo.create(slug="late", name="LATE", owner_user_id="owner1")
+        repo.set_state(app_id, "deploying")
+        stale = datetime.now(timezone.utc) - timedelta(seconds=360)
+        conn.execute(
+            "UPDATE data_apps SET updated_at = ?, last_deploy_at = ? WHERE id = ?",
+            [stale, stale, app_id],
+        )
+    finally:
+        conn.close()
+
+    r = client_granted.get("/apps/late/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    remaining = _grace_ms_in(r.text)
+    assert 0 < remaining <= 60, f"expected ~40s left of 400, got {remaining}"
+
+
+def test_holding_page_gives_a_freshly_woken_app_the_whole_grace(client_granted, fake_runner, monkeypatch):
+    """The asymmetry is deliberate: a wake triggered by THIS request starts
+    booting now, so a stale row must not shorten its window — only a deploy
+    already under way gets the remainder.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import app.api.data_apps_proxy as proxy_api
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    monkeypatch.setattr(proxy_api, "_START_GRACE_SECONDS", 400)
+    conn = get_system_db()
+    try:
+        repo = DataAppsRepository(conn)
+        app_id = repo.create(slug="woken", name="WOKEN", owner_user_id="owner1", sleep_mode="recreate")
+        repo.set_state(app_id, "sleeping")
+        stale = datetime.now(timezone.utc) - timedelta(seconds=390)
+        conn.execute(
+            "UPDATE data_apps SET updated_at = ?, last_deploy_at = ? WHERE id = ?",
+            [stale, stale, app_id],
+        )
+    finally:
+        conn.close()
+
+    r = client_granted.get("/apps/woken/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert _grace_ms_in(r.text) == 400
+
+
+def test_readiness_reports_a_failed_wake_as_error(client_granted, fake_runner):
+    """The contract the holding page stops on. A wake that fails writes
+    ``error`` (``_run_wake_fn``) and the probe reports it — but ``ready`` is
+    merely false, so a page reading only ``ready`` treats a dead app as a slow
+    one and sits out the whole grace (Devin Review on #2336). The state has to
+    be in the payload for the page to tell those apart.
+    """
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    conn = get_system_db()
+    try:
+        repo = DataAppsRepository(conn)
+        app_id = repo.create(slug="wakefail", name="WAKEFAIL", owner_user_id="owner1")
+        repo.set_state(app_id, "error", "boom")
+    finally:
+        conn.close()
+
+    r = client_granted.get("/api/data-apps/wakefail/readiness")
+    assert r.status_code == 200
+    assert r.json() == {"state": "error", "ready": False}
+
+
+def test_holding_page_carries_the_servers_reachable_states(client_granted, fake_runner, sleeping_app):
+    """The page decides "is this still coming up?" from the same set the proxy
+    serves from, handed over rather than restated — so a state the server has
+    given up on cannot read as "still starting" in the browser.
+    """
+    import json as _json
+
+    from app.api.data_apps import REACHABLE_STATES
+
+    r = client_granted.get(f"/apps/{sleeping_app}/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert f"const REACHABLE_STATES = {_json.dumps(sorted(REACHABLE_STATES))};" in r.text
+
+
+def test_holding_page_bounds_each_readiness_request_and_counts_http_errors(
+    client_granted, fake_runner, sleeping_app
+):
+    """Two ways the bound could be escaped, both closed in the page itself:
+    a request that never settles (nothing after the ``await`` ever runs, so
+    neither the error count nor the deadline is reached) and an HTTP error
+    carrying a JSON body (it parses, so the error count used to reset on it).
+
+    Honest about what this is: a PRESENCE check on the rendered page, not a
+    proof of the behaviour. Both live entirely in browser JS, and the suites
+    this file runs in have no JS runtime — the repo's browser harness
+    (Playwright) is a separate opt-in suite needing `playwright install
+    chromium`. So this guards against the abort or the `r.ok` test being
+    deleted, and a real hung-fetch case belongs in that browser suite.
+    """
+    r = client_granted.get(f"/apps/{sleeping_app}/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert "AbortController" in r.text
+    assert "signal: ctl.signal" in r.text
+    assert "if (!r.ok) throw" in r.text
+    assert 'if (j.state === "error")' in r.text
+    # A terminal state must not be announced under the still-starting heading.
+    assert '"App failed to start"' in r.text
+    assert "Still starting" in r.text  # kept for the genuinely slow cases
+
+
+def test_holding_page_bounds_its_retry_on_the_servers_own_start_grace(
+    client_granted, fake_runner, sleeping_app, monkeypatch
+):
+    """The holding page used to retry forever under a line promising it
+    reloads by itself — so every failure, including a poll that structurally
+    cannot answer (an app subdomain with no ``server.public_url``; see
+    ``_readiness_poll_url``), presented as an app that was still starting.
+
+    It now gives up and offers a reload. The horizon it gives up on is the
+    server's ``_START_GRACE_SECONDS``, passed into the template rather than
+    written there, so the page stops calling an app "starting" at the same
+    moment this module does — pinned here, since two copies of that number
+    is exactly how they would drift.
+    """
+    import app.api.data_apps_proxy as proxy_api
+
+    monkeypatch.setattr(proxy_api, "_START_GRACE_SECONDS", 137)
+    r = client_granted.get(f"/apps/{sleeping_app}/", headers={"accept": "text/html"})
+    assert r.status_code == 503
+    assert "const GRACE_MS = 137 * 1000;" in r.text
+    assert 'id="wake-reload"' in r.text
+
+
 def test_sleeping_app_json_accept(client_granted, fake_runner, sleeping_app):
     r = client_granted.get("/apps/s/", headers={"accept": "application/json"})
     assert r.status_code == 503
@@ -1353,7 +1512,9 @@ def test_the_waking_page_polls_a_relative_url_on_the_path_form(client_granted, f
     """No host pinned into the page when it is not needed."""
     r = client_granted.get("/apps/s/", headers={"accept": "text/html"})
     assert r.status_code == 503
-    assert 'fetch("/api/data-apps/s/readiness", { credentials: "include" })' in r.text
+    # Asserted on the URL the page is handed, not on the shape of the fetch
+    # call that consumes it — the value is the contract here.
+    assert 'const READINESS_URL = "/api/data-apps/s/readiness";' in r.text
 
 
 def test_the_waking_page_polls_an_absolute_url_on_a_subdomain(monkeypatch):
@@ -1523,3 +1684,256 @@ def test_logged_out_on_subdomain_carries_a_usable_return_url(proxy_client, runni
     assert "/apps/s" not in nxt, f"the rewritten path leaked into the return URL: {nxt}"
     assert "//s.apps.example.com" in nxt, nxt
     assert safe_next_path(nxt, default="/D") == nxt, "login would discard this target"
+
+
+@pytest.mark.parametrize("state", ["sleeping", "deploying", "created", "stopped", "error"])
+def test_reachable_states_matches_what_the_proxy_actually_serves(client_granted, fake_runner, state):
+    """``REACHABLE_STATES`` is a SECOND statement of this module's branch
+    table — the UI reads it to decide whether an app's URL is worth offering
+    as a link (``data_apps.html``, ``data_app_detail.html``). Pin the two
+    together so the copy cannot drift again: a state in the set must not be
+    answered with ``app_not_running``/``app_error``, and a state outside it
+    must be. Drift is exactly how a sleeping app — which this proxy wakes for
+    any viewer — came to render a dead ``<code>`` and a "not running" label.
+
+    ``running`` is left to ``test_running_app_is_proxied``: proving it here
+    would need the mocked upstream, and it is the one state that was never
+    in doubt.
+
+    Scope: this pins the STATE dimension only. ``proxy_env`` turns
+    ``allow_same_origin`` on, so the state-independent gate that runs first
+    (``_same_origin_serving_refused``) never fires here — ``reachable`` answers
+    that one through ``hosted_serving_possible()``, pinned by
+    ``tests/test_web_data_apps.py::test_detail_page_does_not_link_the_url_when_the_deployment_cannot_serve_apps``.
+    (Devin Review on #2336.)
+    """
+    from app.api.data_apps import REACHABLE_STATES
+
+    slug = f"rs-{state}"
+    _create_app_row(slug=slug, state=state)
+    r = client_granted.get(f"/apps/{slug}/", headers={"accept": "application/json"})
+    refused = r.status_code == 409 and r.json().get("detail") in ("app_not_running", "app_error")
+    assert refused is (state not in REACHABLE_STATES)
+
+
+# ---------------------------------------------------------------------------
+# Viewer identity — `X-Agnes-Viewer` assertion + (viewer mode) `X-Agnes-Viewer-Token`
+# ---------------------------------------------------------------------------
+
+
+def _set_service_token(slug: str, token_id: str = "svc-tok-1") -> dict:
+    """A running app always has one (redeploy_current wrote it before the
+    container came up); `_create_app_row` does not, so set it explicitly."""
+    from src.repositories import data_apps_repo
+
+    repo = data_apps_repo()
+    row = repo.get_by_slug(slug)
+    repo.update(row["id"], service_token_id=token_id)
+    return repo.get_by_slug(slug)
+
+
+def _decode_assertion(token: str, slug: str, service_token_id: str) -> dict:
+    import jwt
+
+    from app.auth.data_app_viewer import derive_viewer_secret
+    from app.auth.jwt import ALGORITHM
+
+    return jwt.decode(
+        token,
+        derive_viewer_secret(slug, service_token_id),
+        algorithms=[ALGORITHM],
+        audience=f"data-app:{slug}",
+    )
+
+
+def test_proxy_adds_viewer_assertion_signed_with_derived_secret(
+    client_granted, fake_runner, respx_upstream, running_app
+):
+    from app.auth.data_app_viewer import VIEWER_HEADER, VIEWER_TOKEN_HEADER
+
+    row = _set_service_token("s")
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200, r.text
+    sent = respx_upstream.calls[0].request.headers
+    claims = _decode_assertion(sent[VIEWER_HEADER], "s", row["service_token_id"])
+    assert claims["sub"] == "owner1"
+    assert claims["email"] == "owner@test.local"
+    assert claims["name"] == "Owner"
+    assert claims["typ"] == "data_app_viewer_assertion"
+    assert claims["via"] == "pat"  # the test client authenticates with a PAT
+    assert isinstance(claims["groups"], list)
+    assert claims["exp"] - claims["iat"] == 300
+    # Owner mode (the default): no viewer data token rides along.
+    assert VIEWER_TOKEN_HEADER.lower() not in {k.lower() for k in sent.keys()}
+
+
+def test_viewer_assertion_is_not_a_server_signed_credential(client_granted, fake_runner, respx_upstream, running_app):
+    """The assertion verifies ONLY under the per-app derived secret. Fed to
+    `verify_token` (server key) it is nothing — it must never be mistaken for
+    an Agnes credential by anything that reads bearer tokens."""
+    from app.auth.data_app_viewer import VIEWER_HEADER
+    from app.auth.jwt import verify_token
+
+    _set_service_token("s")
+    client_granted.get("/apps/s/hello")
+    assertion = respx_upstream.calls[0].request.headers[VIEWER_HEADER]
+    assert verify_token(assertion) is None
+
+
+def test_viewer_assertion_rotates_with_the_service_token(client_granted, fake_runner, respx_upstream, running_app):
+    import jwt
+
+    from app.auth.data_app_viewer import VIEWER_HEADER, derive_viewer_secret
+    from app.auth.jwt import ALGORITHM
+
+    _set_service_token("s", "tok-A")
+    client_granted.get("/apps/s/hello")
+    signed_under_a = respx_upstream.calls[0].request.headers[VIEWER_HEADER]
+    _set_service_token("s", "tok-B")
+    client_granted.get("/apps/s/hello")
+    signed_under_b = respx_upstream.calls[1].request.headers[VIEWER_HEADER]
+    # Each verifies under its own id's secret and NOT under the other's.
+    assert jwt.decode(signed_under_b, derive_viewer_secret("s", "tok-B"), algorithms=[ALGORITHM], audience="data-app:s")
+    with pytest.raises(jwt.InvalidSignatureError):
+        jwt.decode(signed_under_a, derive_viewer_secret("s", "tok-B"), algorithms=[ALGORITHM], audience="data-app:s")
+
+
+def test_inbound_x_agnes_viewer_headers_are_stripped(client_granted, fake_runner, respx_upstream, running_app):
+    """A caller cannot smuggle a forged identity past the proxy — every
+    inbound `x-agnes-viewer*` header (any casing) is dropped BEFORE ours is
+    added, so the container sees exactly one, and it is the proxy's."""
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    r = client_granted.get(
+        "/apps/s/hello",
+        headers={
+            "X-AGNES-VIEWER": "forged.forged.forged",
+            "x-agnes-viewer-token": "forged-token",
+            "X-Agnes-Viewer-Email": "ceo@example.com",
+        },
+    )
+    assert r.status_code == 200
+    raw = respx_upstream.calls[0].request.headers.raw  # every (name, value) pair, duplicates included
+    viewer_pairs = [(k.decode().lower(), v.decode()) for k, v in raw if k.decode().lower().startswith("x-agnes-viewer")]
+    assert [k for k, _ in viewer_pairs] == ["x-agnes-viewer"], viewer_pairs
+    assert viewer_pairs[0][1] != "forged.forged.forged"
+    assert _decode_assertion(respx_upstream.calls[0].request.headers[VIEWER_HEADER], "s", row["service_token_id"])["sub"] == "owner1"
+
+
+def test_viewer_assertion_via_preview_token(proxy_client, fake_runner, respx_upstream, running_app, mint_preview):
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    tok = mint_preview("s", ttl_s=1800)
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": tok.cookie})
+    assert r.status_code == 200, r.text
+    claims = _decode_assertion(respx_upstream.calls[0].request.headers[VIEWER_HEADER], "s", row["service_token_id"])
+    assert claims["via"] == "preview"
+    assert claims["sub"] == "owner1"  # the preview grant was minted for the owner
+
+
+def test_viewer_assertion_via_session_cookie(proxy_client, fake_runner, respx_upstream, running_app):
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": _session_cookie()})
+    assert r.status_code == 200, r.text
+    claims = _decode_assertion(respx_upstream.calls[0].request.headers[VIEWER_HEADER], "s", row["service_token_id"])
+    assert claims["via"] == "session"
+
+
+def _force_viewer_mode(monkeypatch, slug="s"):
+    """The proxy env is DuckDB-backed, where the PG-only `data_identity`
+    column does not exist — inject it on the row the proxy reads, exactly as
+    a Postgres row would carry it."""
+    import app.api.data_apps_proxy as proxy_api
+
+    real = proxy_api._get_row_or_404
+
+    def _viewer_row(s):
+        row = real(s)
+        return {**row, "data_identity": "viewer"} if s == slug else row
+
+    monkeypatch.setattr(proxy_api, "_get_row_or_404", _viewer_row)
+
+
+def test_viewer_token_added_in_viewer_mode_and_resolves_to_a_viewer_principal(
+    monkeypatch, client_granted, fake_runner, respx_upstream, running_app
+):
+    from app.auth.data_app_viewer import VIEWER_TOKEN_HEADER
+    from app.auth.jwt import verify_token
+
+    _set_service_token("s")
+    _force_viewer_mode(monkeypatch)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200, r.text
+    token = respx_upstream.calls[0].request.headers[VIEWER_TOKEN_HEADER]
+    payload = verify_token(token)  # SERVER-signed, unlike the assertion
+    assert payload is not None
+    assert payload["typ"] == "data_app_viewer"
+    assert payload["scope"] == "data-app-viewer:s"
+    assert payload["sub"] == "owner1"
+    assert payload["slug"] == "s"
+    assert payload["exp"] - payload["iat"] == 600
+
+
+def test_holding_page_mints_nothing(monkeypatch, client_granted, fake_runner, sleeping_app):
+    """A viewer who reaches the waking page has passed RBAC, but nothing is
+    served from the container yet — no identity is minted for a page WE
+    render. (Ordering invariant: mint only inside the `running` branch.)"""
+    import app.api.data_apps_proxy as proxy_api
+
+    def _boom(*a, **kw):
+        raise AssertionError("build_viewer_headers must not run for a holding page")
+
+    monkeypatch.setattr(proxy_api, "build_viewer_headers", _boom)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 503  # the waking holding page
+
+
+def test_ws_handshake_carries_viewer_headers(monkeypatch, client_granted, fake_runner, running_app):
+    """The WS bridge forwards no CALLER headers, but it does add the proxy's
+    own viewer headers to the upstream handshake — same identity contract as
+    the HTTP path, so a Streamlit/Dash app learns its viewer too."""
+    import websockets
+
+    from app.auth.data_app_viewer import VIEWER_HEADER
+
+    row = _set_service_token("s")
+    captured: dict = {}
+
+    class _FakeUpstream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def send(self, _msg):
+            pass
+
+        async def close(self):
+            pass
+
+    def _fake_connect(url, **kw):
+        captured["url"] = url
+        captured.update(kw)
+        return _FakeUpstream()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    try:
+        with client_granted.websocket_connect("/apps/s/ws", headers={"x-agnes-viewer": "forged"}):
+            pass
+    except WebSocketDisconnect:
+        pass  # the empty fake upstream closes the bridge immediately — fine
+    assert captured["url"] == "ws://agnes-dataapp-s:8888/ws"
+    headers = captured["additional_headers"]
+    assert set(headers) == {VIEWER_HEADER}  # only ours; the caller's forged one never reaches upstream
+    assert _decode_assertion(headers[VIEWER_HEADER], "s", row["service_token_id"])["sub"] == "owner1"

@@ -36,7 +36,8 @@ if [ -x ".venv/bin/mypy" ]; then
 elif command -v mypy >/dev/null 2>&1; then
     MYPY=(mypy)
 elif command -v uv >/dev/null 2>&1; then
-    MYPY=(uv run --quiet mypy)
+    # --frozen: never rewrite uv.lock from a typecheck run (see post-edit-quality.sh).
+    MYPY=(uv run --frozen --quiet mypy)
 else
     echo "typecheck-core: mypy not found. Install the dev extra:" >&2
     echo "    uv pip install '.[dev]'" >&2

@@ -1,0 +1,249 @@
+name: Devin clean verdict approves org members' PRs
+
+# Why (#2295): `main`'s ruleset requires one approving review before a PR can
+# enter the merge queue, and the queue evaluates that rule as ITSELF — a
+# ruleset bypass actor's own PR is refused just the same ("At least 1
+# approving review is required by reviewers with write access"). The rule
+# exists to gate outside collaborators, who have write access here. Devin
+# reviews every PR but only ever COMMENTS, and its app has no write access,
+# so its verdict never counted. This workflow makes it count, for org members:
+#
+#   author is an org member AND Devin's latest verdict is clean -> approve
+#   ... or its latest verdict listed issues, every Devin review thread is
+#       resolved and the branch has moved past the reviewed commit  -> approve
+#   Devin's latest verdict lists issues still open                  -> dismiss ours
+#
+# The second line exists because Devin does not re-review a diff it considers
+# already reviewed: once the author fixes every finding and resolves the
+# threads, "found N potential issues" stays Devin's last word forever. A
+# resolved thread is the same trust the team extends to a human approval that
+# persists across pushes. A "N security issues" verdict never clears this way —
+# those findings are hidden from GitHub by the org setting, so there is no
+# thread whose resolution could vouch for them; they need a fresh clean verdict
+# or a human approval.
+#
+# It is a POLLER, on purpose. It runs only from the default branch — on a
+# schedule and on manual dispatch — and never from a pull request's ref.
+# A `pull_request_review`-triggered version would execute the PR's own copy
+# of this file with a write token, so any same-repository author could edit
+# the gate and approve themselves (Devin finding, CWE-829). Polling also
+# covers the case an event never fires: Devin re-reviews only some pushes
+# (its latest review matched the final head on 4 of the last 15 merged PRs)
+# and never re-reviews a merge of `main` into a branch, since the PR's diff
+# does not change.
+#
+# Membership is never inferred from `author_association` (Devin finding,
+# CWE-863: CONTRIBUTOR does not prove membership). A same-repository branch
+# needs write access, and write access minus the repository's outside
+# collaborators (`GET /repos/{repo}/collaborators?affiliation=outside`) is
+# exactly the organization members — both facts come from repo-scoped API
+# calls the Actions token can make. Bots (Devin, Copilot, the release-cut
+# author github-actions[bot]) are excluded by type; the cut PR needs a human
+# approval, one click by whoever merges it.
+#
+# The approval persists across later pushes, like a human's under this
+# ruleset, and falls to a later Devin review that lists issues (including the
+# "N security issues" headline Devin posts when the org setting hides the
+# findings from GitHub); leave the ruleset's "dismiss stale reviews on push"
+# OFF. Every decision is logged per PR, so a run that does nothing says why.
+#
+# Safety: nothing is checked out; the step only calls the GitHub API.
+#
+# Who may hold the approving credential is the whole game. `workflow_dispatch`
+# can be pointed at ANY ref, and a guard inside this file cannot stop someone
+# dispatching a modified copy from their own branch — so the credential must
+# live where a branch cannot reach it. The job runs in the `devin-bridge`
+# environment and approves with `secrets.DEVIN_BRIDGE_TOKEN`; once that
+# environment's deployment-branch policy is "main only" and the token is a
+# dedicated bot account with write access (an environment secret is only
+# released to jobs on allowed branches), a copy on any other ref gets neither
+# the environment nor the token. Until those are configured the step falls
+# back to the Actions token and only the runtime ref guard below applies —
+# and in that state the repo setting "Allow GitHub Actions to create and
+# approve pull requests" is what lets ANY same-repository workflow approve,
+# this one included. Configure the environment + secret, then turn that
+# setting off.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Only this pull request number (default: every open, non-draft PR)"
+        required: false
+        type: string
+
+permissions:
+  pull-requests: write
+  contents: read   # compare API ("is the head ahead of the reviewed commit?")
+
+concurrency:
+  # ONE group for every run, scheduled or dispatched: two runs looking at the
+  # same PR under different groups can interleave (a poll reads a clean
+  # verdict, a dispatch reads a newer issue verdict and finds nothing to
+  # dismiss, then the poll approves — stale approval). Serializing costs a
+  # dispatch at most one poll's runtime (well under a minute); correctness of
+  # the gate is worth that.
+  group: devin-clean-approves
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Deployment-branch policy "main only" on this environment is what makes a
+    # branch-dispatched copy fail before it runs; the secret below is released
+    # only to jobs that got the environment.
+    environment: devin-bridge
+    steps:
+      - name: Approve org members' PRs on Devin's clean verdict, dismiss on issues
+        env:
+          GH_TOKEN: ${{ secrets.DEVIN_BRIDGE_TOKEN || github.token }}
+          TOKEN_KIND: ${{ secrets.DEVIN_BRIDGE_TOKEN && 'dedicated bot token' || 'Actions token (fallback; configure DEVIN_BRIDGE_TOKEN)' }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ONLY_PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          owner=${REPO%/*}; name=${REPO#*/}
+          echo "credential: $TOKEN_KIND"
+
+          # The dispatch input is free text; accept "123", " 123 " or "#123", refuse the rest
+          # with a clear message instead of a GraphQL type error. Only LEADING and
+          # TRAILING whitespace is trimmed — "12 3" must fail, not become #123.
+          ONLY_PR="${ONLY_PR#"${ONLY_PR%%[![:space:]]*}"}"
+          ONLY_PR="${ONLY_PR%"${ONLY_PR##*[![:space:]]}"}"
+          ONLY_PR=${ONLY_PR#\#}
+          if [ -n "$ONLY_PR" ] && ! [[ "$ONLY_PR" =~ ^[0-9]+$ ]]; then
+            echo "input 'pr' must be a pull request number, got '$ONLY_PR'"; exit 1
+          fi
+
+          # Runtime guard: this file must be the default branch's copy. (Belt;
+          # the environment's branch policy is the braces — see the header.)
+          default_branch=${DEFAULT_BRANCH:-$(gh api "repos/$REPO" --jq '.default_branch')}
+          if [ "$REF" != "refs/heads/$default_branch" ]; then
+            echo "refusing to run from $REF; only refs/heads/$default_branch may approve"; exit 1
+          fi
+
+          # Everyone with access who is NOT an organization member.
+          outside=$(gh api --paginate "repos/$REPO/collaborators?affiliation=outside&per_page=100" --jq '.[].login' | sort -u)
+          echo "outside collaborators: $(printf '%s' "$outside" | tr '\n' ' ')"
+
+          # The PR set: one PR when dispatched with a number, else EVERY open PR
+          # (paginated — a list capped at 100 would silently skip the rest).
+          # GraphQL logins carry no "[bot]" suffix; __typename tells User from Bot.
+          # Reviews are NOT fetched here: per candidate PR they come from the REST
+          # endpoint, paginated, so no window can hide a verdict or an approval.
+          fields='number isDraft headRefOid author { login __typename } headRepository { nameWithOwner }'
+          # One compact JSON object per line (`@json`); `gh api --jq` prints strings raw.
+          if [ -n "$ONLY_PR" ]; then
+            prs=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$ONLY_PR" -f query="
+              query(\$owner: String!, \$name: String!, \$number: Int!) {
+                repository(owner: \$owner, name: \$name) { pullRequest(number: \$number) { state $fields } } }" \
+              --jq '.data.repository.pullRequest | select(.state == "OPEN") | @json')
+          else
+            prs=$(gh api graphql --paginate -f owner="$owner" -f name="$name" -f query="
+              query(\$owner: String!, \$name: String!, \$endCursor: String) {
+                repository(owner: \$owner, name: \$name) {
+                  pullRequests(states: OPEN, first: 100, after: \$endCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes { $fields } } } }" \
+              --jq '.data.repository.pullRequests.nodes[] | @json')
+          fi
+          echo "open PRs considered: $(printf '%s\n' "$prs" | grep -c . || true)"
+          # Identity of the approving token. The Actions token cannot call /user
+          # (403); gh prints the error body on stdout, so validate the shape.
+          me=$(gh api user --jq '.login' 2>/dev/null || true)
+          [[ "$me" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$ ]] || me="github-actions[bot]"
+          echo "approving as: $me"
+
+          clean_re='Devin Review: No Issues Found|found 0 (new )?potential issues'
+          issues_re='found [1-9][0-9]* (new )?potential issue|Devin Review: [1-9][0-9]* security issue'
+          verdict_re='Devin Review: No Issues Found|found [0-9]+ (new )?potential issue|Devin Review: [0-9]+ security issue'
+
+          printf '%s\n' "$prs" | while read -r pr; do
+            [ -n "$pr" ] || continue   # an empty poll is a valid, quiet run — not a failure
+            n=$(jq -r '.number' <<<"$pr")
+            if [ -n "$ONLY_PR" ] && [ "$n" != "$ONLY_PR" ]; then continue; fi
+            author=$(jq -r '.author.login // "?"' <<<"$pr")
+            atype=$(jq -r '.author.__typename // "?"' <<<"$pr")
+            head_repo=$(jq -r '.headRepository.nameWithOwner // "?"' <<<"$pr")
+            head=$(jq -r '.headRefOid' <<<"$pr")
+
+            if [ "$(jq -r '.isDraft' <<<"$pr")" = "true" ]; then echo "#$n: draft; skip"; continue; fi
+            if [ "$head_repo" != "$REPO" ]; then echo "#$n: head in $head_repo, not this repository; skip"; continue; fi
+            if [ "$atype" != "User" ]; then echo "#$n: author $author is a $atype, not a person; a human approval is required"; continue; fi
+            if printf '%s\n' "$outside" | grep -qx -- "$author"; then
+              echo "#$n: author $author is an outside collaborator; a human approval is required"; continue
+            fi
+            # Same-repository branch (needs write) and not an outside collaborator => organization member.
+
+            # Every review of this PR, one JSON object per line, all pages.
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" --jq '.[] | @json')
+            verdict_review=$(printf '%s\n' "$reviews" | jq -cs --arg re "$verdict_re" '[.[]
+                | select(.user.login == "devin-ai-integration[bot]")
+                | select((.body // "") | test("This report is out of date") | not)
+                | select((.body // "") | test($re))] | last // {}')
+            verdict=$(jq -r '.body // ""' <<<"$verdict_review")
+            verdict_sha=$(jq -r '.commit_id // ""' <<<"$verdict_review")
+            # Our own active approval (whichever identity approves: the bot token's
+            # login or github-actions[bot]); an old one must never outlive a later
+            # issue verdict, so it is looked up over all pages, never a window.
+            ours=$(printf '%s\n' "$reviews" | jq -rs --arg me "$me" '[.[]
+                | select(.state == "APPROVED" and (.user.login == $me or .user.login == "github-actions[bot]")) | .id] | last // ""')
+            headline=$(printf '%s' "$verdict" | grep -oE 'Devin Review: No Issues Found|found [0-9]+ (new )?potential issues?|Devin Review: [0-9]+ security issues?' | head -1 || true)
+
+            # Findings fixed but never re-verdicted: all of Devin's threads resolved
+            # and commits after the reviewed one. Not for security verdicts (no threads).
+            if printf '%s' "$verdict" | grep -Eq 'found [1-9][0-9]* (new )?potential issue' \
+               && [ -n "$verdict_sha" ] && [ "$verdict_sha" != "$head" ]; then
+              # "Moved past" means the head DESCENDS from the reviewed commit (compare
+              # status "ahead"). A rewound or rewritten branch ("behind", "diverged", or
+              # a commit GitHub no longer knows) proves nothing and keeps the findings open.
+              relation=$(gh api "repos/$REPO/compare/$verdict_sha...$head" --jq '.status' 2>/dev/null || true)
+              case "$relation" in ahead|behind|identical|diverged) ;; *) relation="unknown" ;; esac
+              if [ "$relation" != "ahead" ]; then
+                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; head ${head:0:9} is '$relation' relative to it, not ahead — findings stay open"
+                open_threads="n/a"
+              else
+              open_threads=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$n" -f query='
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+                    reviewThreads(first: 100) { totalCount nodes { isResolved comments(first: 1) { nodes { author { login } } } } } } } }' \
+                --jq '.data.repository.pullRequest.reviewThreads
+                      | if .totalCount > (.nodes | length) then "unknown (\(.totalCount) threads, only \(.nodes | length) fetched)"
+                        else ([.nodes[] | select(.isResolved == false
+                                 and (.comments.nodes[0].author.login | IN("devin-ai-integration", "devin-ai-integration[bot]")))] | length | tostring)
+                        end')
+              fi
+              # GraphQL returns bot logins without the "[bot]" suffix; accept both spellings.
+              if [ "$open_threads" = "0" ]; then
+                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} — treating the findings as addressed"
+                verdict="Devin Review: No Issues Found (all findings resolved)"
+                headline="$headline — all threads resolved, head moved on"
+              elif [[ "$open_threads" =~ ^[0-9]+$ ]]; then
+                echo "#$n: Devin said \"$headline\"; $open_threads Devin thread(s) still unresolved — findings stay open"
+              elif [ "$open_threads" != "n/a" ]; then
+                echo "#$n: Devin said \"$headline\"; cannot prove every Devin thread is resolved ($open_threads) — findings stay open"
+              fi
+            fi
+
+            if printf '%s' "$verdict" | grep -Eq "$issues_re"; then
+              if [ -n "$ours" ]; then
+                gh api -X PUT "repos/$REPO/pulls/$n/reviews/$ours/dismissals" \
+                  -f message="Dismissed: Devin's latest review lists issues (\"$headline\"). It re-approves once a clean verdict lands." >/dev/null
+                echo "#$n: Devin says \"$headline\"; dismissed our approval $ours"
+              else
+                echo "#$n: Devin says \"$headline\"; nothing of ours to dismiss"
+              fi
+            elif printf '%s' "$verdict" | grep -Eq "$clean_re"; then
+              if [ -n "$ours" ]; then echo "#$n: Devin says \"$headline\"; already approved ($ours)"; continue; fi
+              gh pr review "$n" --repo "$REPO" --approve --body \
+                "Approved for an organization member's pull request on Devin's verdict \"$headline\" (PR head ${head:0:9}; see .github/workflows/devin-clean-approves.yml). Dismissed again if a later Devin review lists issues."
+              echo "#$n: Devin says \"$headline\"; approved"
+            else
+              echo "#$n: no Devin verdict yet; nothing to do"
+            fi
+          done

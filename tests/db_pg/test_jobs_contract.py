@@ -234,6 +234,91 @@ def test_list_respects_limit(repo):
     assert len(repo.list(kind="bulk", limit=50)) == 5
 
 
+# ---------------------------------------------------------------------------
+# list_by_idempotency_prefix — the exact, idx_jobs_idem-backed alternative
+# to list()'s kind+status+limit scan (2026-09-07 finding: that scan's
+# fleet-wide `limit` can hide an older connection's own shard job behind
+# 200+ newer ones sharing the same status).
+# ---------------------------------------------------------------------------
+
+
+def test_list_by_idempotency_prefix_matches_only_the_prefix(repo):
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn1:1")
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn1:2")
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn2:1")
+
+    matches = repo.list_by_idempotency_prefix("corpus-extraction-shard:conn1:")
+
+    assert {j["idempotency_key"] for j in matches} == {
+        "corpus-extraction-shard:conn1:1",
+        "corpus-extraction-shard:conn1:2",
+    }
+
+
+def test_list_by_idempotency_prefix_ignores_jobs_with_no_idempotency_key(repo):
+    repo.enqueue("corpus-extraction-shard", {})  # no idempotency_key at all
+
+    assert repo.list_by_idempotency_prefix("corpus-extraction-shard:conn1:") == []
+
+
+def test_list_by_idempotency_prefix_filters_by_statuses(repo):
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn1:1")
+    running = repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn1:2")
+    repo.claim_next(kinds=["corpus-extraction-shard"], worker_id="w1")
+    assert repo.get(running["id"])["status"] in ("running", "queued")  # sanity: claim_next ran
+
+    queued_only = repo.list_by_idempotency_prefix("corpus-extraction-shard:conn1:", statuses=["queued"])
+    assert len(queued_only) == 1
+
+    both = repo.list_by_idempotency_prefix("corpus-extraction-shard:conn1:", statuses=["queued", "running"])
+    assert len(both) == 2
+
+
+def test_list_by_idempotency_prefix_is_not_bounded_by_a_fleet_wide_limit(repo):
+    """The exact scenario the prefix scan replaces list()'s scan for: many
+    OTHER connections' matching-status jobs must never hide this one's."""
+    for i in range(210):
+        repo.enqueue("corpus-extraction-shard", {}, idempotency_key=f"corpus-extraction-shard:conn-other-{i}:1")
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn1:1")
+
+    matches = repo.list_by_idempotency_prefix("corpus-extraction-shard:conn1:", statuses=["queued"])
+
+    assert len(matches) == 1
+
+
+def test_list_by_idempotency_prefix_treats_wildcard_characters_in_the_prefix_literally(repo):
+    """A prefix containing a literal `%`/`_` (however unlikely in a real
+    connection id) must not be treated as a SQL wildcard."""
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:conn_1:1")
+    repo.enqueue("corpus-extraction-shard", {}, idempotency_key="corpus-extraction-shard:connX1:1")
+
+    matches = repo.list_by_idempotency_prefix("corpus-extraction-shard:conn_1:")
+
+    assert {j["idempotency_key"] for j in matches} == {"corpus-extraction-shard:conn_1:1"}
+
+
+def test_idx_jobs_idem_pattern_exists_for_locale_independent_prefix_scans(pg_engine_with_schema):
+    """2026-09-07 review finding: a plain B-tree index (``idx_jobs_idem``)
+    only gets Postgres's internal ``LIKE 'prefix%'``-to-range rewrite under
+    a "C" locale database — verified live against the test database, which
+    happens to be "C"/"C.UTF-8". A production instance created with a
+    locale-aware collation (e.g. ``en_US.UTF-8``) would silently fall back
+    to a sequential scan for the exact same query as job history grows.
+    ``idx_jobs_idem_pattern`` (migration 0112) is the standard Postgres fix:
+    a ``text_pattern_ops`` partial index, which pattern-matching operators
+    use regardless of the column's collation."""
+    import sqlalchemy as sa
+
+    with pg_engine_with_schema.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT indexdef FROM pg_indexes WHERE tablename = 'jobs' AND indexname = 'idx_jobs_idem_pattern'")
+        ).fetchone()
+
+    assert row is not None, "idx_jobs_idem_pattern is missing — did migration 0112 run?"
+    assert "text_pattern_ops" in row[0]
+    assert "idempotency_key" in row[0]
+
+
 def test_counts_by_kind_groups_queued_and_running_per_kind(repo):
     repo.enqueue("corpus-extraction", {})
     repo.enqueue("corpus-extraction", {})

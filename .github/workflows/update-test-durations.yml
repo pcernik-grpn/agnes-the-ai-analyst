@@ -29,7 +29,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev,server]"
+        run: scripts/ci/install-from-lock.sh dev server
 
       - name: Regenerate .test_durations
         # || true so a flaky/broken test on main doesn't block the duration

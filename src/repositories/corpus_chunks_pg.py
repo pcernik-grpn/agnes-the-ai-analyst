@@ -39,6 +39,14 @@ _STATEMENT_TIMEOUT_MS = 5_000
 _RANK_CANDIDATE_MULTIPLIER = 4
 _RANK_CANDIDATE_FLOOR = 20_000
 
+# The tokenizer config shared by everything full-text on this table: the
+# ``0101`` GIN index expression, the WHERE predicate in ``search_candidates``,
+# the stored ``tsv`` column ``add_many`` writes (migration
+# ``0114_corpus_chunks_tsv``) and the per-row fallback that stands in for it.
+# A vector built with any other config would rank differently from the
+# expression it replaces, so this is one literal, used everywhere.
+_FTS_CONFIG = "simple"
+
 
 class CorpusChunksPgRepository:
     """Postgres twin of ``CorpusChunksRepository``."""
@@ -64,6 +72,14 @@ class CorpusChunksPgRepository:
         so a wrong-dimension vector raises the same ``ValueError`` before any
         insert round-trip, mirroring the DuckDB sibling.
 
+        Also writes ``tsv`` — the tokenized body,
+        ``to_tsvector('simple', text)`` — from the insert itself (migration
+        ``0114_corpus_chunks_tsv``), so a new row is rankable from its
+        stored vector without any backfill; see ``search_candidates`` for
+        why ranking reads that column and how a row without one (written
+        before the column existed, not yet backfilled) still ranks. The
+        DuckDB sibling has no such column (frozen backend, no ranking).
+
         Returns the number of rows inserted.
         """
         if not chunks:
@@ -79,9 +95,10 @@ class CorpusChunksPgRepository:
                 conn.execute(
                     sa.text(
                         "INSERT INTO corpus_chunks "
-                        "(id, corpus_id, file_id, ordinal, text, embedding, "
+                        "(id, corpus_id, file_id, ordinal, text, tsv, embedding, "
                         " section_path, page, bbox, metadata) "
-                        "VALUES (:id, :corpus_id, :file_id, :ordinal, :text, :embedding, "
+                        "VALUES (:id, :corpus_id, :file_id, :ordinal, :text, "
+                        f"        to_tsvector('{_FTS_CONFIG}', :tsv_text), :embedding, "
                         "        :section_path, :page, :bbox, :metadata)"
                     ),
                     {
@@ -90,6 +107,11 @@ class CorpusChunksPgRepository:
                         "file_id": chunk["file_id"],
                         "ordinal": chunk.get("ordinal"),
                         "text": chunk.get("text"),
+                        # The same value bound twice under two names on purpose:
+                        # psycopg deduces one parameter's type from every place
+                        # it appears, and the varchar column vs. to_tsvector's
+                        # text argument disagree ("inconsistent types deduced").
+                        "tsv_text": chunk.get("text"),
                         "embedding": embedding,
                         "section_path": chunk.get("section_path"),
                         "page": chunk.get("page"),
@@ -127,6 +149,20 @@ class CorpusChunksPgRepository:
                 .all()
             )
         return [dict(r) for r in rows]
+
+    def list_text_for_file(self, file_id: str) -> list[str]:
+        """Chunk texts for one file in ordinal order — nothing else.
+
+        The whole-file text a preview pages over needs only this column;
+        ``list_for_file`` also hauls every chunk's embedding out of the
+        database, which a preview never reads.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT text FROM corpus_chunks WHERE file_id = :file_id ORDER BY ordinal"),
+                {"file_id": file_id},
+            ).all()
+        return [r[0] for r in rows]
 
     def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
         """All chunks for an entire corpus, ordered by file_id then ordinal."""
@@ -347,6 +383,41 @@ class CorpusChunksPgRepository:
         uniform slice of the corpus, so which slice gets ranked barely
         changes the top results.
 
+        Ranking reads the STORED tokenized body (``tsv``, migration
+        ``0114_corpus_chunks_tsv``) rather than re-tokenizing ``text``
+        (perf follow-up, 2026-09). With the GIN index bounding the WHERE
+        clause, the remaining cost of this query was
+        ``to_tsvector('simple', c.text)`` evaluated once per matched row
+        inside the ORDER BY — measured on a 15M-row instance at 2 s for a
+        two-term query with ~4 500 matches, all from shared buffers,
+        against 40 ms for a three-term query with a handful (the cost is
+        per matched row, not per query). ``tsv`` is written by
+        ``add_many`` for every new row and backfilled for older ones (in
+        place by the migration on a small table, by
+        ``scripts/backfill_corpus_chunks_tsv.py`` on a large one), and the
+        ORDER BY wraps it in ``COALESCE(tsv, to_tsvector('simple', text))``
+        so a row the backfill has not reached yet ranks exactly as before
+        — slower, never wrong, never missing; a partially backfilled table
+        is a normal state. The WHERE clause stays on the
+        ``to_tsvector('simple', text)`` EXPRESSION on purpose: that is what
+        the ``0101`` GIN index is over (an index on the column would not
+        serve it), and it is what a NULL-``tsv`` row still satisfies —
+        ``tsv @@ query`` would silently drop every row not yet backfilled.
+
+        The ranking sorts NARROW rows, then fetches columns for the top
+        ``limit`` only (the ``matched`` → ``ranked`` → join-back shape).
+        Sorting the full candidate rows — ``text`` included — was the other
+        half of the cost: a few thousand chunk-sized rows exceed the default
+        4 MB ``work_mem``, so the top-``limit`` sort ran as an on-disk
+        external merge on every query (measured on a 400k-row bench: 8.6 MB
+        of temp files for 8 000 candidates, vs a 755 kB in-memory quicksort
+        over ``(id, rank)``). The join-back is ``limit`` primary-key
+        lookups, milliseconds. Each CTE is referenced once, so Postgres
+        inlines both; the ``LIMIT`` inside each is still the optimization
+        fence that bounds what gets ranked and what gets fetched. The
+        returned dicts carry the same column-pruned set as every other
+        candidate fetch here — ``tsv`` and ``rank`` never leave the query.
+
         Empty ``corpus_ids`` → ``[]`` without querying, matching
         ``list_for_corpora``.
         """
@@ -357,14 +428,19 @@ class CorpusChunksPgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        f"SELECT {_SELECT_NO_EMBED} FROM ("
-                        f"  SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
-                        "   WHERE corpus_id = ANY(:corpus_ids) "
-                        "     AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :query) "
-                        "   LIMIT :rank_cap"
-                        ") c "
-                        "ORDER BY ts_rank_cd(to_tsvector('simple', c.text), plainto_tsquery('simple', :query)) DESC "
-                        "LIMIT :limit"
+                        "WITH matched AS ("
+                        "  SELECT id, tsv, text FROM corpus_chunks "
+                        "  WHERE corpus_id = ANY(:corpus_ids) "
+                        f"    AND to_tsvector('{_FTS_CONFIG}', text) @@ plainto_tsquery('{_FTS_CONFIG}', :query) "
+                        "  LIMIT :rank_cap"
+                        "), ranked AS ("
+                        f"  SELECT id, ts_rank_cd(COALESCE(tsv, to_tsvector('{_FTS_CONFIG}', text)), "
+                        f"                        plainto_tsquery('{_FTS_CONFIG}', :query)) AS rank "
+                        "  FROM matched ORDER BY rank DESC LIMIT :limit"
+                        ") "
+                        f"SELECT {_SELECT_CC_NO_EMBED} FROM ranked "
+                        "JOIN corpus_chunks cc ON cc.id = ranked.id "
+                        "ORDER BY ranked.rank DESC"
                     ),
                     {"corpus_ids": list(corpus_ids), "query": query, "limit": limit, "rank_cap": rank_cap},
                 )
@@ -389,6 +465,25 @@ class CorpusChunksPgRepository:
         tokenize punctuation-heavy filenames (``quarterly-report.md``).
         Column-pruned (``embedding`` always ``None``) like every candidate
         fetch here. Empty ``corpus_ids``/``terms`` → ``[]``.
+
+        Scoped on BOTH sides of the join (perf follow-up, 2026-09): the
+        file row's ``corpus_id`` as well as the chunk's. Filtering
+        ``corpus_files`` by collection first lets the planner narrow the
+        ``ILIKE`` scan to the caller's collections through
+        ``idx_corpus_files_corpus_path`` (leading column ``corpus_id``)
+        instead of pattern-matching every filename on the instance — on a
+        large instance that was a sequential scan over a few hundred
+        thousand file rows per query. A ``%term%`` pattern has no index
+        path of its own without the ``pg_trgm`` extension, which this
+        schema does not use, so a caller whose grant spans (nearly) every
+        collection still pays one pass over ``corpus_files`` — bounded by
+        that table, never by ``corpus_chunks``. Semantically the extra
+        predicate is fail-closed: a chunk row is a name hit only when its
+        file's CURRENT collection is in scope too, so a file moved to a
+        collection outside the caller's scope stops answering by name
+        under the one it left even while stale chunk rows still carry the
+        old ``corpus_id``. Mirrored in the DuckDB sibling so both backends
+        agree.
         """
         if not corpus_ids or not terms:
             return []
@@ -400,8 +495,9 @@ class CorpusChunksPgRepository:
             params[key] = f"%{term}%"
         sql = (
             f"SELECT {_SELECT_CC_NO_EMBED} "
-            "FROM corpus_chunks cc JOIN corpus_files cf ON cf.id = cc.file_id "
-            "WHERE cc.corpus_id = ANY(:corpus_ids) AND (" + " OR ".join(clauses) + ") "
+            "FROM corpus_files cf JOIN corpus_chunks cc ON cc.file_id = cf.id "
+            "WHERE cf.corpus_id = ANY(:corpus_ids) AND cc.corpus_id = ANY(:corpus_ids) "
+            "AND (" + " OR ".join(clauses) + ") "
             "ORDER BY cc.file_id, cc.ordinal LIMIT :limit"
         )
         with self._engine.connect() as conn:

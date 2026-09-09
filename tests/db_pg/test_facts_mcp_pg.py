@@ -259,6 +259,62 @@ def test_fact_search_q_reaches_the_repository(pg_env, repo, mcp_call):
     assert ids == [parts_authority]
 
 
+def test_fact_search_statement_timeout_is_a_hinted_tool_error(pg_env, repo, mcp_call, monkeypatch):
+    """Live finding (2026-09): `fact_search` answered a statement timeout
+    with the raw `(psycopg.errors.QueryCanceled) canceling statement due to
+    statement timeout` — nothing the model could act on, and 8 of 35 calls
+    in the sampled sessions failed that way. The tool must surface the
+    repository's typed error as a `ValueError` whose message IS the next
+    step (command-ux.md: an error hints forward), the same shape the
+    not-found path already uses. Deterministic slow statement: a second
+    connection holds an ACCESS EXCLUSIVE lock on `facts` so the search
+    blocks until its own (shortened) statement timeout cancels it."""
+    import sqlalchemy as sa
+
+    import src.repositories.facts_pg as facts_pg
+    from app.auth.jwt import create_access_token
+
+    owner_id, owner_email = _seed_two_collection_fixture()
+    token = create_access_token(user_id=owner_id, email=owner_email)
+    monkeypatch.setattr(facts_pg, "_STATEMENT_TIMEOUT_MS", 200)
+
+    blocker = pg_env.connect()
+    try:
+        blocker.execute(sa.text("LOCK TABLE facts IN ACCESS EXCLUSIVE MODE"))
+        with pytest.raises(ValueError) as excinfo:
+            mcp_call("fact_search", token, type="organization", q="anything")
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    message = str(excinfo.value)
+    assert "narrow" in message.lower() and "`q`" in message, message
+    assert "psycopg" not in message and "canceling statement" not in message, message
+
+
+def test_fact_search_passes_the_candidate_cap_disclosure_through(pg_env, repo, mcp_call, monkeypatch):
+    """`candidates_capped` reaches the model unchanged — the tool returns
+    the repository's dict as-is, and this pins that no transport-side
+    reshaping drops the one field that tells the model to narrow `q`."""
+    from app.auth.jwt import create_access_token
+    from src.repositories import facts_repo
+
+    owner_id, owner_email = _seed_two_collection_fixture()
+    token = create_access_token(user_id=owner_id, email=owner_email)
+
+    real_search = facts_repo().search
+
+    def capped_search(caller, **kwargs):
+        result = real_search(caller, **kwargs)
+        result["candidates_capped"] = True
+        return result
+
+    monkeypatch.setattr(type(facts_repo()), "search", lambda self, caller, **kw: capped_search(caller, **kw))
+
+    result = mcp_call("fact_search", token, type="organization", q="widget")
+    assert result["candidates_capped"] is True
+
+
 def test_fact_type_map_reports_both_node_and_edge_types(pg_env, repo, mcp_call):
     """`fact_type_map` (build order step 6 discovery tool) surfaces edge
     types alongside node types -- the cheap primer a session should read

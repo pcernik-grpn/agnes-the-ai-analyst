@@ -49,6 +49,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from collections import defaultdict
 from datetime import date, datetime
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -107,6 +108,30 @@ _CLAIMS_FETCH_CAP = 5_000
 # `search()` directly cannot bypass it. A blank/whitespace `q` is exempt —
 # that already degrades to "no filter" (pre-existing contract).
 MIN_SEARCH_Q_LENGTH = 2
+# Live finding (2026-09): a 2–3 character `q` is a SUBSTRING of a large share
+# of any real alias set (`%ing%` matched 225k of 830k facts on one graph,
+# `%ent%` 318k), so as a plain substring it fills `SEARCH_CANDIDATE_CAP` with
+# noise on every call. Below this many NORMALIZED characters `q` must instead
+# start a name TOKEN of the alias slug — the slug itself or a punctuation-
+# delimited part of it (`llr` matches `llr-corp` and `acme-llr`, never
+# `fullrange`). Disclosed in the `fact_search` tool docstring, the REST
+# docstring and the CLI help; at this length and above the plain substring
+# semantics apply unchanged.
+SHORT_Q_TOKEN_PREFIX_LENGTH = 4
+# Hard ceiling on the candidate set a `q` search ranks and projects (live
+# finding, 2026-09): matching via `EXISTS (... fact_aliases ... ILIKE ...)`
+# left the planner with no selectivity estimate, it sized the candidate CTE
+# at ~416k rows (actual 122) on an ~830k-fact graph and chose full scans of
+# `claims` (3.9M rows) and `fact_aliases` (841k) over 122 index probes —
+# 5.3 s, i.e. past the 5 s guard of the time, for a three-letter name. Selecting
+# candidates as a MATERIALIZED, ranked, LIMIT-ed CTE hands the planner a
+# cardinality ceiling it trusts (same query, same instance: 309 ms). The
+# effective cap is `max(limit * 4, SEARCH_CANDIDATE_CAP)`; at
+# `MAX_SEARCH_LIMIT` the floor dominates, so this constant is the cap.
+# Hitting it is disclosed (`candidates_capped: true`) rather than presented
+# as a complete ranking, and it is counted over READABLE aliases only, so it
+# cannot become an oracle for how many restricted names match (S9).
+SEARCH_CANDIDATE_CAP = 500
 
 # Ingest batch caps (spec §7.2): "≤500 documents, ≤5000 claims per request".
 # A single document's evidence count over MAX_INGEST_CLAIMS is a protocol
@@ -151,7 +176,26 @@ CHUNK_JOIN_SEPARATOR = "\n\n"
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
 # repo, not an operator switch — the caps above are the primary defense.
-_STATEMENT_TIMEOUT_MS = 5_000
+# 20 s, not 5 s, for the INTERACTIVE reads (`search`, `neighbors`, `claims`,
+# `edges`, `collection_facts_summary`): on a graph of hundreds of thousands
+# of facts and millions of claims a well-formed read finishes well under a
+# second once its plan is right (`search`'s bounded candidate set, the
+# collection summary's UNION legs), so the guard only has to stop the
+# pathological walk — and at 5 s it was cutting off ordinary lookups under
+# concurrent load and blanking the Library Facts section on a large
+# collection. Stays under the 30 s HTTP timeout the MCP foundation tools
+# use, so the statement dies before the tool call does.
+_STATEMENT_TIMEOUT_MS = 20_000
+
+# The AGGREGATE reads keep the original 5 s: `approximate_counts_for_
+# collections` and `facet_top_values_for_collections` run once per page view
+# over EVERY collection a caller can see, and their fallback legs can scan
+# all claims — the exact shape that once starved the shared Postgres pool
+# for minutes (see `approximate_counts_for_collections`'s docstring and the
+# 5 s contract `app/api/admin_sharepoint.py` documents). A per-page-view
+# read that is slow must fail fast, not hold a pooled connection four times
+# longer; the interactive guard above is deliberately NOT shared with them.
+_AGGREGATE_STATEMENT_TIMEOUT_MS = 5_000
 
 # `sweep_orphans()`'s grace period (live finding, 2026-09 — see
 # migrations/versions/0100_facts_created_at.py for the incident numbers): a
@@ -241,6 +285,101 @@ class FactNotFound(RuntimeError):
     def __init__(self, subject_id: str) -> None:
         self.subject_id = subject_id
         super().__init__(f"fact subject {subject_id!r} not found")
+
+
+class FactsQueryTimeout(RuntimeError):
+    """A read statement outlived ``_STATEMENT_TIMEOUT_MS`` (Postgres
+    ``57014 query_canceled``, lock waits included). The message IS the
+    caller-facing hint (command-ux.md: an error names the next step): the
+    REST layer answers ``504 {"reason": "facts_search_timeout", "hint":
+    <message>}`` and the MCP tool re-raises it as a ``ValueError``, so the
+    model reads what to do instead of the raw driver text — the live
+    failure this closes surfaced ``(psycopg.errors.QueryCanceled) canceling
+    statement due to statement timeout`` in the tool result, which told it
+    nothing it could act on (2026-09)."""
+
+    reason = "facts_search_timeout"
+
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        if reason:
+            self.reason = reason
+
+
+_PG_QUERY_CANCELED_SQLSTATE = "57014"
+
+
+def _is_statement_timeout(exc: sa.exc.DBAPIError) -> bool:
+    """True when a SQLAlchemy-wrapped driver error is Postgres cancelling the
+    statement because ``statement_timeout`` fired."""
+    orig = exc.orig
+    return getattr(orig, "sqlstate", None) == _PG_QUERY_CANCELED_SQLSTATE or type(orig).__name__ == "QueryCanceled"
+
+
+def _search_timeout_message(timeout_ms: int) -> str:
+    return (
+        f"The fact search did not finish within {timeout_ms / 1000:g} s and was cancelled. Narrow `q` to a "
+        "longer, more specific name (a short or common fragment matches too many names), add `type`, "
+        "or lower `limit`, then retry."
+    )
+
+
+def _read_timeout_message(what: str, timeout_ms: int) -> str:
+    return (
+        f"The fact {what} did not finish within {timeout_ms / 1000:g} s and was cancelled. Narrow the request "
+        "(a smaller `limit`, fewer hops, a `type` or edge-type filter) and retry."
+    )
+
+
+class _ReadBudget:
+    """One wall-clock budget shared by EVERY statement of a multi-statement
+    read. ``statement_timeout`` is per statement, so a read that runs several
+    (``neighbors``' per-node walk, ``collection_facts_summary``'s three legs)
+    would otherwise get ``_STATEMENT_TIMEOUT_MS`` per statement and could hold
+    a pooled connection for a multiple of the guard. ``arm(conn)`` re-issues
+    ``SET LOCAL statement_timeout`` with the time LEFT before each statement
+    and raises ``FactsQueryTimeout`` once the budget is spent — never a zero,
+    which Postgres reads as "no timeout at all"."""
+
+    def __init__(self, total_ms: int, *, reason: str, message: str) -> None:
+        self.total_ms = int(total_ms)
+        self.reason = reason
+        self.message = message
+        self.started = time.monotonic()
+
+    def remaining_ms(self) -> int:
+        return self.total_ms - int((time.monotonic() - self.started) * 1000)
+
+    def arm(self, conn: Connection) -> None:
+        remaining = self.remaining_ms()
+        if remaining <= 0:
+            raise FactsQueryTimeout(self.message, reason=self.reason)
+        conn.execute(sa.text(f"SET LOCAL statement_timeout = {remaining}"))
+
+
+@contextlib.contextmanager
+def _typed_statement_timeout(budget: _ReadBudget) -> Iterator[None]:
+    """Translate Postgres cancelling a statement of a budgeted read into the
+    typed, hinted ``FactsQueryTimeout`` (same contract ``search`` has)."""
+    try:
+        yield
+    except sa.exc.DBAPIError as exc:
+        if _is_statement_timeout(exc):
+            raise FactsQueryTimeout(budget.message, reason=budget.reason) from exc
+        raise
+
+
+def _regex_literal(text: str) -> str:
+    """Escape ``text`` for use as a LITERAL inside a Postgres ARE pattern:
+    every ASCII non-alphanumeric character gets a backslash (in an ARE a
+    backslash before a non-alphanumeric character is that character,
+    verbatim), so a caller-supplied ``q`` can never contribute regex syntax.
+    Non-ASCII characters are left alone — none is regex syntax, and a
+    backslash before a locale-alphanumeric one would be an invalid escape.
+    The pattern this feeds is a fixed boundary class plus this literal, so
+    it is linear-time by construction (security playbook: no ReDoS surface
+    over untrusted text)."""
+    return "".join(("\\" + ch) if (ch.isascii() and not ch.isalnum()) else ch for ch in text)
 
 
 class IngestBatchTooLarge(RuntimeError):
@@ -2193,25 +2332,64 @@ class FactsPgRepository:
         ``q`` is an OPTIONAL free-text name lookup, matched against
         ``fact_aliases.natural_key`` ONLY — never a claim's quote or attrs,
         so it can never reopen the S2 attribute oracle. It is a real FILTER
-        (candidates without a matching alias never enter ``visible`` at
+        (a fact without a matching alias never enters ``candidates`` at
         all — S6's shortfall rule: pre-limit, in SQL, never a Python
         post-filter), not merely a sort key. The query is normalized
         (casefolded, spaces -> hyphens) before matching so a natural-
         language name like "Parts Authority" matches the
-        ``<type>:<kebab-slug>`` alias ``organization:parts-authority`` as a
-        substring. Matching subjects are then RANKED — an exact match on the
-        alias's slug (the part after the first ``:``) first, a slug prefix
-        match second, any other substring match last, shorter alias and
-        then ``subject_id`` breaking further ties. No ``pg_trgm`` (or other
-        extension) similarity ranking: this schema does not enable one, and
-        this repo intentionally does not add the operational dependency —
-        this deterministic CASE-based tiering needs nothing beyond stock
+        ``<type>:<kebab-slug>`` alias ``organization:parts-authority``.
+        Matching is by substring, EXCEPT that a normalized ``q`` shorter
+        than ``SHORT_Q_TOKEN_PREFIX_LENGTH`` must start a name TOKEN of the
+        alias slug (the slug itself or a punctuation-delimited part of it:
+        ``llr`` matches ``llr-corp`` and ``acme-llr``, never ``fullrange``)
+        — a 2–3 character substring is a fragment of a large share of any
+        real alias set and would fill the candidate cap with noise on every
+        call. Matching subjects are RANKED — an exact match on the alias's
+        slug (the part after the first ``:``) first, a slug prefix match
+        second, any other match last, shorter alias and then ``subject_id``
+        breaking further ties. No ``pg_trgm`` (or other extension)
+        similarity ranking: this schema does not enable one, and this repo
+        intentionally does not add the operational dependency — this
+        deterministic CASE-based tiering needs nothing beyond stock
         Postgres. A blank/whitespace-only ``q`` degrades to "no filter"; a
         non-blank ``q`` shorter than ``MIN_SEARCH_Q_LENGTH`` raises
         ``ValueError`` (P2 review finding — a 1-char query has no useful
-        selectivity against a full ILIKE scan). The query itself runs under
-        a bounded Postgres statement timeout, same mechanism as
-        ``neighbors()``.
+        selectivity against a full ILIKE scan).
+
+        **Bounded candidate selection (live finding, 2026-09).** With ``q``
+        the candidate set is selected as a ``MATERIALIZED`` CTE that is
+        ranked by the rule above and cut at ``max(limit * 4,
+        SEARCH_CANDIDATE_CAP)`` + 1 rows. This is the fix for the statement
+        timeout the old shape hit on a large graph: matching via ``EXISTS
+        (... fact_aliases ...)`` left the planner with no selectivity
+        estimate for the ILIKE, it sized ``candidates`` at ~416k rows for an
+        actual 122 and scanned all of ``claims`` and ``fact_aliases`` instead
+        of probing two indexes 122 and 750 times (5.3 s vs 309 ms, same
+        query, same instance). Because candidates are ORDERED by the same
+        key the final result is, everything returned is still the best-
+        ranked visible match; only when more readable aliases match than the
+        cap admits can lower-ranked visible facts be missing, and that call
+        carries the additive ``candidates_capped: true`` so the caller
+        narrows ``q`` (or adds ``type``, which is applied BEFORE the cap)
+        rather than reading the page as complete. Visibility and the
+        attribute ``filters`` are evaluated on the capped set — deliberately,
+        the visibility gate over ``claims`` is the join that exploded — so a
+        capped page can be shorter than ``limit`` or empty while matches
+        exist beyond the cap; that is exactly the case the flag names, and
+        ``filters`` alone can never widen it. Both the
+        match and the cap count READABLE (or revealed) aliases only — the
+        same restriction S9 puts on the match itself — so neither can leak
+        how many restricted names match. ``limit_applied`` keeps its own
+        meaning (the caller's OWN visible set exceeds ``limit``). Without
+        ``q`` the candidate set is the type filter alone, unbounded as
+        before: the planner has real statistics for ``facts.type``, and a
+        cap there would silently shorten a restricted caller's id-ordered
+        page.
+
+        The statement runs under a bounded Postgres statement timeout, same
+        mechanism as ``neighbors()``; when it fires the caller gets
+        :class:`FactsQueryTimeout` — whose message is the next step, never
+        the raw driver text.
 
         ``include_claims=k`` (TCRD-295, ≤ ``MAX_INLINE_CLAIMS_K``) attaches
         the k newest readable claims to each returned subject via
@@ -2231,10 +2409,11 @@ class FactsPgRepository:
         tiered_hidden, audience_pairs = _audience_context(caller, readable)
         vis = self._visibility_predicate("c.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
-        candidates_alias_readable = self._alias_readable_sql(
-            revealed_expr="f.id IN (SELECT subject_id FROM revealed_ids)", is_admin=is_admin
-        )
-        alias_rank_readable = self._alias_readable_sql(
+        # `q` matching itself must never become an oracle for a restricted
+        # name's existence (security hardening): only an alias the caller
+        # can see (or a revealed subject, which bypasses grants entirely per
+        # spec §4) counts as a match — AND as a candidate toward the cap.
+        alias_readable = self._alias_readable_sql(
             revealed_expr="fa.fact_id IN (SELECT subject_id FROM revealed_ids)", is_admin=is_admin
         )
 
@@ -2242,23 +2421,9 @@ class FactsPgRepository:
         if q_clean and len(q_clean) < MIN_SEARCH_Q_LENGTH:
             raise ValueError(f"q must be at least {MIN_SEARCH_Q_LENGTH} characters")
         q_norm = q_clean.casefold().replace(" ", "-") if q_clean else None
-        q_substr: Optional[str] = None
-        q_prefix: Optional[str] = None
-        if q_norm:
-            # ESCAPE '\' per the security playbook (F-series LIKE guidance):
-            # a literal '%'/'_' in the query must never act as a wildcard.
-            q_escaped = q_norm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            q_substr = f"%{q_escaped}%"
-            q_prefix = f"{q_escaped}%"
 
         filter_clauses = []
-        params: Dict[str, Any] = {
-            "type": type,
-            "limit_plus_one": limit + 1,
-            "q_substr": q_substr,
-            "q_prefix": q_prefix,
-            "q_norm": q_norm,
-        }
+        params: Dict[str, Any] = {"type": type, "limit_plus_one": limit + 1}
         if not is_admin:
             params["readable"] = list(readable)
             params["tiered_hidden"] = tiered_hidden
@@ -2272,34 +2437,75 @@ class FactsPgRepository:
             )
         filter_sql = ("AND " + " AND ".join(filter_clauses)) if filter_clauses else ""
 
+        type_sql = "(CAST(:type AS TEXT) IS NULL OR f.type = :type)"
+        withheld_sql = """NOT EXISTS (
+                    SELECT 1 FROM corrections co
+                    WHERE co.subject_kind = 'fact' AND co.subject_id = f.id
+                      AND co.verdict IN ('wrong', 'restricted')
+                  )"""
+        candidate_cap = max(limit * 4, SEARCH_CANDIDATE_CAP)
+        if q_norm is not None:
+            # ESCAPE '\' per the security playbook (F-series LIKE guidance):
+            # a literal '%'/'_' in the query must never act as a wildcard.
+            q_escaped = q_norm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params["q_norm"] = q_norm
+            params["q_prefix"] = f"{q_escaped}%"
+            params["candidate_cap_plus_one"] = candidate_cap + 1
+            if len(q_norm) < SHORT_Q_TOKEN_PREFIX_LENGTH:
+                # Token-start rule for very short queries (see the constant):
+                # a fixed boundary class + an escaped literal, matched
+                # against the slug only so `org` cannot match every
+                # `organization:` alias at position 0. Linear-time.
+                params["q_token_re"] = "(^|[^[:alnum:]])" + _regex_literal(q_norm)
+                alias_match_sql = "split_part(fa.natural_key, ':', 2) ~* :q_token_re"
+            else:
+                params["q_substr"] = f"%{q_escaped}%"
+                alias_match_sql = "fa.natural_key ILIKE :q_substr ESCAPE '\\'"
+            candidates_sql = f"""
+            candidates AS MATERIALIZED (
+                -- Ranked + capped: the planner's hard cardinality ceiling
+                -- (docstring, "Bounded candidate selection"). Deterministic,
+                -- extension-free tiers (no pg_trgm in this schema): exact
+                -- slug match (0) < slug prefix match (1) < any other match
+                -- (2), shortest alias next, id last. Ranking only over
+                -- READABLE aliases — ranking by a restricted alias's match
+                -- strength would leak its existence through result ORDER.
+                SELECT f.id AS subject_id, f.type AS subject_type, m.match_tier, m.alias_len
+                FROM (
+                    SELECT fa.fact_id,
+                           MIN(CASE
+                                 WHEN split_part(fa.natural_key, ':', 2) = :q_norm THEN 0
+                                 WHEN split_part(fa.natural_key, ':', 2) ILIKE :q_prefix ESCAPE '\\' THEN 1
+                                 ELSE 2
+                               END) AS match_tier,
+                           MIN(LENGTH(fa.natural_key)) AS alias_len
+                    FROM fact_aliases fa
+                    WHERE {alias_match_sql}
+                      AND {alias_readable}
+                    GROUP BY fa.fact_id
+                ) m
+                JOIN facts f ON f.id = m.fact_id
+                WHERE {type_sql}
+                  AND {withheld_sql}
+                ORDER BY m.match_tier, m.alias_len, f.id
+                LIMIT :candidate_cap_plus_one
+            )"""
+        else:
+            candidates_sql = f"""
+            candidates AS MATERIALIZED (
+                SELECT f.id AS subject_id, f.type AS subject_type,
+                       CAST(NULL AS INTEGER) AS match_tier, CAST(NULL AS INTEGER) AS alias_len
+                FROM facts f
+                WHERE {type_sql}
+                  AND {withheld_sql}
+            )"""
+
         sql = sa.text(
             f"""
             WITH revealed_ids AS (
                 SELECT subject_id FROM corrections WHERE subject_kind = 'fact' AND verdict = 'revealed'
             ),
-            candidates AS (
-                SELECT f.id AS subject_id, f.type AS subject_type
-                FROM facts f
-                WHERE (CAST(:type AS TEXT) IS NULL OR f.type = :type)
-                  AND (
-                    CAST(:q_substr AS TEXT) IS NULL
-                    OR EXISTS (
-                        -- `q` matching itself must never become an oracle
-                        -- for a restricted name's existence (security
-                        -- hardening): only an alias the caller can see (or
-                        -- a revealed subject, which bypasses grants
-                        -- entirely per spec §4) counts as a match.
-                        SELECT 1 FROM fact_aliases fa
-                        WHERE fa.fact_id = f.id AND fa.natural_key ILIKE :q_substr ESCAPE '\\'
-                          AND {candidates_alias_readable}
-                    )
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM corrections co
-                    WHERE co.subject_kind = 'fact' AND co.subject_id = f.id
-                      AND co.verdict IN ('wrong', 'restricted')
-                  )
-            ),
+            {candidates_sql},
             counted_claims AS (
                 SELECT c.id AS claim_id, c.fact_id AS subject_id, c.attrs, c.document_date
                 FROM claims c
@@ -2326,7 +2532,7 @@ class FactsPgRepository:
                 )
             ),
             visible AS (
-                SELECT cand.subject_id, cand.subject_type,
+                SELECT cand.subject_id, cand.subject_type, cand.match_tier, cand.alias_len,
                        (cand.subject_id IN (SELECT subject_id FROM revealed_ids)) AS is_revealed
                 FROM candidates cand
                 WHERE cand.subject_id IN (SELECT subject_id FROM revealed_ids)
@@ -2355,44 +2561,29 @@ class FactsPgRepository:
             target_ids AS (
                 SELECT subject_id, is_revealed AS revealed FROM visible
             ),
-            alias_rank AS (
-                -- Deterministic, extension-free ranking (no pg_trgm in this
-                -- schema): exact slug match (0) < slug prefix match (1) <
-                -- any other substring match (2), shortest alias next. Empty
-                -- (zero rows) whenever `q` is absent, so the final ORDER BY
-                -- below degrades to the pre-`q` `v.subject_id` ordering.
-                -- Same readable-or-revealed filter as `candidates` above —
-                -- ranking by a restricted alias's match strength would leak
-                -- its existence through result ORDER even though every
-                -- candidate row already passed the existence filter on a
-                -- DIFFERENT, readable alias.
-                SELECT fa.fact_id AS subject_id,
-                       MIN(CASE
-                             WHEN split_part(fa.natural_key, ':', 2) = :q_norm THEN 0
-                             WHEN split_part(fa.natural_key, ':', 2) ILIKE :q_prefix ESCAPE '\\' THEN 1
-                             ELSE 2
-                           END) AS match_tier,
-                       MIN(LENGTH(fa.natural_key)) AS alias_len
-                FROM fact_aliases fa
-                WHERE fa.fact_id IN (SELECT subject_id FROM target_ids)
-                  AND CAST(:q_substr AS TEXT) IS NOT NULL
-                  AND fa.natural_key ILIKE :q_substr ESCAPE '\\'
-                  AND {alias_rank_readable}
-                GROUP BY fa.fact_id
-            ),
-            {self._projection_cte_sql(with_aliases=True, is_admin=is_admin)}
-            SELECT v.subject_id, v.subject_type, v.is_revealed,
-                   COALESCE(cnt.claim_count, 0) AS claim_count,
-                   COALESCE(al.aliases, '[]'::jsonb) AS aliases,
-                   COALESCE(sa.attrs, '{{}}'::jsonb) AS attrs
-            FROM visible v
-            LEFT JOIN counts cnt ON cnt.subject_id = v.subject_id
-            LEFT JOIN aliases al ON al.subject_id = v.subject_id
-            LEFT JOIN subject_attrs sa ON sa.subject_id = v.subject_id
-            LEFT JOIN alias_rank ar ON ar.subject_id = v.subject_id
-            WHERE TRUE {filter_sql}
-            ORDER BY COALESCE(ar.match_tier, 3), COALESCE(ar.alias_len, 0), v.subject_id
-            LIMIT :limit_plus_one
+            {self._projection_cte_sql(with_aliases=True, is_admin=is_admin)},
+            results AS (
+                SELECT v.subject_id, v.subject_type, v.is_revealed, v.match_tier, v.alias_len,
+                       COALESCE(cnt.claim_count, 0) AS claim_count,
+                       COALESCE(al.aliases, '[]'::jsonb) AS aliases,
+                       COALESCE(sa.attrs, '{{}}'::jsonb) AS attrs
+                FROM visible v
+                LEFT JOIN counts cnt ON cnt.subject_id = v.subject_id
+                LEFT JOIN aliases al ON al.subject_id = v.subject_id
+                LEFT JOIN subject_attrs sa ON sa.subject_id = v.subject_id
+                WHERE TRUE {filter_sql}
+                ORDER BY COALESCE(v.match_tier, 3), COALESCE(v.alias_len, 0), v.subject_id
+                LIMIT :limit_plus_one
+            )
+            -- The aggregate always yields exactly one row, so the candidate
+            -- count reaches Python even when `results` is empty (a capped
+            -- selection none of whose members passed visibility/filters is
+            -- still a capped selection the caller must be told about).
+            SELECT r.subject_id, r.subject_type, r.is_revealed, r.claim_count, r.aliases, r.attrs,
+                   c.n_candidates
+            FROM (SELECT COUNT(*) AS n_candidates FROM candidates) c
+            LEFT JOIN results r ON TRUE
+            ORDER BY COALESCE(r.match_tier, 3), COALESCE(r.alias_len, 0), r.subject_id
             """
         )
         # P2 review finding: bound this statement the same way `neighbors()`
@@ -2400,25 +2591,33 @@ class FactsPgRepository:
         # could stall a connection out of the pool. `.begin()` (not
         # `.connect()`) so `SET LOCAL` applies to the query that follows in
         # the same transaction.
-        with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
-            rows = conn.execute(sql, params).mappings().all()
+        timeout_ms = _STATEMENT_TIMEOUT_MS
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(sa.text(f"SET LOCAL statement_timeout = {timeout_ms}"))
+                raw_rows = conn.execute(sql, params).mappings().all()
 
-            limit_applied = len(rows) > limit
-            rows = rows[:limit]
-            inline: Dict[str, List[Dict[str, Any]]] = {}
-            claims_truncated = False
-            if include_claims > 0:
-                inline, claims_truncated = self._inline_claims(
-                    conn,
-                    kind="fact",
-                    ids_with_revealed=[(r["subject_id"], bool(r["is_revealed"])) for r in rows],
-                    k=include_claims,
-                    is_admin=is_admin,
-                    readable=readable,
-                    tiered_hidden=tiered_hidden,
-                    audience_pairs=audience_pairs,
-                )
+                n_candidates = int(raw_rows[0]["n_candidates"]) if raw_rows else 0
+                rows = [r for r in raw_rows if r["subject_id"] is not None]
+                limit_applied = len(rows) > limit
+                rows = rows[:limit]
+                inline: Dict[str, List[Dict[str, Any]]] = {}
+                claims_truncated = False
+                if include_claims > 0:
+                    inline, claims_truncated = self._inline_claims(
+                        conn,
+                        kind="fact",
+                        ids_with_revealed=[(r["subject_id"], bool(r["is_revealed"])) for r in rows],
+                        k=include_claims,
+                        is_admin=is_admin,
+                        readable=readable,
+                        tiered_hidden=tiered_hidden,
+                        audience_pairs=audience_pairs,
+                    )
+        except sa.exc.DBAPIError as exc:
+            if _is_statement_timeout(exc):
+                raise FactsQueryTimeout(_search_timeout_message(timeout_ms)) from exc
+            raise
 
         subjects = []
         for r in rows:
@@ -2437,6 +2636,11 @@ class FactsPgRepository:
                 subject["claims"] = inline[r["subject_id"]]
             subjects.append(subject)
         result: Dict[str, Any] = {"subjects": subjects, "limit_applied": limit_applied}
+        if q_norm is not None and n_candidates > candidate_cap:
+            # Additive, same convention as `collections_search`/knowledge
+            # search: present only when true, so the default shape is
+            # unchanged for existing callers.
+            result["candidates_capped"] = True
         if include_claims > 0:
             result["claims_truncated"] = claims_truncated
         return result
@@ -2481,8 +2685,13 @@ class FactsPgRepository:
         all_evidence = _visibility_mode() == "all_evidence"
         tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
-        with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+        budget = _ReadBudget(
+            _STATEMENT_TIMEOUT_MS,
+            reason="facts_neighbors_timeout",
+            message=_read_timeout_message("traversal", _STATEMENT_TIMEOUT_MS),
+        )
+        with _typed_statement_timeout(budget), self._engine.begin() as conn:
+            budget.arm(conn)
 
             root_status = self._subject_status(
                 conn,
@@ -2496,6 +2705,8 @@ class FactsPgRepository:
             )
             if not self._is_visible(root_status):
                 raise FactNotFound(subject_id)
+
+            budget.arm(conn)
 
             root_row = (
                 conn.execute(sa.text("SELECT id, type FROM facts WHERE id = :id"), {"id": subject_id})
@@ -2561,6 +2772,7 @@ class FactsPgRepository:
                         params["audience_pairs"] = audience_pairs
                     if edge_types:
                         params["edge_types"] = list(edge_types)
+                    budget.arm(conn)
                     edge_rows = conn.execute(edge_sql, params).mappings().all()
                     if len(edge_rows) > fanout:
                         truncated["fanout"] = True
@@ -2587,6 +2799,7 @@ class FactsPgRepository:
                 )
                 types: Dict[str, str] = {}
                 if candidate_ids:
+                    budget.arm(conn)
                     types = {
                         r["id"]: r["type"]
                         for r in conn.execute(
@@ -2669,6 +2882,7 @@ class FactsPgRepository:
                         check_params["readable"] = list(readable)
                         check_params["tiered_hidden"] = tiered_hidden
                         check_params["audience_pairs"] = audience_pairs
+                    budget.arm(conn)
                     more = conn.execute(check_sql, check_params).first()
                     truncated["depth"] = more is not None
 
@@ -3843,7 +4057,7 @@ class FactsPgRepository:
         )
         out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
         with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_AGGREGATE_STATEMENT_TIMEOUT_MS}"))
             for r in conn.execute(sql, params).mappings():
                 out.setdefault(r["type"], []).append(
                     {"fact_id": r["fact_id"], "label": r["label"], "document_count": int(r["n"])}
@@ -4132,7 +4346,7 @@ class FactsPgRepository:
             """
         )
         with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_AGGREGATE_STATEMENT_TIMEOUT_MS}"))
             rows = conn.execute(sql, {"ids": list(corpus_ids)}).mappings().all()
         for r in rows:
             out[r["corpus_id"]] = {"facts": int(r["facts"]), "edges": int(r["edges"])}
@@ -4310,8 +4524,13 @@ class FactsPgRepository:
         cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
         sv_types = list(_single_valued_edge_types())
 
-        with self._engine.begin() as conn:
-            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+        budget = _ReadBudget(
+            _STATEMENT_TIMEOUT_MS,
+            reason="facts_summary_timeout",
+            message=_read_timeout_message("collection summary", _STATEMENT_TIMEOUT_MS),
+        )
+        with _typed_statement_timeout(budget), self._engine.begin() as conn:
+            budget.arm(conn)
 
             # Gap #79: resolved INSIDE this same transaction so the maintained
             # table's own bootstrap-populated check and the combined query
@@ -4402,6 +4621,8 @@ class FactsPgRepository:
             combined_params["offset"] = offset
             combined_params["sv_types"] = sv_types
 
+            budget.arm(conn)
+
             combined_row = conn.execute(combined_sql, combined_params).mappings().first()
             assert combined_row is not None
 
@@ -4445,6 +4666,7 @@ class FactsPgRepository:
                 }
                 if not is_admin:
                     alias_params["readable"] = list(readable)
+                budget.arm(conn)
                 alias_rows = conn.execute(alias_sql, alias_params).mappings().all()
                 display_name: Dict[str, str] = {}
                 for r in alias_rows:
@@ -4469,6 +4691,7 @@ class FactsPgRepository:
                     claims_params["readable"] = list(readable)
                     claims_params["tiered_hidden"] = tiered_hidden
                     claims_params["audience_pairs"] = audience_pairs
+                budget.arm(conn)
                 claim_rows = conn.execute(claims_sql, claims_params).mappings().all()
 
                 claim_count: Dict[str, int] = {}

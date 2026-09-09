@@ -24,9 +24,9 @@ import signal
 import sys
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import httpx
 import pytest
@@ -338,10 +338,14 @@ class FakeSourceConnectionsRepo:
     """Stands in for ``source_connections_repo()`` — just enough of the
     contract for the crawl's own reads/writes: ``.get()`` returns the SAME
     connection dict every call (by reference, so a ``config_patch`` is
-    immediately visible to the next ``.get()``), and ``.config_patch()``
+    immediately visible to the next ``.get()``), ``.config_patch()``
     merges the patch's TOP-LEVEL keys into ``config`` the same shallow way
     both real repos do — no new store, the same JSON column
-    ``config.scopes``/``config.extraction`` already live on.
+    ``config.scopes``/``config.extraction`` already live on — and
+    ``.clear_stop_requested_if_unchanged()`` mirrors the real repos' own
+    compare-and-delete guard (``src/repositories/source_connections.py``),
+    so a fake-backed test can exercise the SAME atomicity `_clear_stale_
+    stop` relies on.
     """
 
     def __init__(self, connection: Dict[str, Any]) -> None:
@@ -357,6 +361,28 @@ class FakeSourceConnectionsRepo:
             return None
         config = dict(self.connection.get("config") or {})
         config.update(patch)
+        self.connection["config"] = config
+        return self.connection
+
+    def clear_stop_requested_if_unchanged(self, connection_id: str, expected_stop_at: str) -> bool:
+        if connection_id != self.connection.get("id"):
+            return False
+        config = dict(self.connection.get("config") or {})
+        extraction = dict(config.get("extraction") or {})
+        if extraction.get("stop_requested_at") != expected_stop_at:
+            return False
+        extraction.pop("stop_requested_at", None)
+        config["extraction"] = extraction
+        self.connection["config"] = config
+        return True
+
+    def merge_extraction(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if connection_id != self.connection.get("id"):
+            return None
+        config = dict(self.connection.get("config") or {})
+        extraction = dict(config.get("extraction") or {})
+        extraction.update(patch)
+        config["extraction"] = extraction
         self.connection["config"] = config
         return self.connection
 
@@ -7267,6 +7293,94 @@ class TestStopSignalStore:
 
         assert connection["config"] == {}
 
+    def test_clear_stale_stop_with_not_after_clears_a_flag_that_predates_it(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1", not_after="2026-09-06T18:00:00+00:00")
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_clear_stale_stop_never_clobbers_a_flag_that_changed_between_read_and_clear(self, monkeypatch):
+        """The atomicity finding: if something else (`request_stop`)
+        commits a FRESH flag in the window between `_clear_stale_stop`'s
+        own outer read/decision and its call into the atomic clear, that
+        clear must be a no-op against the now-current value — never blindly
+        replace it with the (by then stale) snapshot this function decided
+        to clear. Simulated at exactly that call boundary: the atomic
+        method re-reads truth from the live store at call time (what makes
+        the real repos' own re-read-under-lock safe), not from a snapshot
+        `_clear_stale_stop` already committed to. Exercised even with
+        `not_after=None` (the unconditional-clear path): the compare-and-
+        delete guard is unconditional too, not tied to the staleness check.
+        """
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "old"}}}
+        repo = FakeSourceConnectionsRepo(connection)
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: repo)
+        real_clear = repo.clear_stop_requested_if_unchanged
+
+        def clear_after_a_concurrent_request_stop_lands(connection_id, expected_stop_at):
+            connection["config"]["extraction"]["stop_requested_at"] = "fresh"
+            return real_clear(connection_id, expected_stop_at)
+
+        monkeypatch.setattr(repo, "clear_stop_requested_if_unchanged", clear_after_a_concurrent_request_stop_lands)
+
+        crawler._clear_stale_stop("conn1")  # not_after=None: decides "old" looks stale, attempts to clear it
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "fresh"
+
+    def test_clear_stale_stop_with_not_after_preserves_a_flag_written_later(self, monkeypatch):
+        """The race: a stop written AFTER `not_after` (this run's own
+        trigger) must survive the clear so the run's own cooperative-stop
+        checks still see it."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1", not_after="2026-09-06T18:00:00+00:00")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
+
+    def test_clear_stale_stop_with_not_after_preserves_a_flag_on_an_exact_tie(self, monkeypatch):
+        """Defense in depth for a value that predates `request_stop`'s move
+        to microsecond precision (a hand-written fixture, an older
+        persisted flag): an EXACT tie must resolve to "preserve", not
+        "stale" — two genuine writes essentially never land on the same
+        microsecond, so this only ever matters for a coarser legacy value."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1", not_after=datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc))
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:00+00:00"
+
+    def test_a_same_second_retrigger_still_clears_a_stale_flag_at_microsecond_precision(self, monkeypatch):
+        """The exact scenario `request_stop`'s move to microsecond precision
+        exists for: a cancel and the very next trigger can land in the SAME
+        wall-clock SECOND, no artificial backdating — the incident this PR
+        fixes. Second-level precision alone cannot order two timestamps
+        that close together, which is what let a stale flag survive a
+        retrigger issued moments later; microsecond precision can."""
+        connection = {"id": "conn1", "config": {}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler.request_stop("conn1")  # the previous run's cancel
+        not_after = datetime.now(timezone.utc)  # this trigger's own job, created a moment later
+
+        crawler._clear_stale_stop("conn1", not_after=not_after)
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_clear_stale_stop_accepts_a_naive_datetime_not_after_as_utc(self, monkeypatch):
+        """A DuckDB-backed job row's own ``created_at`` comes back naive
+        (no tzinfo) — must compare correctly against the aware stop stamp
+        rather than raising or silently miscomparing."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1", not_after=datetime(2026, 9, 6, 18, 0, 0))
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
     def test_stop_requested_reads_the_live_flag(self, monkeypatch):
         connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-01T00:00:00+00:00"}}}
         monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
@@ -7280,6 +7394,227 @@ class TestStopSignalStore:
         )
 
         assert crawler._stop_requested("does-not-exist") is None
+
+
+class TestShardChildrenStillLive:
+    """``_shard_children_still_live`` — the fleet-wide job-queue scan that
+    tells ``_clear_stale_stop_for_trigger`` a PREVIOUS sharded run's
+    children may still be draining."""
+
+    def test_true_for_a_queued_child_of_this_connection(self, monkeypatch):
+        jobs = FakeJobsRepo()
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is True
+
+    def test_true_for_a_running_child_of_this_connection(self, monkeypatch):
+        jobs = FakeJobsRepo()
+        row = jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        row["status"] = "running"
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is True
+
+    def test_false_when_nothing_is_queued_or_running(self, monkeypatch):
+        jobs = FakeJobsRepo()
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is False
+
+    def test_false_for_a_live_child_of_a_different_connection(self, monkeypatch):
+        jobs = FakeJobsRepo()
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn-other", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn-other:1",
+        )
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is False
+
+    def test_false_for_a_terminal_child_of_this_connection(self, monkeypatch):
+        jobs = FakeJobsRepo()
+        row = jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        row["status"] = "done"
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is False
+
+    def test_true_even_when_200_other_connections_own_newer_shard_jobs_in_the_same_status(self, monkeypatch):
+        """2026-09-07 review finding: querying by idempotency-key prefix,
+        not `list()`'s own `kind`+`status`+`limit` scan, is what keeps this
+        correct on a busy fleet — 200 OTHER connections' newer shard jobs
+        sharing the same status must never make this connection's own
+        (older) child invisible."""
+        jobs = FakeJobsRepo()
+        for i in range(200):
+            jobs.enqueue(
+                "corpus-extraction-shard",
+                {"connection_id": f"conn-other-{i}", "shard_index": 1},
+                idempotency_key=f"corpus-extraction-shard:conn-other-{i}:1",
+            )
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is True
+
+    def test_ignores_a_live_job_of_a_different_kind(self, monkeypatch):
+        jobs = FakeJobsRepo()
+        jobs.enqueue("corpus-extraction", {"connection_id": "conn1"})
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        assert crawler._shard_children_still_live("conn1") is False
+
+
+class TestClearStaleStopForTrigger:
+    """``_clear_stale_stop_for_trigger`` — the ``job_id`` -> ``jobs_repo().
+    get()`` -> ``created_at`` resolution :func:`run_builtin_crawl` calls
+    exactly once per top-level trigger."""
+
+    def test_resolves_not_after_from_the_jobs_repo_and_clears_a_stale_flag(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        jobs = FakeJobsRepo()
+        jobs.jobs_by_id["job1"] = {"id": "job1", "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc)}
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        crawler._clear_stale_stop_for_trigger("conn1", "job1")
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_a_flag_written_after_the_jobs_created_at_survives(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        jobs = FakeJobsRepo()
+        jobs.jobs_by_id["job1"] = {"id": "job1", "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc)}
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        crawler._clear_stale_stop_for_trigger("conn1", "job1")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
+
+    def test_no_job_id_falls_back_to_the_unconditional_clear(self, monkeypatch):
+        """A payload built outside the worker (a test, a manual replay) —
+        no anchor available, same behavior as before this fix."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop_for_trigger("conn1", None)
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_an_unresolvable_job_id_preserves_the_flag_rather_than_guessing(self, monkeypatch):
+        """2026-09-07 review finding: a ``job_id`` that was GIVEN but fails
+        to resolve (the row is gone) proves an anchor was expected — this
+        must NOT collapse into the job-id-less unconditional-clear path,
+        or a fresh stop on a run whose triggering job row has (for
+        whatever reason) vanished would be silently erased."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: FakeJobsRepo())  # empty — job1 unknown to it
+
+        crawler._clear_stale_stop_for_trigger("conn1", "job1")  # must not raise
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
+
+    def test_refuses_the_whole_trigger_while_a_previous_runs_shard_children_are_still_live(self, monkeypatch):
+        """2026-09-07 review findings: a cancel force-closes the PARENT
+        ``extraction_runs`` row immediately, without waiting for shard
+        children to notice the stop flag and exit. Merely preserving the
+        flag while letting THIS trigger proceed anyway was tried first and
+        found insufficient — the new plan's children would collide (same
+        idempotency-key namespace) with the OLD parent's still-live ones
+        and strand the new parent forever — so this now refuses the WHOLE
+        trigger by raising, never merely skipping the clear."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        jobs = FakeJobsRepo()
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        jobs.jobs_by_id["job1"] = {"id": "job1", "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc)}
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        with pytest.raises(crawler._PreviousRunStillDraining):
+            crawler._clear_stale_stop_for_trigger("conn1", "job1")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2020-01-01T00:00:00+00:00"
+
+    def test_clears_normally_once_no_shard_children_are_left_live(self, monkeypatch):
+        """The other half: once every child from the cancelled run has
+        actually finished (nothing queued/running for this connection),
+        the SAME stale flag clears exactly as before."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2020-01-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        jobs = FakeJobsRepo()
+        # A live shard child, but for a DIFFERENT connection — must not
+        # block this one's own clear.
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn-other", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn-other:1",
+        )
+        jobs.jobs_by_id["job1"] = {"id": "job1", "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc)}
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        crawler._clear_stale_stop_for_trigger("conn1", "job1")
+
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_a_jobs_repo_failure_refuses_the_trigger_and_preserves_the_flag(self, monkeypatch):
+        """A `jobs_repo()` failure here happens inside `_shard_children_
+        still_live`'s own lookup first — unknown liveness is treated the
+        same as "still live": the caller sees a clean, typed refusal
+        (never a bare `RuntimeError`), and the flag is never touched."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def _boom():
+            raise RuntimeError("db unavailable")
+
+        monkeypatch.setattr("src.repositories.jobs_repo", _boom)
+
+        with pytest.raises(crawler._PreviousRunStillDraining):
+            crawler._clear_stale_stop_for_trigger("conn1", "job1")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
+
+    def test_a_job_lookup_failure_after_liveness_check_succeeds_also_preserves_the_flag(self, monkeypatch):
+        """2026-09-07 review finding, the exact scenario named: `jobs_repo
+        ().get(job_id)` itself fails (the shard-liveness scan succeeded —
+        this is not the same failure as the test above) — must not
+        collapse into the unconditional clear."""
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-06T18:00:05+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        class _FlakyJobsRepo(FakeJobsRepo):
+            def get(self, job_id):
+                raise RuntimeError("db unavailable")
+
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: _FlakyJobsRepo())
+
+        crawler._clear_stale_stop_for_trigger("conn1", "job1")  # must not raise
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:05+00:00"
 
 
 class TestStopWatcher:
@@ -7849,10 +8184,19 @@ class TestFolderShardDeleteGuard:
 
 
 class FakeJobsRepo:
-    """Records every ``enqueue()`` call — stands in for ``jobs_repo()``."""
+    """Records every ``enqueue()`` call — stands in for ``jobs_repo()``.
+
+    ``jobs_by_id`` is a second, test-owned seam: ``get()`` reads from it
+    rather than from ``enqueued`` so a test can hand ``run_builtin_crawl``'s
+    OWN triggering job — the one ``_clear_stale_stop_for_trigger`` looks up
+    by the ``job_id`` in the payload, never enqueued by this fake itself —
+    with an exact, controlled ``created_at``, instead of depending on
+    wall-clock timing.
+    """
 
     def __init__(self) -> None:
         self.enqueued: List[Dict[str, Any]] = []
+        self.jobs_by_id: Dict[str, Dict[str, Any]] = {}
 
     def enqueue(
         self,
@@ -7872,15 +8216,32 @@ class FakeJobsRepo:
             "max_attempts": max_attempts,
             "idempotency_key": idempotency_key,
             "deduped": False,
+            "status": "queued",
         }
         self.enqueued.append(row)
         return row
 
+    def get(self, job_id: str) -> Optional[Dict[str, Any]]:
+        return self.jobs_by_id.get(job_id)
+
     def list(self, *, kind: str, status: str, limit: int = 200) -> List[Dict[str, Any]]:
-        """Empty — ``maybe_run_facts_extraction``'s ``_standalone_facts_
-        pass_in_flight`` check calls this on the inline path's own tail;
-        these planner tests never enqueue a facts pass of their own."""
-        return []
+        """Filters ``self.enqueued`` by kind/status — real enough for
+        ``maybe_run_facts_extraction``'s ``_standalone_facts_pass_in_
+        flight`` check (these planner tests never enqueue a
+        ``sharepoint-facts-extraction`` job, so this naturally still
+        returns ``[]`` for it)."""
+        return [j for j in self.enqueued if j["kind"] == kind and j.get("status") == status][:limit]
+
+    def list_by_idempotency_prefix(
+        self, prefix: str, *, statuses: Optional[Sequence[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Mirrors the real repos' prefix scan — ``_shard_children_still_
+        live`` uses this instead of ``list()`` precisely so a fleet-wide
+        ``limit`` can never hide one connection's own shard job."""
+        matches = [j for j in self.enqueued if (j.get("idempotency_key") or "").startswith(prefix)]
+        if statuses is not None:
+            matches = [j for j in matches if j.get("status") in statuses]
+        return matches
 
 
 class FakeStateStore:
@@ -7967,6 +8328,23 @@ class TestAutoParallelCrawlPlanner:
         _install_fake_state_store(monkeypatch, store)
         monkeypatch.setattr(crawler, "_shard_target_docs", lambda: target_docs)
         return runs, jobs, store
+
+    @staticmethod
+    def _complete_all_shard_jobs(jobs: "FakeJobsRepo") -> None:
+        """Marks every currently-enqueued shard job ``done`` — these
+        planner tests never run the children themselves, so a test that
+        triggers the SAME connection more than once (plan reuse/re-plan)
+        must do this between triggers or `_shard_children_still_live`
+        would see the FIRST trigger's own still-"queued" children and
+        (correctly, for the real cancel scenario this guards against)
+        refuse the second one. In production this never arises: the
+        admin API's OWN `_extraction_run_already_in_flight` 409 gate
+        already refuses an overlapping trigger before it ever reaches
+        this far — these tests call the worker-level entry point
+        directly, bypassing that gate, purely to test plan persistence.
+        """
+        for job in jobs.enqueued:
+            job["status"] = "done"
 
     def _handler(self) -> Callable[[httpx.Request], httpx.Response]:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -8079,6 +8457,7 @@ class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
         assert first["mode"] == "sharded"
         graph_calls_after_first = len(seen)
         assert graph_calls_after_first > 0
+        self._complete_all_shard_jobs(jobs)
 
         second = _run(_connection([_drive_scope()]), monkeypatch)
 
@@ -8094,6 +8473,7 @@ class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
         # A THIRD trigger must ALSO reuse — re-persisting the reused plan
         # must carry its own fingerprint forward, not just fast-path the
         # ONE trigger right after the plan was originally built.
+        self._complete_all_shard_jobs(jobs)
         third = _run(_connection([_drive_scope()]), monkeypatch)
 
         assert third["mode"] == "sharded"
@@ -8101,23 +8481,25 @@ class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
         assert len(runs.started) == 3
 
     def test_resync_forces_a_fresh_plan(self, crawl_env, monkeypatch):
-        _runs, _jobs, _store = self._install_env(monkeypatch)
+        _runs, jobs, _store = self._install_env(monkeypatch)
         seen = _install_graph(monkeypatch, self._handler())
 
         _run(_connection([_drive_scope()]), monkeypatch)
         graph_calls_after_first = len(seen)
+        self._complete_all_shard_jobs(jobs)
 
         _run(_connection([_drive_scope()]), monkeypatch, resync=True)
 
         assert len(seen) > graph_calls_after_first, "resync must trigger a fresh plan, not reuse the persisted one"
 
     def test_force_replan_forces_a_fresh_plan_without_resync(self, crawl_env, monkeypatch):
-        _runs, _jobs, store = self._install_env(monkeypatch)
+        _runs, jobs, store = self._install_env(monkeypatch)
         seen = _install_graph(monkeypatch, self._handler())
 
         _run(_connection([_drive_scope()]), monkeypatch)
         graph_calls_after_first = len(seen)
         state_before = store.get("crawl", "conn1")
+        self._complete_all_shard_jobs(jobs)
 
         _run(_connection([_drive_scope()]), monkeypatch, force_replan=True)
 
@@ -8126,11 +8508,12 @@ class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
         assert state_before.get("delta_links") == store.get("crawl", "conn1").get("delta_links")
 
     def test_a_scope_set_change_invalidates_the_persisted_plan(self, crawl_env, monkeypatch):
-        _runs, _jobs, _store = self._install_env(monkeypatch)
+        _runs, jobs, _store = self._install_env(monkeypatch)
         seen = _install_graph(monkeypatch, self._handler())
 
         _run(_connection([_drive_scope()]), monkeypatch)
         graph_calls_after_first = len(seen)
+        self._complete_all_shard_jobs(jobs)
 
         # A second, differently-identified drive scope — the connection's
         # confirmed scope SET changed since the plan was built.
@@ -8666,6 +9049,119 @@ class TestShardStopBeforeClaim:
         # The shard still counts as finished for the parent's own tally,
         # even though the job itself re-raises and fails.
         assert runs.shards["er_parent1"]["shards_done"] == 1
+
+
+class TestStopFlagSurvivesATrigger(TestAutoParallelCrawlPlanner):
+    """2026-09-06 production incident: an admin cancelled one run — which
+    sets the connection-wide ``stop_requested_at`` flag, the SAME one
+    ``POST …/extraction/stop`` writes — then immediately triggered a fresh
+    crawl on the same connection. The trigger auto-sharded into 989 shards;
+    every child read the still-set flag and exited immediately with
+    ``CrawlStopped: stop requested at … — stopping; the next run resumes``.
+    Result: 989/989 shards reported ``done``, 0 files walked, 0 failures —
+    looked green, did nothing. The flag had to be cleared by hand in
+    Postgres before a crawl would run again.
+
+    Root cause: the INLINE path (``_run_crawl_async``) cleared a stale stop
+    at its own start, but the auto-parallel planner's SHARDED path
+    (``_plan_or_run_inline``'s non-inline branch, ``_enqueue_shard_plan``)
+    never called that clear at all — so a site large enough to auto-shard
+    (exactly what happened here) never got the clear its own docstring
+    already claimed happened "once, per top-level trigger". Fixed by
+    ``_clear_stale_stop_for_trigger``, now called exactly once in
+    ``run_builtin_crawl`` BEFORE the inline-vs-sharded decision, so both
+    branches share the same call.
+
+    ``TestShardStopBeforeClaim`` (above) already covers the OTHER half of
+    this incident's design: the connection-wide flag reaching a shard child
+    is load-bearing (a shard child has no run-scoped stop signal of its
+    own) and must keep working exactly as before — this fix only changes
+    WHEN the flag is cleared, never how a crawl reads it.
+    """
+
+    def test_a_stale_flag_from_a_previous_cancelled_run_does_not_kill_a_fresh_sharded_trigger(
+        self, crawl_env, monkeypatch
+    ):
+        runs, jobs, store = self._install_env(monkeypatch)
+        _install_graph(monkeypatch, self._handler())
+
+        connection = _connection([_drive_scope()])
+        # Left over from a PREVIOUS run's cancel — long since finished,
+        # unrelated to the fresh trigger below.
+        connection["config"]["extraction"] = {"stop_requested_at": "2020-01-01T00:00:00+00:00"}
+        jobs.jobs_by_id["job-trigger-1"] = {
+            "id": "job-trigger-1",
+            "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc),
+        }
+
+        report = _run(connection, monkeypatch, job_id="job-trigger-1")
+
+        assert report["mode"] == "sharded"
+        assert report["shards_total"] >= 1
+        # Every planned shard actually got enqueued — the stale flag did
+        # not short-circuit planning, exactly the 989/0/0 failure mode.
+        assert len(jobs.enqueued) == report["shards_total"]
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_a_stop_requested_after_the_trigger_still_wins_even_though_a_plan_is_in_flight(
+        self, crawl_env, monkeypatch
+    ):
+        """The race: the operator's Stop click landed WHILE this trigger's
+        own job was already queued and planning was under way (the stop's
+        own timestamp is AFTER the triggering job's ``created_at``) — the
+        run this trigger is starting must still see that stop, not have it
+        wiped as though it were stale leftover from something else."""
+        runs, jobs, store = self._install_env(monkeypatch)
+        _install_graph(monkeypatch, self._handler())
+
+        connection = _connection([_drive_scope()])
+        jobs.jobs_by_id["job-trigger-2"] = {
+            "id": "job-trigger-2",
+            "created_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+        }
+        # Written AFTER the triggering job's own created_at above — an
+        # admin's Stop click landing during this same run's start-up.
+        connection["config"]["extraction"] = {"stop_requested_at": "2026-09-06T18:00:00+00:00"}
+
+        _run(connection, monkeypatch, job_id="job-trigger-2")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2026-09-06T18:00:00+00:00"
+
+    def test_a_retrigger_never_un_cancels_a_previous_runs_still_live_shard_children(self, crawl_env, monkeypatch):
+        """2026-09-07 review findings: cancel force-closes the PARENT
+        ``extraction_runs`` row immediately, without waiting for shard
+        children to notice the stop flag on their own. An immediate
+        retrigger clearing the connection-wide flag out from under those
+        STILL-LIVE children would silently un-cancel work the operator
+        explicitly stopped — and merely preserving the flag while letting
+        THIS trigger's own plan get built anyway was tried first and found
+        insufficient too: its children would collide (same idempotency-key
+        namespace) with the OLD parent's still-live ones and strand the
+        NEW parent forever. So the whole trigger is refused outright —
+        `run_builtin_crawl` never reaches `_plan_or_run_inline` at all —
+        and the flag survives untouched, exactly as before."""
+        runs, jobs, store = self._install_env(monkeypatch)
+        _install_graph(monkeypatch, self._handler())
+
+        connection = _connection([_drive_scope()])
+        connection["config"]["extraction"] = {"stop_requested_at": "2020-01-01T00:00:00+00:00"}
+        # A child from the run that was just cancelled — still queued,
+        # depending entirely on the connection-wide flag to know to stop.
+        jobs.enqueue(
+            "corpus-extraction-shard",
+            {"connection_id": "conn1", "shard_index": 1},
+            idempotency_key="corpus-extraction-shard:conn1:1",
+        )
+        jobs.jobs_by_id["job-trigger-3"] = {
+            "id": "job-trigger-3",
+            "created_at": datetime(2026, 9, 6, 18, 0, 0, tzinfo=timezone.utc),
+        }
+
+        with pytest.raises(crawler._PreviousRunStillDraining):
+            _run(connection, monkeypatch, job_id="job-trigger-3")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == "2020-01-01T00:00:00+00:00"
+        assert jobs.enqueued == [jobs.enqueued[0]]  # no NEW shard plan was ever created
 
 
 class TestFinalizeRaceAndAggregation:

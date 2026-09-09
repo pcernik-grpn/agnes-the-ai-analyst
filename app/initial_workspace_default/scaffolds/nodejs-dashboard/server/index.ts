@@ -2,6 +2,7 @@ import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runQuery } from "./agnesQuery.js";
+import { getViewer, viewerTokenFrom } from "./agnesViewer.js";
 
 // `"type": "module"` (ESM) means Node needs the explicit `.js` extension above,
 // even though the source is `agnesQuery.ts` — TS resolves the `.js` specifier to
@@ -23,9 +24,22 @@ app.post("/", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.get("/api/data", async (_req, res) => {
+// Who is viewing right now — see `agnesViewer.ts` and
+// `references/agnes-query.md` "Who is viewing". 401s when the assertion
+// header is missing or fails verification (should never happen behind the
+// Agnes proxy; useful when running the app directly during development).
+app.get("/api/me", (req, res) => {
+  const viewer = getViewer(req);
+  if (!viewer) {
+    res.status(401).json({ error: "unauthenticated" });
+    return;
+  }
+  res.json({ email: viewer.email, name: viewer.name, groups: viewer.groups });
+});
+
+app.get("/api/data", async (req, res) => {
   try {
-    const result = await runQuery("SELECT * FROM my_table LIMIT 100");
+    const result = await runQuery("SELECT * FROM my_table LIMIT 100", { viewerToken: viewerTokenFrom(req) });
     res.json(result);
   } catch (err) {
     res.status(502).json({ error: String(err) });

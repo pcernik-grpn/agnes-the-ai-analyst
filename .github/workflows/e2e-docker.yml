@@ -60,11 +60,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python deps
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install Python deps (from uv.lock)
         run: |
           python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -e ".[dev,server]"
+          INSTALL_PYTHON=.venv/bin/python scripts/ci/install-from-lock.sh dev server
 
       - name: Build the chat-sandbox image
         run: docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox
@@ -112,12 +113,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python deps
+      - uses: astral-sh/setup-uv@v7
+        if: env.ANTHROPIC_API_KEY != ''
+
+      - name: Install Python deps (from uv.lock)
         if: env.ANTHROPIC_API_KEY != ''
         run: |
           python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -e ".[dev,server]"
+          INSTALL_PYTHON=.venv/bin/python scripts/ci/install-from-lock.sh dev server
 
       - name: Build the chat-sandbox image
         if: env.ANTHROPIC_API_KEY != ''

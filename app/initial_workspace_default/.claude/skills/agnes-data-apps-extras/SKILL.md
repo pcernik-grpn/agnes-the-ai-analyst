@@ -18,16 +18,33 @@ If you haven't loaded `dataapp-development` yet, load it now. If you're
 unsure which deployment path applies, see `references/path-d.md` — Agnes is
 detected by the presence of the `data_app_*` MCP tools.
 
-## 0. The app has to exist before it can have a draft
+## 0. Create the app, then its draft, before anything is deployed
 
-For a NEW app, call `data_app_create(slug, name, description)` first. A draft
-is a sibling row on an existing app's repo, so `data_app_create_draft` against
-a slug that was never created returns `404 data_app_not_found` — watched live,
-that is exactly where a run stops, retrying the draft call and getting the same
-404. Order: `data_app_create` → seed the repo (§1) → `data_app_create_draft`
-only when you want an iteration branch off a *deployed* app.
+For a NEW app the order is fixed, and every step is a precondition of the
+next — watched live, skipping either of the first two stops the run:
 
-For an app that already exists, skip this and go straight to §1.
+1. `data_app_create(slug, name, description)` — the registry row and its
+   empty repo. `data_app_create_draft` against a slug that was never created
+   returns `404 data_app_not_found` (a run used to stall here, retrying the
+   draft call and getting the same 404).
+2. Seed the repo: clone through the relay (§0b), copy the scaffold (§1),
+   commit, push to `main`.
+3. `data_app_create_draft(slug)` — a draft is a sibling row pinned to a
+   branch of the same repo. **Every dev deploy needs one, including the very
+   first**: `data_app_deploy(<slug>, mode="dev")` on the prod row fails with
+   `400 dev_requires_draft` (watched live: the agent deployed the prod slug
+   in dev mode, got the 400, and only then created the draft).
+4. `data_app_deploy(<draft_slug>, mode="dev")`, then the preview cadence
+   in §3.
+
+Never deploy the prod row (`data_app_deploy(slug)` with no `mode`) before the
+user has picked "Publish" — that is the promote flow
+(`references/promote-flow.md`), not the first deploy.
+
+For an app that already exists, skip step 1. If its repo has no `main`
+commit yet (created, never seeded), complete step 2 before step 3 —
+`data_app_create_draft` refuses a repo without `main`
+(`parent_has_no_main`). Otherwise, if it has no open draft, start at step 3.
 
 ## 0b. Cloning the repo: use the relay, not the credential URL
 
@@ -101,6 +118,31 @@ redeploy (HMR does not pick those up); ordinary `src/**`/`server/**` edits
 don't need it. Call `agnes_data_app_close(slug)` before tearing down a draft
 (`data_app_delete_draft`) so the pane never points at a deleted app.
 
+## 3b. After Publish: who should see it
+
+Right after promote (`references/promote-flow.md`), check who can already see
+the app: `data_app_share_get(<prod_slug>)` returns `{visibility, group_ids,
+groups, pending_group_ids, available_groups}` — `groups`/`available_groups`
+are `{id, name}` (`available_groups` also flags `is_everyone`). **Never share
+on your own initiative** — always ask first, via `AskUserQuestion`, offering
+the names from `available_groups` plus "Everyone" and "Only me". Apply the
+answer with `data_app_share(slug, groups: [...], everyone: <bool>)`.
+
+Say what sharing means in one plain sentence before asking — granting a group
+means everyone in it sees the app's data exactly as it renders today, under
+the app's own credentials, not their own. If the user wants viewers to see
+only what *they* individually have access to, that's a separate switch — data
+identity (below), not sharing.
+
+One more thing worth mentioning once, not re-explained every time: a hosted
+app reads data as its **owner** by default (`data_identity: owner` — every
+viewer sees the same rendered output, whoever they are). Switching an app to
+`data_identity: viewer` (`data_app_set_data_identity(slug, "viewer")`) makes
+each viewer's own grants bind live, narrowed by the owner's — but it
+redeploys the app, and only works on a Postgres-backed Agnes instance. Bring
+this up only if the user asks for per-viewer personalization; don't offer it
+unprompted.
+
 ## 4. Visual-quality bar, chat voice, jargon ban
 
 - Real React + Vite + Tailwind. Charting libraries come from npm
@@ -139,6 +181,17 @@ Where a figure corresponds to a defined business metric, read the metric's
 definition and run *its* SQL instead of writing your own — see the
 "Metrics before hand-written SQL" section of that reference.
 
+### Who is viewing
+
+The scaffold also ships `server/agnesViewer.ts`. Its `getViewer(req)` helper
+verifies the `X-Agnes-Viewer` header the Agnes proxy attaches to every
+request and returns `{sub, email, name?, groups, via, exp}` (or `null` when
+it can't be verified). Use it to personalize a page ("Hi, {name}") or gate a
+section by `groups` (e.g. only render an admin panel when `groups` contains
+`"Admin"`) — it is the one trustworthy source of "who is looking at this
+right now" available to the app. See `references/agnes-query.md` for the
+full claim list and the Python equivalent for a Flask/Streamlit app.
+
 ## 8. What the app must never expose
 
 Everything the app serves is reachable by everyone holding a grant on it — with
@@ -171,6 +224,14 @@ put the environment itself, or an error object that closes over it, into a
 response body. The same scan separately flags the token itself being echoed
 back on a response line (`DA005`) and debug mode left on (`DA006`,
 informational only).
+
+**Never echo `AGNES_VIEWER_SECRET`, `AGNES_TOKEN`, or the
+`X-Agnes-Viewer-Token` header value back to the browser.** Same failure mode
+as `DA005`, two more names: `AGNES_VIEWER_SECRET` signs every viewer
+assertion for this app, and the viewer token is a live bearer credential —
+either one landing in a response, a log line the app itself renders, or a
+debug page hands a caller the means to forge or replay a viewer's identity.
+`DA005` covers all three names, not just `AGNES_TOKEN`.
 
 The scaffold's error handling is a worked example: it returns the upstream
 response text on failure, never the request headers it sent.

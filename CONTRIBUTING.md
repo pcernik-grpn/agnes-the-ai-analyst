@@ -14,29 +14,67 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
 5. Add a CHANGELOG fragment (`changelog.d/<slug>.md`, see `changelog.d/README.md`) for any user-visible behavior change. A feature/fix PR never edits `CHANGELOG.md` itself — only the daily release-cut PR does, when it folds the fragments in.
 
-## Landing a PR — the train is the gate, not the review badge
+## Dependencies — `uv.lock` is what ships
 
-What merges a ready (non-draft) PR is a **merge train** driven by a person
-with ruleset bypass, not GitHub's review state (`docs/RELEASING.md` → *The
-train-driver role*). `main`'s active ruleset asks for one approving review
-plus an extra approval for unattributed changes, but the core team bypasses
-it — which is why PRs routinely land with `reviewDecision: REVIEW_REQUIRED`
-still set. What follows from that, for an agent or a person:
+`pyproject.toml` declares ranges; `uv.lock` pins the exact set. The Docker
+image and every CI job install from the lock (`scripts/ci/install-from-lock.sh`
+— `uv export --frozen`, then `uv pip install`), so what CI tested is what the
+image runs. Two rules follow:
 
-- **A PR sitting `BEHIND` between trains is normal.** Do not merge `main` into
-  it because `main` moved; the train re-verifies the merged tree. Sync before a
-  build wave, before review, and when the driver asks — not once per train.
+- **Changed `pyproject.toml`? Run `uv lock` and commit `uv.lock` in the same
+  PR.** CI's `lock-check` job (`uv lock --check`) is blocking — the `test`
+  rollup needs it. Dependabot PRs already re-lock; the daily release cut
+  re-locks after its version bump.
+- **Never let tooling re-lock for you.** `uv run`, `uv sync`, `uv export` and
+  `uv tree` rewrite `uv.lock` whenever it is behind `pyproject.toml`; pass
+  `--frozen` (the repo's hooks already do). A dirty `uv.lock` you did not mean
+  to change is `git checkout -- uv.lock`, never a commit.
+
+A local venv built with `uv pip install ".[dev,server]"` resolves from the
+ranges and is fine for development; `uv sync --extra server --extra extraction`
+gives you the exact set CI runs instead.
+
+## Landing a PR — the merge queue is the gate, not the review badge
+
+What merges a ready (non-draft) PR is GitHub's **merge queue** on `main`
+(since 2026-09-07; `docs/RELEASING.md` → *Landing PRs through the merge
+queue*), and what decides whether a PR may *enter* the queue is the ruleset's
+one-approval rule, evaluated by the queue itself — ruleset bypass does not
+apply inside the queue, so a bypass actor's own unreviewed PR is refused like
+anyone else's. For an organization member's PR that approval comes from a
+clean Devin verdict (`.github/workflows/devin-clean-approves.yml`, added in #2339, approves on
+"No Issues Found" and dismisses its approval when a later verdict lists
+issues), so the gate reads **CI green + Devin clean = the author queues**. An
+outside collaborator's PR and the daily release-cut PR need a human approval.
+Like a human's approval under this ruleset, Devin's persists across later
+pushes (Devin re-reviews only some of them) and falls to a later Devin review
+that lists issues. What follows from that, for an agent or a person:
+
+- **To land a ready PR, queue it:** `gh pr merge <N> --merge --auto` (or "Merge when ready" in the UI). The queue builds `main`
+  plus your PR plus whatever else is queued, runs the required checks on that
+  merged result once (`ci.yml` runs on `merge_group`), and merges. The merge
+  method is the queue's (merge commit), set in the ruleset, not per PR.
+  GitHub deletes the head branch after the queue merges it (repo setting *Automatically delete head branches*).
+- **A PR sitting `BEHIND` is normal.** `main` no longer requires an up-to-date
+  branch. Do not merge `main` into a PR because `main` moved; the queue tests
+  the merged result. Sync before a build wave, before review, and when a
+  reviewer asks for it — not on every `main` move.
 - **Waiting on a gate is a `BLOCKER` with an owner, not a wait.** Name the gate
-  and the person who can open it, in the PR or the issue, and re-ping that
-  person every two hours until it moves. Two long autonomous runs lost 18 h and
-  33 h each modelling "needs an approving review" for a badge that was never
-  the gate (#2295).
+  and who opens it — for a member's PR that is Devin's verdict (fix what it
+  flagged, or wait for the re-review after a push); for an outside
+  collaborator's or the cut PR, a named human approver — in the PR or the
+  issue, and re-ping that person every two hours until it moves. Two long autonomous runs lost 18 h and 33 h each modelling
+  "needs an approving review" for a badge that was never the gate (#2295).
 - **Un-draft only when you would merge as-is** (`CLAUDE.md`: "ready for review"
   means "ready to merge") and name a reviewer at un-draft time, so the blocker
   has an owner from the first minute.
-- **`ci.yml` already runs on `merge_group`**, so a GitHub merge queue can
-  replace the hand-driven train the day the team enables it on `main`. The
-  queue tests the merged result once, then lands it.
+- **Bypass is the exception, with a stated reason.** `internal` members can
+  merge around the queue (`gh pr merge <N> --merge --admin`) for a hotfix, the
+  cut PR, or a PR Devin never re-reviewed and so never approved; required CI
+  still applies. Say why in the merge commit or a comment. Everything else is
+  queued.
+- **The hand-driven merge trains are retired.** CHANGELOG fragments removed
+  the collisions the train driver used to resolve; the queue does the rest.
 
 ## Testing conventions
 

@@ -10,11 +10,19 @@ carries no participant identity (SR-4), so this object is always live-fresh.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import ClassVar, Union
 
 
 @dataclass(frozen=True)
 class SessionPrincipal:
+    #: Whether ``src.rbac`` keeps the internal usage tables
+    #: (``agnes_sessions`` & co.) reachable for this principal kind despite
+    #: its intersection — the chat-context carve-out (a co-session or agent
+    #: has no personal stack, and the row filter still yields only its own
+    #: rows). A NEW principal kind must opt in explicitly; the default read by
+    #: ``src.rbac`` is False.
+    internal_tables_reachable: ClassVar[bool] = True
+
     session_id: str
     participant_user_ids: list[str]
     participant_emails: list[str]
@@ -58,6 +66,9 @@ class AgentPrincipal:
     exercised there.
     """
 
+    #: See :attr:`SessionPrincipal.internal_tables_reachable`.
+    internal_tables_reachable: ClassVar[bool] = True
+
     session_id: str
     agent_id: str
     owner_user_id: str
@@ -67,18 +78,62 @@ class AgentPrincipal:
     caller_email: str | None = None
 
 
-#: Either restricted principal. Consumers that mean "not a full user dict —
+@dataclass(frozen=True)
+class DataAppViewerPrincipal:
+    """Auth subject of a hosted data app querying Agnes AS ITS VIEWER.
+
+    Minted per proxied request by ``app.auth.data_app_viewer`` only for an
+    app whose ``data_identity`` is ``'viewer'`` (``src.data_apps.identity``),
+    and resolved by ``app.auth.pat_resolver`` from the short-lived
+    ``X-Agnes-Viewer-Token`` the container forwards as its bearer.
+
+    Effective authority = ``owner ∩ viewer`` (``src.grant_intersection.
+    compute_viewer_intersection``), rebuilt live on every request and never
+    the Admin god-mode short-circuit on either side:
+
+    - the VIEWER never exceeds their own grants — the whole point of viewer
+      mode versus the default "sharing is publication" owner mode;
+    - the viewer never exceeds the OWNER's grants either — the app is
+      owner-authored code that sees every response, so a better-privileged
+      viewer would otherwise be a lens the owner could use to read tables the
+      owner cannot.
+
+    Row-level access policies (``src/access_policy.py``) bind ``$user_*`` to
+    the ``viewer_*`` identity; audit attribution (``identity_for_audit``)
+    names the viewer too. ``owner_*`` is kept alongside so a consumer can
+    still say whose app ran the query. Same "restriction, never elevation"
+    shape as :class:`AgentPrincipal`.
+    """
+
+    #: NO internal-table carve-out: this principal runs inside owner-authored
+    #: code, so a table absent from both the owner's and the viewer's grants
+    #: must stay unreadable — the intersection is the whole authority (Devin
+    #: Review on #2383, "viewer tokens bypass internal-table grants").
+    internal_tables_reachable: ClassVar[bool] = False
+
+    slug: str
+    app_id: str
+    owner_user_id: str
+    owner_email: str
+    viewer_user_id: str
+    viewer_email: str
+    intersection: dict[str, frozenset[str]]
+
+
+#: Any restricted principal. Consumers that mean "not a full user dict —
 #: use the intersection, deny admin" should branch on this union, not on one
 #: member, so a new principal kind cannot silently bypass a seam.
-Principal = Union[SessionPrincipal, AgentPrincipal]
+Principal = Union[SessionPrincipal, AgentPrincipal, DataAppViewerPrincipal]
 
 #: Runtime companion to :data:`Principal` for ``isinstance`` checks —
 #: ``isinstance(x, Principal)`` is a TypeError on a ``typing.Union``. Every
 #: seam that means "restricted principal" MUST test against this tuple, never
-#: against a single member, so adding a third principal kind cannot silently
-#: leave a seam behind. Checks that are deliberately co-drive-specific (the
+#: against a single member, so adding another principal kind cannot silently
+#: leave a seam behind (``DataAppViewerPrincipal`` was the third; the one seam
+#: that had hard-coded the original pair — ``can_access_session`` — denied it
+#: everywhere until it was moved onto this tuple). Checks that are deliberately co-drive-specific (the
 #: participant bookkeeping in ``app/api/chat_copresence.py``, the resolver's
 #: construction site in ``app/auth/pat_resolver.py``) keep naming
 #: ``SessionPrincipal`` directly — that is the signal they are NOT a
 #: restricted-principal seam.
-PRINCIPAL_TYPES: tuple[type, ...] = (SessionPrincipal, AgentPrincipal)
+PRINCIPAL_TYPES: tuple[type, ...] = (SessionPrincipal, AgentPrincipal, DataAppViewerPrincipal)

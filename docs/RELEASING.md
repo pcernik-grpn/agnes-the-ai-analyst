@@ -46,7 +46,10 @@ logic.
 `changelog.d/` fragment** (see the Changelog discipline section above).
 The version bump + CHANGELOG rename is cut once a day by
 `.github/workflows/daily-cut.yml`, which opens a PR labeled `release-cut` for
-a human to review and merge. It never merges or tags anything itself.
+a human to review and merge. It never merges or tags anything itself. After
+the bump it runs `uv lock`, so `uv.lock`'s own version line follows
+`pyproject.toml` — the image installs from the lock behind CI's blocking
+`lock-check`, and a cut PR that skipped this would fail its own checks.
 
 This replaces the old rule ("the release-cut ships in the same PR that earns
 the version"), which made whichever PR happened to land last-with-content in
@@ -72,31 +75,55 @@ a day.
   major` only when the team has actually decided this cut is a milestone
   boundary; never automatic.
 
-### The train-driver role
+### Landing PRs through the merge queue
 
-A human (or an agent session acting for one) merges the ready PR queue
-completely *first*, then reviews and merges the cut PR — in that order. Once
-a cut PR is open, treat it as a short lock on `main`: merging more feature
-PRs while it sits open means `main`'s `[Unreleased]` keeps growing
-underneath a cut branch that already snapshotted an older state of that same
-section, and merging the stale cut PR on top risks the same kind of
-same-region collision this workflow exists to avoid. `daily-cut.yml` won't
-open a second cut PR while one is already open (it checks for an open PR
-carrying the `release-cut` label first), so the practical rule is: **flush
-the queue, then merge the cut PR, in that order, before resuming feature
-merges.** If the cut PR ends up showing a merge conflict against a newer
-`main` (the queue wasn't fully flushed before someone merged past it), close
-it and re-dispatch `daily-cut.yml` rather than resolving the conflict by
-hand — a hand-resolved overlap on `[Unreleased]` is exactly the collision
-class this exists to prevent. Bullets that land after a cut PR opened simply
-ride into the next day's cut; that is expected, not a bug. Since fragments
-(#2295) a PR merged past an open cut PR adds a *new* file under `changelog.d/`
-rather than editing `[Unreleased]`, so it no longer collides with the cut
-branch at all — the flush-first rule now only keeps a bullet from waiting a
-day, it no longer guards a conflict. `ci.yml` also runs on the `merge_group`
-event, so this role can become a GitHub merge queue (a ruleset rule on `main`,
-no workflow change): the queue tests the merged result once and lands it — the
-automated form of the train.
+Since 2026-09-07 `main` has a GitHub **merge queue** (ruleset *Merge queue on
+main*: merge-commit method, `ALLGREEN` grouping, up to five entries per group,
+60 min check timeout; the `internal` team can bypass it — see the last bullet
+below for when that is legitimate)
+and its "require branch up to date" rule is off. This is the automated form of the merge train that used to land
+most of `main` as `Train N: #…`; the hand-driven train is retired.
+
+- **Queue a ready PR** with `gh pr merge <N> --merge --auto`
+  or "Merge when ready" in the UI (GitHub deletes the head branch after the queue merges it (repo setting *Automatically delete head branches*).) The queue creates a temporary branch with
+  `main` + the queued PRs, `ci.yml` runs on that `merge_group` event, and the
+  required checks (`test`, `docker-build`) must pass on the merged result
+  before it lands. A group in which one entry fails is re-formed without it.
+- **Do not update a PR's branch because `main` moved.** BEHIND is the normal
+  state between queue runs; the queue tests the combination.
+- **One approving review gates entry to the queue**, evaluated by the queue
+  itself — ruleset bypass does not apply inside it. For an organization
+  member's PR a clean Devin verdict supplies that approval
+  (`.github/workflows/devin-clean-approves.yml`, added in #2339: approves on "No Issues
+  Found", dismisses its approval when a later verdict lists issues), so the
+  gate is CI green + Devin clean. The approval persists across later pushes,
+  as a human's does under this ruleset — Devin re-reviews only some pushes,
+  so pinning approval to one commit would strand most PRs. An outside collaborator's PR needs a human approval; so does the cut
+  PR (its commits are `github-actions[bot]`'s own, which the bridge cannot
+  self-approve). A blocked PR names that approver.
+- **The cut PR rides the same queue.** Queue it after the feature PRs you
+  want in that version have landed. A fragment merged after the cut PR opened
+  is a new file under `changelog.d/` and does not collide with the cut branch;
+  it rides the next day's cut. A cut PR that *does* conflict with `main` (one
+  cut before fragments existed, or a hand-edited `CHANGELOG.md`) is closed and
+  `daily-cut.yml` re-dispatched — never hand-resolved, since a hand-resolved
+  cut is exactly the collision class the cut PR exists to prevent.
+  `daily-cut.yml` will not open a second cut PR while one is open (it checks
+  for the `release-cut` label first).
+- **Bypassing the queue is the exception, and you say why.** Members of the
+  `internal` team can merge directly (`gh pr merge <N> --merge --admin`, or
+  the "bypass rules" checkbox), which skips the queue and the review rule;
+  classic branch protection still requires `test` and `docker-build` green,
+  so a bypass merge is "not re-tested against current `main`", never
+  "untested". Legitimate reasons: a hotfix, the cut PR (its bot commits can
+  never get the bridge's approval), or a PR Devin never re-reviewed after its
+  last push and so has no approval — Devin re-reviews only some heads. Put the
+  reason in the merge commit or a PR comment. Everything else goes through the
+  queue with `gh pr merge <N> --merge --auto`.
+- **Changing the queue's behaviour** (merge method, group size, timeout) is a
+  ruleset edit (`gh api repos/<owner>/<repo>/rulesets/<id>`), not a per-PR
+  flag; `--merge` on the `gh` command line only has to be *a* method so `gh`
+  runs non-interactively.
 
 ### Post-merge: tag + Release
 
@@ -170,12 +197,14 @@ cd agnes-<topic> && git checkout -b zs/<branch-name>
 #    subprocess timeout) are OK to ignore; verify by reverting your
 #    diff and reproducing on bare main.
 
-# 6. Push branch + open PR + enable auto-merge SQUASH:
+# 6. Push branch + open PR + queue it (the merge queue lands it once the
+#    required checks pass on main + this PR; the queue's own merge method
+#    applies, see § Landing PRs through the merge queue):
 #    git push -u origin HEAD
 #    gh pr create --repo keboola/agnes-the-ai-analyst \
 #      --head <branch> --title "<...>" --body "<...>"
 #    gh pr merge <N> --repo keboola/agnes-the-ai-analyst \
-#      --squash --auto --delete-branch
+#      --merge --auto
 ```
 
 That's it for a feature PR — no version bump, no tag, no Release. The cut
@@ -193,16 +222,22 @@ writes that field, there is no drift to reconcile and no need to cross-check
 
 ### Authoring expectations on the PR
 
-- **Self-PRs** (you're both author and reviewer): GitHub forbids self-approve.
-  If branch protection requires N approving reviews (we don't today —
-  `required_approving_review_count = 0`), you need someone else to approve. With
-  our current 0-review setup, self-PRs can still merge automatically once
-  required CI passes.
+- **Approval to enter the queue.** The ruleset requires one approving review,
+  evaluated by the queue itself, so nobody's bypass helps and GitHub still
+  forbids self-approval. For an organization member's PR the approval comes
+  from Devin's clean verdict (`.github/workflows/devin-clean-approves.yml`,
+  added in #2339): fix what Devin flagged, push, wait for the re-review. The
+  approval persists across later pushes and falls only to a later Devin
+  review that lists issues. An outside
+  collaborator's PR and the cut PR need a person other than the author to
+  approve (`gh pr review <N> --approve`).
 - **Other people's PRs you're taking over**: dismiss any prior
-  CHANGES_REQUESTED reviews (yours or someone else's) before auto-merge can
-  fire. `gh pr review <N> --approve --body "..."` after pushing your fixes.
-- **Devin Review**: not a required check today; runs in parallel and posts a
-  comment. Don't wait on it for merge unless the human reviewer explicitly asks.
+  CHANGES_REQUESTED reviews (yours or someone else's) before the queue will
+  take the PR; after pushing your fixes, wait for Devin's verdict (member PR)
+  or get the human approval.
+- **Devin Review**: not a required status check, but no longer advisory for a
+  member's PR — its verdict IS the approval. Read its findings; a verdict that
+  lists issues keeps the PR out of the queue until the next clean one.
 
 ### CI quirks you WILL hit
 
@@ -214,14 +249,18 @@ writes that field, there is no drift to reconcile and no need to cross-check
   `pass` and `fail` rows, the `fail` row is from an older auto-cancelled SHA.
   Verify with `gh api repos/keboola/agnes-the-ai-analyst/commits/<sha>/check-runs`
   — the raw API distinguishes `cancelled` from `failure` truthfully.
-- **Branch protection's "strict" mode caches cancelled `test` as blocking** even
-  after newer `test` runs succeed. Symptom: `mergeable_state: blocked` despite
-  all required checks green on the latest SHA. Fix: re-run the cancelled
-  `Release` workflow run (`gh run rerun <run-id>`); once its `test` job lands as
-  success, the block clears. We've hit this on PRs #273, #281, #285, #286.
+- **(Historical, pre-2026-09-07) branch protection's "strict" mode cached a
+  cancelled `test` as blocking** even after newer `test` runs succeeded;
+  the fix was to re-run the cancelled `Release` run (`gh run rerun <run-id>`).
+  The strict (up-to-date) rule is off now and the merge queue owns the
+  "tested against current `main`" guarantee, so this block can no longer
+  occur. Kept because PRs #273, #281, #285, #286 in the history reference it.
 - **Required checks** (per branch protection): `test` + `docker-build` only.
   Other workflows (`cli-wheel-clean-install`, `build-and-push`,
-  `Release`-pipeline, Devin Review) are advisory — green/red doesn't gate merge.
+  `Release`-pipeline) are advisory — green/red doesn't gate merge. Devin Review
+  is not a required check either, but its clean verdict is what supplies the
+  approving review an organization member's PR needs to enter the queue (see
+  § Landing PRs through the merge queue).
 - **`enforce_admins: true`** in branch protection means `--admin` flag on
   `gh pr merge` does NOT bypass. Don't try; just fix the underlying block.
 - **A cut PR's CI needs one click before it can merge.** See § A cut PR
@@ -264,16 +303,17 @@ and opening the PR under your own identity produces the *same* diff, and its
 `pull_request` run starts immediately — the queue-for-approval rule keys on
 who opened the PR, not on what the branch contains. 0.97.0 shipped this way.
 
-**The same 405 has a second, unrelated cause: a branch that is behind.**
-Required status checks are evaluated against the CURRENT base, so a PR whose
-`test` and `docker-build` are green — but whose head predates the latest
-`main` — is refused with that identical message, with nothing waiting for
-approval. Tell the two apart by `mergeable_state`, which reads `behind` here
-and `blocked` in the unapproved-run case, and by the checks themselves:
-green-but-stale versus never reported. The fix is to update the branch (merge
-`main` in, or *Update branch*) and let CI re-run against the new base. Worth
-stating because the message names neither cause, so the one that comes to
-mind is whichever you debugged last.
+**Until 2026-09-07 the same 405 had a second, unrelated cause: a branch that
+was behind.** Branch protection's "require branches to be up to date" rule
+evaluated the required checks against the CURRENT base, so a PR whose `test`
+and `docker-build` were green — but whose head predated the latest `main` —
+was refused with that identical message, and the fix was to update the branch.
+That rule is off now and the merge queue tests the merged result itself, so a
+PR reading `mergeable_state: behind` is not refused: queue it. If you still
+see the 405 on a behind PR, the cause is the unapproved-run one above (check
+`blocked` and the never-reported checks), never the staleness. Worth stating
+because the message names neither cause, so the one that comes to mind is
+whichever you debugged last — and this one no longer exists.
 
 **Do not reach for `gh workflow run ci.yml` instead.** It looks like the
 obvious workaround and it is not one. A `workflow_dispatch` run does put
@@ -301,14 +341,13 @@ re-run click, not a second push.
 
 - **Force-pushed and lost auto-merge?** GitHub *usually* preserves auto-merge
   across force-pushes for the same PR; if it cleared, just re-run
-  `gh pr merge <N> --squash --auto --delete-branch`.
-- **A cut PR went stale (merge conflict against a newer `main`)?** The queue
-  wasn't fully flushed before something else merged past it — close the
+  `gh pr merge <N> --merge --auto` to re-queue it.
+- **A cut PR went stale (merge conflict against a newer `main`)?** Close the
   stale cut PR and re-dispatch `daily-cut.yml` rather than resolving the
-  conflict by hand (see § The train-driver role above). Closing the PR
-  leaves its `release-cut/vX.Y.Z` branch behind on the remote; there is
-  nothing to clean up first — the branch is workflow-owned, and the
-  re-dispatch force-pushes over it when it computes the same version.
+  conflict by hand (see § Landing PRs through the merge queue above).
+  Closing the PR leaves its `release-cut/vX.Y.Z` branch behind on the
+  remote; there is nothing to clean up first — the branch is workflow-owned,
+  and the re-dispatch force-pushes over it when it computes the same version.
 - **Wrong version number tagged?** `git tag -d vX.Y.Z && git push --delete
   origin vX.Y.Z` then re-tag against the right SHA. Update the GitHub Release if
   you already created it.

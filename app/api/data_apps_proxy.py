@@ -58,6 +58,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.data_apps import (
     _PREVIEW_COOKIE_NAME,
+    REACHABLE_STATES,
     OwnerNotFoundError,
     _can_view,
     _feature_gate,
@@ -66,6 +67,7 @@ from app.api.data_apps import (
     same_origin_serving_allowed,
     try_acquire_op_lease,
 )
+from app.auth.data_app_viewer import VIEWER_HEADER_PREFIX, build_viewer_headers, viewer_via
 from app.auth.dependencies import _get_db, get_current_user
 from app.auth.rate_limit import limiter as _rate_limiter
 from app.auth.jwt import verify_token
@@ -143,6 +145,7 @@ async def tls_check(request: Request, domain: str = Query(...)):
         raise HTTPException(status_code=404, detail="not_issuable")
     return {"ok": True, "domain": host}
 
+
 # Hop-by-hop headers (RFC 7230 §6.1) plus `host` — stripped in BOTH
 # directions. `host` specifically must not ride through to the upstream
 # (it would carry the caller's original Host, not `agnes-dataapp-<slug>`)
@@ -171,6 +174,12 @@ _HOP_BY_HOP = {
 # headers are never checked against this set — a data app setting its OWN
 # `Set-Cookie` on the way back is legitimate and none of this proxy's business.
 _CREDENTIAL_HEADERS = {"authorization", "cookie"}
+
+# Every inbound header in the `x-agnes-viewer*` family is stripped too, by
+# lowercase PREFIX (`VIEWER_HEADER_PREFIX`), before the proxy adds its own
+# `X-Agnes-Viewer` / `X-Agnes-Viewer-Token` (`app/auth/data_app_viewer.py`).
+# A plain dict → httpx would otherwise emit BOTH the caller's forged copy and
+# ours; stripping first is what makes the header the app receives ours alone.
 
 _TOUCH_DEBOUNCE_TTL_S = 30
 
@@ -481,7 +490,17 @@ def _readiness_poll_url(request: Request, slug: str) -> str:
     return f"{base}/api/data-apps/{slug}/readiness" if base else f"/api/data-apps/{slug}/readiness"
 
 
-def _waking_response(request: Request, slug: str, accepts_json: bool) -> Response:
+def _waking_response(request: Request, slug: str, accepts_json: bool, *, grace_seconds: int) -> Response:
+    """The holding page (or its JSON equivalent).
+
+    ``grace_seconds`` is the page's give-up horizon, decided by the caller
+    because the two reasons for showing this page start their clocks at
+    different moments: a wake this request just triggered starts booting NOW
+    and gets the full window, while a deploy already under way gets only what
+    is left of it (:func:`_remaining_start_grace`). Passing it in — rather
+    than writing a number into the template — is what keeps the page from
+    calling an app "starting" long after this module has stopped.
+    """
     if accepts_json:
         return JSONResponse({"status": "waking"}, status_code=503)
     from app.web.router import templates
@@ -489,7 +508,18 @@ def _waking_response(request: Request, slug: str, accepts_json: bool) -> Respons
     return templates.TemplateResponse(
         request,
         "data_app_waking.html",
-        {"slug": slug, "readiness_url": _readiness_poll_url(request, slug)},
+        {
+            "slug": slug,
+            "readiness_url": _readiness_poll_url(request, slug),
+            "start_grace_seconds": max(0, int(grace_seconds)),
+            # The states this proxy would still serve from. The readiness
+            # probe returns the row's `state` alongside `ready`, so handing
+            # the page the same set the branch table uses lets it stop the
+            # moment a wake FAILS (`_run_wake_fn` writes `error`) instead of
+            # reading a dead app as a slow one and waiting out the whole
+            # grace under "taking longer than usual" (Devin Review on #2336).
+            "reachable_states": sorted(REACHABLE_STATES),
+        },
         status_code=503,
     )
 
@@ -553,6 +583,27 @@ def _within_start_grace(row: dict) -> bool:
     return abs((now - max(stamps)).total_seconds()) < _START_GRACE_SECONDS
 
 
+def _remaining_start_grace(row: dict) -> int:
+    """Seconds of the start grace this row has LEFT, floored at zero.
+
+    The holding page's give-up horizon. :func:`_within_start_grace` answers
+    the same question as a boolean off the same stamps; this returns the
+    remainder, so a viewer arriving late into a deploy is not handed a fresh
+    full window. The server counts from the deploy; a page counting from its
+    own load let every new viewer restart the deadline (Devin Review on
+    #2336).
+
+    No stamps means no provable start time — which :func:`_within_start_grace`
+    reads as "not provably still starting" — so the remainder is zero and the
+    page says so at once instead of waiting out a window it cannot place.
+    """
+    stamps = [s for s in (_as_utc(row.get("last_deploy_at")), _as_utc(row.get("updated_at"))) if s is not None]
+    if not stamps:
+        return 0
+    elapsed = abs((datetime.now(timezone.utc) - max(stamps)).total_seconds())
+    return max(0, int(_START_GRACE_SECONDS - elapsed))
+
+
 def _error_response(row: dict) -> Response:
     return JSONResponse(
         {"detail": "app_error", "state_detail": row.get("state_detail") or ""},
@@ -560,9 +611,10 @@ def _error_response(row: dict) -> Response:
     )
 
 
-async def _proxy(request: Request, slug: str, path: str) -> Response:
+async def _proxy(request: Request, slug: str, path: str, viewer_headers: Optional[dict[str, str]] = None) -> Response:
     """Stream-proxy one request to ``agnes-dataapp-<slug>``'s runtime
-    container.
+    container. ``viewer_headers`` (``build_viewer_headers``) are added after
+    the caller's own `x-agnes-viewer*` headers have been stripped.
 
     Deliberately does NOT use ``async with _upstream_client() as client:
     ...; return StreamingResponse(...)`` (a shape that would close the
@@ -576,7 +628,9 @@ async def _proxy(request: Request, slug: str, path: str) -> Response:
     headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in _CREDENTIAL_HEADERS
+        if k.lower() not in _HOP_BY_HOP
+        and k.lower() not in _CREDENTIAL_HEADERS
+        and not k.lower().startswith(VIEWER_HEADER_PREFIX)
     }
     # A subdomain-origin request (rewritten by
     # app/data_apps_subdomain.py, which stamps this scope marker) serves
@@ -584,6 +638,8 @@ async def _proxy(request: Request, slug: str, path: str) -> Response:
     # unlike the `/apps/<slug>/...` path-prefix form of the same route.
     if not request.scope.get("agnes_data_app_subdomain"):
         headers["X-Forwarded-Prefix"] = f"/apps/{slug}"
+    if viewer_headers:
+        headers.update(viewer_headers)
 
     client = _upstream_client()
     try:
@@ -675,8 +731,13 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
     state = row["state"]
 
     if state == "running":
+        # Minted HERE and nowhere earlier: after RBAC, after the same-origin
+        # gate, and only for a request that is actually going to be served
+        # from the container — a holding page carries no identity. Off the
+        # event loop: the group lookup behind the assertion is a DB read.
+        viewer_headers = await run_in_threadpool(build_viewer_headers, row, user, viewer_via(user, via_preview))
         try:
-            return await _proxy(request, slug, path)
+            return await _proxy(request, slug, path, viewer_headers)
         except (httpx.ConnectError, httpx.ConnectTimeout):
             # A refused connection is not proof the app is broken, and this
             # is a latch: nothing clears `error` except a redeploy, because
@@ -716,9 +777,11 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
                 # through to the sleeping branch's wake rather than recording
                 # an error the caller would have to redeploy away.
                 await _trigger_wake(row)
-                return _waking_response(request, slug, accepts_json)
+                # Wake just triggered: the boot starts now, so the full window.
+                return _waking_response(request, slug, accepts_json, grace_seconds=_START_GRACE_SECONDS)
             if container == "running" and _within_start_grace(row):
-                return _waking_response(request, slug, accepts_json)
+                # Already booting when we got here — only the remainder is left.
+                return _waking_response(request, slug, accepts_json, grace_seconds=_remaining_start_grace(row))
             if container is not None:
                 detail = "container not listening" if container == "running" else f"container {container}"
                 data_apps_repo().set_state(row["id"], "error", detail)
@@ -726,10 +789,13 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
 
     if state == "sleeping":
         await _trigger_wake(row)
-        return _waking_response(request, slug, accepts_json)
+        # Wake just triggered: the boot starts now, so the full window.
+        return _waking_response(request, slug, accepts_json, grace_seconds=_START_GRACE_SECONDS)
 
     if state == "deploying":
-        return _waking_response(request, slug, accepts_json)
+        # The deploy started before this page load; hand over what is left of
+        # its window, not a fresh one per viewer.
+        return _waking_response(request, slug, accepts_json, grace_seconds=_remaining_start_grace(row))
 
     if state in ("stopped", "created"):
         return _not_running_response(slug, state, accepts_json)
@@ -805,6 +871,10 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
 
     _touch(row)
 
+    # Same placement rule as the HTTP handler: after every gate, only for a
+    # handshake that is actually going upstream.
+    viewer_headers = await run_in_threadpool(build_viewer_headers, row, user, viewer_via(user, via_preview))
+
     await websocket.accept()
 
     query = f"?{websocket.url.query}" if websocket.url.query else ""
@@ -812,13 +882,14 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
 
     import websockets
 
-    # No caller headers (incl. `Authorization`/`Cookie`) are forwarded to the
+    # No CALLER headers (incl. `Authorization`/`Cookie`) are forwarded to the
     # upstream handshake at all — same credential-hygiene guarantee as the
-    # HTTP proxy's `_CREDENTIAL_HEADERS` strip, just trivially satisfied here
-    # since this bridge never builds a header dict from `websocket.headers`
-    # in the first place.
+    # HTTP proxy's `_CREDENTIAL_HEADERS` strip, trivially satisfied here since
+    # this bridge never builds a header dict from `websocket.headers`. The
+    # ONLY headers added are the proxy's own viewer identity headers
+    # (`app/auth/data_app_viewer.py`), exactly as on the HTTP path.
     try:
-        async with websockets.connect(upstream_url) as upstream:
+        async with websockets.connect(upstream_url, additional_headers=viewer_headers) as upstream:
 
             async def client_to_upstream() -> None:
                 try:

@@ -264,6 +264,125 @@ def test_detail_page_renders_for_admin_with_deploy_button(web_env):
 
 
 # ---------------------------------------------------------------------------
+# Sharing + data identity (TCRD-291) — the Library's reusable Share dialog,
+# wired onto the data-app detail page, plus the owner/viewer data-identity
+# toggle. `data_identity` is a sibling change to `_serialize()`; these tests
+# also pin that the page renders correctly while that field is still absent
+# from the serialized row.
+# ---------------------------------------------------------------------------
+
+
+def _grant_data_app(slug: str, user_id: str, group_name: str) -> None:
+    """Grant ``user_id`` view access to data app ``slug`` via a fresh group,
+    mirroring ``test_detail_page_for_granted_non_owner_hides_deploy_and_logs``
+    above."""
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    try:
+        gid = UserGroupsRepository(conn).create(name=group_name, description="d")["id"]
+        UserGroupMembersRepository(conn).add_member(user_id, gid, source="admin")
+        ResourceGrantsRepository(conn).create(group_id=gid, resource_type="data_app", resource_id=slug)
+    finally:
+        conn.close()
+
+
+def test_detail_page_owner_sees_share_chip_and_identity_toggle(web_env):
+    """The owner is a manager: the Sharing chip is an interactive control
+    (``data-share-open``) and the hosted, non-draft app offers the data
+    identity toggle."""
+    _create_app_row(slug="ownershare", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/ownershare", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert 'id="dda-vis"' in resp.text
+    assert "data-share-open" in resp.text
+    assert 'data-share-type="data_app"' in resp.text
+    assert 'data-share-id="ownershare"' in resp.text
+    assert 'id="dda-identity"' in resp.text
+    assert 'id="dda-identity-save"' in resp.text
+    # share_dialog.js's assets ride along only when the caller may re-share.
+    assert "share_dialog.js" in resp.text
+
+
+def test_detail_page_granted_viewer_sees_readonly_chip_and_no_toggle(web_env):
+    """A granted non-owner, non-admin viewer sees the visibility chip as a
+    read-out only — no ``data-share-open`` control, and no data-identity
+    toggle (owner/Admin-only)."""
+    _create_app_row(slug="grantedshare", owner_id="owner1", state="running")
+    _grant_data_app("grantedshare", "other1", "dda-share-viewers")
+
+    c = web_env["client"]
+    resp = c.get("/apps/detail/grantedshare", headers=_auth(web_env["other_pat"]))
+    assert resp.status_code == 200
+    assert 'id="dda-vis"' in resp.text
+    assert "data-share-open" not in resp.text
+    assert 'id="dda-identity"' not in resp.text
+    assert 'id="dda-identity-save"' not in resp.text
+    # No control for this caller, so the dialog's own assets are not shipped.
+    assert "share_dialog.js" not in resp.text
+
+
+def test_detail_page_owner_mode_shows_publishing_warning(web_env):
+    """A hosted app defaults to owner-mode data identity (absent field ==
+    ``owner``): the note warns that sharing publishes what the owner's own
+    grants can fetch."""
+    _create_app_row(slug="ownermode", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/ownermode", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    # The RENDERED note, not the whole page: the save script legitimately
+    # carries both texts so it can re-render the note after a mode flip.
+    note = _identity_note(resp.text)
+    assert "Sharing this app publishes what it fetches." in note
+    assert "Each viewer sees only what their own grants allow" not in note
+
+
+def _identity_note(page_html: str) -> str:
+    """Text of the server-rendered ``#dda-identity-note`` paragraph, entities decoded."""
+    import html as _html
+    import re
+
+    m = re.search(r'<p class="dda-identity-note" id="dda-identity-note">(.*?)</p>', page_html, re.S)
+    assert m, "identity note not rendered"
+    return _html.unescape(" ".join(m.group(1).split()))
+
+
+def test_detail_linked_app_share_control_is_admin_only(web_env):
+    """A linked row's synthetic ``system`` owner never matches a real
+    visitor, so a granted non-admin viewer gets the read-only chip while an
+    admin gets the real control -- mirrors the sharing-REST contract."""
+    _create_linked_row(slug="kbc-identity-linked", name="Linked")
+    _grant_data_app("kbc-identity-linked", "other1", "dda-linked-viewers")
+
+    c = web_env["client"]
+    admin_resp = c.get("/apps/detail/kbc-identity-linked", headers=_auth(web_env["admin_pat"]))
+    assert admin_resp.status_code == 200
+    assert "data-share-open" in admin_resp.text
+
+    viewer_resp = c.get("/apps/detail/kbc-identity-linked", headers=_auth(web_env["other_pat"]))
+    assert viewer_resp.status_code == 200
+    assert "data-share-open" not in viewer_resp.text
+    # Linked apps have no hosted lifecycle, so no identity toggle either way.
+    assert 'id="dda-identity"' not in admin_resp.text
+
+
+def test_detail_page_renders_when_data_identity_absent_from_serialized_row(web_env):
+    """`_serialize()` does not (yet) return `data_identity` in this worktree
+    -- the router must default it to 'owner' rather than erroring, and the
+    toggle must reflect that default."""
+    _create_app_row(slug="noidentity", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/noidentity", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert 'id="dda-identity"' in resp.text
+    assert '<option value="owner" selected>' in resp.text
+
+
+# ---------------------------------------------------------------------------
 # Route-collision regression: /apps/detail/{slug} must hit the web detail
 # page, NOT the ingress proxy's `/apps/{slug}/{path:path}` catch-all.
 # ---------------------------------------------------------------------------
@@ -430,3 +549,115 @@ def test_app_publishing_calls_real_access_endpoints():
     # It is the ONE caller that designates its tool as the data-app lister —
     # without the flag the server never projects a targeted run.
     assert "lister: true" in src
+
+
+# ---------------------------------------------------------------------------
+# URL clickability on the detail page — must follow what the proxy would serve
+# ---------------------------------------------------------------------------
+#
+# Only the DETAIL page is exercised here, deliberately. The Library's
+# Artifacts band is the live inventory surface (`/apps` 302s into it whenever
+# the feature is on and the caller has a visible app row), and its rows link to
+# `/apps/detail/<slug>` (`app/web/router.py::library_page`) — so the detail
+# page's URL field is the only place a viewer is offered the app itself.
+# `data_apps.html` keeps the same corrected condition for consistency, but it
+# renders its table only on the fallback path the redirect leaves behind (the
+# caller has nothing visible), where there is no row to assert on.
+#
+# `reachable` answers TWO gates the proxy applies in order, so both are pinned:
+# whether the deployment can serve hosted apps at all, and whether this app's
+# state is one the proxy serves from.
+
+
+def _set_data_apps_config(data_dir, **overrides):
+    """Rewrite the `data_apps` overlay `web_env` wrote and drop the cached
+    config, so a test can vary the serving configuration."""
+    import app.instance_config as instance_config
+
+    cfg = {"enabled": True, **overrides}
+    (data_dir / "state" / "instance.yaml").write_text(yaml.dump({"data_apps": cfg}))
+    instance_config._instance_config = None
+
+
+@pytest.mark.parametrize("state", ["running", "sleeping", "deploying"])
+def test_detail_page_links_the_url_when_the_proxy_would_serve_it(web_env, state):
+    """A sleeping app wakes on request for anyone allowed to view it
+    (``data_apps_proxy.proxy_app``: ``sleeping`` triggers a wake and answers
+    the holding page, ``deploying`` answers it outright), so its URL has to be
+    a link. The page used to test ``state == 'running'`` alone, which left a
+    granted viewer nothing to click on the very states that would have worked
+    — and no way out, since the endpoint that restarts an app is
+    owner/Admin-only.
+    """
+    _set_data_apps_config(web_env["data_dir"], allow_same_origin=True)
+    _create_app_row(slug="wake1", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/wake1", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/wake1/"' in resp.text
+
+
+@pytest.mark.parametrize("state", ["created", "stopped", "error"])
+def test_detail_page_does_not_link_the_url_when_the_proxy_would_refuse(web_env, state):
+    _set_data_apps_config(web_env["data_dir"], allow_same_origin=True)
+    _create_app_row(slug="dead1", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/dead1", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/dead1/"' not in resp.text
+    assert "<code>/apps/dead1/</code>" in resp.text
+
+
+@pytest.mark.parametrize("state", ["running", "sleeping"])
+def test_detail_page_does_not_link_the_url_when_the_deployment_cannot_serve_apps(web_env, state):
+    """``_same_origin_serving_refused`` runs BEFORE the state branches, so on a
+    deployment with neither ``subdomain_base`` nor ``allow_same_origin`` every
+    hosted app is refused with a 403 page — a ``running`` one exactly as
+    readily as a sleeping one. Offering the link there is a lie regardless of
+    state, and this is the configuration ``web_env`` leaves in place by
+    default. (Devin Review on #2336.)
+    """
+    _create_app_row(slug="noserve", owner_id="owner1", state=state)
+    resp = web_env["client"].get("/apps/detail/noserve", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    assert '<a href="/apps/noserve/"' not in resp.text
+    assert "<code>/apps/noserve/</code>" in resp.text
+
+
+def test_detail_page_identity_note_is_about_the_owner_not_the_reader(web_env):
+    """An Admin managing someone else's app must not read "YOUR grants": the
+    app reads data under its OWNER's grants regardless of who is looking at
+    the page (Devin Review on #2383). The note names the owner and reads the
+    same for the owner and for the admin."""
+    _create_app_row(slug="adminview", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    admin_resp = c.get("/apps/detail/adminview", headers=_auth(web_env["admin_pat"]))
+    owner_resp = c.get("/apps/detail/adminview", headers=_auth(web_env["owner_pat"]))
+    import html as _html
+
+    for resp in (admin_resp, owner_resp):
+        assert resp.status_code == 200
+        page = _html.unescape(resp.text)
+        assert "YOUR grants" not in page
+        assert "under your grants" not in page
+        assert "under the app owner's grants (owner@test.local)" in _identity_note(resp.text)
+        assert "runs under the app owner's grants" in page  # the selector label
+
+
+def test_detail_page_identity_script_rerenders_the_note_from_the_response(web_env):
+    """After a successful save the explanatory note must describe the mode the
+    server now holds, not the one the page was rendered with — the script
+    carries both texts and keys them off ``body.data_identity``; a failed
+    save returns before that line, so the old text survives there."""
+    _create_app_row(slug="notelive", owner_id="owner1", state="stopped")
+    c = web_env["client"]
+    resp = c.get("/apps/detail/notelive", headers=_auth(web_env["owner_pat"]))
+    assert resp.status_code == 200
+    html = resp.text
+    assert 'id="dda-identity-note"' in html
+    script = html[html.index('const noteEl = document.getElementById("dda-identity-note")') :]
+    assert "const NOTES = {" in script
+    assert "Sharing this app publishes what it fetches." in script
+    assert "Each viewer sees only what their own grants allow" in script
+    assert "NOTES[body.data_identity]" in script
+    # The re-render happens on the success path only: it sits after the
+    # `!r.ok` early return and before the `catch`.
+    assert script.index("if (!r.ok)") < script.index("NOTES[body.data_identity]") < script.index("} catch (e)")

@@ -97,7 +97,7 @@ import json
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import duckdb
 
@@ -229,6 +229,43 @@ class JobsRepository:
             params.append(kind)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        return self._rows_to_dicts(rows)
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def list_by_idempotency_prefix(
+        self, prefix: str, *, statuses: Optional[Sequence[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Every job whose ``idempotency_key`` starts with ``prefix`` — an
+        EXACT alternative to :meth:`list`'s ``kind``+``status``+``limit``
+        scan for a caller that needs every matching row, not just the most
+        recent ``limit`` of them fleet-wide. Uses ``idx_jobs_idem``, so
+        this stays cheap regardless of how many OTHER jobs of the same
+        kind/status currently sit ahead of these in :meth:`list`'s own
+        ``created_at DESC`` ordering.
+
+        Built for ``connectors.sharepoint.crawler._shard_children_still_
+        live`` (2026-09-07 finding: a busy fleet with 200+ newer shard
+        jobs in the SAME status could make :meth:`list`'s ``limit=200``
+        scan miss an OLDER connection's own still-live child entirely,
+        letting a retrigger un-cancel it): a shard child's idempotency key
+        is deterministically ``corpus-extraction-shard:{connection_id}:
+        {index}``, so this returns exactly (and only) one connection's own
+        shard jobs, however many exist for everyone else. ``prefix`` is
+        escaped for ``LIKE`` wildcards — a value from a real connection id
+        never contains ``%``/``_``, but this is a value, not a trusted
+        identifier, so it is escaped defensively rather than assumed safe.
+        """
+        escaped = self._escape_like(prefix)
+        sql = "SELECT * FROM jobs WHERE idempotency_key LIKE ? ESCAPE '\\'"
+        params: List[Any] = [f"{escaped}%"]
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(statuses)
         rows = self.conn.execute(sql, params).fetchall()
         return self._rows_to_dicts(rows)
 

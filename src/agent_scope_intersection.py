@@ -328,6 +328,15 @@ def _owner_ids_for_type(
     return base
 
 
+#: Public name for :func:`_owner_ids_for_type` — "how far ONE identity's
+#: access reaches for one axis", god-mode-free, package-aware for TABLE.
+#: ``src.grant_intersection.compute_viewer_intersection`` (a hosted data app
+#: querying as its viewer) intersects it for two identities; it is the same
+#: reach ``resolve_agent_authority`` measures per owner/granter, exposed under
+#: a name that does not say "owner".
+identity_ids_for_type = _owner_ids_for_type
+
+
 def agent_scope_filter(
     agent_id: Optional[str],
     mode_field: str,
