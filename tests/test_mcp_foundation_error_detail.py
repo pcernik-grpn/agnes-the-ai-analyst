@@ -94,6 +94,26 @@ def test_message_never_names_the_internal_endpoint():
     assert str(exc.value.request.url).startswith("http://server/")
 
 
+def test_column_not_found_hint_from_query_survives_to_the_model():
+    """The `query` MCP tool's ONLY error path is this helper wrapping a
+    `/api/query` 400 -- so the enriched, table-naming hint
+    `app/api/query.py` builds via `src.query_error_hints` (one definition,
+    shared with the CLI's `agnes query --remote` through the same REST
+    response) must reach the model verbatim, table name and `schema`
+    pointer included, not just the bare DuckDB text."""
+    detail = (
+        'Query error: Binder Error: Table "s" does not have a column named "X"\n\n'
+        "Hint: `orders` (aliased `s`) has no column named 'X'. Run `schema orders` "
+        "(CLI) or the `schema` MCP tool to see its real columns before retrying."
+    )
+    r = _resp(400, json_body={"detail": detail})
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        _raise_for_status_with_detail(r)
+    msg = str(exc.value)
+    assert "orders" in msg
+    assert "schema orders" in msg
+
+
 def test_oversized_detail_is_truncated():
     r = _resp(400, json_body={"detail": "x" * 5000})
     with pytest.raises(httpx.HTTPStatusError) as exc:

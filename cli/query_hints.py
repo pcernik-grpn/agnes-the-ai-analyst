@@ -4,12 +4,32 @@ Used by `agnes query` (CLI) and the stdio MCP `query_local` tool so both
 surfaces explain query_mode='remote' / server_only tables the same way, and
 by `agnes facts neighbors|claims` for the fact-graph query surface (spec
 `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`).
+
+``column_not_found_hint``/``unregistered_table_hint`` are re-exported here
+from ``src.query_error_hints`` — that module is the actual definition (it
+must also be importable from `app/api/query.py`'s server-side error
+handler, which never imports from `cli/`), but this file stays the one
+place CLI/stdio-MCP code reaches for a query "not found" hint, same as
+every other function below.
 """
 
 from __future__ import annotations
 
 import json
 import re
+
+from src.query_error_hints import column_not_found_hint, unregistered_table_hint
+
+__all__ = [
+    "column_not_found_hint",
+    "facts_not_found_hint",
+    "missing_table",
+    "remote_table_hint",
+    "row_scope_note",
+    "row_scope_note_from_header",
+    "sharepoint_connection_not_found_hint",
+    "unregistered_table_hint",
+]
 
 _TABLE_MISS_RE = re.compile(r"Table with name ([A-Za-z_][A-Za-z0-9_]*) does not exist")
 
@@ -81,7 +101,7 @@ def facts_not_found_hint(subject_id: str, *, surface: str = "cli") -> str:
     return base + " Check the id with `agnes facts search <type>`, or ask an admin whether `facts` is enabled here."
 
 
-def row_scope_note(row_scope: "dict | None") -> "str | None":
+def row_scope_note(row_scope: dict | None) -> str | None:
     """Render the `[scope]` disclosure line (table access policies §10) for
     an already-parsed ``row_scope`` envelope
     (``src/access_policy.py::row_scope_payload``), or ``None`` if absent.
@@ -103,7 +123,7 @@ def row_scope_note(row_scope: "dict | None") -> "str | None":
     return f"[scope] {note}"
 
 
-def row_scope_note_from_header(header_value: "str | None") -> "str | None":
+def row_scope_note_from_header(header_value: str | None) -> str | None:
     """Same disclosure line as :func:`row_scope_note`, for a caller that only
     has the raw ``X-Agnes-Row-Scope`` response header.
 

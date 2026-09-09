@@ -9,11 +9,12 @@ import os
 import re
 import threading
 import time
-from typing import Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
+
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 
 # Imported at module level so tests can monkeypatch via
 # `app.api.query._bq_dry_run_bytes` without resolving lazy imports inside
@@ -39,7 +40,6 @@ from connectors.internal.access import (
     find_internal_refs,
     is_internal_table,
 )
-from app.api.access_policy_http import assert_no_empty_policy_mapping
 from src.access_policy import (
     PolicyError,
     PolicyIdentityUnresolvable,
@@ -51,9 +51,10 @@ from src.access_policy import (
     rewrite_sql,
     row_scope_payload,
 )
-from src.audit_helpers import client_kind_from_user
 from src.access_policy_udf import POLICY_UDF_NAMES
+from src.audit_helpers import client_kind_from_user
 from src.db import _open_duckdb, get_analytics_db_readonly
+from src.query_error_hints import column_not_found_hint, unregistered_table_hint
 from src.rbac import get_accessible_tables, require_table_access
 from src.remote_engines import (
     SQL_RESERVED_NAMES,
@@ -1658,10 +1659,7 @@ def _assert_select_only(sql_lower: str) -> None:
         if _reserved in masked_body:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"{_reserved}() is reserved for access-policy bodies and cannot be "
-                    "called from a query"
-                ),
+                detail=(f"{_reserved}() is reserved for access-policy bodies and cannot be called from a query"),
             )
     # SQL-as-a-string table functions (query/query_table/…): their target never
     # appears as a matchable token, so the RBAC name denylist cannot see it.
@@ -2296,6 +2294,18 @@ def execute_query(
         # instead of DuckDB's bare error.
         msg = str(e)
         helpful = _materialized_hint_for_query_error(conn, request.sql, msg)
+        if helpful is None:
+            # Neither shape below hides or replaces DuckDB's own text — an
+            # agent debugging its own SQL still needs the raw diagnostic
+            # (including a `Candidate bindings:` list, when DuckDB gives
+            # one). They only APPEND the one thing DuckDB never says: which
+            # command resolves it. #1974's production finding: 27 failures
+            # in one day on this tool, nearly all a guessed column name,
+            # and DuckDB's own message either names an alias (never the
+            # underlying table) or names no relation at all.
+            _hint = column_not_found_hint(msg, request.sql) or unregistered_table_hint(msg)
+            if _hint:
+                helpful = f"Query error: {msg}\n\n{_hint}"
         _first_table = _first_table_from_sql(request.sql)
         _resource = (f"table:{_first_table}" if _first_table else "adhoc")[:256]
         try:
@@ -2828,7 +2838,7 @@ def _policied_row_over_physical_source(
     return None
 
 
-def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> Optional[dict]:
+def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> dict | None:
     """Registry + RBAC gate for direct ``sf."schema"."table"`` paths.
 
     Snowflake is a DuckDB community extension, so ``sf.*`` resolves locally,
@@ -2893,7 +2903,7 @@ def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> O
     return None
 
 
-def _kbc_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> Optional[dict]:
+def _kbc_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> dict | None:
     """Registry + RBAC gate for direct ``kbc."bucket"."table"`` paths (#1492).
 
     The Keboola DuckDB extension resolves locally (like Snowflake's), but the

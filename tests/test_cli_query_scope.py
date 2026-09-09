@@ -9,7 +9,12 @@ import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
-from cli.query_hints import missing_table, remote_table_hint
+from cli.query_hints import (
+    column_not_found_hint,
+    missing_table,
+    remote_table_hint,
+    unregistered_table_hint,
+)
 
 runner = CliRunner()
 
@@ -48,6 +53,27 @@ class TestMissingTableHelper:
         hint = remote_table_hint("unit_economics", surface="mcp")
         assert "query" in hint
         assert "agnes query --remote" not in hint
+
+
+class TestColumnAndUnregisteredTableHintsReExported:
+    """`column_not_found_hint`/`unregistered_table_hint` are defined once in
+    `src.query_error_hints` (importable from both `app/api/query.py` and this
+    CLI-only wheel), and re-exported here so `cli.query_hints` stays the one
+    place CLI/stdio-MCP code reaches for a query "not found" hint."""
+
+    def test_column_not_found_hint_is_reachable_from_cli_query_hints(self):
+        hint = column_not_found_hint(
+            'Binder Error: Table "s" does not have a column named "X"',
+            "SELECT s.X FROM orders s",
+        )
+        assert hint is not None
+        assert "orders" in hint
+        assert "schema orders" in hint
+
+    def test_unregistered_table_hint_is_reachable_from_cli_query_hints(self):
+        hint = unregistered_table_hint("Catalog Error: Table with name typo_table does not exist!")
+        assert hint is not None
+        assert "catalog" in hint
 
 
 class TestScopeAutoFallback:
