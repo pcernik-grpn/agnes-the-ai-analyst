@@ -53,9 +53,18 @@
      a transparent / background-less zone (e.g. the My Stack search+sort+table
      band, which otherwise reads dark grey because the scrim bleeds through). */
   background: var(--ds-surface);
+  /* `!important` for the same reason `z-index` above carries it: this rule has
+     one class (0,1,0) and loses the cascade to any page rule with two, or to a
+     state rule on the target itself. The chat composer's own focus ring
+     (`box-shadow: … 0 0 0 4px`) did exactly that — /chat autofocuses the
+     composer, so step 1 opened with the spotlight ring simply not drawn, and it
+     appeared only once the reader clicked something else and the input blurred.
+     Unlike the fill above (forcing that would flatten a primary button — see
+     _applySpotlightBacking in tour.js), the ring is the spotlight's entire job
+     and must outrank whatever the target draws for itself. */
   box-shadow:
     0 0 0 6px var(--ds-surface),
-    0 0 0 8px var(--ds-assistant);
+    0 0 0 8px var(--ds-assistant) !important;
   outline: none;
 }
 
@@ -111,6 +120,56 @@
 
 @media (prefers-reduced-motion: reduce) {
   .tour-popover { animation: none; }
+}
+
+/* ── Pending (cross-page hop) ───────────────────────────────────────────────
+   The next step lives on another page, so advancing means a full-page load.
+   The browser keeps painting THIS card until the destination is ready, which
+   on a real instance is seconds — long enough that an unchanged card with a
+   live "Next" reads as a button that doesn't work. tour.js adds this class the
+   moment the hop is committed: actions go dead, and an indeterminate bar along
+   the card's top edge says the press landed and something is happening. No
+   copy changes — the card is about to be replaced, and swapped-in wording
+   would only flash. */
+.tour-popover--pending {
+  cursor: progress;
+}
+
+.tour-popover--pending .tour-btn {
+  pointer-events: none;
+}
+
+/* Dim the roads not taken; the pressed action keeps its full weight so it
+   still reads as the one that was chosen. */
+.tour-popover--pending .tour-btn-end,
+.tour-popover--pending .tour-btn-back {
+  opacity: 0.38;
+}
+
+.tour-popover--pending::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 2px;
+  width: 40%;
+  background: var(--ds-assistant);
+  border-radius: 0 2px 2px 0;
+  animation: tour-pending-sweep 1.1s var(--ds-ease-standard) infinite;
+}
+
+@keyframes tour-pending-sweep {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(250%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Still say "working", just without the travelling bar. */
+  .tour-popover--pending::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.55;
+  }
 }
 
 /* Header strip — Agnes orb + label */
@@ -407,5 +466,5 @@
 [data-theme="paper"] .tour-spotlight {
   box-shadow:
     0 0 0 6px var(--ds-surface),
-    0 0 0 8px var(--ds-assistant);
+    0 0 0 8px var(--ds-assistant) !important;
 }

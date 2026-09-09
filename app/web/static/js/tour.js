@@ -478,6 +478,14 @@ function _startTour(id, steps, index, skipped) {
     // tracked so they are cleaned up on step change and on end, exactly like
     // the anchor's own ring.
     extraSpotlights: [],
+    // Set once a cross-page hop is committed, so the outgoing card — which the
+    // browser keeps painting until the destination is ready — stops acting on
+    // presses. See _gotoStep.
+    navigating: false,
+    // Targets whose transparent background we filled so the scrim cannot show
+    // through them, with the inline value to put back — see
+    // _applySpotlightBacking.
+    backed: [],
   };
   _showStep(index);
 }
@@ -522,6 +530,16 @@ function _applyExtraSpotlights(step, anchor) {
     // Never double-ring the anchor (it already has one, and removing the class
     // on step change would then be order-dependent).
     if (!el || el === anchor) continue;
+    // A ring nobody can see teaches nothing. `_visibleMatch` only proves the
+    // element is LAID OUT, not that it is in the viewport — and centring the
+    // anchor routinely scrolls a second target clean off screen (the Library's
+    // "In stack only" filter ends up ~490px above the fold once the page has
+    // scrolled to a row's Add button). Ringing it there costs the reader a
+    // highlight they never find, so check the rect the reader is actually
+    // looking at. Called after the anchor scroll has landed for that reason.
+    const r = el.getBoundingClientRect();
+    if (r.bottom <= 0 || r.top >= window.innerHeight
+        || r.right <= 0 || r.left >= window.innerWidth) continue;
     el.classList.add('tour-spotlight');
     _active.extraSpotlights.push(el);
   }
@@ -531,6 +549,75 @@ function _clearExtraSpotlights() {
   if (!_active || !_active.extraSpotlights) return;
   for (const el of _active.extraSpotlights) el.classList.remove('tour-spotlight');
   _active.extraSpotlights = [];
+}
+
+// Make sure a ringed target actually paints something of its own.
+//
+// `.tour-spotlight`'s `z-index: 9010 !important` does put the anchor above the
+// 9000 scrim, and the ring and its white halo paint at full brightness — but
+// only what the ELEMENT ITSELF paints gets lifted. The rule tries to guarantee
+// an opaque box with `background: var(--ds-surface)`, and that declaration is
+// not `!important`, so any page rule with two classes beats it: `.library-page
+// .lib-vis--editable { background: transparent }` (0,2,0) over `.tour-spotlight`
+// (0,1,0). The anchor then has NOTHING of its own to paint, the scrim-dimmed
+// page shows straight through it, and the reader gets a greyed-out control
+// sitting inside a bright ring — highlighted and disabled-looking at once.
+//
+// Fixed by writing the fill as an INLINE style, which outranks any stylesheet
+// rule that isn't `!important`, and only on targets whose computed background
+// is fully transparent. Three earlier attempts were each worse:
+//
+//   • `background: … !important` in tour.css repaints every anchor that
+//     legitimately HAS a background — `#lib-new-btn` and `[data-ag-new]` are
+//     primary blue buttons, and both already measured correct.
+//   • A rectangular hole cut in the scrim leaves artefacts wherever the anchor
+//     is not a rectangle: the chat composer is a pill, so its bounding-box
+//     corners showed as four bright notches outside the rounded edge.
+//   • A separate plate element behind the target has no fixed geometry problem,
+//     but it OUTLIVES its target. Clicking "Add to my agents" — which this very
+//     step invites — re-renders the row, and the plate was left behind as an
+//     empty white pill floating over the page.
+//
+// Painting through the element's own `background-color` has none of those
+// failure modes: it is exactly the element's shape, it moves when the element
+// moves, and it disappears when the element does.
+function _applySpotlightBacking() {
+  if (!_active) return;
+  const els = [_active.spotlight].concat(_active.extraSpotlights || []).filter(Boolean);
+  for (const el of els) {
+    if (_active.backed.some((entry) => entry.el === el)) continue;
+    if (!_isFullyTransparent(getComputedStyle(el).backgroundColor)) continue;
+    // Remember the author's own inline value (usually '') so ending the tour
+    // puts the element back exactly as it was found.
+    _active.backed.push({ el, prev: el.style.backgroundColor });
+    el.style.backgroundColor = 'var(--ds-surface)';
+  }
+}
+
+function _clearSpotlightBacking() {
+  if (!_active || !_active.backed) return;
+  for (const { el, prev } of _active.backed) el.style.backgroundColor = prev;
+  _active.backed = [];
+}
+
+// Only a FULLY transparent background needs backing. A semi-transparent one is
+// left alone: overriding it would change a colour the page chose on purpose,
+// and the dimming it picks up is far less wrong than that.
+//
+// Read the alpha CHANNEL, never the last number in the string. `rgb(0, 0, 0)`
+// is opaque black and ends in ", 0)" — a tail match would call it transparent
+// and repaint a legitimately black control surface-white.
+function _isFullyTransparent(color) {
+  if (!color) return true;
+  if (color === 'transparent') return true;
+  // color(srgb r g b / a) and any other slash-separated alpha.
+  const slash = /\/\s*([\d.]+)(%?)\s*\)\s*$/.exec(color);
+  if (slash) return parseFloat(slash[1]) === 0;
+  // rgba()/hsla() carry alpha as a fourth comma-separated component; rgb() and
+  // hsl() carry none at all and are therefore opaque.
+  if (!/^(rgba|hsla)\(/i.test(color)) return false;
+  const parts = color.slice(color.indexOf('(') + 1, color.lastIndexOf(')')).split(',');
+  return parts.length === 4 && parseFloat(parts[3]) === 0;
 }
 
 // Open the collapsed container that HOLDS the anchor.
@@ -654,6 +741,10 @@ function _showStep(index) {
     _active.liftedAncestor.classList.remove('tour-lifts-ancestor');
     _active.liftedAncestor = null;
   }
+  // Put the previous step's targets back the way they were, along with its
+  // rings. A step whose anchor takes a frame or two to resolve would otherwise
+  // leave the last one filled while nothing points at it any more.
+  _clearSpotlightBacking();
 
   _active.index = index;
 
@@ -710,15 +801,13 @@ function _renderStep(index, anchor) {
       stackingAncestor.classList.add('tour-lifts-ancestor');
       _active.liftedAncestor = stackingAncestor;
     }
-  }
 
-  // Ring anything else the step is teaching. Some steps explain a CONCEPT that
-  // two controls between them express — "in stack" is what the filter names and
-  // what the Add button does — and one ring around one of them leaves the reader
-  // to guess which half of the sentence they are looking at. These take the same
-  // ring but never the popover: a card can only point at one place, and it
-  // points at the control the copy asks you to click.
-  _applyExtraSpotlights(step, anchor);
+    // Back the target as soon as the ring goes on. The settle callback below
+    // runs on requestAnimationFrame, which a browser pauses in a hidden or
+    // background tab — waiting only for it leaves the target dimmed for as
+    // long as the tab stays hidden.
+    _applySpotlightBacking();
+  }
 
   // Keep the resume record in sync with the step actually on screen (not just
   // cross-page hops), so a reload mid-tour resumes here — and re-stamp its
@@ -740,6 +829,19 @@ function _renderStep(index, anchor) {
   _waitForScrollSettle(anchor, () => {
     if (_active && _active.index === index) {
       _ensureAnchorVisible(anchor);
+      // Ring anything else the step is teaching. Some steps explain a CONCEPT
+      // that two controls between them express — "in stack" is what the filter
+      // names and what the Add button does — and one ring around one of them
+      // leaves the reader to guess which half of the sentence they are looking
+      // at. These take the same ring but never the popover: a card can only
+      // point at one place, and it points at the control the copy asks you to
+      // click.
+      //
+      // Applied HERE, not before the scroll: `_ensureAnchorVisible` above can
+      // jump the page several hundred pixels to bring the anchor into view, and
+      // an extra target measured before that jump gets ringed off screen.
+      _applyExtraSpotlights(step, anchor);
+      _applySpotlightBacking();
       _positionPopover(popover, anchor, step.centered);
     }
   });
@@ -968,6 +1070,13 @@ function _buildPopover(step, index, total) {
 // recurse on the current page and blow through every cross-page step to the end.
 function _gotoStep(nextIndex) {
   if (!_active) return;
+  // A cross-page hop is already under way — the document is being replaced and
+  // this card is a ghost. Ignore anything it emits. Without this, a second
+  // press during the load re-fires the hop, and a press that lands just after
+  // the destination has painted advances the FRESHLY RESUMED tour instead:
+  // three impatient presses on "Next" walked a reader from step 2 to step 5,
+  // skipping the two steps in between. See _markPopoverPending.
+  if (_active.navigating) return;
   const { id, steps } = _active;
   if (nextIndex >= steps.length) { _endTour(true); return; }
 
@@ -975,12 +1084,32 @@ function _gotoStep(nextIndex) {
   if (!pathMatches(nextStep.page, window.location.pathname)) {
     // Cross-page: persist progress (as pending, NOT "seen" — the tour isn't
     // done) + navigate. resumePendingTour resumes it on the destination page.
+    //
+    // Acknowledge the press BEFORE navigating. The browser keeps painting this
+    // page until the destination is ready, so between the click and that paint
+    // the reader is looking at an unchanged card with a live-looking "Next" —
+    // for as long as the destination takes to load. On a real instance that is
+    // seconds, and it reads as a dead button, not as a wait ("Agnes is showing
+    // me around but won't let me click next here").
+    _active.navigating = true;
+    _markPopoverPending();
     stashPending(id, nextIndex, _active.skipped);
     window.location.href = nextStep.page;
     return;
   }
 
   _showStep(nextIndex);
+}
+
+// Put the card into its "working on it" state: actions dead, progress bar
+// running. Used for the one transition the engine cannot make instant — a
+// full-page navigation to the next step's page.
+function _markPopoverPending() {
+  const pop = _active && _active.popover;
+  if (!pop) return;
+  pop.classList.add('tour-popover--pending');
+  pop.setAttribute('aria-busy', 'true');
+  for (const btn of pop.querySelectorAll('button')) btn.disabled = true;
 }
 
 function _advanceStep() {
@@ -999,6 +1128,7 @@ function _endTour(markSeenNow) {
     _active.spotlight.classList.remove('tour-spotlight');
   }
   _clearExtraSpotlights();
+  _clearSpotlightBacking();
   if (_active.liftedAncestor) {
     _active.liftedAncestor.classList.remove('tour-lifts-ancestor');
   }
@@ -1096,8 +1226,28 @@ function _positionPopover(popover, anchor, centered) {
   let top = popH <= spaceBelow ? rect.bottom + POPOVER_GAP : rect.top - POPOVER_GAP - popH;
   top = Math.max(VIEWPORT_PAD, Math.min(top, vh - popH - VIEWPORT_PAD));
 
-  // Horizontal: align to anchor left, clamped into viewport.
+  // Horizontal: align to the anchor's left edge — right for an anchor with room
+  // to its right, actively wrong for one near the right edge.
+  //
+  // There the clamp slides the card back inside the viewport and parks it
+  // directly beneath the anchor's own column. On /library that is a table whose
+  // last two columns are the controls these steps are ABOUT, repeated per row:
+  // "Put it in your stack" says "click Add on a row" while the card covers
+  // eight Add buttons, and "Share what turns out to be useful" says "every row
+  // shows who can see it" while it covers eight sharing badges. The one thing a
+  // coach-mark owes the reader is a clear view of what it is describing.
+  //
+  // So when the card cannot start at the anchor's left edge without clamping —
+  // which is exactly the "anchor is near the right edge" signal — put it BESIDE
+  // the anchor, to its left, and the column stays readable top to bottom. Only
+  // if there isn't room for that does it fall back to the old clamp.
   let left = rect.left;
+  if (left + popW + VIEWPORT_PAD > vw) {
+    const beside = rect.left - POPOVER_GAP - popW;
+    left = beside >= VIEWPORT_PAD
+      ? beside
+      : Math.max(VIEWPORT_PAD, vw - popW - VIEWPORT_PAD);
+  }
   left = Math.max(VIEWPORT_PAD, Math.min(left, vw - popW - VIEWPORT_PAD));
 
   popover.style.top = `${top}px`;
@@ -1119,10 +1269,29 @@ function _onKeyDown(e) {
 
 let _listenersAttached = false;
 
+// Coming BACK to a page we hopped away from restores it whole from the
+// back/forward cache — same DOM, same module state — so `navigating` and the
+// card's pending look survive a navigation that, from the reader's point of
+// view, was undone. Without this the restored tour is frozen: the card sits
+// there greyed out and `_gotoStep` refuses every press.
+function _onPageShow(e) {
+  if (!e.persisted || !_active || !_active.navigating) return;
+  _active.navigating = false;
+  const pop = _active.popover;
+  if (!pop) return;
+  pop.classList.remove('tour-popover--pending');
+  pop.removeAttribute('aria-busy');
+  for (const btn of pop.querySelectorAll('button')) btn.disabled = false;
+  // "Back" is disabled on the first step by _buildPopover, not by the hop.
+  const back = pop.querySelector('.tour-btn-back');
+  if (back && _active.index === 0) back.disabled = true;
+}
+
 function _attachListeners() {
   if (_listenersAttached) return;
   window.addEventListener('resize', _onReflow, { passive: true });
   window.addEventListener('scroll', _onReflow, { passive: true });
+  window.addEventListener('pageshow', _onPageShow);
   document.addEventListener('keydown', _onKeyDown);
   _listenersAttached = true;
 }
@@ -1130,6 +1299,7 @@ function _attachListeners() {
 function _removeListeners() {
   window.removeEventListener('resize', _onReflow);
   window.removeEventListener('scroll', _onReflow);
+  window.removeEventListener('pageshow', _onPageShow);
   document.removeEventListener('keydown', _onKeyDown);
   _listenersAttached = false;
 }
