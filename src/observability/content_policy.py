@@ -117,20 +117,45 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def _workloads(value: Any) -> tuple[tuple[str, ...], list[str]]:
+def _workloads(value: Any) -> tuple[tuple[str, ...], list[str], bool]:
     """The ``workloads`` allowlist, validated against the spec vocabulary.
 
-    An entry the vocabulary does not know is dropped rather than kept — a
-    typo silently expanding "only these workloads" into "everything" would
-    make the field lie about what it does. The warning rides the SAME
-    ``warnings`` list every other malformed field uses, surfaced once at
-    startup rather than on every read.
+    Returns ``(allowlist, warnings, disable_export)``. Absent or an empty
+    list means "every workload" (spec default) and is NOT a failure — the
+    field was simply not narrowed. A value that WAS specified but contains
+    nothing the vocabulary recognizes (a typo-only list, an unparseable
+    scalar, a mapping, a number, ...) is a different case: silently falling
+    back to "every workload" there would let a typo widen content export to
+    everything, so ``disable_export`` tells the caller to force ``mode`` to
+    ``off`` instead of failing open. A bare string is accepted as shorthand
+    for a one-element (or comma-separated multi-element) list, since that is
+    the most likely thing an operator types by hand.
+
+    A recognized-but-unknown ENTRY inside an otherwise-valid list is still
+    just dropped with a warning (existing behaviour) — the allowlist stays
+    useful as long as at least one entry survived.
     """
-    if not isinstance(value, (list, tuple)):
-        return (), []
+    if value is None:
+        return (), [], False
+    if isinstance(value, str):
+        if not value.strip():
+            return (), [], False
+        items: list[Any] = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        bad_type_warning = (
+            "observability.content_export.workloads must be a list (or comma-separated string) of "
+            f"workload names; got {type(value).__name__}, content export disabled"
+        )
+        return (), [bad_type_warning], True
+
+    if not items:
+        return (), [], False
+
     out: list[str] = []
     warnings: list[str] = []
-    for item in value:
+    for item in items:
         name = str(item).strip()
         if not name:
             continue
@@ -139,7 +164,12 @@ def _workloads(value: Any) -> tuple[tuple[str, ...], list[str]]:
             continue
         if name not in out:
             out.append(name)
-    return tuple(out), warnings
+
+    if not out:
+        warnings.append("observability.content_export.workloads has no valid entry; content export disabled")
+        return (), warnings, True
+
+    return tuple(out), warnings, False
 
 
 def load_content_export_policy(config: Mapping[str, Any] | None = None) -> ContentExportPolicy:
@@ -169,7 +199,7 @@ def load_content_export_policy(config: Mapping[str, Any] | None = None) -> Conte
     basis = _text(block.get("basis"))
     approved_by = _text(block.get("approved_by"))
     approved_at = _text(block.get("approved_at"))
-    workloads, workload_warnings = _workloads(block.get("workloads"))
+    workloads, workload_warnings, workloads_disable_export = _workloads(block.get("workloads"))
     warnings: list[str] = list(workload_warnings)
 
     mode = requested
@@ -184,6 +214,12 @@ def load_content_export_policy(config: Mapping[str, Any] | None = None) -> Conte
         mode = "off"
     if mode != "off" and placement not in PLACEMENTS:
         warnings.append(f"unknown observability.content_export.placement {placement!r}; exporting sizes only")
+        mode = "off"
+    # `workloads` specified but nothing in it survived validation (a typo-only
+    # list, an unparseable scalar, a mapping, ...) is fail-closed the same way
+    # an unknown mode/placement is: never widen export to "everything" because
+    # the narrowing field was broken.
+    if workloads_disable_export:
         mode = "off"
 
     if mode == "off" and os.environ.get(DEPRECATED_ENV_VAR, "").strip():
