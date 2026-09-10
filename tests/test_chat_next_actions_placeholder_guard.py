@@ -96,6 +96,38 @@ def test_empty_and_missing_text_are_not_flagged():
     assert _check([""]) == [False]
 
 
+def test_comparison_syntax_is_not_flagged():
+    """Bracket/angle syntax alone is not proof of an unfilled placeholder —
+    this product is an analytics chat, and comparison phrasing in a
+    suggested action is entirely ordinary. The old `<[^<>]+>` pattern
+    matched clear across `<10 and >10` (everything between the first `<`
+    and the first `>`), which would have taken one-click submission away
+    from a perfectly answerable follow-up."""
+    results = _check(
+        [
+            "Compare customers with revenue <10 and >10",
+            "Filter for score <5 or >95",
+        ]
+    )
+    assert results == [False, False]
+
+
+def test_bracketed_citation_marker_is_not_flagged():
+    """`[1]` is a citation/footnote marker, not a fill-in-the-blank slot —
+    digits inside brackets read as a reference, never as an unfilled
+    template."""
+    (r,) = _check(["See the finding in [1] for details"])
+    assert r is False
+
+
+def test_literal_bracketed_proper_name_is_not_flagged():
+    """A literal, already-filled-in name in brackets must not be mistaken
+    for a placeholder just because it is bracketed — only lowercase,
+    template-shaped content (`[name]`, `[real name]`) reads as unfilled."""
+    (r,) = _check(["Draft a renewal quote for [Acme Corp]"])
+    assert r is False
+
+
 # ── structural pin: the click handler must consult the guard ───────────────
 
 
@@ -116,6 +148,24 @@ def test_render_next_actions_click_handler_consults_the_guard():
     # The composer must still receive the text (pre-fill, not drop) — the
     # user still benefits from the chip, they just have to complete it.
     assert "ta.value = action" in fn
+
+
+def test_guarded_branch_dispatches_input_event_before_returning():
+    """A programmatic `ta.value = action` does not fire the textarea's own
+    `input` listener — the one that owns autosizing, prompt-history reset,
+    and slash-menu sync. Reproduced live: open the slash menu with `/`,
+    then click a placeholder chip — the text is replaced but the menu stays
+    open and the textarea keeps its old height. The guarded branch must
+    dispatch that event itself, after the assignment and before its own
+    early return, so the existing synchronisation path runs instead of a
+    second, duplicated update here."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
+    guard_pos = fn.index("_hasUnfilledPlaceholder(action)")
+    # The guarded branch's own `return;` — the first one after the guard.
+    guard_return_pos = fn.index("return;", guard_pos)
+    dispatch_pos = fn.index('dispatchEvent(new Event("input"', guard_pos)
+    assert guard_pos < dispatch_pos < guard_return_pos
 
 
 def test_extract_next_actions_does_not_drop_placeholder_actions():

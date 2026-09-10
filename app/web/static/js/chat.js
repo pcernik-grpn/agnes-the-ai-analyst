@@ -1687,7 +1687,18 @@ const _NEXT_ACTIONS_MAX = 3;
 //: remove a genuinely useful suggestion; `renderNextActions`'s click
 //: handler is the one place that needs to know, since pre-filling the
 //: composer without auto-submitting still gives the reader the shortcut.
-const _PLACEHOLDER_RE = /\[[^\]]*\]|<[^<>]+>|\{\{[^}]*\}\}|\bTBD\b/i;
+//:
+//: The `[...]`/`<...>` branches deliberately require lowercase-letters-
+//: and-spaces-only content (no digits, no uppercase, case-sensitive — no
+//: `/i` flag). That is what tells a template slot apart from ordinary
+//: bracket/angle usage this product sees constantly: a citation marker
+//: (`[1]`), a literal proper name someone already filled in (`[Acme
+//: Corp]`), and — the case that actually broke — comparison phrasing
+//: (`revenue <10 and >10`), which the old permissive `<[^<>]+>` matched
+//: clear across as one fake placeholder. `{{...}}` and `TBD` stay
+//: permissive/literal since neither collides with anything this chat
+//: legitimately produces.
+const _PLACEHOLDER_RE = /\[[a-z][a-z ]*\]|<[a-z][a-z ]*>|\{\{[^}]*\}\}|\bTBD\b/;
 
 function _hasUnfilledPlaceholder(text) {
   return _PLACEHOLDER_RE.test(text || "");
@@ -1851,6 +1862,14 @@ function renderNextActions(bubble, actions, pending = false) {
         // guaranteed dead turn, see `_PLACEHOLDER_RE`). The chip still did
         // its job: the composer is pre-filled, cursor focused, one edit
         // away from send.
+        //
+        // The assignment above is programmatic and does not fire the
+        // textarea's own "input" listener — the one that owns autosizing,
+        // prompt-history reset, and slash-menu sync — so a placeholder chip
+        // clicked while e.g. the slash menu was open left the menu open and
+        // the box at its old height. Dispatch it ourselves so that one
+        // synchronisation path runs instead of a second, duplicated one here.
+        ta.dispatchEvent(new Event("input", { bubbles: true }));
         return;
       }
       const form = $("chat-form");
