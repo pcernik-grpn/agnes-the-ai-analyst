@@ -31,9 +31,12 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from src.mcp_tooling import (
+    compact_graph_result,
+    compact_listing,
     compact_search_results,
     ensure_output_size,
     ensure_query_output_size,
+    paginate_text_response,
     progressive_tool,
 )
 
@@ -1002,13 +1005,20 @@ def register_foundation_tools(
         The file list is paginated, not exhaustive — a crawled collection can
         hold thousands of files, far more than fits in a model's context.
         This returns at most ``limit`` files starting at ``offset``; read
-        ``files_total`` (the true count, after any ``q`` filter) and
-        ``files_truncated`` (``files_total`` greater than the files returned)
-        before treating ``files`` as the whole collection. When
-        ``files_truncated`` is true, call again with
-        ``offset=<this call's offset + len(files)>`` (or a larger ``limit``,
-        capped at 200 server-side) to reach the rest — ``files_limit`` and
-        ``files_offset`` on the response say exactly what page you just saw.
+        ``files_total`` (the true count, after any ``q`` filter) before
+        treating ``files`` as the whole collection. ``files_next_offset`` is
+        the exact offset to pass next — ``null`` once nothing remains,
+        otherwise call again with ``offset=files_next_offset`` (same
+        ``limit``). Prefer it over hand-computing ``offset + len(files)``:
+        it is correct whether more files exist beyond this page
+        (``files_truncated``) OR this page itself was too large for the tool
+        output budget and had files dropped from its own tail — two
+        different reasons that both mean "there is more to fetch", and
+        ``files_truncated`` alone only ever reports the first one (it is
+        computed on the page BEFORE compaction, so it can read false on the
+        very last page even though that page was itself compacted).
+        ``files_limit`` and ``files_offset`` say exactly what page you just
+        saw.
 
         ``q`` filters files by a case-insensitive SUBSTRING match over the
         filename OR path — this is NOT the whole-word content search
@@ -1056,7 +1066,39 @@ def register_foundation_tools(
         detail["files_truncated"] = total > (effective_offset + len(files))
         detail["files_limit"] = page.get("limit", limit)
         detail["files_offset"] = effective_offset
-        return detail
+        # A page's own SIZE can exceed the tool output budget even though
+        # `limit` already bounds its COUNT — a handful of files stuck with a
+        # long `processing_detail` error is enough (measured on a production
+        # instance: eight oversized `collection_get` calls in one day, every
+        # one already carrying an explicit `limit`). Distinct from
+        # `files_truncated` above (more files exist beyond this page) — this
+        # is "this page itself didn't fit" and never claims the two mean the
+        # same thing.
+        result = compact_listing(
+            detail,
+            "collection_get",
+            list_field="files",
+            text_fields=("processing_detail",),
+            envelope_fields=("description",),
+            shortened_note="{shortened} of {total} files in this page carry a shortened processing_detail",
+            dropped_note=(
+                "{dropped} of {total} files in this page were dropped for size — see "
+                "`files_next_offset` on this response to continue exactly where this page left off"
+            ),
+            next_step="lower `limit`, or narrow with `q`.",
+            item_noun="file",
+        )
+        # The offset to continue from, accounting for whatever ACTUALLY came
+        # back in `files` — whether it is shorter than `limit` because the
+        # server ran out of files (`files_truncated`) or because compaction
+        # above dropped some for size. `offset + limit` (same reasoning as
+        # `files_truncated`'s own clamp comment) would silently re-serve
+        # files already returned when compaction shortened this page; this
+        # is why it is computed from the FINAL, possibly-compacted list.
+        kept_files = result.get("files", [])
+        more_remains = total > (effective_offset + len(kept_files))
+        result["files_next_offset"] = (effective_offset + len(kept_files)) if more_remains else None
+        return result
 
     @tool(read_only=True)
     async def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict:
@@ -1214,7 +1256,9 @@ def register_foundation_tools(
         (any authenticated user; admins see everything). A model with no
         linked Data Package yet is invisible here — ask an admin to link
         it to one you have access to. Use `semantic_model_get` with a
-        matching result's `slug` to read the full document.
+        matching result's `slug` to read the full document — this tool
+        never carries it (see ``truncated``/``truncated_note`` below if the
+        match list itself still had to be shortened).
 
         Args:
             query: Substring to match against slug, name, or description.
@@ -1228,29 +1272,64 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            return r.json()
+            result = r.json()
+        if isinstance(result, dict) and isinstance(result.get("models"), list):
+            # Each row carries the model's WHOLE Ossie document
+            # (`document`/`document_json`) — never needed for a search hit
+            # (this tool's own docstring points a match at
+            # `semantic_model_get` for that), and a handful of matches on an
+            # ordinary word could otherwise run to hundreds of thousands of
+            # characters before the budget check below even sees them.
+            result["models"] = [
+                {field: value for field, value in m.items() if field not in ("document", "document_json")}
+                if isinstance(m, dict)
+                else m
+                for m in result["models"]
+            ]
+        return compact_listing(
+            result,
+            "semantic_model_search",
+            list_field="models",
+            text_fields=("description",),
+            envelope_fields=("query",),
+            shortened_note="{shortened} of {total} models carry a shortened description",
+            dropped_note="{dropped} of {total} models were dropped — pass k={kept} next time to stay under budget",
+            next_step="call `semantic_model_get(slug=...)` for a match's full document; narrow `query` or lower `k`.",
+            item_noun="model",
+        )
 
     @tool(read_only=True)
-    async def semantic_model_get(slug: str) -> dict:
+    async def semantic_model_get(slug: str, offset: int = 0) -> dict:
         """Read one semantic model's full Ossie document, byte-for-byte.
 
         RBAC tier matches `semantic_model_search` — a Data Package grant,
         not admin-only. Use `semantic_model_search` first if you don't
         already know the slug.
 
-        The response also carries `content_hash` — sha256 of `document`,
-        the same value every other semantic-layer surface calls
-        `content_hash` — so a caller that must pin *which* revision it read
-        (a skill citing provenance, an agent comparing against a cached
-        copy) doesn't need to hash the document itself. Read from the
-        export endpoint's `ETag` response header (issue #2153); falls back
-        to hashing the response body when an older server sends no `ETag`
-        (export is byte-for-byte, so the two are always equal). `updated_at`
-        (ISO-8601) is included only when the server's `X-Semantic-Model-
-        Updated-At` header is present.
+        The response also carries `content_hash` — sha256 of the FULL
+        document, never just the page returned here — the same value every
+        other semantic-layer surface calls `content_hash` — so a caller
+        that must pin *which* revision it read (a skill citing provenance,
+        an agent comparing against a cached copy) doesn't need to hash the
+        document itself. Read from the export endpoint's `ETag` response
+        header (issue #2153); falls back to hashing the response body when
+        an older server sends no `ETag` (export is byte-for-byte, so the
+        two are always equal). `updated_at` (ISO-8601) is included only
+        when the server's `X-Semantic-Model-Updated-At` header is present.
+
+        `document` is paginated like `collection_file_read`: at most ~20k
+        characters per call. `total_chars` says up front how large the full
+        document is; `truncated: true` with a non-null `next_offset` means
+        you are holding a PREFIX — call again with `offset=next_offset` to
+        keep reading. A document within the page size (the common case)
+        still carries `total_chars`/`next_offset` for consistency, just
+        with `truncated: false` and `next_offset: null`.
 
         Args:
             slug: Model slug, e.g. from a `semantic_model_search` result.
+            offset: Character offset into `document` to read from — `0`
+                (the default) for the start, the previous response's
+                `next_offset` to continue.
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
@@ -1259,7 +1338,8 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            result: dict[str, Any] = {"slug": slug, "document": r.text}
+            full_text = r.text
+            result: dict[str, Any] = {"slug": slug}
             etag = r.headers.get("etag")
             if etag:
                 # Strip the RFC 7232 quoting, tolerating a weak validator
@@ -1270,7 +1350,26 @@ def register_foundation_tools(
             updated_at = r.headers.get("x-semantic-model-updated-at")
             if updated_at:
                 result["updated_at"] = updated_at
-            return result
+
+        def _assemble(page: dict) -> dict:
+            out = {
+                **result,
+                "document": page["text"],
+                "offset": page["offset"],
+                "next_offset": page["next_offset"],
+                "total_chars": page["total_chars"],
+                "truncated": page["truncated"],
+            }
+            if page["truncated"]:
+                out["truncated_note"] = (
+                    f"semantic_model_get: the document is {page['total_chars']:,} characters, over the tool "
+                    f"output budget — this call returned offset {page['offset']}-"
+                    f"{page['offset'] + len(page['text'])}. Call again with offset={page['next_offset']} to "
+                    "keep reading."
+                )
+            return out
+
+        return paginate_text_response(full_text, offset, _assemble)
 
     @tool(read_only=True)
     async def validate_semantic_query(
@@ -1803,11 +1902,14 @@ def register_foundation_tools(
                 `fact_claims` call per edge.
 
         Returns ``{"nodes": [...], "edges": [{..., "claims"?}], "truncated":
-        {"depth", "fanout", "result", "claims"?}}``. Errors for a
-        `subject_id` that does not exist OR has no readable claim —
-        indistinguishable from your point of view on purpose (design doc §5
-        rule 2); re-check the id with `fact_search` rather than treating
-        this as a permission signal.
+        {"depth", "fanout", "result", "claims"?, "output"?}}`` — `output`
+        (present only when true) means the tool output budget, not the
+        server-side traversal cap, forced edges out of THIS response
+        (`truncated_note` says exactly what and how many); narrow the same
+        way as `result`. Errors for a `subject_id` that does not exist OR
+        has no readable claim — indistinguishable from your point of view
+        on purpose (design doc §5 rule 2); re-check the id with
+        `fact_search` rather than treating this as a permission signal.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
@@ -1816,7 +1918,7 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         try:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 facts_repo().neighbors,
                 caller,
                 subject_id,
@@ -1828,6 +1930,18 @@ def register_foundation_tools(
             )
         except FactNotFound:
             raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
+        return compact_graph_result(
+            result,
+            "fact_neighbors",
+            next_step=(
+                "Lower `limit`/`fanout`, pass `edge_types` to narrow the traversal, or call "
+                "`fact_claims(subject_id=...)` for one node/edge's full evidence."
+            ),
+            # The queried root is always in `result["nodes"]`, even with zero
+            # visible edges — never let output-budget compaction drop the
+            # exact fact the caller asked about.
+            required_node_ids={subject_id},
+        )
 
     @tool(read_only=True)
     async def fact_edges(
@@ -1887,18 +2001,21 @@ def register_foundation_tools(
         Returns ``{"nodes": [<subject: id, type, aliases, attrs,
         claim_count, quote_count, revealed>], "edges": [{"id", "src",
         "dst", "type", "attrs", "claims"?}], "truncated": {"result",
-        "extension", "claims"}}`` — each `truncated` flag is true only when
-        YOUR OWN visible set exceeded the cap, never a hint at hidden
-        matches. When `truncated.result` is true, narrow with `src_type`/
-        `dst_type`/`src_id`/`dst_id` rather than assuming you saw
-        everything.
+        "extension", "claims", "output"?}}`` — each of the first three flags
+        is true only when YOUR OWN visible set exceeded the cap, never a
+        hint at hidden matches; `output` (present only when true) means the
+        tool output budget, not the server-side cap, forced edges out of
+        THIS response — narrow the same way, or lower `limit`; the response
+        also carries a `truncated_note` explaining exactly what happened.
+        When `truncated.result` is true, narrow with `src_type`/`dst_type`/
+        `src_id`/`dst_id` rather than assuming you saw everything.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             facts_repo().edges,
             caller,
             edge_type=edge_type,
@@ -1910,6 +2027,14 @@ def register_foundation_tools(
             extend_edge_type=extend_edge_type,
             extend_from=extend_from,
             include_claims=include_claims,
+        )
+        return compact_graph_result(
+            result,
+            "fact_edges",
+            next_step=(
+                "Lower `limit`, narrow with `src_type`/`dst_type`/`src_id`/`dst_id`, or call "
+                "`fact_claims(subject_id=...)` for one edge's full evidence."
+            ),
         )
 
     @tool(read_only=True)
@@ -1951,9 +2076,21 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         try:
-            return await asyncio.to_thread(facts_repo().claims, caller, subject_id, limit=limit)
+            result = await asyncio.to_thread(facts_repo().claims, caller, subject_id, limit=limit)
         except FactNotFound:
             raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
+        return compact_listing(
+            result,
+            "fact_claims",
+            list_field="claims",
+            text_fields=("quote",),
+            shortened_note="{shortened} of {total} claims carry a shortened quote",
+            dropped_note=(
+                "{dropped} of {total} claims were dropped — pass limit={kept} next time to stay under budget"
+            ),
+            next_step="lower `limit` — the newest claims are kept first, so a smaller `limit` loses nothing you'd see.",
+            item_noun="claim",
+        )
 
     @tool(read_only=True)
     async def schema(table_id: str) -> dict:
@@ -2160,7 +2297,13 @@ def register_foundation_tools(
         - ``body``           — full SKILL.md text with frontmatter stripped
 
         Load a ``body`` into your context when you need to follow that skill's
-        instructions.
+        instructions. There is no filter or pagination — every RBAC-authorised
+        skill's full body comes back in one call, so a large marketplace can
+        exceed the tool output budget; see ``truncated``/``truncated_note``
+        below when that happens (bodies are shortened first, whole skills
+        dropped only last — there is no per-skill fetch to fall back to, so
+        a dropped skill's full body is unavailable until the instance's
+        marketplace is narrowed or the budget is raised).
         """
         async with httpx.AsyncClient() as c:
             r = await c.get(
@@ -2169,7 +2312,20 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            return r.json()
+            result = r.json()
+        return compact_listing(
+            result,
+            "skills",
+            list_field="skills",
+            text_fields=("body", "description"),
+            shortened_note="{shortened} of {total} skills carry a shortened body",
+            dropped_note="{dropped} of {total} skills were dropped",
+            next_step=(
+                "There is no per-skill read endpoint — a dropped skill's full body needs an admin to reduce "
+                "this instance's marketplace size, or raise AGNES_MCP_SEARCH_MAX_CHARS."
+            ),
+            item_noun="skill",
+        )
 
     @tool(read_only=True)
     async def chat_skills() -> dict:
@@ -2833,7 +2989,7 @@ def register_foundation_tools(
             return r.json()
 
     @tool(read_only=True)
-    async def documentation_api() -> str:
+    async def documentation_api(offset: int = 0) -> dict:
         """Return the curated Agnes REST API reference as Markdown.
 
         Mirrors the in-app ``/documentation/api`` page and the ``agnes docs api``
@@ -2842,12 +2998,43 @@ def register_foundation_tools(
         request against ``/api/*`` and needs to know payload shapes, auth
         requirements, or the inventory of available endpoints without leaving the
         chat.
+
+        The guide is one long document, always well over the tool output
+        budget on its own, so it is paged like ``collection_file_read``:
+        returns ``{"content", "offset", "next_offset", "total_chars",
+        "truncated"}`` — at most ~20k characters per call. ``next_offset``
+        is ``null`` once you have reached the end; chain
+        ``offset=next_offset`` until then. ``total_chars`` says up front how
+        many pages that is.
+
+        Args:
+            offset: Character offset to read from — ``0`` (the default) for
+                the start, the previous response's ``next_offset`` to
+                continue.
         """
         md_path = Path(__file__).resolve().parent.parent.parent.parent / "docs" / "api-reference.md"
         try:
-            return md_path.read_text(encoding="utf-8")
+            text = md_path.read_text(encoding="utf-8")
         except OSError:
-            return "# API reference unavailable\n\nThe source markdown file is missing from this deployment."
+            text = "# API reference unavailable\n\nThe source markdown file is missing from this deployment."
+
+        def _assemble(page: dict) -> dict:
+            result: dict[str, Any] = {
+                "content": page["text"],
+                "offset": page["offset"],
+                "next_offset": page["next_offset"],
+                "total_chars": page["total_chars"],
+                "truncated": page["truncated"],
+            }
+            if page["truncated"]:
+                result["truncated_note"] = (
+                    f"documentation_api: the guide is {page['total_chars']:,} characters, over the tool output "
+                    f"budget — this call returned offset {page['offset']}-{page['offset'] + len(page['text'])}. "
+                    f"Call again with offset={page['next_offset']} to keep reading."
+                )
+            return result
+
+        return paginate_text_response(text, offset, _assemble)
 
     @tool(read_only=True)
     async def list_contributed_skills() -> dict:

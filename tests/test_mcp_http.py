@@ -1841,3 +1841,321 @@ class TestSearchCompaction:
         texts = [block.text for block in content if getattr(block, "type", "") == "text"]
         assert texts, "knowledge_search produced no text content block"
         assert sum(len(t) for t in texts) <= DEFAULT_SEARCH_MAX_CHARS
+
+
+# ── MCP output-budget sweep (2026-09) ──────────────────────────────────────────
+#
+# `semantic_model_search`, `semantic_model_get`, `skills`, `documentation_api`
+# and `collection_get` measured 66k-480k char single-call results on a
+# production instance — all comfortably over the agent sandbox's real tool
+# output cap even though several already carried an explicit `limit`/`k`.
+# `fact_edges`/`fact_neighbors`/`fact_claims` are covered separately in
+# tests/db_pg/test_facts_mcp_output_budget_pg.py (they call `facts_repo()`
+# directly, not via a self-HTTP-call this module's mocking idiom can intercept).
+
+
+class TestSemanticModelSearchToolBudget:
+    def _get(self, mod, coro_factory, resp_data):
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(resp_data))
+            return _run(coro_factory(mod))
+
+    def test_document_and_document_json_are_never_returned(self):
+        """The root cause behind the measured 467k/480k-char results: the
+        search endpoint's row carries the model's WHOLE Ossie document. A
+        search hit never needs it — `semantic_model_get` is the documented
+        way to read it — so it is stripped before the budget check even
+        runs."""
+        mod = _import_mod()
+        resp = {
+            "query": "revenue",
+            "models": [
+                {
+                    "slug": "retail",
+                    "name": "Retail",
+                    "description": "d",
+                    "document": "y" * 50_000,
+                    "document_json": {"huge": "z" * 50_000},
+                    "source": None,
+                }
+            ],
+            "count": 1,
+            "truncated": False,
+        }
+        out = self._get(mod, lambda m: m.semantic_model_search(query="revenue"), resp)
+        assert out["models"] == [{"slug": "retail", "name": "Retail", "description": "d", "source": None}]
+
+    def test_oversized_match_list_is_compacted_with_disclosure(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        mod = _import_mod()
+        resp = {
+            "query": "revenue",
+            "models": [
+                {"slug": f"m{i}", "name": f"Model {i}", "description": "d" * 3_000, "source": None} for i in range(30)
+            ],
+            "count": 30,
+            "truncated": False,
+        }
+        out = self._get(mod, lambda m: m.semantic_model_search(query="revenue"), resp)
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert "semantic_model_get" in out["truncated_note"]
+        assert "models" in out and isinstance(out["models"], list)
+
+    def test_small_result_passes_through_besides_the_strip(self):
+        mod = _import_mod()
+        resp = {
+            "query": "x",
+            "models": [{"slug": "a", "name": "A", "description": "d", "document": "full", "document_json": {}}],
+            "count": 1,
+            "truncated": False,
+        }
+        out = self._get(mod, lambda m: m.semantic_model_search(query="x"), resp)
+        assert out["models"][0] == {"slug": "a", "name": "A", "description": "d"}
+        assert "truncated" not in out or out.get("truncated") is False
+
+
+class TestSemanticModelGetPagination:
+    def test_small_document_returned_whole_with_paging_metadata(self):
+        mod = _import_mod()
+        doc = "version: '0.2.0.dev0'\nsemantic_model: []\n"
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            resp = _mock_resp(doc)
+            resp.text = doc
+            resp.content = doc.encode()
+            resp.headers = {}
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+            out = _run(mod.semantic_model_get(slug="retail"))
+        assert out["document"] == doc
+        assert out["truncated"] is False
+        assert out["next_offset"] is None
+        assert out["total_chars"] == len(doc)
+
+    def test_large_document_is_paged_and_chains_to_the_end(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS
+
+        mod = _import_mod()
+        doc = "x" * (DEFAULT_SEARCH_MAX_CHARS * 2 + 500)
+
+        def _call(offset):
+            with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+                tv.get.return_value = "tok"
+                resp = _mock_resp(doc)
+                resp.text = doc
+                resp.content = doc.encode()
+                resp.headers = {}
+                MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=resp)
+                return _run(mod.semantic_model_get(slug="retail", offset=offset))
+
+        from src.mcp_tooling import wire_size
+
+        page1 = _call(0)
+        assert page1["truncated"] is True
+        # Slightly under the raw budget — room is left for the wrapper
+        # (content_hash, slug, truncated_note), verified via the actual
+        # wire size rather than an exact raw-length match.
+        assert wire_size(page1) <= DEFAULT_SEARCH_MAX_CHARS
+        assert len(page1["document"]) > DEFAULT_SEARCH_MAX_CHARS * 0.9
+        assert "offset=" in page1["truncated_note"]
+
+        pages = [page1]
+        offset = page1["next_offset"]
+        while offset is not None:
+            p = _call(offset)
+            pages.append(p)
+            offset = p["next_offset"]
+        assert "".join(p["document"] for p in pages) == doc
+        # content_hash is always of the FULL document, not whatever page was returned.
+        assert len({p["content_hash"] for p in pages}) == 1
+
+
+class TestSkillsToolBudget:
+    def _get(self, mod, resp_data):
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(resp_data))
+            return _run(mod.skills())
+
+    def test_oversized_skill_bodies_are_shortened_with_disclosure(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        mod = _import_mod()
+        resp = {
+            "skills": [
+                {
+                    "marketplace_id": "mkt",
+                    "plugin_name": f"plugin-{i}",
+                    "skill_name": f"skill-{i}",
+                    "name": f"Skill {i}",
+                    "description": "short",
+                    "invocation": None,
+                    "body": ("Do the thing. " * 400),
+                }
+                for i in range(15)
+            ]
+        }
+        out = self._get(mod, resp)
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert "AGNES_MCP_SEARCH_MAX_CHARS" in out["truncated_note"]
+
+    def test_small_result_passes_through_unchanged(self):
+        mod = _import_mod()
+        resp = {"skills": [{"marketplace_id": "m", "plugin_name": "p", "skill_name": "s", "name": "S", "body": "hi"}]}
+        assert self._get(mod, resp) == resp
+
+
+class TestDocumentationApiPagination:
+    def test_short_doc_returned_whole(self):
+        mod = _import_mod()
+        out = _run(mod.documentation_api())
+        assert isinstance(out, dict)
+        assert "content" in out and "total_chars" in out and "truncated" in out
+
+    def test_real_guide_is_paged_under_budget(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        mod = _import_mod()
+        out = _run(mod.documentation_api())
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        if out["truncated"]:
+            assert out["next_offset"] is not None
+            assert "offset=" in out["truncated_note"]
+
+            second = _run(mod.documentation_api(offset=out["next_offset"]))
+            assert second["offset"] == out["next_offset"]
+
+
+class TestCollectionGetBudget:
+    def _get(self, mod, detail, files_page):
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(
+                side_effect=[_mock_resp(detail), _mock_resp(files_page)]
+            )
+            return _run(mod.collection_get(collection_id="col_1"))
+
+    def test_long_processing_detail_errors_are_shortened_with_disclosure(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files = [
+            {
+                "file_id": f"cf_{i}",
+                "corpus_id": "col_1",
+                "filename": f"f{i}.pdf",
+                "sha256": "x",
+                "file_type": "pdf",
+                "size_bytes": 10,
+                "processing_status": "rejected",
+                "processing_detail": ("error: could not parse the document. " * 200),
+                "created_at": None,
+            }
+            for i in range(100)
+        ]
+        files_page = {"files": files, "total": 100, "limit": 25, "offset": 0}
+        out = self._get(mod, detail, files_page)
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert "files" in out and isinstance(out["files"], list)
+
+    def test_small_page_passes_through_unchanged_besides_pagination_fields(self):
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {
+            "files": [
+                {
+                    "file_id": "cf_1",
+                    "corpus_id": "col_1",
+                    "filename": "f.pdf",
+                    "sha256": "x",
+                    "file_type": "pdf",
+                    "size_bytes": 10,
+                    "processing_status": "ready",
+                    "processing_detail": None,
+                    "created_at": None,
+                }
+            ],
+            "total": 1,
+            "limit": 25,
+            "offset": 0,
+        }
+        out = self._get(mod, detail, files_page)
+        assert "truncated" not in out or out.get("truncated") is False
+        assert out["files_total"] == 1
+
+    def _files(self, n: int) -> list[dict]:
+        return [
+            {
+                "file_id": f"cf_{i}",
+                "corpus_id": "col_1",
+                "filename": f"f{i}.pdf",
+                "sha256": "x",
+                "file_type": "pdf",
+                "size_bytes": 10,
+                "processing_status": "rejected",
+                "processing_detail": ("error: could not parse the document. " * 200),
+                "created_at": None,
+            }
+            for i in range(n)
+        ]
+
+    def test_dropped_files_expose_a_continuation_offset_past_what_was_kept(self):
+        """The compacted page keeps a PREFIX of the requested files —
+        retrying the SAME offset with a smaller `limit` (the previous
+        wording) would return exactly the files already seen, a loop with
+        no exit (Devin review on #2426). The continuation must skip past
+        what was actually kept, and this is true even though the server's
+        own `files_truncated` (computed before compaction, on the full
+        100-file page) reads False — the last page can still be compacted."""
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {"files": self._files(100), "total": 100, "limit": 100, "offset": 0}
+        out = self._get(mod, detail, files_page)
+        kept = len(out["files"])
+        assert 0 < kept < 100
+        assert out["files_truncated"] is False
+        assert out["files_next_offset"] == kept
+        assert "same offset" not in out["truncated_note"]
+
+    def test_continuation_offset_accounts_for_server_truncation_too(self):
+        """Mid-collection page: both more files beyond the server page AND
+        this page itself compacted. `files_next_offset` must reflect the
+        actual kept count relative to the REAL (server-clamped) offset, not
+        just the requested one."""
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {"files": self._files(100), "total": 500, "limit": 100, "offset": 200}
+        out = self._get(mod, detail, files_page)
+        kept = len(out["files"])
+        assert 0 < kept < 100
+        assert out["files_truncated"] is True
+        assert out["files_next_offset"] == 200 + kept
+
+    def test_next_offset_is_none_once_nothing_remains(self):
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {
+            "files": [
+                {
+                    "file_id": "cf_1",
+                    "corpus_id": "col_1",
+                    "filename": "f.pdf",
+                    "sha256": "x",
+                    "file_type": "pdf",
+                    "size_bytes": 10,
+                    "processing_status": "ready",
+                    "processing_detail": None,
+                    "created_at": None,
+                }
+            ],
+            "total": 1,
+            "limit": 25,
+            "offset": 0,
+        }
+        out = self._get(mod, detail, files_page)
+        assert out["files_next_offset"] is None
