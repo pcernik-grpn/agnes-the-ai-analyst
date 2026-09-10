@@ -102,8 +102,9 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
   count as addressed once every Devin thread is resolved and the head has
   either moved past the reviewed commit or — after a rebase, which makes the
   head "diverged" rather than "ahead" — been analysed by Devin without a new
-  issue posted at it (Devin's "Devin Review" commit status on the head is the
-  witness). A head Devin never analysed still needs a fresh verdict or a person. An outside collaborator's PR needs a human approval; so does the cut
+  issue posted at it (Devin's own "Devin Review" commit status on the head is the
+  witness — only a status the Devin app itself created counts, never one merely
+  named like it). A head Devin never analysed still needs a fresh verdict or a person. An outside collaborator's PR needs a human approval; so does the cut
   PR (its commits are `github-actions[bot]`'s own, which the bridge cannot
   self-approve). A blocked PR names that approver.
 - **The cut PR rides the same queue.** Queue it after the feature PRs you

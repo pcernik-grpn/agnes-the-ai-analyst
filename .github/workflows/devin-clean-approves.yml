@@ -34,8 +34,11 @@ name: Devin clean verdict approves org members' PRs
 # witness then: it analysed exactly this head, and it reports findings by
 # posting a review AT that head — the review lands seconds BEFORE the status
 # flips to success — so a success status a couple of minutes old with no issue
-# review at the head means Devin had nothing new to say about it. A head Devin
-# never analysed (no status) still proves nothing and stays open.
+# review at the head means Devin had nothing new to say about it. Only a status
+# CREATED BY Devin's app counts (any write-access account can post a status
+# under any context name, so the context alone would let an author vouch for
+# themselves). A head Devin never analysed (no status) still proves nothing and
+# stays open.
 #
 # It is a POLLER, on purpose. It runs only from the default branch — on a
 # schedule and on manual dispatch — and never from a pull request's ref.
@@ -227,8 +230,17 @@ jobs:
                 # head: a "Devin Review" success status at least two minutes old and no
                 # Devin review listing issues at this exact commit (Devin posts the
                 # review before it flips the status, so the age guard closes that gap).
-                analysed_at=$(gh api "repos/$REPO/commits/$head/status" \
-                  --jq '[.statuses[] | select(.context == "Devin Review" and .state == "success")] | last | .updated_at // ""' 2>/dev/null || true)
+                # The status must have been CREATED BY Devin's app — anyone with write
+                # access can post a status under any context name, so a status is only
+                # a witness when its creator is the Devin bot (the combined `/status`
+                # endpoint omits `creator`; the list endpoint carries it). The newest
+                # Devin-created status for the context decides: a later `pending`
+                # (re-analysis in flight) supersedes an earlier `success`.
+                analysed_at=$(gh api "repos/$REPO/commits/$head/statuses?per_page=100" \
+                  --jq '[.[] | select(.context == "Devin Review"
+                                   and .creator.type == "Bot"
+                                   and (.creator.login | IN("devin-ai-integration[bot]", "devin-ai-integration")))]
+                        | sort_by(.updated_at) | last // {} | if .state == "success" then .updated_at else "" end' 2>/dev/null || true)
                 issues_at_head=$(printf '%s\n' "$reviews" | jq -rs --arg re "$issues_re" --arg head "$head" '[.[]
                     | select(.user.login == "devin-ai-integration[bot]" and .commit_id == $head and ((.body // "") | test($re)))] | length')
                 age=0
