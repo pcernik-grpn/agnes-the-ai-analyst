@@ -15,21 +15,23 @@ Both backend paths reuse ``_session_data_dir`` + the filename regex from
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.auth.access import require_admin
 from app.api.admin_user_sessions import _SESSION_FILE_RE, _session_data_dir
+from app.auth.access import require_admin
 from services.session_pipeline.lib import parse_jsonl
-
 from src.repositories import (
     audit_repo,
     usage_repo,
     users_repo,
 )
+
+if TYPE_CHECKING:
+    from app.chat.session_export import ChatTranscriptFreshness
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ router = APIRouter(prefix="/api/admin/sessions", tags=["admin-sessions"])
 
 
 def _window_since(since_minutes: int) -> datetime:
-    return datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    return datetime.now(UTC) - timedelta(minutes=since_minutes)
 
 
 # ---------------------------------------------------------------------------
@@ -53,10 +55,10 @@ def _window_since(since_minutes: int) -> datetime:
 @router.get("/list")
 def list_sessions(
     since_minutes: int = Query(default=10080, ge=1, le=525600),  # default 7d
-    username: Optional[str] = None,
-    model: Optional[str] = None,
+    username: str | None = None,
+    model: str | None = None,
     only_errors: bool = False,
-    q: Optional[str] = None,
+    q: str | None = None,
     anchor: str = Query(default="uploaded", pattern="^(started|uploaded)$"),
     sort: str = Query(default="started_at:desc"),
     limit: int = Query(default=50, ge=1, le=200),
@@ -119,10 +121,10 @@ def list_sessions(
 @router.get("/kpis")
 def kpis(
     since_minutes: int = Query(default=10080, ge=1, le=525600),
-    username: Optional[str] = None,
-    model: Optional[str] = None,
+    username: str | None = None,
+    model: str | None = None,
     only_errors: bool = False,
-    q: Optional[str] = None,
+    q: str | None = None,
     anchor: str = Query(default="uploaded", pattern="^(started|uploaded)$"),
     _user: dict = Depends(require_admin),
 ):
@@ -173,6 +175,19 @@ def facets(
 import re as _re
 
 _USERNAME_RE = _re.compile(r"^[A-Za-z0-9._@+-]{1,200}$")
+
+# A web-chat session's exported jsonl is always named this way
+# (app/chat/session_export.py::export_chat_session_jsonl) — matching the
+# filename here is what lets the transcript route tell "not exported yet"
+# apart from "never had a transcript at all" (see `_chat_id_from_session_file`
+# and its one caller below). A legacy CLI-collector filename never matches,
+# so it is entirely unaffected — no chat lookaside, no on-demand export.
+_CHAT_SESSION_FILE_RE = _re.compile(r"^chat-(?P<chat_id>.+)\.jsonl$")
+
+
+def _chat_id_from_session_file(session_file: str) -> str | None:
+    m = _CHAT_SESSION_FILE_RE.match(session_file)
+    return m.group("chat_id") if m else None
 
 
 def _resolve_dir_candidates(username: str) -> list[str]:
@@ -419,7 +434,7 @@ def download(
     )
 
 
-def _sum_usage_from_turns(turns: list[dict]) -> Optional[dict]:
+def _sum_usage_from_turns(turns: list[dict]) -> dict | None:
     """Sum ``message.usage`` across assistant turns (TCRD-222).
 
     Same field mapping the UsageProcessor uses (``usage_lib``), computed
@@ -456,13 +471,176 @@ def _sum_usage_from_turns(turns: list[dict]) -> Optional[dict]:
     return totals
 
 
+def _chat_transcript_not_found_detail(freshness: ChatTranscriptFreshness) -> dict:
+    """Turn a failed on-demand refresh into an honest, actionable 404 body —
+    never a bare "session not found" once we know a chat session by this id
+    actually exists. See ``ensure_chat_transcript_current``'s docstring for
+    what each ``freshness`` field means.
+    """
+    if freshness.lookup_failed:
+        # We never established whether this session exists, so we must not
+        # say it does not — the id may be perfectly good and the store down.
+        return {
+            "error": "session_lookup_failed",
+            "hint": (
+                "The session store did not answer, so this is not a statement "
+                "about the id. Retry; if it persists, check the server logs "
+                "for the lookup failure."
+            ),
+        }
+    if not freshness.session_found:
+        return {
+            "error": "session_not_found",
+            "hint": "No such session. Check the id with `agnes admin sessions list`.",
+        }
+    if freshness.export_disabled:
+        return {
+            "error": "chat_transcript_export_disabled",
+            "hint": (
+                "This instance has `sessions.include_chat` turned off, so chat "
+                "sessions are never materialized into a browsable transcript. "
+                "An admin can turn it on in instance.yaml."
+            ),
+        }
+    if not freshness.message_count:
+        return {
+            "error": "session_has_no_messages",
+            "hint": "This session exists but has no messages yet — there is nothing to show.",
+        }
+    since = freshness.last_message_at.isoformat() if freshness.last_message_at else "an unknown time"
+    return {
+        "error": "chat_transcript_not_exported_yet",
+        "hint": (
+            f"Not exported yet — {freshness.message_count} message(s) pending "
+            f"since {since}. Retry shortly, or check server logs if this persists."
+        ),
+    }
+
+
+def _chat_transcript_freshness_note(freshness: ChatTranscriptFreshness | None) -> dict:
+    """Say, on a transcript we ARE serving, whether we could confirm it is
+    the current one.
+
+    ``ensure_chat_transcript_current`` sets ``path`` only when the export is
+    known current — it either already was, or was just rewritten. Every
+    other outcome can still resolve to a real file on disk: the periodic
+    sweep wrote one minutes ago, and messages since then are simply not in
+    what the admin is now reading. Serving it is still the right call — in
+    the middle of an incident a partial transcript is often the only
+    evidence there is — but serving it silently lets a partial record read
+    as the whole one, which is the failure this endpoint exists to end.
+
+    ``verified`` is therefore a claim we only make when we checked, and
+    ``reason`` names what stopped us when we could not. ``freshness=None``
+    means the refresh call itself raised; ``raced`` means we wrote the file
+    but a message landed while we were writing it, so a real ``path`` is
+    still not a current one.
+    """
+    if freshness is not None and freshness.path is not None and not freshness.raced:
+        return {"verified": True}
+    if freshness is not None and freshness.raced:
+        return {
+            "verified": False,
+            "reason": "export_raced_a_new_message",
+            "hint": (
+                "A message landed while this transcript was being exported, so "
+                "what is shown is already one or more messages behind. Reload "
+                "for a current copy."
+            ),
+        }
+    if freshness is None:
+        return {
+            "verified": False,
+            "reason": "refresh_failed",
+            "hint": (
+                "Could not check whether this export is current — the refresh "
+                "itself failed (see server logs). Newer messages may be missing "
+                "from what is shown."
+            ),
+        }
+    if freshness.lookup_failed:
+        return {
+            "verified": False,
+            "reason": "session_lookup_failed",
+            "hint": (
+                "Could not check whether this export is current — the session "
+                "store did not answer. Newer messages may be missing from what "
+                "is shown; retry for a verified copy."
+            ),
+        }
+    if not freshness.session_found:
+        return {
+            "verified": False,
+            "reason": "session_not_found",
+            "hint": (
+                "This file is a historical export — the chat session it came "
+                "from no longer exists, so there is nothing left to check it "
+                "against."
+            ),
+        }
+    if freshness.export_disabled:
+        return {
+            "verified": False,
+            "reason": "chat_transcript_export_disabled",
+            "hint": (
+                "This instance has `sessions.include_chat` turned off, so this "
+                "file is frozen at whatever was exported before it was turned "
+                "off. Newer messages are not in it."
+            ),
+        }
+    return {
+        "verified": False,
+        "reason": "export_not_written",
+        "hint": (
+            "Could not bring this export current (see server logs). Newer messages may be missing from what is shown."
+        ),
+    }
+
+
 @router.get("/{username}/{session_file}/transcript")
 def transcript(
     username: str,
     session_file: str,
     user: dict = Depends(require_admin),
 ):
-    session_dir, path = _resolve_session_target(username, session_file)
+    # F4 freshness follow-up (measured on a production instance, 2026-09-09):
+    # a chat session's jsonl is otherwise only (re-)written by the periodic
+    # sweep, which can lag the session's own activity by several minutes. A
+    # chat-shaped filename gets brought current here, on demand, before we
+    # even try to resolve it on disk — the same idempotent, mtime-guarded
+    # work the sweep would do a few minutes later
+    # (app/chat/session_export.py::ensure_chat_transcript_current). A
+    # non-chat (legacy CLI-collector) filename never matches and is
+    # completely unaffected.
+    chat_id = _chat_id_from_session_file(session_file)
+    chat_freshness = None
+    if chat_id is not None:
+        from app.chat.session_export import ensure_chat_transcript_current
+
+        try:
+            chat_freshness = ensure_chat_transcript_current(chat_id)
+        except Exception:
+            logger.warning("on-demand chat transcript refresh failed for %s", chat_id, exc_info=True)
+
+    try:
+        session_dir, path = _resolve_session_target(username, session_file)
+    except HTTPException as exc:
+        if exc.status_code == 404 and chat_freshness is not None:
+            # 404 says "this does not exist". When the session store never
+            # answered we cannot say that, so a lookup failure goes out as a
+            # retryable 503 instead — the caller should come back, not go
+            # hunting for a typo in a correct id.
+            status = 503 if chat_freshness.lookup_failed else 404
+            raise HTTPException(
+                status_code=status,
+                detail=_chat_transcript_not_found_detail(chat_freshness),
+            ) from exc
+        raise
+    # A file resolved. Whether it is the CURRENT one is a separate question,
+    # and one we can only have answered for a chat-shaped filename: a legacy
+    # CLI-collector file is not ours to refresh, so we make no claim about it.
+    freshness_note = _chat_transcript_freshness_note(chat_freshness) if chat_id is not None else None
+
     turns = parse_jsonl(path)
     events = _render_transcript(turns)
     tokens = _sum_usage_from_turns(turns)
@@ -495,7 +673,7 @@ def transcript(
     except Exception:
         logger.exception("audit_log write failed for session.transcript_view")
 
-    return {
+    body: dict[str, Any] = {
         "username": username,
         "session_file": session_file,
         "summary": summary,
@@ -503,3 +681,6 @@ def transcript(
         "counts": counts,
         "events": events,
     }
+    if freshness_note is not None:
+        body["freshness"] = freshness_note
+    return body

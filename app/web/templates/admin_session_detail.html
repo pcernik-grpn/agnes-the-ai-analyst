@@ -58,6 +58,11 @@
 .td-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--text-secondary, #6b7280); margin: 0 0 4px; }
 .obs-empty { padding: 40px 16px; text-align: center; color: var(--text-secondary, #6b7280); }
+.td-unverified { display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px;
+                 border: 1px solid var(--ds-accent-warn-line); border-radius: 8px;
+                 background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+                 font-size: 13px; line-height: 1.45; }
+.td-unverified b { font-weight: 600; }
 </style>
 {% endblock %}
 
@@ -345,10 +350,41 @@
 
   fetch('/api/admin/sessions/' + encodeURIComponent(username) + '/' +
         encodeURIComponent(sessionFile) + '/transcript', { credentials: 'same-origin' })
-    .then(r => r.json())
-    .then(d => {
+    .then(r => r.json().then(body => ({ ok: r.ok, status: r.status, body })))
+    .then(({ ok, status, body }) => {
       loading.remove();
+      if (!ok) {
+        // A non-2xx (typically 404) must never render as "an empty
+        // transcript" -- that read as "the session has nothing" when it
+        // actually meant "not exported yet" or "no such session", and an
+        // operator investigating a live incident couldn't tell the two
+        // apart. `detail` is either a plain string (legacy path-safety
+        // errors) or our structured {error, hint} body (chat-session
+        // freshness -- app/api/admin_sessions.py::transcript).
+        const detail = body && body.detail;
+        const message = (detail && typeof detail === 'object' && detail.hint)
+          || (typeof detail === 'string' ? detail : null)
+          || ('Failed to load transcript (HTTP ' + status + ')');
+        eventsRoot.innerHTML = '<div class="obs-empty">' + escapeHtml(message) + '</div>';
+        return;
+      }
+      const d = body;
       renderMeta(d.summary, d.tokens, d.counts);
+      // The endpoint brings a chat export current before serving it, but it
+      // cannot always confirm that it managed to -- a session store that
+      // didn't answer leaves a real file on disk whose currency is unknown.
+      // We still show that file (during an incident it is often the only
+      // evidence there is), so the one thing we must not do is let it read
+      // as the whole conversation.
+      const fresh = d.freshness;
+      if (fresh && fresh.verified === false) {
+        const warn = document.createElement('div');
+        warn.className = 'td-unverified';
+        warn.id = 'td-unverified';
+        warn.innerHTML = '<span aria-hidden="true">\u26A0</span><span><b>Possibly incomplete.</b> ' +
+          escapeHtml(fresh.hint || 'This transcript could not be confirmed current.') + '</span>';
+        eventsRoot.appendChild(warn);
+      }
       const events = d.events || [];
       let errorCount = 0;
       events.forEach((ev, i) => {
@@ -385,7 +421,14 @@
         });
       }
       if (!events.length) {
-        eventsRoot.innerHTML = '<div class="obs-empty">No conversational events in this JSONL (only system / summary turns).</div>';
+        // Append, never innerHTML= : an unverified export that is ALSO empty
+        // is the case where the warning matters most ("nothing here" vs
+        // "we could not check whether anything is here"), and replacing the
+        // container's contents is exactly what would drop it.
+        const empty = document.createElement('div');
+        empty.className = 'obs-empty';
+        empty.textContent = 'No conversational events in this JSONL (only system / summary turns).';
+        eventsRoot.appendChild(empty);
       }
     })
     .catch(e => {

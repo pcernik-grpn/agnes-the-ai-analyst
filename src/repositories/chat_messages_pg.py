@@ -131,11 +131,14 @@ class ChatMessagePgRepository:
     def list_messages(self, session_id: str, *, after_id: Optional[str] = None, limit: int = 500) -> list[ChatMessage]:
         with self._engine.connect() as conn:
             cutoff = None
+            cutoff_id = None
             if after_id:
                 cutoff = conn.execute(
                     sa.text("SELECT created_at FROM chat_messages WHERE id = :id"),
                     {"id": after_id},
                 ).scalar()
+                if cutoff is not None:
+                    cutoff_id = after_id
             sql = (
                 "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                 "tokens_out, cache_read_tokens, cache_creation_tokens, "
@@ -145,9 +148,15 @@ class ChatMessagePgRepository:
             )
             params: dict = {"session_id": session_id}
             if cutoff is not None:
-                sql += " AND created_at > :cutoff"
+                # See the DuckDB sibling (app/chat/persistence.py::ChatRepository
+                # .list_messages) for why ``created_at`` alone is not enough: a
+                # tie at the page boundary needs the row id as a tiebreaker so
+                # the cursor position is representable INSIDE the tie, not just
+                # "after this timestamp".
+                sql += " AND (created_at > :cutoff OR (created_at = :cutoff AND id > :cutoff_id))"
                 params["cutoff"] = cutoff
-            sql += " ORDER BY created_at ASC LIMIT :limit"
+                params["cutoff_id"] = cutoff_id
+            sql += " ORDER BY created_at ASC, id ASC LIMIT :limit"
             params["limit"] = limit
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [

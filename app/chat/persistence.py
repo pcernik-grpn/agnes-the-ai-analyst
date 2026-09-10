@@ -712,11 +712,13 @@ class ChatRepository:
     ) -> list[ChatMessage]:
         if self._messages_pg is not None:
             return self._messages_pg.list_messages(session_id, after_id=after_id, limit=limit)
+        cutoff = None
+        cutoff_id = None
         if after_id:
             row = self._conn.execute("SELECT created_at FROM chat_messages WHERE id = ?", [after_id]).fetchone()
-            cutoff = row[0] if row else None
-        else:
-            cutoff = None
+            if row is not None:
+                cutoff = row[0]
+                cutoff_id = after_id
 
         q = (
             "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, "
@@ -724,9 +726,17 @@ class ChatRepository:
         )
         params: list = [session_id]
         if cutoff is not None:
-            q += " AND created_at > ?"
-            params.append(cutoff)
-        q += " ORDER BY created_at ASC LIMIT ?"
+            # Ordering/resuming on ``created_at`` alone loses the rest of a
+            # tie at a page boundary: two messages sharing one ``created_at``
+            # (same-millisecond writes are routine under load) would put the
+            # cursor at "after this created_at", never "after this exact
+            # row", and any sibling row with the identical timestamp that
+            # sorted before ``after_id`` on the previous page is simply gone
+            # from every later page. Comparing the full ``(created_at, id)``
+            # pair makes the cursor position representable INSIDE a tie.
+            q += " AND (created_at > ? OR (created_at = ? AND id > ?))"
+            params.extend([cutoff, cutoff, cutoff_id])
+        q += " ORDER BY created_at ASC, id ASC LIMIT ?"
         params.append(limit)
 
         rows = self._conn.execute(q, params).fetchall()

@@ -17,13 +17,12 @@ from __future__ import annotations
 
 import json as json_lib
 from pathlib import Path
-from typing import Optional
 from urllib.parse import quote
 
 import typer
 
 from cli.client import api_get
-from cli.commands.admin_activity import _parse_since, _handle_error
+from cli.commands.admin_activity import _handle_error, _parse_since
 
 sessions_app = typer.Typer(help="Browse Claude Code sessions across all users")
 
@@ -35,7 +34,7 @@ def _seg(value: str) -> str:
     return quote(value, safe="")
 
 
-def _fmt_duration(s: Optional[int]) -> str:
+def _fmt_duration(s: int | None) -> str:
     if s is None:
         return "—"
     if s < 60:
@@ -45,7 +44,7 @@ def _fmt_duration(s: Optional[int]) -> str:
     return f"{s / 3600:.1f}h"
 
 
-def _fmt_ts(iso: Optional[str]) -> str:
+def _fmt_ts(iso: str | None) -> str:
     if not iso:
         return "—"
     # Compact for table display: YYYY-MM-DD HH:MM
@@ -64,7 +63,7 @@ def list_sessions(
         "--anchor",
         help="Window anchor: 'uploaded' (arrival — default) or 'started'",
     ),
-    user: Optional[str] = typer.Option(
+    user: str | None = typer.Option(
         None,
         "--user",
         "-u",
@@ -75,12 +74,12 @@ def list_sessions(
         "--errors",
         help="Show only sessions where at least one tool call failed",
     ),
-    model: Optional[str] = typer.Option(
+    model: str | None = typer.Option(
         None,
         "--model",
         help="Filter by primary model name (e.g. 'claude-sonnet-4-6')",
     ),
-    q: Optional[str] = typer.Option(
+    q: str | None = typer.Option(
         None,
         "--q",
         "--query",
@@ -157,6 +156,32 @@ def list_sessions(
     )
 
 
+def _handle_transcript_error(resp) -> None:
+    """``_handle_error`` plus one refinement: a chat-session transcript's
+    failure carries a structured ``{"error", "hint"}`` body (freshness
+    follow-up, ``app/api/admin_sessions.py::transcript``) distinguishing
+    "not exported yet" from "no such session" from "the session store did
+    not answer" — surface the ``hint`` verbatim instead of the raw dict
+    repr `_handle_error` would otherwise print.
+
+    Both statuses that body can arrive on are handled: 404 for a session
+    that genuinely has no transcript, and 503 for a lookup that failed and
+    is worth retrying. Formatting only the 404 left the retryable case —
+    the one where the operator most needs to be told to come back — as the
+    only one printing a raw Python dict.
+    """
+    if resp.status_code in (404, 503):
+        try:
+            detail = resp.json().get("detail")
+        except Exception:  # noqa: BLE001 — an unparseable body just means "no structured hint"
+            detail = None
+        if isinstance(detail, dict) and detail.get("hint"):
+            fallback = "session_lookup_failed" if resp.status_code == 503 else "not_found"
+            typer.echo(f"[err] {detail.get('error', fallback)}: {detail['hint']}", err=True)
+            raise typer.Exit(1)
+    _handle_error(resp, "sessions show")
+
+
 @sessions_app.command("show")
 def show_transcript(
     username: str = typer.Argument(
@@ -174,7 +199,7 @@ def show_transcript(
     Use `--errors` to grep to just the failures.
     """
     resp = api_get(f"/api/admin/sessions/{_seg(username)}/{_seg(session_file)}/transcript")
-    _handle_error(resp, "sessions show")
+    _handle_transcript_error(resp)
     data = resp.json()
 
     if as_json:
@@ -236,7 +261,7 @@ def download(
         help="User e-mail as printed by `agnes admin sessions list`, or the on-disk session directory",
     ),
     session_file: str = typer.Argument(..., help="Session filename, e.g. abc-123-def.jsonl"),
-    output: Optional[Path] = typer.Option(
+    output: Path | None = typer.Option(
         None,
         "--output",
         "-o",
@@ -268,7 +293,7 @@ def download(
 def kpis(
     since: str = typer.Option("7d", "--since"),
     anchor: str = typer.Option("uploaded", "--anchor", help="Window anchor: uploaded|started"),
-    user: Optional[str] = typer.Option(None, "--user", "-u"),
+    user: str | None = typer.Option(None, "--user", "-u"),
     errors_only: bool = typer.Option(False, "--errors"),
     as_json: bool = typer.Option(False, "--json"),
 ):
