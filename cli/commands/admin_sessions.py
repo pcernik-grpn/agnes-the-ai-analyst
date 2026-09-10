@@ -157,18 +157,27 @@ def list_sessions(
 
 
 def _handle_transcript_error(resp) -> None:
-    """``_handle_error`` plus one refinement: a chat-session transcript's 404
-    carries a structured ``{"error", "hint"}`` body (freshness follow-up,
-    ``app/api/admin_sessions.py::transcript``) distinguishing "not exported
-    yet" from "no such session" — surface the ``hint`` verbatim instead of
-    the raw dict repr `_handle_error` would otherwise print."""
-    if resp.status_code == 404:
+    """``_handle_error`` plus one refinement: a chat-session transcript's
+    failure carries a structured ``{"error", "hint"}`` body (freshness
+    follow-up, ``app/api/admin_sessions.py::transcript``) distinguishing
+    "not exported yet" from "no such session" from "the session store did
+    not answer" — surface the ``hint`` verbatim instead of the raw dict
+    repr `_handle_error` would otherwise print.
+
+    Both statuses that body can arrive on are handled: 404 for a session
+    that genuinely has no transcript, and 503 for a lookup that failed and
+    is worth retrying. Formatting only the 404 left the retryable case —
+    the one where the operator most needs to be told to come back — as the
+    only one printing a raw Python dict.
+    """
+    if resp.status_code in (404, 503):
         try:
             detail = resp.json().get("detail")
-        except Exception:
+        except Exception:  # noqa: BLE001 — an unparseable body just means "no structured hint"
             detail = None
         if isinstance(detail, dict) and detail.get("hint"):
-            typer.echo(f"[err] {detail.get('error', 'not_found')}: {detail['hint']}", err=True)
+            fallback = "session_lookup_failed" if resp.status_code == 503 else "not_found"
+            typer.echo(f"[err] {detail.get('error', fallback)}: {detail['hint']}", err=True)
             raise typer.Exit(1)
     _handle_error(resp, "sessions show")
 

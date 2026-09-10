@@ -532,10 +532,22 @@ def _chat_transcript_freshness_note(freshness: ChatTranscriptFreshness | None) -
 
     ``verified`` is therefore a claim we only make when we checked, and
     ``reason`` names what stopped us when we could not. ``freshness=None``
-    means the refresh call itself raised.
+    means the refresh call itself raised; ``raced`` means we wrote the file
+    but a message landed while we were writing it, so a real ``path`` is
+    still not a current one.
     """
-    if freshness is not None and freshness.path is not None:
+    if freshness is not None and freshness.path is not None and not freshness.raced:
         return {"verified": True}
+    if freshness is not None and freshness.raced:
+        return {
+            "verified": False,
+            "reason": "export_raced_a_new_message",
+            "hint": (
+                "A message landed while this transcript was being exported, so "
+                "what is shown is already one or more messages behind. Reload "
+                "for a current copy."
+            ),
+        }
     if freshness is None:
         return {
             "verified": False,

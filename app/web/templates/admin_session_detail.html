@@ -421,7 +421,14 @@
         });
       }
       if (!events.length) {
-        eventsRoot.innerHTML = '<div class="obs-empty">No conversational events in this JSONL (only system / summary turns).</div>';
+        // Append, never innerHTML= : an unverified export that is ALSO empty
+        // is the case where the warning matters most ("nothing here" vs
+        // "we could not check whether anything is here"), and replacing the
+        // container's contents is exactly what would drop it.
+        const empty = document.createElement('div');
+        empty.className = 'obs-empty';
+        empty.textContent = 'No conversational events in this JSONL (only system / summary turns).';
+        eventsRoot.appendChild(empty);
       }
     })
     .catch(e => {

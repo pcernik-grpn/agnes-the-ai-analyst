@@ -166,7 +166,7 @@ def _sweep_chat_session_exports(effective_dir: Path, *, limit: int = 200) -> int
         # (app/api/admin_sessions.py::transcript, via
         # ensure_chat_transcript_current) — one shared definition of "is
         # this transcript current" rather than two copies drifting apart.
-        if not is_chat_export_stale(target, last_active):
+        if not is_chat_export_stale(target, last_active, s.message_count):
             continue
         try:
             if export_chat_session_jsonl(s.id) is not None:

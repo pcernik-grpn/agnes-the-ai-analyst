@@ -110,14 +110,43 @@ def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
-def _export_watermark(messages: list[ChatMessage]) -> datetime:
-    """The newest ``created_at`` actually present among *messages* -- i.e.
-    exactly what the exported file's content can vouch for. Recorded
-    alongside the file by :func:`_write_export_watermark` and read back by
+@dataclass(frozen=True)
+class ExportWatermark:
+    """What an exported jsonl's content can vouch for: the newest message it
+    actually contains, and how many messages that was.
+
+    The count is not redundant with the timestamp. ``created_at`` ties are
+    routine under load -- routine enough that this module's own pagination
+    had to start ordering by ``(created_at, id)`` to stop losing a row at a
+    page boundary -- so a message committed between the exporter's read and
+    its write can carry the SAME timestamp as the newest one written.
+    Against a timestamp alone that message is invisible *forever*: the
+    strict ``>`` in :func:`is_chat_export_stale` never fires, the session's
+    own ``last_message_at`` equals the recorded watermark, and no later
+    check ever exports it. ``chat_messages`` maintains ``message_count``
+    and ``last_message_at`` in one statement on every append, so the count
+    moves for exactly the tie the timestamp cannot see.
+
+    ``messages=None`` is a sidecar written before the count existed: the
+    timestamp comparison still applies, the tie check simply cannot.
+    """
+
+    last_message_at: datetime
+    messages: int | None
+
+
+def _export_watermark(messages: list[ChatMessage]) -> ExportWatermark:
+    """The newest ``created_at`` actually present among *messages*, and how
+    many there were -- i.e. exactly what the exported file's content can
+    vouch for. Recorded alongside the file by
+    :func:`_write_export_watermark` and read back by
     :func:`is_chat_export_stale`, deliberately NOT via the file's own mtime
     (see that function's docstring for why the two must stay separate)."""
     newest = max((m.created_at for m in messages if m.created_at is not None), default=None)
-    return _as_utc(newest) if newest is not None else datetime.now(UTC)
+    return ExportWatermark(
+        last_message_at=_as_utc(newest) if newest is not None else datetime.now(UTC),
+        messages=len(messages),
+    )
 
 
 def _watermark_path(target: Path) -> Path:
@@ -128,16 +157,31 @@ def _watermark_path(target: Path) -> Path:
     return target.with_name(target.name + ".watermark")
 
 
-def _write_export_watermark(target: Path, watermark: datetime) -> None:
+def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
     """Atomically record *watermark* (:func:`_export_watermark` of the
     messages just written to *target*) in its sidecar file -- via
     :func:`_atomic_write_text`, so a reader never observes a half-written
     watermark AND two writers racing the same sidecar (see that function's
-    docstring) can't interleave or clobber each other either."""
-    _atomic_write_text(_watermark_path(target), watermark.isoformat())
+    docstring) can't interleave or clobber each other either.
+
+    Written as a JSON object rather than the bare ISO timestamp this
+    sidecar used to hold, because the timestamp alone cannot see a tie
+    (see :class:`ExportWatermark`). :func:`_read_export_watermark` still
+    reads the old shape, so an instance upgrading in place keeps its
+    existing exports instead of re-exporting every session at once.
+    """
+    _atomic_write_text(
+        _watermark_path(target),
+        json.dumps(
+            {
+                "last_message_at": watermark.last_message_at.isoformat(),
+                "messages": watermark.messages,
+            }
+        ),
+    )
 
 
-def _read_export_watermark(target: Path) -> datetime | None:
+def _read_export_watermark(target: Path) -> ExportWatermark | None:
     """The content watermark :func:`_write_export_watermark` recorded for
     *target*, or ``None`` when there is no sidecar to read (an export
     written before this mechanism existed, or one whose sidecar write
@@ -155,7 +199,24 @@ def _read_export_watermark(target: Path) -> datetime | None:
     except OSError:
         return None
     try:
-        return _as_utc(datetime.fromisoformat(text))
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        raw = payload.get("last_message_at")
+        count = payload.get("messages")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return ExportWatermark(
+                last_message_at=_as_utc(datetime.fromisoformat(raw)),
+                messages=count if isinstance(count, int) else None,
+            )
+        except ValueError:
+            return None
+    # Pre-count sidecar: a bare ISO timestamp. Readable, just blind to ties.
+    try:
+        return ExportWatermark(last_message_at=_as_utc(datetime.fromisoformat(text)), messages=None)
     except ValueError:
         return None
 
@@ -442,7 +503,11 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     return target
 
 
-def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime | None) -> bool:
+def is_chat_export_stale(
+    existing_path: Path | None,
+    last_message_at: datetime | None,
+    message_count: int | None = None,
+) -> bool:
     """True when a chat session's exported jsonl is missing, unreadable, or
     older than the session's last message.
 
@@ -473,9 +538,16 @@ def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime |
 
     A message committed between :func:`export_chat_session_jsonl`'s read
     and its ``os.replace`` is absent from both the jsonl and the sidecar,
-    so it is newer than the recorded watermark and shows up as stale here
-    on the very next call — this is what actually closes the write race,
-    the file's own mtime plays no part in it.
+    so it shows up as stale here on the very next call — this is what
+    actually closes the write race, the file's own mtime plays no part in
+    it. Closing it takes BOTH halves of the watermark: a message that
+    landed in the same instant as the newest one written is not *newer*
+    than the recorded timestamp, so against the timestamp alone it would
+    stay invisible forever (see :class:`ExportWatermark`). *message_count*
+    — the session's own row count, moved by the same statement that moves
+    ``last_message_at`` — is what catches that tie. Passing it is optional
+    only because a sidecar written before the count existed cannot answer
+    the question either way; every caller in this repo passes it.
     """
     if last_message_at is None:
         return False
@@ -484,8 +556,13 @@ def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime |
     watermark = _read_export_watermark(existing_path)
     if watermark is None:
         return True
-    last_active = _as_utc(last_message_at)
-    return last_active > watermark
+    if _as_utc(last_message_at) > watermark.last_message_at:
+        return True
+    # Strictly MORE messages than we wrote, at a timestamp we already have:
+    # the tie above. Never `!=` — a count that has drifted low (nothing in
+    # this repo deletes chat messages, but a restore or a manual fix could)
+    # would otherwise re-export the same session on every sweep tick.
+    return message_count is not None and watermark.messages is not None and message_count > watermark.messages
 
 
 @dataclass
@@ -502,6 +579,10 @@ class ChatTranscriptFreshness:
     ``lookup_failed=True`` means we never got to find out — the session
     store raised — and must never be reported as a missing session, which
     would tell an admin to check an id that may well be correct;
+    ``raced=True`` means we DID write a file but a message landed while we
+    were writing it, so ``path`` is real content that is already one
+    message behind — the caller may serve it, but must not call it
+    current;
     ``export_disabled=True`` means ``sessions.include_chat`` is off (the
     session may well have messages, but this instance never materializes
     them to disk); ``message_count``/``last_message_at`` describe a
@@ -515,6 +596,7 @@ class ChatTranscriptFreshness:
     export_disabled: bool
     message_count: int
     last_message_at: datetime | None
+    raced: bool = False
 
 
 def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
@@ -584,9 +666,42 @@ def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
         return freshness
 
     existing = _session_data_dir() / owner["id"] / f"chat-{chat_id}.jsonl"
-    if existing.is_file() and not is_chat_export_stale(existing, session.last_message_at):
+    if existing.is_file() and not is_chat_export_stale(existing, session.last_message_at, session.message_count):
         freshness.path = existing
         return freshness
 
     freshness.path = export_chat_session_jsonl(chat_id)
+    if freshness.path is not None:
+        freshness.raced = _export_raced_a_new_message(chat_id, freshness.path)
     return freshness
+
+
+def _export_raced_a_new_message(chat_id: str, exported: Path) -> bool:
+    """True when a message landed while we were exporting *chat_id*.
+
+    ``export_chat_session_jsonl`` reads the messages, then writes; anything
+    committed in between is in neither the file nor its watermark. The next
+    check catches it — but the response that TRIGGERED the export would
+    otherwise serve that same file as confirmed-current, which is the one
+    thing this whole freshness path exists to stop. So we re-read the
+    session (the cheap single row, not the messages again) and re-run the
+    same staleness rule against what we actually wrote.
+
+    This narrows the window from "however long the export took" — seconds,
+    on a conversation long enough to page — to the gap between this read
+    and the response, and it cannot be closed entirely: a message committed
+    after this line is not knowable here. That residue is why the answer is
+    a claim about a check we ran, never a promise about the future.
+    """
+    from src.repositories import chat_session_repo
+
+    try:
+        latest = chat_session_repo().get_session(chat_id)
+    except Exception:
+        # We could not check. Saying "current" would be a claim we did not
+        # verify; saying "raced" is the honest, conservative reading.
+        logger.warning("chat transcript freshness: post-export re-check failed for %s", chat_id, exc_info=True)
+        return True
+    if latest is None:
+        return False
+    return is_chat_export_stale(exported, latest.last_message_at, latest.message_count)

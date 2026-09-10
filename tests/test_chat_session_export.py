@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -556,7 +557,7 @@ class TestIsChatExportStale:
 
         f = tmp_path / "f.jsonl"
         f.write_text("x")
-        session_export._write_export_watermark(f, datetime.now(UTC))
+        session_export._write_export_watermark(f, session_export.ExportWatermark(datetime.now(UTC), messages=1))
         assert not is_chat_export_stale(f, datetime.now(UTC) - timedelta(hours=1))
 
     def test_watermark_before_last_message_is_stale(self, tmp_path):
@@ -564,7 +565,9 @@ class TestIsChatExportStale:
 
         f = tmp_path / "f.jsonl"
         f.write_text("x")
-        session_export._write_export_watermark(f, datetime.now(UTC) - timedelta(hours=2))
+        session_export._write_export_watermark(
+            f, session_export.ExportWatermark(datetime.now(UTC) - timedelta(hours=2), messages=1)
+        )
         assert is_chat_export_stale(f, datetime.now(UTC) + timedelta(hours=1))
 
     def test_file_present_without_a_watermark_sidecar_is_stale(self, tmp_path):
@@ -589,10 +592,67 @@ class TestIsChatExportStale:
         f = tmp_path / "f.jsonl"
         f.write_text("x")
         last_message_at = datetime.now(UTC) - timedelta(hours=1)
-        session_export._write_export_watermark(f, last_message_at)
+        session_export._write_export_watermark(f, session_export.ExportWatermark(last_message_at, messages=1))
         old = (datetime.now(UTC) - timedelta(days=30)).timestamp()
         os.utime(f, (old, old))
         assert not is_chat_export_stale(f, last_message_at)
+
+
+class TestWatermarkTieBreaking:
+    """A message committed mid-export can carry the SAME ``created_at`` as
+    the newest message the export wrote. Against the timestamp alone it is
+    invisible forever -- the strict ``>`` never fires and the session's own
+    ``last_message_at`` equals the recorded watermark -- so the watermark
+    also records how many messages the file contains."""
+
+    def test_a_message_tied_on_timestamp_is_stale_not_current(self, tmp_path):
+        from app.chat import session_export
+
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        tied = datetime.now(UTC)
+        session_export._write_export_watermark(f, session_export.ExportWatermark(tied, messages=2))
+
+        # Same instant, one more row than we wrote: the tie.
+        assert is_chat_export_stale(f, tied, 3)
+        # Same instant, same count: genuinely current.
+        assert not is_chat_export_stale(f, tied, 2)
+
+    def test_a_count_that_drifted_low_does_not_re_export_forever(self, tmp_path):
+        """`>`, never `!=` -- a count below what we wrote must not put the
+        sweep into a re-export loop on every tick."""
+        from app.chat import session_export
+
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        tied = datetime.now(UTC)
+        session_export._write_export_watermark(f, session_export.ExportWatermark(tied, messages=5))
+
+        assert not is_chat_export_stale(f, tied, 3)
+
+    def test_a_pre_count_sidecar_still_reads_as_a_timestamp(self, tmp_path):
+        """An export written before the count existed keeps working on the
+        timestamp half rather than re-exporting every session at once."""
+        from app.chat import session_export
+
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        written = datetime.now(UTC) - timedelta(hours=1)
+        session_export._watermark_path(f).write_text(written.isoformat(), encoding="utf-8")
+
+        assert session_export._read_export_watermark(f).messages is None
+        assert not is_chat_export_stale(f, written, 7)  # count unknown -> cannot claim the tie
+        assert is_chat_export_stale(f, datetime.now(UTC), 7)
+
+    def test_a_corrupt_sidecar_is_stale_rather_than_trusted(self, tmp_path):
+        from app.chat import session_export
+
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        session_export._watermark_path(f).write_text("{not json and not a date", encoding="utf-8")
+
+        assert session_export._read_export_watermark(f) is None
+        assert is_chat_export_stale(f, datetime.now(UTC), 1)
 
 
 class TestExportRaceWithConcurrentInsert:
@@ -930,6 +990,37 @@ class TestOnDemandTranscriptFreshness:
         assert resp.status_code == 200, resp.text
         assert "freshness" not in resp.json()
 
+    def test_a_message_landing_mid_export_is_served_but_not_called_current(self, seeded_app, tmp_path, monkeypatch):
+        """The exporter reads, then writes. A message committed in that
+        window is in neither the file nor its watermark — and the response
+        that TRIGGERED the export is exactly the one that would otherwise
+        serve it as confirmed-current."""
+        from app.chat import session_export as mod
+        from src.repositories import chat_message_repo
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        read_all = mod._list_all_chat_messages
+
+        def _racing_read(cid, repo):
+            messages = read_all(cid, repo)
+            chat_message_repo().append_message(session_id=cid, role="user", content="landed mid-export")
+            return messages
+
+        monkeypatch.setattr(mod, "_list_all_chat_messages", _racing_read)
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["events"]  # we wrote a real file and we serve it
+        assert body["freshness"]["verified"] is False
+        assert body["freshness"]["reason"] == "export_raced_a_new_message"
+        texts = [e.get("text") or "" for e in body["events"] if e.get("kind") == "text"]
+        assert not any("landed mid-export" in t for t in texts)  # ...and it really is behind
+
     def test_non_chat_filename_keeps_the_plain_404(self, seeded_app, tmp_path, monkeypatch):
         """A legacy CLI-collector filename never matches the ``chat-*``
         pattern, so it never triggers the chat lookaside at all -- the
@@ -994,3 +1085,37 @@ def test_a_failed_session_lookup_is_not_reported_as_a_missing_session(monkeypatc
     freshness = mod.ensure_chat_transcript_current("11111111-1111-1111-1111-111111111111")
     assert freshness.lookup_failed is True
     assert freshness.session_found is False
+
+
+class TestTranscriptErrorSurfacesPairUp:
+    """REST and CLI are one surface pair: the structured ``{"error",
+    "hint"}`` body the route returns has to render as guidance on both. The
+    CLI formatted only the 404 and printed a raw Python dict for the 503 —
+    the retryable case, i.e. the one where the operator most needs to be
+    told to come back."""
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def _run(self, status, payload):
+        import typer
+
+        from cli.commands.admin_sessions import _handle_transcript_error
+
+        with pytest.raises(typer.Exit):
+            _handle_transcript_error(self._Resp(status, payload))
+
+    def test_a_retryable_503_prints_the_hint_not_a_dict_repr(self, capsys):
+        self._run(503, {"detail": {"error": "session_lookup_failed", "hint": "Retry; the store did not answer."}})
+        err = capsys.readouterr().err
+        assert "session_lookup_failed: Retry; the store did not answer." in err
+        assert "{" not in err
+
+    def test_a_404_still_prints_the_hint(self, capsys):
+        self._run(404, {"detail": {"error": "session_not_found", "hint": "No such session."}})
+        assert "session_not_found: No such session." in capsys.readouterr().err
