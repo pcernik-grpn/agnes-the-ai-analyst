@@ -8857,6 +8857,76 @@ class TestStalePersistedPlanNeverReusedAcrossTheRemainderScopeFix(TestShardScope
         )
         assert remainder["targets"][0]["root_item_id"] == "01FOLDERID"
 
+    def test_an_unsplit_folder_plan_pinned_at_the_drive_root_is_not_reused_either(self, crawl_env, monkeypatch):
+        """The label is not the tell — the scope kind and the target are.
+
+        `plan_shards` answers a subtree it cannot split (total already under
+        `target_docs`, or a flat listing with no subfolders) with exactly ONE
+        shard labelled "whole drive", and before the remainder-scope fix that
+        shard carried the drive root for a folder scope too. So a connection
+        whose folder scopes were each small enough to stay unsplit persisted a
+        stale plan with NO shard labelled "remainder" in it at all, and a
+        staleness check keyed on that label waved it straight through —
+        reusing it crawled the entire drive for that scope, which is the
+        incident this class exists to stop, reached by the other door (Devin
+        Review on #2321).
+        """
+        runs, jobs, store = self._install_env(monkeypatch, target_docs=100)
+        seen = _install_graph(monkeypatch, self._multi_folder_handler(folder_scope_root_item_id="01FOLDERID"))
+        scope = _drive_scope(source_scope_id="01FOLDERID", drive_id="b!drive1", display_path="Corp / Documents / HR")
+        connection = _connection([scope])
+
+        # Exactly what a pre-fix `plan_shards` persisted for an UNSPLIT folder
+        # scope: one shard, labelled "whole drive", at the drive root.
+        state = crawler.load_state(connection["id"])
+        state["shard_plan"] = {
+            "parent_run_id": "prior-run-before-the-fix",
+            "shards_total": 1,
+            "planned_at": "2026-09-01T00:00:00+00:00",
+            "scope_set_hash": crawler._scope_set_hash([scope]),
+            "signal": "none",
+            "min_modified": None,
+            "shards": [
+                {
+                    "scope_id": "01FOLDERID",
+                    "label": "whole drive",
+                    "signal": "none",
+                    "targets": [
+                        {
+                            "drive_id": "b!drive1",
+                            "root_item_id": None,
+                            "state_key": "b!drive1",
+                            "path": "",
+                            "signal": "none",
+                        }
+                    ],
+                    "exclude_prefixes": [],
+                    "expected": 0,
+                }
+            ],
+        }
+        crawler.save_state(connection["id"], state)
+
+        report = _run(connection, monkeypatch)
+
+        assert report["mode"] == "sharded"
+        assert len(seen) > 0, "an unsplit pre-fix plan was reused verbatim instead of being recomputed"
+        # The invariant is the drive ROOT, not one particular id: a freshly
+        # planned folder scope packs its SUBFOLDERS (f0, f1, …) and scopes only
+        # its remainder at the scope root. What must never reappear is the
+        # whole drive.
+        for job in jobs.enqueued:
+            for target in job["payload_json"]["shard"]["targets"]:
+                assert target["root_item_id"] is not None, (
+                    "a folder scope's shard must never be enqueued at the drive root"
+                )
+        remainder = next(
+            (j["payload_json"]["shard"] for j in jobs.enqueued if j["payload_json"]["shard"]["label"] == "remainder"),
+            None,
+        )
+        assert remainder is not None, "a re-planned folder scope carries its own remainder"
+        assert remainder["targets"][0]["root_item_id"] == "01FOLDERID"
+
     def test_a_stale_whole_drive_remainder_for_a_genuine_whole_drive_scope_is_still_reused(
         self, crawl_env, monkeypatch
     ):

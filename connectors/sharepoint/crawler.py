@@ -7554,9 +7554,20 @@ def _predates_remainder_scope_fix(shard: Dict[str, Any]) -> bool:
     same subtree its scope covers, never to the drive root"). A genuine
     WHOLE-DRIVE scope's remainder legitimately has ``root_item_id=None``
     too — this only flags the combination that is never legitimate: a
-    ``kind=="folder"`` scope's own remainder pointing at the drive root."""
-    if shard.get("label") != "remainder":
-        return False
+    ``kind=="folder"`` scope's own remainder pointing at the drive root.
+
+    The test is the SCOPE KIND and the target, NOT the label. Requiring
+    ``label == "remainder"`` missed the unsplit plan entirely: ``plan_shards``
+    answers a subtree it cannot split — its total already under
+    ``target_docs``, or a flat listing with no subfolders — with exactly ONE
+    shard labelled ``"whole drive"``, and before the fix that shard carried
+    the drive root for a folder scope too. A connection whose folder scopes
+    were each small enough to stay unsplit therefore persisted a plan with no
+    ``remainder`` shard in it at all, which the label check waved straight
+    through; reusing it, or re-running it by index, crawled the entire drive
+    per scope — this predicate's own incident, reached by the other door
+    (Devin Review on #2321). So for a folder scope NO shard may target the
+    drive root, whatever it is called."""
     if _scope_kind(str(shard.get("scope_id") or "")) != "folder":
         return False
     return any(t.get("root_item_id") is None for t in shard.get("targets") or ())
