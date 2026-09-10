@@ -7,7 +7,10 @@
   immediately, but the losing file stays on disk until a rebuild publishes the
   winner and can remove it atomically, so a reader that goes to the filesystem
   directly rather than through the manifest or the API can still find it in
-  between. Previously the flat file won
+  between. It also stands down entirely on a pass where any partition file
+  failed verification: a rejected part keeps its last known-good manifest
+  entry, which would otherwise look like a successful publish and take the
+  only servable copy with it. Previously the flat file won
   unconditionally, which froze distribution silently whenever the directory was
   the current data: the manifest advertised the table as a single file hashed
   from the stale pre-conversion copy, so `agnes pull` downloaded it, the md5

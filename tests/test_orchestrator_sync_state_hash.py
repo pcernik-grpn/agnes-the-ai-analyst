@@ -1081,3 +1081,47 @@ def test_update_sync_state_count_unavailable_and_rejected_part_together_keeps_th
     assert "month=2026-01/data.parquet" in (state["error"] or ""), (
         f"expected the specific rejected-part message to win; got {state['error']!r}"
     )
+
+
+def test_a_rejected_part_with_a_frozen_entry_never_reclaims_the_valid_flat_file(
+    system_db_path, tmp_path
+):
+    """The reclaim must be barred by `rejected`, not merely by an empty `parts`.
+
+    `_merge_frozen_parts` deliberately reintroduces a rejected part's last
+    known-good manifest entry, so a pass where the only part is corrupt still
+    produces a non-empty `parts`. Guarding on `parts` alone therefore deleted
+    the flat parquet — the only valid copy the server had left — and published
+    a part whose bytes no longer match its frozen hash, so every client
+    rejected the download. Data loss plus an undownloadable table
+    (2026-09-08 review finding on #1339).
+    """
+    pq_path, table_dir, flat_bytes = _write_both_layouts(tmp_path)
+    part = table_dir / "2025_11.parquet"
+
+    # Pass 1: the part is good, so it enters the manifest and the flat file is
+    # legitimately reclaimed... except we keep a copy to restore, because the
+    # scenario needs BOTH a frozen entry and a surviving flat sibling.
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, part.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+    pq_path.write_bytes(flat_bytes)
+    os.utime(pq_path, (1000.0, 1000.0))
+
+    # Pass 2: the same part is now corrupt. Its frozen entry comes back, so
+    # `parts` is truthy — but nothing servable was published.
+    part.write_bytes(b"not-a-parquet")
+    os.utime(part, (2000.0, 2000.0))
+    _run_update(
+        system_db_path,
+        meta_rows=[("orders", 100, part.stat().st_size, "local")],
+        data_dir=tmp_path,
+    )
+
+    assert pq_path.exists(), (
+        "the valid flat parquet was reclaimed on a pass whose only part failed "
+        "verification — the server has lost its last servable copy"
+    )
+    assert pq_path.read_bytes() == flat_bytes, "the surviving flat parquet was altered"

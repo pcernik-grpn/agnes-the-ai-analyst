@@ -9782,6 +9782,13 @@ def _admitting_child_statement(caller: str):
 def _barring_child_statements(caller: str):
     """Hold the admission handshake for the duration of a parent close.
 
+    ONE domain covers both singletons on purpose: in production every caller
+    closes both, so splitting the registry would only give the two a way to
+    drift. The cost is that a close of one interrupts published statements on
+    the other — harmless while every caller is a shutdown path, and worth
+    revisiting if either close ever gains a non-shutdown caller
+    (2026-09-08 review note).
+
     Bars a publisher from taking a fresh child cursor off a singleton while
     this close is interrupting, draining and closing its parent — so no
     publication can land right after the drain concluded the registry was

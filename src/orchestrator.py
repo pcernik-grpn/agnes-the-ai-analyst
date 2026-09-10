@@ -1925,13 +1925,32 @@ class SyncOrchestrator:
                     # part also sets `rejected` below, whose message names the
                     # exact bad path and deliberately replaces this one — same
                     # specific-message-wins ordering as `count_unavailable`.)
-                    if not parts:
+                    if not parts or rejected:
+                        # `rejected` bars the reclaim even when `parts` is
+                        # truthy, because `_merge_frozen_parts` deliberately
+                        # reintroduces a rejected part's last known-good
+                        # manifest entry. That makes `parts` non-empty WITHOUT
+                        # making the current file publishable: a client that
+                        # downloads it gets bytes that do not match the frozen
+                        # hash. Retiring the flat parquet there would delete
+                        # the only valid copy the server still has and leave
+                        # an undownloadable partition in its place — the
+                        # publish-before-retire ordering this branch relies on
+                        # assumes what was published is actually SERVABLE, and
+                        # a frozen entry for a corrupt file is not
+                        # (2026-09-08 review finding).
+                        reason = (
+                            f"{len(rejected)} partition file(s) failed verification this pass "
+                            f"(first: {rejected[0]})"
+                            if rejected
+                            else "the directory published nothing this pass"
+                        )
                         repo.set_error(
                             sync_key,
                             f"Both a flat parquet ({pq_path}) and a partition "
-                            f"directory ({table_dir}) exist for this table; the "
-                            f"directory published nothing this pass, so the flat "
-                            f"parquet was kept rather than reclaimed. See #1339.",
+                            f"directory ({table_dir}) exist for this table; "
+                            f"{reason}, so the flat parquet was kept rather "
+                            f"than reclaimed. See #1339.",
                         )
                     elif not retire_superseded_parquet(pq_path, root=extracts_dir / source_name / "data"):
                         repo.set_error(
