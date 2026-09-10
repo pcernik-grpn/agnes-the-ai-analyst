@@ -93,28 +93,57 @@ def test_gate_ignores_a_commented_out_key(tmp_path):
 @pytest.mark.parametrize(
     "scalar",
     [
+        # A plain scalar: YAML strips the comment, so the host must too.
+        "allowlist",
         "allowlist # restrict sandbox traffic",
+        '"allowlist"',
+        "'allowlist'",
         '"allowlist" # restrict sandbox traffic',
-        "allowlist\t# tab before the hash",
+        "allowlist   ",
+        # A QUOTED hash is part of the value, not a comment: the app sees an
+        # unknown mode and falls back to the secure `none`, so the host must
+        # NOT provision a proxy for it (Devin Review on #2417, second round).
+        '"allowlist # restrict sandbox traffic"',
+        "'allowlist # restrict sandbox traffic'",
+        # Other modes, with and without a comment that mentions allowlist.
+        "open",
+        "open # not allowlist yet",
+        "none",
+        "none # allowlist comes later",
     ],
 )
-def test_gate_survives_a_yaml_inline_comment(tmp_path, scalar):
-    """An inline comment is legal YAML and the app's own loader reads the
-    value as `allowlist`, so the host must too. Leaving the comment attached
-    made the shell compare `allowlist # …` against `allowlist`, omit
-    `--profile chat-docker-egress`, and leave a configured allowlist
-    deployment with no proxy — the host/app drift this resolver exists to
-    prevent (Devin Review on #2417)."""
-    assert _gate(tmp_path / scalar[:12].strip(), f"chat:\n  docker_egress_mode: {scalar}\n") == 0
+def test_the_host_gate_and_the_app_parser_never_disagree(tmp_path, scalar):
+    """The single property this resolver exists to guarantee: the shell's
+    verdict matches what the app's own config parser will read from the SAME
+    file. Enumerating expected answers by hand would just re-encode my
+    assumptions, so this compares the gate against the real
+    `_parse_docker_egress_mode` instead.
 
+    Both directions of disagreement were real findings on #2417: an unquoted
+    comment made the host omit the profile for a deployment the app ran in
+    allowlist mode (no proxy, no egress), and stripping a QUOTED hash made
+    the host provision a proxy for a deployment the app had fallen back to
+    `none` for."""
+    import yaml
 
-def test_an_inline_comment_does_not_turn_another_mode_into_allowlist(tmp_path):
-    """The comment strip must not be able to manufacture a match: `open` with
-    a comment that merely mentions the word stays inactive."""
-    assert (
-        _gate(tmp_path / "open-cmt", "chat:\n  docker_egress_mode: open # not allowlist yet\n")
-        == 1
+    from app.chat.config import _parse_docker_egress_mode
+
+    body = f"chat:\n  docker_egress_mode: {scalar}\n"
+    d = tmp_path / f"parity-{abs(hash(scalar))}"
+    host_active = _gate(d, body) == 0
+    app_active = _parse_docker_egress_mode(yaml.safe_load(body)["chat"]) == "allowlist"
+    assert host_active == app_active, (
+        f"host/app drift for {scalar!r}: shell says "
+        f"{'active' if host_active else 'inactive'}, app reads "
+        f"{_parse_docker_egress_mode(yaml.safe_load(body)['chat'])!r}"
     )
+
+
+def test_an_unterminated_quote_never_provisions_a_proxy(tmp_path):
+    """Malformed YAML the app cannot even load (a ScannerError) must not make
+    the host provision anything — the documented-safe direction, where the
+    app's own boot gate is what speaks up."""
+    assert _gate(tmp_path / "unterminated", 'chat:\n  docker_egress_mode: "allowlist\n') == 1
 
 
 # ---------------------------------------------------------------------------

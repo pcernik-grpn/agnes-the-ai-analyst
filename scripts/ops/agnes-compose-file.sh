@@ -96,17 +96,39 @@ agnes_chat_egress_allowlist_active() {
     # instance.yaml.example ships) configures nothing, as it should.
     _acf_egress=$(sed -n 's/^[[:space:]]*docker_egress_mode:[[:space:]]*//p' \
         "$_acf_sdir/instance.yaml" 2>/dev/null | head -1)
-    # Drop a YAML inline comment BEFORE unquoting. `docker_egress_mode:
-    # allowlist # restrict sandbox traffic` is legal YAML that the app's own
-    # loader reads as `allowlist`, so leaving the comment on made the host and
-    # the app disagree about whether the proxy profile is required — the exact
-    # drift this resolver exists to prevent. In YAML a `#` opens a comment only
-    # when whitespace precedes it, and unquoting first would throw away the
-    # information that tells a comment apart from a `#` inside the scalar, so
-    # the order of these two steps is load-bearing.
-    _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]#.*$//')
-    # Then unquote, and trim trailing whitespace a hand edit may leave behind.
-    _acf_egress=$(printf '%s' "$_acf_egress" | tr -d '"' | tr -d "'" | sed 's/[[:space:]]*$//')
+    # Resolve the scalar EXACTLY as a YAML loader would, because the whole
+    # point of this helper is that the host and the app never disagree about
+    # whether the proxy profile is required. Two shapes bite, in opposite
+    # directions, and both were real review findings on #2417:
+    #
+    #   docker_egress_mode: allowlist # restrict traffic
+    #     -> YAML strips the comment and the app reads `allowlist`, so the
+    #        host must too, or a configured allowlist deployment silently
+    #        runs with no proxy.
+    #   docker_egress_mode: "allowlist # restrict traffic"
+    #     -> YAML keeps the hash INSIDE the quotes, the app sees an unknown
+    #        mode and falls back to the secure `none`. Stripping it here would
+    #        manufacture `allowlist` and provision a proxy for a deployment
+    #        the app is running with no egress at all.
+    #
+    # So a `#` is a comment only OUTSIDE a quoted scalar. Handle the quoted
+    # forms by taking the quoted region itself, and only strip a comment from
+    # a plain scalar. An unterminated quote matches no branch and stays
+    # unequal, i.e. no profile — the documented-safe direction, where the
+    # app's own boot gate refuses chat loudly instead.
+    case $_acf_egress in
+        '"'*)
+            _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/^"\([^"]*\)".*$/\1/')
+            ;;
+        "'"*)
+            _acf_egress=$(printf '%s' "$_acf_egress" | sed "s/^'\([^']*\)'.*\$/\1/")
+            ;;
+        *)
+            _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]#.*$//')
+            ;;
+    esac
+    # Trim trailing whitespace a hand edit may leave behind.
+    _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]*$//')
     [ "$_acf_egress" = "allowlist" ]
 }
 
