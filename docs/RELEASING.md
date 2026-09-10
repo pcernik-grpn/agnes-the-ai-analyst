@@ -98,7 +98,13 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
   Found", dismisses its approval when a later verdict lists issues), so the
   gate is CI green + Devin clean. The approval persists across later pushes,
   as a human's does under this ruleset — Devin re-reviews only some pushes,
-  so pinning approval to one commit would strand most PRs. An outside collaborator's PR needs a human approval; so does the cut
+  so pinning approval to one commit would strand most PRs. Findings you fixed
+  count as addressed once every Devin thread is resolved and the head has
+  either moved past the reviewed commit or — after a rebase, which makes the
+  head "diverged" rather than "ahead" — been analysed by Devin without a new
+  issue posted at it (Devin's own "Devin Review" commit status on the head is the
+  witness — only a status the Devin app itself created counts, never one merely
+  named like it). A head Devin never analysed still needs a fresh verdict or a person. An outside collaborator's PR needs a human approval; so does the cut
   PR (its commits are `github-actions[bot]`'s own, which the bridge cannot
   self-approve). A blocked PR names that approver.
 - **The cut PR rides the same queue.** Queue it after the feature PRs you
@@ -116,8 +122,10 @@ most of `main` as `Train N: #…`; the hand-driven train is retired.
   classic branch protection still requires `test` and `docker-build` green,
   so a bypass merge is "not re-tested against current `main`", never
   "untested". Legitimate reasons: a hotfix, the cut PR (its bot commits can
-  never get the bridge's approval), or a PR Devin never re-reviewed after its
-  last push and so has no approval — Devin re-reviews only some heads. Put the
+  never get the bridge's approval), or a PR Devin never ANALYSED after its
+  last push (no "Devin Review" status on the head) and so has no approval.
+  A rebased PR whose head Devin did analyse is not such a case — the bridge
+  approves it once every thread is resolved. Put the
   reason in the merge commit or a PR comment. Everything else goes through the
   queue with `gh pr merge <N> --merge --auto`.
 - **Changing the queue's behaviour** (merge method, group size, timeout) is a

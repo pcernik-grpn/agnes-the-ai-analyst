@@ -11,6 +11,9 @@ name: Devin clean verdict approves org members' PRs
 #   author is an org member AND Devin's latest verdict is clean -> approve
 #   ... or its latest verdict listed issues, every Devin review thread is
 #       resolved and the branch has moved past the reviewed commit  -> approve
+#   ... or its latest verdict listed issues, every Devin review thread is
+#       resolved and Devin ANALYSED the current head without posting
+#       a single issue at it (a rebased branch, see below)          -> approve
 #   Devin's latest verdict lists issues still open                  -> dismiss ours
 #
 # The second line exists because Devin does not re-review a diff it considers
@@ -21,6 +24,21 @@ name: Devin clean verdict approves org members' PRs
 # those findings are hidden from GitHub by the org setting, so there is no
 # thread whose resolution could vouch for them; they need a fresh clean verdict
 # or a human approval.
+#
+# The third line exists because "moved past" is proven by GitHub's compare
+# status being "ahead", and a REBASE (the normal way to clear a conflict with
+# `main`) makes the head "diverged" from the reviewed commit even though every
+# fix is still in it — while Devin, having already reviewed that diff, posts
+# nothing for the new head (#2397 sat green, conflict-free and fully resolved
+# with no path to approval). Devin's own commit status on the head is the
+# witness then: it analysed exactly this head, and it reports findings by
+# posting a review AT that head — the review lands seconds BEFORE the status
+# flips to success — so a success status a couple of minutes old with no issue
+# review at the head means Devin had nothing new to say about it. Only a status
+# CREATED BY Devin's app counts (any write-access account can post a status
+# under any context name, so the context alone would let an author vouch for
+# themselves). A head Devin never analysed (no status) still proves nothing and
+# stays open.
 #
 # It is a POLLER, on purpose. It runs only from the default branch — on a
 # schedule and on manual dispatch — and never from a pull request's ref.
@@ -204,10 +222,41 @@ jobs:
               # a commit GitHub no longer knows) proves nothing and keeps the findings open.
               relation=$(gh api "repos/$REPO/compare/$verdict_sha...$head" --jq '.status' 2>/dev/null || true)
               case "$relation" in ahead|behind|identical|diverged) ;; *) relation="unknown" ;; esac
+              witness="head moved on"
+              open_threads=""   # per-PR; never inherit the previous PR's verdict
               if [ "$relation" != "ahead" ]; then
-                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; head ${head:0:9} is '$relation' relative to it, not ahead — findings stay open"
-                open_threads="n/a"
-              else
+                # Not provably moved past (a rebase makes the head "diverged" although
+                # every fix is still in it). Fall back to Devin's own analysis of THIS
+                # head: a "Devin Review" success status at least two minutes old and no
+                # Devin review listing issues at this exact commit (Devin posts the
+                # review before it flips the status, so the age guard closes that gap).
+                # The status must have been CREATED BY Devin's app — anyone with write
+                # access can post a status under any context name, so a status is only
+                # a witness when its creator is the Devin bot (the combined `/status`
+                # endpoint omits `creator`; the list endpoint carries it). The newest
+                # Devin-created status for the context decides: a later `pending`
+                # (re-analysis in flight) supersedes an earlier `success`. The list is
+                # every status EVENT on the commit, newest first, paginated — so all
+                # pages are read (one page could hide Devin's event behind a hundred
+                # newer ones from other workflows), like the reviews above.
+                analysed_at=$(gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" --jq '.[] | @json' 2>/dev/null \
+                  | jq -rs '[.[] | select(.context == "Devin Review"
+                                      and .creator.type == "Bot"
+                                      and (.creator.login | IN("devin-ai-integration[bot]", "devin-ai-integration")))]
+                           | sort_by(.updated_at) | last // {} | if .state == "success" then .updated_at else "" end' || true)
+                issues_at_head=$(printf '%s\n' "$reviews" | jq -rs --arg re "$issues_re" --arg head "$head" '[.[]
+                    | select(.user.login == "devin-ai-integration[bot]" and .commit_id == $head and ((.body // "") | test($re)))] | length')
+                age=0
+                if [ -n "$analysed_at" ]; then age=$(( $(date -u +%s) - $(date -u -d "$analysed_at" +%s) )); fi
+                if [ -n "$analysed_at" ] && [ "$age" -ge 120 ] && [ "$issues_at_head" = "0" ]; then
+                  echo "#$n: head ${head:0:9} is '$relation' relative to Devin's reviewed ${verdict_sha:0:9}, but Devin analysed this head ($analysed_at) and listed no issue at it"
+                  witness="head re-analysed clean"
+                else
+                  echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; head ${head:0:9} is '$relation' relative to it, not ahead, and Devin has not analysed it clean (status: ${analysed_at:-none}, issue reviews at head: $issues_at_head) — findings stay open"
+                  open_threads="n/a"
+                fi
+              fi
+              if [ "${open_threads:-}" != "n/a" ]; then
               open_threads=$(gh api graphql -f owner="$owner" -f name="$name" -F number="$n" -f query='
                 query($owner: String!, $name: String!, $number: Int!) {
                   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
@@ -220,9 +269,9 @@ jobs:
               fi
               # GraphQL returns bot logins without the "[bot]" suffix; accept both spellings.
               if [ "$open_threads" = "0" ]; then
-                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} — treating the findings as addressed"
+                echo "#$n: Devin said \"$headline\" at ${verdict_sha:0:9}; every Devin thread is resolved and the head is ${head:0:9} ($witness) — treating the findings as addressed"
                 verdict="Devin Review: No Issues Found (all findings resolved)"
-                headline="$headline — all threads resolved, head moved on"
+                headline="$headline — all threads resolved, $witness"
               elif [[ "$open_threads" =~ ^[0-9]+$ ]]; then
                 echo "#$n: Devin said \"$headline\"; $open_threads Devin thread(s) still unresolved — findings stay open"
               elif [ "$open_threads" != "n/a" ]; then
