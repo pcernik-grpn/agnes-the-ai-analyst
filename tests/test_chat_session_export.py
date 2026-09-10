@@ -875,6 +875,61 @@ class TestOnDemandTranscriptFreshness:
         assert resp.status_code == 404
         assert resp.json()["detail"]["error"] == "session_not_found"
 
+    def test_a_confirmed_current_export_says_so(self, seeded_app, tmp_path, monkeypatch):
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["freshness"] == {"verified": True}
+
+    def test_a_lookup_failure_over_an_existing_export_serves_it_marked_unverified(
+        self, seeded_app, tmp_path, monkeypatch
+    ):
+        """The 503 only covers a lookup failure with NO file on disk. When an
+        older export exists, resolution succeeds and we serve it — which is
+        right (during an outage it is often the only evidence there is) as
+        long as we never let a partial record read as the whole one."""
+        import src.repositories as repos
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        assert export_chat_session_jsonl(chat_id) is not None
+
+        class _Boom:
+            def get_session(self, _chat_id):
+                raise RuntimeError("session store unavailable")
+
+        monkeypatch.setattr(repos, "chat_session_repo", lambda: _Boom())
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["events"]  # the file we could not verify is still served
+        assert body["freshness"]["verified"] is False
+        assert body["freshness"]["reason"] == "session_lookup_failed"
+        assert body["freshness"]["hint"]
+
+    def test_a_legacy_filename_carries_no_freshness_claim(self, seeded_app, tmp_path, monkeypatch):
+        """A CLI-collector file is not ours to refresh, so we say nothing
+        about its currency rather than claim it is verified."""
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        exported = export_chat_session_jsonl(chat_id)
+        assert exported is not None
+        legacy = exported.parent / "session-001.jsonl"
+        legacy.write_text(exported.read_text())
+
+        resp = self._get_transcript(seeded_app, "analyst1", "session-001.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        assert "freshness" not in resp.json()
+
     def test_non_chat_filename_keeps_the_plain_404(self, seeded_app, tmp_path, monkeypatch):
         """A legacy CLI-collector filename never matches the ``chat-*``
         pattern, so it never triggers the chat lookaside at all -- the

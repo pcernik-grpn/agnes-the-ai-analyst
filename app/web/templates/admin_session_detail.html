@@ -58,6 +58,11 @@
 .td-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--text-secondary, #6b7280); margin: 0 0 4px; }
 .obs-empty { padding: 40px 16px; text-align: center; color: var(--text-secondary, #6b7280); }
+.td-unverified { display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px;
+                 border: 1px solid var(--ds-accent-warn-line); border-radius: 8px;
+                 background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+                 font-size: 13px; line-height: 1.45; }
+.td-unverified b { font-weight: 600; }
 </style>
 {% endblock %}
 
@@ -365,6 +370,21 @@
       }
       const d = body;
       renderMeta(d.summary, d.tokens, d.counts);
+      // The endpoint brings a chat export current before serving it, but it
+      // cannot always confirm that it managed to -- a session store that
+      // didn't answer leaves a real file on disk whose currency is unknown.
+      // We still show that file (during an incident it is often the only
+      // evidence there is), so the one thing we must not do is let it read
+      // as the whole conversation.
+      const fresh = d.freshness;
+      if (fresh && fresh.verified === false) {
+        const warn = document.createElement('div');
+        warn.className = 'td-unverified';
+        warn.id = 'td-unverified';
+        warn.innerHTML = '<span aria-hidden="true">\u26A0</span><span><b>Possibly incomplete.</b> ' +
+          escapeHtml(fresh.hint || 'This transcript could not be confirmed current.') + '</span>';
+        eventsRoot.appendChild(warn);
+      }
       const events = d.events || [];
       let errorCount = 0;
       events.forEach((ev, i) => {

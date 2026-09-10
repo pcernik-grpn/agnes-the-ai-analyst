@@ -517,6 +517,74 @@ def _chat_transcript_not_found_detail(freshness: ChatTranscriptFreshness) -> dic
     }
 
 
+def _chat_transcript_freshness_note(freshness: ChatTranscriptFreshness | None) -> dict:
+    """Say, on a transcript we ARE serving, whether we could confirm it is
+    the current one.
+
+    ``ensure_chat_transcript_current`` sets ``path`` only when the export is
+    known current — it either already was, or was just rewritten. Every
+    other outcome can still resolve to a real file on disk: the periodic
+    sweep wrote one minutes ago, and messages since then are simply not in
+    what the admin is now reading. Serving it is still the right call — in
+    the middle of an incident a partial transcript is often the only
+    evidence there is — but serving it silently lets a partial record read
+    as the whole one, which is the failure this endpoint exists to end.
+
+    ``verified`` is therefore a claim we only make when we checked, and
+    ``reason`` names what stopped us when we could not. ``freshness=None``
+    means the refresh call itself raised.
+    """
+    if freshness is not None and freshness.path is not None:
+        return {"verified": True}
+    if freshness is None:
+        return {
+            "verified": False,
+            "reason": "refresh_failed",
+            "hint": (
+                "Could not check whether this export is current — the refresh "
+                "itself failed (see server logs). Newer messages may be missing "
+                "from what is shown."
+            ),
+        }
+    if freshness.lookup_failed:
+        return {
+            "verified": False,
+            "reason": "session_lookup_failed",
+            "hint": (
+                "Could not check whether this export is current — the session "
+                "store did not answer. Newer messages may be missing from what "
+                "is shown; retry for a verified copy."
+            ),
+        }
+    if not freshness.session_found:
+        return {
+            "verified": False,
+            "reason": "session_not_found",
+            "hint": (
+                "This file is a historical export — the chat session it came "
+                "from no longer exists, so there is nothing left to check it "
+                "against."
+            ),
+        }
+    if freshness.export_disabled:
+        return {
+            "verified": False,
+            "reason": "chat_transcript_export_disabled",
+            "hint": (
+                "This instance has `sessions.include_chat` turned off, so this "
+                "file is frozen at whatever was exported before it was turned "
+                "off. Newer messages are not in it."
+            ),
+        }
+    return {
+        "verified": False,
+        "reason": "export_not_written",
+        "hint": (
+            "Could not bring this export current (see server logs). Newer messages may be missing from what is shown."
+        ),
+    }
+
+
 @router.get("/{username}/{session_file}/transcript")
 def transcript(
     username: str,
@@ -556,6 +624,11 @@ def transcript(
                 detail=_chat_transcript_not_found_detail(chat_freshness),
             ) from exc
         raise
+    # A file resolved. Whether it is the CURRENT one is a separate question,
+    # and one we can only have answered for a chat-shaped filename: a legacy
+    # CLI-collector file is not ours to refresh, so we make no claim about it.
+    freshness_note = _chat_transcript_freshness_note(chat_freshness) if chat_id is not None else None
+
     turns = parse_jsonl(path)
     events = _render_transcript(turns)
     tokens = _sum_usage_from_turns(turns)
@@ -588,7 +661,7 @@ def transcript(
     except Exception:
         logger.exception("audit_log write failed for session.transcript_view")
 
-    return {
+    body: dict[str, Any] = {
         "username": username,
         "session_file": session_file,
         "summary": summary,
@@ -596,3 +669,6 @@ def transcript(
         "counts": counts,
         "events": events,
     }
+    if freshness_note is not None:
+        body["freshness"] = freshness_note
+    return body
