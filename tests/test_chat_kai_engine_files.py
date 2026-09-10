@@ -25,14 +25,19 @@ KAI_CONFIG = SimpleNamespace(provider="kai-agent", kai_agent_url="http://engine.
 
 
 class _FakeChatRepo:
-    def __init__(self, sessions: dict[str, str]):
+    def __init__(self, sessions: dict[str, str], sandbox_ids: dict[str, str | None] | None = None):
         self._sessions = sessions
+        # Defaults to an already-has-a-sandbox placeholder: this module tests
+        # the engine proxy itself, so a session must reach the engine unless
+        # a test explicitly opts a chat id out with ``None``.
+        self._sandbox_ids = sandbox_ids or {}
 
     def get_session(self, chat_id: str):
         email = self._sessions.get(chat_id)
         if email is None:
             return None
-        return SimpleNamespace(id=chat_id, user_email=email)
+        sandbox_id = self._sandbox_ids.get(chat_id, f"kai-engine:{chat_id}")
+        return SimpleNamespace(id=chat_id, user_email=email, sandbox_id=sandbox_id)
 
 
 @pytest.fixture

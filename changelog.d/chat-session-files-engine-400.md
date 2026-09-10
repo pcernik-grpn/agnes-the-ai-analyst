@@ -9,6 +9,13 @@
   "no files here", falling back to any harvested copies), and a genuine
   engine outage logs its full traceback only once per session instead of on
   every poll.
+- **The Files panel no longer asks the engine about a conversation that has
+  no sandbox yet.** It polls this route the instant a chat opens, well
+  before the first turn can mint one — every one of those polls was landing
+  a "chat not found" 404 on the engine's own log, for a well-formed id the
+  engine simply hasn't seen. The listing now checks the session's own
+  `sandbox_id` first and skips the round trip when it is unset, answering
+  with the same "no files here yet" shape a 404 already produced.
 
 ### Internal
 - The `kai-agent` development stub now mirrors the real engine's `400` for a

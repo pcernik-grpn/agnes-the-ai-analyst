@@ -36,7 +36,11 @@ class _FakeChatRepo:
         email = self._sessions.get(chat_id)
         if email is None:
             return None
-        return SimpleNamespace(id=chat_id, user_email=email)
+        # These tests exercise a session that already has an engine sandbox
+        # (or is proving what an unknown/legacy chat id looks like once the
+        # engine itself is actually asked) — never the no-sandbox-yet gate,
+        # which is unit-tested in tests/test_chat_session_files.py.
+        return SimpleNamespace(id=chat_id, user_email=email, sandbox_id=f"kai-engine:{chat_id}")
 
 
 def _b64url(raw: bytes) -> str:

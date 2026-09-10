@@ -385,6 +385,15 @@ def _owned_session_or_404(request: Request, chat_id: str, user: object) -> dict:
     """Return the caller as a plain user dict, 404-ing on any session the
     caller does not own (and 403-ing restricted principals, which have no
     single identity to own a session's files)."""
+    user, _session = _owned_session_and_row_or_404(request, chat_id, user)
+    return user
+
+
+def _owned_session_and_row_or_404(request: Request, chat_id: str, user: object) -> tuple[dict, Any]:
+    """Same ownership check as :func:`_owned_session_or_404`, but also hands
+    back the session row a caller already paid the repo round trip for —
+    e.g. ``sandbox_id``, which the engine-listing gate below reads without a
+    second lookup."""
     from app.auth.session_principal import PRINCIPAL_TYPES
 
     if isinstance(user, PRINCIPAL_TYPES) or not isinstance(user, dict) or not user.get("email"):
@@ -396,7 +405,7 @@ def _owned_session_or_404(request: Request, chat_id: str, user: object) -> dict:
     s = repo.get_session(chat_id)
     if s is None or s.user_email != user["email"]:
         raise HTTPException(status_code=404)
-    return user
+    return user, s
 
 
 def _session_dir(email: str, chat_id: str) -> Path:
@@ -701,11 +710,24 @@ async def list_session_files(
     existed. Sessions on an engine-sandbox provider (``kai-agent``) never
     walk the host dir — see the module docstring; they report
     ``source="engine"``.
+
+    An engine-sandbox session with no ``sandbox_id`` yet (a brand-new chat,
+    or one whose sandbox was torn down) never asks the engine at all: this
+    route is polled the instant a conversation opens, well before the first
+    turn can mint a sandbox, and the engine has no way to know a chat id it
+    has never seen — every such poll used to land a "chat not found" 404 on
+    the engine's own log for no reason. The answer is the same shape a 404
+    from the engine gives today, just without the round trip.
     """
-    user = _owned_session_or_404(request, chat_id, user)
+    user, session = _owned_session_and_row_or_404(request, chat_id, user)
     cfg = _chat_config(request)
     harvested = _harvested_entries(chat_id)
     if _files_source(cfg) == "engine":
+        if not getattr(session, "sandbox_id", None):
+            return _merge_harvested(
+                SessionFilesResponse(files=[], truncated=False, source="engine", supported=False),
+                harvested,
+            )
         try:
             live = await _list_engine_files(user, chat_id, cfg)
         except EngineFilesUnavailable:

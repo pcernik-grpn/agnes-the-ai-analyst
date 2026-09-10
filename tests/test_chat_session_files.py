@@ -35,15 +35,22 @@ CHAT_ID = "chat_filestest01"
 class _FakeChatRepo:
     """get_session-only stand-in for app.state.chat_repo."""
 
-    def __init__(self, sessions: dict[str, str]):
+    def __init__(self, sessions: dict[str, str], sandbox_ids: dict[str, str | None] | None = None):
         # chat_id -> owner email
         self._sessions = sessions
+        # chat_id -> sandbox_id override. Chats not listed here default to
+        # an already-has-a-sandbox placeholder, so the many pre-existing
+        # engine tests below keep exercising the real engine round trip they
+        # were written against; only the no-sandbox-yet tests opt out with
+        # an explicit ``None``.
+        self._sandbox_ids = sandbox_ids or {}
 
     def get_session(self, chat_id: str):
         email = self._sessions.get(chat_id)
         if email is None:
             return None
-        return SimpleNamespace(id=chat_id, user_email=email)
+        sandbox_id = self._sandbox_ids.get(chat_id, f"kai-engine:{chat_id}")
+        return SimpleNamespace(id=chat_id, user_email=email, sandbox_id=sandbox_id)
 
 
 #: The host-path harness default. Explicit on purpose: the instance default
@@ -56,6 +63,7 @@ def _make_app(
     *,
     data_dir: Path,
     sessions: dict[str, str] | None = None,
+    sandbox_ids: dict[str, str | None] | None = None,
     chat_config: object | None = _DOCKER_CONFIG,
 ) -> FastAPI:
     os.environ["DATA_DIR"] = str(data_dir)
@@ -65,7 +73,9 @@ def _make_app(
 
     app = FastAPI()
     app.include_router(files_router)
-    app.state.chat_repo = _FakeChatRepo(sessions if sessions is not None else {CHAT_ID: TEST_USER["email"]})
+    app.state.chat_repo = _FakeChatRepo(
+        sessions if sessions is not None else {CHAT_ID: TEST_USER["email"]}, sandbox_ids
+    )
     if chat_config is not None:
         app.state.chat_config = chat_config
     app.dependency_overrides[require_chat_access] = lambda: TEST_USER
@@ -301,6 +311,63 @@ def test_list_under_kai_agent_reports_unsupported_not_workspace_noise(
     assert body["supported"] is False
 
 
+def test_list_under_kai_agent_skips_the_engine_when_no_sandbox_exists_yet(
+    data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session with no ``sandbox_id`` — a brand-new chat, or one whose
+    sandbox was torn down — must never be asked about: the panel polls this
+    route the instant a conversation opens, well before the first turn can
+    mint a sandbox, and the engine cannot possibly know a chat id it has
+    never seen. Proven with a transport that would hand back a real file if
+    it were ever reached — the gate must mean the listing never gets there,
+    not merely that this particular engine happens to 404."""
+    import httpx
+
+    import app.api.chat_session_files as mod
+    from app.api import kai
+
+    def _must_not_be_called(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("engine must not be called before a sandbox exists")
+
+    monkeypatch.setattr(mod, "_ENGINE_TRANSPORT", httpx.MockTransport(_must_not_be_called))
+    monkeypatch.setattr(kai, "mint_engine_session_token", lambda email, chat_id: ("jwt", 0))
+    app = _make_app(data_dir=data_dir, chat_config=_KAI_CONFIG, sandbox_ids={CHAT_ID: None})
+    resp = TestClient(app).get(f"/api/chat/sessions/{CHAT_ID}/files")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["files"] == []
+    assert body["source"] == "engine"
+    assert body["supported"] is False
+
+
+def test_list_under_kai_agent_with_a_sandbox_still_reaches_the_engine(
+    data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-sandbox-yet gate must not swallow a session that already has
+    one — its listing still reaches the engine, proven by an engine that
+    hands back a real file the response must actually surface."""
+    import httpx
+
+    import app.api.chat_session_files as mod
+    from app.api import kai
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"entries": [{"name": "report.txt", "path": "report.txt", "type": "file", "size": 5}]},
+        )
+
+    monkeypatch.setattr(mod, "_ENGINE_TRANSPORT", httpx.MockTransport(_handler))
+    monkeypatch.setattr(kai, "mint_engine_session_token", lambda email, chat_id: ("jwt", 0))
+    app = _make_app(data_dir=data_dir, chat_config=_KAI_CONFIG, sandbox_ids={CHAT_ID: f"kai-engine:{CHAT_ID}"})
+    resp = TestClient(app).get(f"/api/chat/sessions/{CHAT_ID}/files")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "engine"
+    assert body["supported"] is True
+    assert {f["path"] for f in body["files"]} == {"report.txt"}
+
+
 def test_download_and_save_artefact_404_under_kai_agent_without_engine(
     data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -523,9 +590,7 @@ def _pptx_bytes(*slides: tuple[str, list[str]]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for number, (title, lines) in reversed(list(enumerate(slides, start=1))):
-            paragraphs = "".join(
-                f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p>" for text in [title, *lines] if text
-            )
+            paragraphs = "".join(f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p>" for text in [title, *lines] if text)
             zf.writestr(
                 f"ppt/slides/slide{number}.xml",
                 '<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree>'
@@ -560,9 +625,7 @@ def test_preview_reads_a_pptx_slide_by_slide(client: TestClient, session_dir: Pa
     assert body["slides"][1]["lines"] == ["All 30 engagement types", "Two-column table"]
 
 
-def test_preview_of_a_pptx_that_is_not_really_a_pptx_is_none_not_500(
-    client: TestClient, session_dir: Path
-) -> None:
+def test_preview_of_a_pptx_that_is_not_really_a_pptx_is_none_not_500(client: TestClient, session_dir: Path) -> None:
     """An agent picks the filename, so the extension is a claim, not a fact.
     A wrong one degrades to the row's own download affordance."""
     (session_dir / "broken.pptx").write_bytes(b"this is not a zip archive")
@@ -591,9 +654,7 @@ def test_preview_truncates_a_long_textual_file_and_says_so(client: TestClient, s
     assert len(body["text"]) == _PREVIEW_MAX_CHARS
 
 
-def test_preview_points_an_image_at_the_raw_viewer_without_reading_it(
-    client: TestClient, session_dir: Path
-) -> None:
+def test_preview_points_an_image_at_the_raw_viewer_without_reading_it(client: TestClient, session_dir: Path) -> None:
     """The browser fetches these bytes itself — the preview endpoint must not
     slurp a 20 MB PNG into memory just to say "it's an image"."""
     (session_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
@@ -695,9 +756,10 @@ def test_preview_refuses_the_same_paths_the_download_route_does(client: TestClie
 
 def test_preview_404s_for_a_session_the_caller_does_not_own(data_dir: Path, session_dir: Path) -> None:
     app = _make_app(data_dir=data_dir, sessions={CHAT_ID: OTHER_USER["email"]})
-    assert TestClient(app).get(
-        f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "notes.md"}
-    ).status_code == 404
+    assert (
+        TestClient(app).get(f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "notes.md"}).status_code
+        == 404
+    )
 
 
 def test_preview_declines_a_file_too_large_to_glance_at(client: TestClient, session_dir: Path, monkeypatch) -> None:
@@ -720,9 +782,7 @@ def _raw(client: TestClient, path: str):
     return client.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": path})
 
 
-def test_raw_serves_an_allowlisted_image_inline_and_framable_by_us(
-    client: TestClient, session_dir: Path
-) -> None:
+def test_raw_serves_an_allowlisted_image_inline_and_framable_by_us(client: TestClient, session_dir: Path) -> None:
     (session_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
     resp = _raw(client, "chart.png")
@@ -762,6 +822,4 @@ def test_raw_enforces_containment_and_ownership(data_dir: Path, session_dir: Pat
     assert _raw(client, "missing.png").status_code == 404
 
     other = TestClient(_make_app(data_dir=data_dir, sessions={CHAT_ID: OTHER_USER["email"]}))
-    assert other.get(
-        f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "chart.png"}
-    ).status_code == 404
+    assert other.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "chart.png"}).status_code == 404
