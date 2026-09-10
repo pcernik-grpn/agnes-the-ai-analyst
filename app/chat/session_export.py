@@ -176,6 +176,13 @@ def _export_watermark(messages: list[ChatMessage], content: str) -> ExportWaterm
     )
 
 
+#: Public alias of :func:`_content_digest` for the one caller outside this
+#: module that has to answer "are these the bytes that were verified" --
+#: ``app/api/admin_sessions.py``'s transcript route. Exported rather than
+#: reimplemented so the two can never disagree about the algorithm.
+content_digest = _content_digest
+
+
 def _watermark_path(target: Path) -> Path:
     """The sidecar file :func:`_write_export_watermark` /
     :func:`_read_export_watermark` use to record the content watermark for
@@ -520,6 +527,22 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     # pinned to THIS transcript and an overlapping writer cannot leave its
     # newer watermark vouching for our older bytes -- see `_content_digest`.
     watermark = _export_watermark(messages, content)
+    # Do not publish backwards. Each os.replace is atomic and the digest
+    # above makes a TORN pair detectable, but neither orders generations: a
+    # slower writer that read fewer messages could still land last and
+    # replace a newer transcript with a coherent, older one. The request
+    # that just certified the newer file would then be serving the older
+    # one. So if what is already on disk covers everything this snapshot
+    # has, leave it alone -- reusing the whole staleness rule, digest check
+    # included, so a torn or older pair is still healed by writing.
+    #
+    # This narrows the window rather than closing it (another writer can
+    # publish between this check and the replace below); a loser still
+    # heals, because a transcript covering fewer messages than the session
+    # has is exactly what `is_chat_export_stale` reports on the next call.
+    if target.is_file() and not is_chat_export_stale(target, watermark.last_message_at, watermark.messages):
+        return target
+
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(target, content)
@@ -538,13 +561,25 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     return target
 
 
-def is_chat_export_stale(
+def _stale_with_watermark(
     existing_path: Path | None,
     last_message_at: datetime | None,
     message_count: int | None = None,
-) -> bool:
+) -> tuple[bool, ExportWatermark | None]:
     """True when a chat session's exported jsonl is missing, unreadable, or
-    older than the session's last message.
+    older than the session's last message -- AND the watermark that answer
+    was reached from, ``None`` when there was none to validate.
+
+    The second half exists for a caller that goes on to CERTIFY the
+    transcript: it must take the digest from the very read this verdict was
+    computed on, never re-read the sidecar afterwards. Those are two
+    different generations the moment anything republishes the file in
+    between, and a digest fetched by that later read describes a generation
+    nothing ever compared against the session -- which the certifying
+    caller would then report as verified. See
+    ``ChatTranscriptFreshness.content_sha256``. Callers that want only the
+    verdict use :func:`is_chat_export_stale`, the plain-boolean face of
+    this.
 
     The ONE staleness rule shared by the periodic sweep
     (``services/session_pipeline/runner.py::_sweep_chat_session_exports``)
@@ -585,12 +620,12 @@ def is_chat_export_stale(
     the question either way; every caller in this repo passes it.
     """
     if last_message_at is None:
-        return False
+        return False, None
     if existing_path is None or not existing_path.is_file():
-        return True
+        return True, None
     watermark = _read_export_watermark(existing_path)
     if watermark is None:
-        return True
+        return True, None
     # The pair has to belong together. Each file is replaced atomically, the
     # PAIR is not, so two overlapping writers can leave one writer's
     # transcript beside the other's watermark -- and a watermark vouching
@@ -599,19 +634,46 @@ def is_chat_export_stale(
     # export heals it. A sidecar predating the digest cannot be checked and
     # is treated exactly like a missing one, for the reason given above.
     if watermark.content_sha256 is None:
-        return True
+        return True, watermark
+    # Always hash. A cheaper "has this file changed" pre-check was tried
+    # here and removed: `(size, mtime_ns)` is not proof of identity, so a
+    # replacement preserving both -- routine on a filesystem with
+    # coarse timestamps -- made this SKIP the digest and certify the old
+    # sidecar over unrelated content, indefinitely. An optimisation that
+    # can bypass the verification is the wrong shape in a function whose
+    # entire job is to verify, and it bought 0.36 s per ten-minute sweep
+    # tick, measured (200 transcripts of 2 000 turns). If that cost ever
+    # matters, the token has to be one a replacement cannot forge --
+    # `(st_dev, st_ino)` of the staged file, which `os.replace` carries
+    # onto the published one -- not its size and timestamp.
     try:
         if _content_digest(existing_path.read_text(encoding="utf-8")) != watermark.content_sha256:
-            return True
+            return True, watermark
     except OSError:
-        return True
+        return True, watermark
     if _as_utc(last_message_at) > watermark.last_message_at:
-        return True
+        return True, watermark
     # Strictly MORE messages than we wrote, at a timestamp we already have:
     # the tie above. Never `!=` — a count that has drifted low (nothing in
     # this repo deletes chat messages, but a restore or a manual fix could)
     # would otherwise re-export the same session on every sweep tick.
-    return message_count is not None and watermark.messages is not None and message_count > watermark.messages
+    if message_count is not None and watermark.messages is not None and message_count > watermark.messages:
+        return True, watermark
+    return False, watermark
+
+
+def is_chat_export_stale(
+    existing_path: Path | None,
+    last_message_at: datetime | None,
+    message_count: int | None = None,
+) -> bool:
+    """The ONE staleness rule -- see :func:`_stale_with_watermark`, which
+    this is the plain-boolean face of. Every caller that only needs the
+    verdict uses this; a caller that then CERTIFIES the transcript must use
+    the underlying helper instead, so the digest it reports comes from the
+    same read as the verdict.
+    """
+    return _stale_with_watermark(existing_path, last_message_at, message_count)[0]
 
 
 @dataclass
@@ -646,6 +708,15 @@ class ChatTranscriptFreshness:
     message_count: int
     last_message_at: datetime | None
     raced: bool = False
+    #: Digest of the exact transcript this verdict covers, when there is
+    #: one -- see :func:`_content_digest`. A caller that renders the file
+    #: must confirm the bytes it read still hash to this before repeating
+    #: the verdict: ``path`` names a file, and a file can be replaced
+    #: between our check and their read (an ordinary re-export, or the
+    #: narrow residue the publish-order guard in
+    #: :func:`export_chat_session_jsonl` leaves open). The verdict is about
+    #: a generation, not about a filename.
+    content_sha256: str | None = None
 
 
 def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
@@ -715,26 +786,45 @@ def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
         return freshness
 
     existing = _session_data_dir() / owner["id"] / f"chat-{chat_id}.jsonl"
+    # `session` was read before the owner lookup and this file check, so a
+    # "not stale" verdict against it only means "not stale as of a snapshot
+    # that is already several I/O calls old" — confirm against a current
+    # read before certifying, and when the session has moved on, fall
+    # through and export rather than merely labelling the file behind.
     if existing.is_file() and not is_chat_export_stale(existing, session.last_message_at, session.message_count):
-        freshness.path = existing
-        return freshness
+        behind, validated = _is_stale_against_a_fresh_read(chat_id, existing)
+        if not behind:
+            freshness.path = existing
+            # The digest comes from the read that produced `behind`, never
+            # from a fresh look at the sidecar afterwards: a writer
+            # publishing between the two would hand us the digest of a
+            # generation nothing had compared against the session, and the
+            # route would then repeat THIS verdict over those bytes.
+            freshness.content_sha256 = validated.content_sha256 if validated else None
+            return freshness
 
     freshness.path = export_chat_session_jsonl(chat_id)
     if freshness.path is not None:
-        freshness.raced = _export_raced_a_new_message(chat_id, freshness.path)
+        freshness.raced, validated = _is_stale_against_a_fresh_read(chat_id, freshness.path)
+        freshness.content_sha256 = validated.content_sha256 if validated else None
     return freshness
 
 
-def _export_raced_a_new_message(chat_id: str, exported: Path) -> bool:
-    """True when a message landed while we were exporting *chat_id*.
+def _is_stale_against_a_fresh_read(chat_id: str, exported: Path) -> tuple[bool, ExportWatermark | None]:
+    """True when *exported* is already behind ``chat_id`` as of a session
+    row read right now.
 
-    ``export_chat_session_jsonl`` reads the messages, then writes; anything
-    committed in between is in neither the file nor its watermark. The next
-    check catches it — but the response that TRIGGERED the export would
-    otherwise serve that same file as confirmed-current, which is the one
-    thing this whole freshness path exists to stop. So we re-read the
-    session (the cheap single row, not the messages again) and re-run the
-    same staleness rule against what we actually wrote.
+    Both callers need this for the same reason. Every value
+    :func:`ensure_chat_transcript_current` decides on is a snapshot taken
+    before some I/O: the session row is read before the owner lookup and
+    the file check, and ``export_chat_session_jsonl`` reads the messages
+    before it writes. A message committed inside either window is in
+    neither the file nor its watermark — and the response that TRIGGERED
+    the refresh is precisely the one that would otherwise serve that file
+    as confirmed-current, which is the single thing this whole freshness
+    path exists to stop. So we re-read the session (the cheap single row,
+    not the messages again) and re-run the same staleness rule against the
+    file we are actually about to certify.
 
     This narrows the window from "however long the export took" — seconds,
     on a conversation long enough to page — to the gap between this read
@@ -748,9 +838,11 @@ def _export_raced_a_new_message(chat_id: str, exported: Path) -> bool:
         latest = chat_session_repo().get_session(chat_id)
     except Exception:
         # We could not check. Saying "current" would be a claim we did not
-        # verify; saying "raced" is the honest, conservative reading.
+        # verify; saying "raced" is the honest, conservative reading -- and
+        # with no validated watermark to hand back, a caller cannot certify
+        # any generation either.
         logger.warning("chat transcript freshness: post-export re-check failed for %s", chat_id, exc_info=True)
-        return True
+        return True, None
     if latest is None:
-        return False
-    return is_chat_export_stale(exported, latest.last_message_at, latest.message_count)
+        return False, _read_export_watermark(exported)
+    return _stale_with_watermark(exported, latest.last_message_at, latest.message_count)

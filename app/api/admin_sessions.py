@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.admin_user_sessions import _SESSION_FILE_RE, _session_data_dir
 from app.auth.access import require_admin
-from services.session_pipeline.lib import parse_jsonl
+from services.session_pipeline.lib import parse_jsonl_text
 from src.repositories import (
     audit_repo,
     usage_repo,
@@ -517,7 +517,22 @@ def _chat_transcript_not_found_detail(freshness: ChatTranscriptFreshness) -> dic
     }
 
 
-def _chat_transcript_freshness_note(freshness: ChatTranscriptFreshness | None) -> dict:
+def _serves_the_verified_generation(freshness: ChatTranscriptFreshness, served: str | None) -> bool:
+    """True when *served* is the exact transcript ``freshness`` vouches for.
+
+    Both halves have to be present to answer: no recorded digest (a sidecar
+    predating it, or one we could not read) and no bytes in hand (the read
+    failed) each mean "cannot confirm", which is not the same as a match and
+    must never be reported as one.
+    """
+    if freshness.content_sha256 is None or served is None:
+        return False
+    from app.chat.session_export import content_digest
+
+    return content_digest(served) == freshness.content_sha256
+
+
+def _chat_transcript_freshness_note(freshness: ChatTranscriptFreshness | None, *, served: str | None) -> dict:
     """Say, on a transcript we ARE serving, whether we could confirm it is
     the current one.
 
@@ -534,10 +549,32 @@ def _chat_transcript_freshness_note(freshness: ChatTranscriptFreshness | None) -
     ``reason`` names what stopped us when we could not. ``freshness=None``
     means the refresh call itself raised; ``raced`` means we wrote the file
     but a message landed while we were writing it, so a real ``path`` is
-    still not a current one.
+    still not a current one; ``export_replaced_while_reading`` means the
+    verdict was about a different generation of the file than the bytes in
+    *served*, which is why *served* is a required argument -- a verdict
+    detached from the content it describes is the failure this whole note
+    exists to prevent, not a detail a caller may omit.
     """
     if freshness is not None and freshness.path is not None and not freshness.raced:
-        return {"verified": True}
+        # `path` names a file; the verdict was about one GENERATION of it.
+        # *served* is the content this response actually renders, so a
+        # verdict is only repeatable if those bytes are the ones that were
+        # verified. When they are not, something republished the file
+        # between the check and the read, and what we hold may be either
+        # newer or (through the narrow generation race in
+        # `session_export._already_covered`) older -- unknowable from here,
+        # so we serve it and say we could not confirm it.
+        if _serves_the_verified_generation(freshness, served):
+            return {"verified": True}
+        return {
+            "verified": False,
+            "reason": "export_replaced_while_reading",
+            "hint": (
+                "This transcript was rewritten between the freshness check "
+                "and this read, so what is shown could not be confirmed "
+                "current. Reload for a checked copy."
+            ),
+        }
     if freshness is not None and freshness.raced:
         return {
             "verified": False,
@@ -636,12 +673,23 @@ def transcript(
                 detail=_chat_transcript_not_found_detail(chat_freshness),
             ) from exc
         raise
-    # A file resolved. Whether it is the CURRENT one is a separate question,
-    # and one we can only have answered for a chat-shaped filename: a legacy
-    # CLI-collector file is not ours to refresh, so we make no claim about it.
-    freshness_note = _chat_transcript_freshness_note(chat_freshness) if chat_id is not None else None
+    # Read the transcript ONCE and reason about those exact bytes. The
+    # freshness verdict above was made about one GENERATION of this file, and
+    # a file can be replaced between that check and this read -- an ordinary
+    # re-export by the sweep, or the narrow generation race
+    # `session_export._already_covered` leaves open. Opening the file a
+    # second time here would repeat a verdict about content nothing ever
+    # checked, which is exactly the "partial record reading as the whole
+    # one" this endpoint exists to end.
+    raw = path.read_text(encoding="utf-8")
+    turns = parse_jsonl_text(raw, source=path)
 
-    turns = parse_jsonl(path)
+    # A file resolved and we hold its content. Whether it is the CURRENT one
+    # is a separate question, and one we can only have answered for a
+    # chat-shaped filename: a legacy CLI-collector file is not ours to
+    # refresh, so we make no claim about it.
+    freshness_note = _chat_transcript_freshness_note(chat_freshness, served=raw) if chat_id is not None else None
+
     events = _render_transcript(turns)
     tokens = _sum_usage_from_turns(turns)
     counts = _count_tools_from_events(events)

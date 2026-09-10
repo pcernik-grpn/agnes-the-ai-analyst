@@ -125,11 +125,23 @@ def _sweep_chat_session_exports(effective_dir: Path, *, limit: int = 200) -> int
     """Bounded pre-scan: export any recently-active chat session whose
     messages are newer than its already-exported jsonl's mtime (or that has
     no exported file yet) — F4, audit-full-coverage plan Task 8. Runs once
-    at the top of every ``run_processor()`` call (i.e. once per processor
-    per scheduler tick); cheap even called that often since the candidate
-    query is capped at *limit* most-recently-active sessions and each one's
-    own mtime check skips anything already current. No-ops (no repo call at
-    all) when ``sessions.include_chat`` is off.
+    at the top of every ``run_processor()`` call — i.e. once per processor
+    per scheduler tick, so with several processors this sweep repeats
+    within a single tick and every session below is checked more than once.
+
+    That repetition costs *limit* × processors staleness checks per tick,
+    and each check DOES read and hash the transcript in full: it has to,
+    because a watermark that cannot be tied to the file beside it is worth
+    nothing (``app/chat/session_export.py::is_chat_export_stale``). A
+    cheaper size-and-mtime pre-check was tried and removed — it could skip
+    the verification rather than merely shorten it. Measured, the honest
+    cost is 0.36 s per tick for 200 transcripts of 2 000 turns each,
+    against a scheduler cadence of minutes. Hoisting this sweep out of
+    ``run_processor`` to once per tick is the right shape if that ever
+    stops being affordable; it is a change to this module's scheduling
+    contract, not to the check.
+
+    No-ops (no repo call at all) when ``sessions.include_chat`` is off.
 
     Returns the number of sessions actually (re-)exported, for the caller's
     log line.

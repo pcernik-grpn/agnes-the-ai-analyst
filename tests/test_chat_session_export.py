@@ -1140,6 +1140,42 @@ class TestOnDemandTranscriptFreshness:
         texts = [e.get("text") or "" for e in body["events"] if e.get("kind") == "text"]
         assert not any("landed mid-export" in t for t in texts)  # ...and it really is behind
 
+    def test_a_message_landing_before_the_file_check_is_not_certified(self, seeded_app, tmp_path, monkeypatch):
+        """The session row is read before the owner lookup and the file
+        check. A message committed inside THAT window leaves the existing
+        export matching a snapshot that is already out of date — the fast
+        path used to certify it without ever looking again."""
+        import src.repositories as repos
+        from src.repositories import chat_message_repo, chat_session_repo
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        assert export_chat_session_jsonl(chat_id) is not None
+        stale_snapshot = chat_session_repo().get_session(chat_id)
+
+        # ...and now a message lands, invisible to that snapshot.
+        chat_message_repo().append_message(session_id=chat_id, role="user", content="landed pre-check")
+
+        real_repo = chat_session_repo()
+        calls = {"n": 0}
+
+        class _SnapshotThenTruth:
+            def get_session(self, cid):
+                calls["n"] += 1
+                return stale_snapshot if calls["n"] == 1 else real_repo.get_session(cid)
+
+        monkeypatch.setattr(repos, "chat_session_repo", lambda: _SnapshotThenTruth())
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        texts = [e.get("text") or "" for e in body["events"] if e.get("kind") == "text"]
+        # Not merely flagged behind — brought current, which is the point.
+        assert any("landed pre-check" in t for t in texts), texts
+        assert body["freshness"] == {"verified": True}
+
     def test_non_chat_filename_keeps_the_plain_404(self, seeded_app, tmp_path, monkeypatch):
         """A legacy CLI-collector filename never matches the ``chat-*``
         pattern, so it never triggers the chat lookaside at all -- the
@@ -1206,6 +1242,35 @@ def test_a_failed_session_lookup_is_not_reported_as_a_missing_session(monkeypatc
     assert freshness.session_found is False
 
 
+def _session(chat_id):
+    from src.repositories import chat_session_repo
+
+    return chat_session_repo().get_session(chat_id)
+
+
+class TestExportDoesNotPublishBackwards:
+    """os.replace orders nothing. A slower writer that read fewer messages
+    can still land last and replace a newer transcript with a coherent,
+    older one -- leaving the request that just certified the newer file
+    serving the older."""
+
+    def test_a_shorter_snapshot_does_not_replace_a_longer_export(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat import session_export as mod
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        target = export_chat_session_jsonl(chat_id)
+        assert target is not None
+        current = target.read_text()
+
+        # A writer whose read predates the second message tries to publish.
+        read_all = mod._list_all_chat_messages
+        monkeypatch.setattr(mod, "_list_all_chat_messages", lambda cid, repo: read_all(cid, repo)[:1])
+
+        assert mod.export_chat_session_jsonl(chat_id) == target
+        assert target.read_text() == current  # the newer transcript survives
+
+
 class TestTranscriptErrorSurfacesPairUp:
     """REST and CLI are one surface pair: the structured ``{"error",
     "hint"}`` body the route returns has to render as guidance on both. The
@@ -1238,3 +1303,216 @@ class TestTranscriptErrorSurfacesPairUp:
     def test_a_404_still_prints_the_hint(self, capsys):
         self._run(404, {"detail": {"error": "session_not_found", "hint": "No such session."}})
         assert "session_not_found: No such session." in capsys.readouterr().err
+
+
+class TestAVerdictBelongsToOneGeneration:
+    """`freshness.verified` means "we checked THESE bytes against the session
+    as it was a moment ago" — never "this filename holds the whole
+    conversation".
+
+    The route used to make the verdict and read the transcript in two
+    independent opens of the same path, so whatever republished the file in
+    between was what got rendered, under a verdict about content nothing had
+    looked at: the periodic sweep on its tick, a teardown hook, or the
+    residue the publish-order guard in `export_chat_session_jsonl` leaves.
+    That is the "partial record reading as the whole one" failure this
+    endpoint exists to end, produced by the endpoint itself.
+    """
+
+    def test_the_route_will_not_repeat_a_verdict_about_bytes_it_did_not_read(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat.session_export import export_chat_session_jsonl
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        exported = export_chat_session_jsonl(chat_id)
+        assert exported is not None
+
+        from app.chat import session_export as se
+
+        real = se.ensure_chat_transcript_current
+
+        def _verdict_then_swap(cid):
+            freshness = real(cid)
+            # Something republishes the file after the verdict and before
+            # the route reads it -- an older generation, in this case.
+            if freshness.path is not None:
+                first = freshness.path.read_text(encoding="utf-8").splitlines(keepends=True)[0]
+                freshness.path.write_text(first, encoding="utf-8")
+            return freshness
+
+        monkeypatch.setattr(se, "ensure_chat_transcript_current", _verdict_then_swap)
+
+        resp = seeded_app["client"].get(
+            f"/api/admin/sessions/analyst1/chat-{chat_id}.jsonl/transcript",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+
+        assert resp.status_code == 200
+        note = resp.json()["freshness"]
+        assert note["verified"] is False
+        assert note["reason"] == "export_replaced_while_reading"
+
+    def test_an_untouched_transcript_is_still_reported_verified(self, seeded_app, tmp_path, monkeypatch):
+        """Positive control: nothing swaps the file, so the verdict travels
+        with the bytes and stays `verified`."""
+        from app.chat.session_export import export_chat_session_jsonl
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        assert export_chat_session_jsonl(chat_id) is not None
+
+        resp = seeded_app["client"].get(
+            f"/api/admin/sessions/analyst1/chat-{chat_id}.jsonl/transcript",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["freshness"] == {"verified": True}
+
+
+class TestTheDigestCannotBeBorrowedFromAnotherGeneration:
+    """Two ways the pairing digest could end up describing a generation
+    nothing verified — both of them a read-then-act gap opened by fixing
+    the previous one, which is why they are pinned rather than reasoned
+    about.
+    """
+
+    def test_the_certified_digest_comes_from_the_read_that_verified_it(self, seeded_app, tmp_path, monkeypatch):
+        """`ensure_chat_transcript_current` used to fetch the digest with a
+        FRESH sidecar read after deciding the export was current. A writer
+        publishing between the two hands it the digest of a generation
+        nothing compared against the session — and the route, matching the
+        bytes it then reads against that digest, reports `verified` over a
+        transcript that was never checked."""
+        from app.chat import session_export as se
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        published = se.export_chat_session_jsonl(chat_id)
+        assert published is not None
+        full = published.read_text(encoding="utf-8")
+
+        real = se._is_stale_against_a_fresh_read
+
+        def _verify_then_republish_something_older(cid, exported):
+            verdict = real(cid, exported)
+            # A delayed writer lands a coherent, digest-valid, SHORTER
+            # generation right after the verdict — sidecar included.
+            shorter = full.splitlines(keepends=True)[0]
+            se._atomic_write_text(exported, shorter)
+            se._write_export_watermark(
+                exported,
+                se.ExportWatermark(datetime.now(UTC), messages=1, content_sha256=se._content_digest(shorter)),
+            )
+            return verdict
+
+        monkeypatch.setattr(se, "_is_stale_against_a_fresh_read", _verify_then_republish_something_older)
+
+        freshness = se.ensure_chat_transcript_current(chat_id)
+
+        # Whatever else it says, it must not certify the generation that
+        # landed after the check: the digest it carries has to belong to
+        # the transcript that was actually verified.
+        assert freshness.content_sha256 != se._content_digest(published.read_text(encoding="utf-8"))
+
+    def test_a_replacement_that_keeps_the_size_and_mtime_is_still_caught(self, tmp_path):
+        """The reason there is no size-and-mtime shortcut in front of the
+        digest. `(size, mtime_ns)` is not proof of identity: a replacement
+        can preserve both — routine on a filesystem whose timestamps are
+        coarse — and a shortcut keying on them would skip the digest and
+        certify the old sidecar over unrelated content for as long as the
+        metadata kept matching. Verification here is the feature; the
+        shortcut bought 0.36 s per ten-minute sweep tick."""
+        import os
+
+        from app.chat import session_export as se
+
+        target = tmp_path / "chat-x.jsonl"
+        ours = '{"turn": 1}\n{"turn": 2}\n'
+        target.write_text(ours, encoding="utf-8")
+        se._write_export_watermark(
+            target,
+            se.ExportWatermark(datetime.now(UTC), messages=2, content_sha256=se._content_digest(ours)),
+        )
+        assert not is_chat_export_stale(target, datetime.now(UTC) - timedelta(hours=1), 2)
+
+        before = target.stat()
+        # Same byte count, different content, and the metadata forced back
+        # to what it was — the collision, constructed.
+        theirs = '{"turn": 9}\n{"turn": 8}\n'
+        assert len(theirs) == len(ours)
+        target.write_text(theirs, encoding="utf-8")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert target.stat().st_size == before.st_size
+        assert target.stat().st_mtime_ns == before.st_mtime_ns
+
+        assert is_chat_export_stale(target, datetime.now(UTC) - timedelta(hours=1), 2)
+
+
+class TestTheSharedJsonlParserStaysStreaming:
+    """`parse_jsonl` is the shared path for uploaded CLI session
+    transcripts — `services/session_processors/usage.py` and
+    `verification.py` call it three times between them, per session per
+    processor tick, on files that can be tens of MB. It briefly delegated
+    to the text parser added for the admin transcript route, which turned
+    it into a whole-file read plus a list of every line. These pin both
+    halves of the contract: the file parser streams, and the text parser
+    splits on real newlines only."""
+
+    def test_the_file_parser_never_reads_the_whole_file(self, tmp_path, monkeypatch):
+        import builtins
+
+        from services.session_pipeline.lib import parse_jsonl
+
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"a": 1}\n{"b": 2}\n', encoding="utf-8")
+
+        real_open = builtins.open
+
+        class _NoBuffering:
+            """A file that can be iterated but refuses to be slurped."""
+
+            def __init__(self, fh):
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._fh.close()
+                return False
+
+            def __iter__(self):
+                return iter(self._fh)
+
+            def read(self, *a, **kw):
+                raise AssertionError("parse_jsonl must stream, not buffer the whole transcript")
+
+        def _guarded_open(*args, **kwargs):
+            return _NoBuffering(real_open(*args, **kwargs))
+
+        monkeypatch.setattr(builtins, "open", _guarded_open)
+
+        assert parse_jsonl(f) == [{"a": 1}, {"b": 2}]
+
+    def test_a_line_separator_inside_a_string_does_not_split_the_record(self):
+        """`str.splitlines()` breaks on U+2028 and friends; JSON allows them
+        raw inside a quoted string, so a record carrying one would become
+        two invalid fragments and vanish. Both parsers must agree, and both
+        must keep the record."""
+        from services.session_pipeline.lib import parse_jsonl_text
+
+        raw = '{"type": "user", "message": {"content": "first second"}}\n'
+
+        assert len(raw.splitlines()) == 2  # the trap this guards
+        assert parse_jsonl_text(raw) == [{"type": "user", "message": {"content": "first second"}}]
+
+    def test_the_two_parsers_agree_on_the_same_content(self, tmp_path):
+        from services.session_pipeline.lib import parse_jsonl, parse_jsonl_text
+
+        raw = '{"a": 1}\r\n{"b": "x y"}\n\n{"c": 3}\n'
+        f = tmp_path / "session.jsonl"
+        f.write_text(raw, encoding="utf-8", newline="")
+
+        assert parse_jsonl(f) == parse_jsonl_text(raw)
+        assert len(parse_jsonl_text(raw)) == 3
