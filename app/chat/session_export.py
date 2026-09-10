@@ -211,6 +211,13 @@ def _export_watermark(messages: list[ChatMessage], content: str) -> ExportWaterm
     )
 
 
+#: Public alias of :func:`_content_digest` for the one caller outside this
+#: module that has to answer "are these the bytes that were verified" --
+#: ``app/api/admin_sessions.py``'s transcript route. Exported rather than
+#: reimplemented so the two can never disagree about the algorithm.
+content_digest = _content_digest
+
+
 def _watermark_path(target: Path) -> Path:
     """The sidecar file :func:`_write_export_watermark` /
     :func:`_read_export_watermark` use to record the content watermark for
@@ -715,6 +722,15 @@ class ChatTranscriptFreshness:
     message_count: int
     last_message_at: datetime | None
     raced: bool = False
+    #: Digest of the exact transcript this verdict covers, when there is
+    #: one -- see :func:`_content_digest`. A caller that renders the file
+    #: must confirm the bytes it read still hash to this before repeating
+    #: the verdict: ``path`` names a file, and a file can be replaced
+    #: between our check and their read (an ordinary re-export, or the
+    #: narrow residue the publish-order guard in
+    #: :func:`export_chat_session_jsonl` leaves open). The verdict is about
+    #: a generation, not about a filename.
+    content_sha256: str | None = None
 
 
 def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
@@ -795,12 +811,30 @@ def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
         and not _is_stale_against_a_fresh_read(chat_id, existing)
     ):
         freshness.path = existing
+        freshness.content_sha256 = _verified_generation(existing)
         return freshness
 
     freshness.path = export_chat_session_jsonl(chat_id)
     if freshness.path is not None:
         freshness.raced = _is_stale_against_a_fresh_read(chat_id, freshness.path)
+        freshness.content_sha256 = _verified_generation(freshness.path)
     return freshness
+
+
+def _verified_generation(target: Path) -> str | None:
+    """The digest recorded for the export at *target* -- the generation any
+    verdict about it refers to.
+
+    Read back from the sidecar rather than remembered from a write, because
+    the endings above reach this differently: one wrote the file, another
+    found it already current, and the publish-order guard in
+    :func:`export_chat_session_jsonl` deliberately publishes nothing at all.
+    Reading covers every case with one rule. ``None`` when there is nothing
+    to pin to, which a caller must treat as "cannot confirm these are the
+    bytes I verified", never as a match.
+    """
+    watermark = _read_export_watermark(target)
+    return watermark.content_sha256 if watermark is not None else None
 
 
 def _is_stale_against_a_fresh_read(chat_id: str, exported: Path) -> bool:

@@ -18,15 +18,27 @@ def parse_jsonl(path: Path) -> list[dict]:
     abort processing of the rest of the session. Lifted verbatim from the
     pre-refactor verification_detector.detector.parse_session so the
     behavior is identical."""
-    turns: list[dict] = []
     with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    turns.append(json.loads(line))
-                except json.JSONDecodeError:
-                    logger.warning("Skipping malformed JSONL line in %s", path)
+        return parse_jsonl_text(f.read(), source=path)
+
+
+def parse_jsonl_text(text: str, *, source: object = "<text>") -> list[dict]:
+    """:func:`parse_jsonl` for a caller that ALREADY holds the bytes.
+
+    Same parser, same skip-a-malformed-line behavior; *source* only names
+    the origin in that warning. Exists so a reader that must reason about
+    the exact content it parsed — the admin transcript route, which repeats
+    a freshness verdict that was made about one specific generation of the
+    file — can hash and parse ONE read instead of opening the file twice
+    and hoping nothing replaced it in between."""
+    turns: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                turns.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed JSONL line in %s", source)
     return turns
 
 

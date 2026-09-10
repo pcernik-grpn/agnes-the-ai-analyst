@@ -1361,3 +1361,68 @@ class TestTranscriptErrorSurfacesPairUp:
     def test_a_404_still_prints_the_hint(self, capsys):
         self._run(404, {"detail": {"error": "session_not_found", "hint": "No such session."}})
         assert "session_not_found: No such session." in capsys.readouterr().err
+
+
+class TestAVerdictBelongsToOneGeneration:
+    """`freshness.verified` means "we checked THESE bytes against the session
+    as it was a moment ago" — never "this filename holds the whole
+    conversation".
+
+    The route used to make the verdict and read the transcript in two
+    independent opens of the same path, so whatever republished the file in
+    between was what got rendered, under a verdict about content nothing had
+    looked at: the periodic sweep on its tick, a teardown hook, or the
+    residue the publish-order guard in `export_chat_session_jsonl` leaves.
+    That is the "partial record reading as the whole one" failure this
+    endpoint exists to end, produced by the endpoint itself.
+    """
+
+    def test_the_route_will_not_repeat_a_verdict_about_bytes_it_did_not_read(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat.session_export import export_chat_session_jsonl
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        exported = export_chat_session_jsonl(chat_id)
+        assert exported is not None
+
+        from app.chat import session_export as se
+
+        real = se.ensure_chat_transcript_current
+
+        def _verdict_then_swap(cid):
+            freshness = real(cid)
+            # Something republishes the file after the verdict and before
+            # the route reads it -- an older generation, in this case.
+            if freshness.path is not None:
+                first = freshness.path.read_text(encoding="utf-8").splitlines(keepends=True)[0]
+                freshness.path.write_text(first, encoding="utf-8")
+            return freshness
+
+        monkeypatch.setattr(se, "ensure_chat_transcript_current", _verdict_then_swap)
+
+        resp = seeded_app["client"].get(
+            f"/api/admin/sessions/analyst1/chat-{chat_id}.jsonl/transcript",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+
+        assert resp.status_code == 200
+        note = resp.json()["freshness"]
+        assert note["verified"] is False
+        assert note["reason"] == "export_replaced_while_reading"
+
+    def test_an_untouched_transcript_is_still_reported_verified(self, seeded_app, tmp_path, monkeypatch):
+        """Positive control: nothing swaps the file, so the verdict travels
+        with the bytes and stays `verified`."""
+        from app.chat.session_export import export_chat_session_jsonl
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        assert export_chat_session_jsonl(chat_id) is not None
+
+        resp = seeded_app["client"].get(
+            f"/api/admin/sessions/analyst1/chat-{chat_id}.jsonl/transcript",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["freshness"] == {"verified": True}
