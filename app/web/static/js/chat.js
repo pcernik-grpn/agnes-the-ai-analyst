@@ -1688,17 +1688,23 @@ const _NEXT_ACTIONS_MAX = 3;
 //: handler is the one place that needs to know, since pre-filling the
 //: composer without auto-submitting still gives the reader the shortcut.
 //:
-//: The `[...]`/`<...>` branches deliberately require lowercase-letters-
-//: and-spaces-only content (no digits, no uppercase, case-sensitive — no
-//: `/i` flag). That is what tells a template slot apart from ordinary
-//: bracket/angle usage this product sees constantly: a citation marker
-//: (`[1]`), a literal proper name someone already filled in (`[Acme
-//: Corp]`), and — the case that actually broke — comparison phrasing
-//: (`revenue <10 and >10`), which the old permissive `<[^<>]+>` matched
-//: clear across as one fake placeholder. `{{...}}` and `TBD` stay
-//: permissive/literal since neither collides with anything this chat
-//: legitimately produces.
-const _PLACEHOLDER_RE = /\[[a-z][a-z ]*\]|<[a-z][a-z ]*>|\{\{[^}]*\}\}|\bTBD\b/;
+//: The `[...]`/`<...>` branches require letters-only content (letters,
+//: spaces, hyphens, underscores — no digits, no operators). That is what
+//: separates a slot from the bracket/angle usage this product sees
+//: constantly: a citation marker (`[1]`) and comparison phrasing
+//: (`revenue <10 and >10`, which the old permissive `<[^<>]+>` matched
+//: clear across as one fake placeholder) both carry digits and are out.
+//:
+//: Case is deliberately NOT part of the test. A slot is as likely to be
+//: written `[Client name]` or `<Start date>` as lowercase, so keying on
+//: capitalization only moves the hole rather than closing it. The cost of
+//: that choice is a filled proper name in brackets — `[Acme Corp]` — being
+//: read as a slot: the chip pre-fills the composer instead of sending, and
+//: the reader presses Enter. That asymmetry is the point. Guessing "filled"
+//: wrongly costs a wasted turn and a refused render; guessing "unfilled"
+//: wrongly costs one keystroke. `{{...}}` and `TBD` stay permissive/literal
+//: since neither collides with anything this chat legitimately produces.
+const _PLACEHOLDER_RE = /\[[A-Za-z][A-Za-z _-]*\]|<[A-Za-z][A-Za-z _-]*>|\{\{[^}]*\}\}|\bTBD\b/;
 
 function _hasUnfilledPlaceholder(text) {
   return _PLACEHOLDER_RE.test(text || "");

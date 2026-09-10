@@ -14,3 +14,4 @@
 - Clicking a placeholder chip now re-syncs the composer's autosize height,
   prompt-history position, and slash-menu state — the programmatic
   pre-fill used to leave those stale (e.g. the slash menu stayed open).
+- The placeholder detector ignores letter case: a slot written `[Client name]` or `<Start date>` is caught the same as a lowercase one. A filled name in brackets therefore pre-fills the composer rather than sending — one keystroke, against a wasted turn if the guess went the other way.

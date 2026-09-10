@@ -45,7 +45,10 @@ def _guard_src() -> str:
     """The shipped placeholder-detection regex plus the shipped predicate."""
     js = _read(CHAT_JS)
     i = js.index("const _PLACEHOLDER_RE")
-    src = js[i : js.index("\n", i) + 1]
+    # To the terminating `;`, not to the end of the line: a wrapped
+    # declaration would otherwise be sliced in half and every case here
+    # would fail with a node syntax error rather than a real verdict.
+    src = js[i : js.index(";", i) + 1] + "\n"
     i = js.index("function _hasUnfilledPlaceholder")
     src += js[i : js.index("\n}", i) + 2]
     return src
@@ -120,12 +123,28 @@ def test_bracketed_citation_marker_is_not_flagged():
     assert r is False
 
 
-def test_literal_bracketed_proper_name_is_not_flagged():
-    """A literal, already-filled-in name in brackets must not be mistaken
-    for a placeholder just because it is bracketed — only lowercase,
-    template-shaped content (`[name]`, `[real name]`) reads as unfilled."""
+def test_capitalised_slot_labels_are_detected():
+    """A slot is as likely to be written `[Client name]` or `<Start date>`
+    as lowercase, so case is not part of the test. Keying on capitalisation
+    would leave exactly this hole: the chip would send the template."""
+    results = _check(
+        [
+            "Draft the proposal for [Client name]",
+            "Schedule the kickoff for <Start date>",
+            "Rename the engagement to [Project_Name]",
+        ]
+    )
+    assert results == [True, True, True]
+
+
+def test_a_filled_bracketed_name_pre_fills_rather_than_sends():
+    """The accepted cost of ignoring case: a literal, already-filled name in
+    brackets reads as a slot, so the chip pre-fills instead of sending. That
+    is one keystroke, against a wasted turn and a refused render if we
+    guessed the other way — the asymmetry is deliberate, so pin it rather
+    than let a future change quietly flip it."""
     (r,) = _check(["Draft a renewal quote for [Acme Corp]"])
-    assert r is False
+    assert r is True
 
 
 # ── structural pin: the click handler must consult the guard ───────────────
