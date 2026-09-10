@@ -197,6 +197,11 @@ agnes facts edges <edge_type> [--extend <type>] [--claims 1]  # EVERY relationsh
 agnes facts claims <subject_id>                           # the evidencing quotes (newest first) for one subject
 ```
 
+The graph is also the fastest way to find WHERE a client's documents live:
+`fact_search` on a person or organization names the folder its documents sit
+in, which is the first step of the document-search section below — resolve
+the folder through the graph, then search inside it.
+
 Cite every fact you use — `--claims`/`include_claims` gives you the quote
 inline, `agnes facts claims` gives the rest; name the quote and its source
 document in your answer. Facts are filtered
@@ -204,6 +209,71 @@ server-side to what YOU can read; a search returning nothing may exist
 outside your access, it is not evidence the fact is absent — fall back to
 `agnes collections search` rather than inventing an answer or refusing
 outright.
+"""
+
+#: Document-search rails appended after :data:`FACTS_ACCESS_RAILS`, ungated.
+#:
+#: Fourth instance of the same gap the three constants around this one
+#: exist for: `config/claude_md_template.txt` carries the "Documents — find
+#: the folder before you search it" section, and a persona REPLACES that
+#: template wholesale, so a persona'd agent asked to extend one client's
+#: work searched every accessible collection for a phrase and had no text
+#: telling it to resolve the folder first.
+#:
+#: Ungated: Collections search and ``path_prefix`` are platform surfaces, not
+#: a feature switch. It therefore names NO fact tool — this text ships to
+#: instances with ``facts`` off, where every one of them 404s
+#: (``app.auth.access.require_facts_enabled``), and
+#: ``tests/test_agent_profile_spawn.py::
+#: test_build_profile_omits_facts_rails_when_the_switch_is_off`` is the guard
+#: that says so. The graph route to a client's folder lives one section up in
+#: :data:`FACTS_ACCESS_RAILS`, which is gated.
+DOCUMENT_SEARCH_RAILS = """
+
+---
+
+## Documents — find the folder before you search it
+
+Agnes adds this section to every agent; it holds regardless of the persona
+above.
+
+A collection here is often a whole crawled bucket: one collection holding
+every client's contracts, invoices and deal files side by side. So for work
+about ONE client, project or engagement — drafting the next statement of
+work, extending something that already exists — do not open with a
+phrase search across your accessible collections. That query competes with
+thousands of chunks of everyone else's paperwork, and the documents that
+answer it need not out-rank any of them.
+
+Locate the folder first, then search inside it:
+
+1. `collection_get(collection_id=…, q="<client>")` filters files by a
+   filename/path substring and shows you their `path`.
+2. Pass `path_prefix` — the `path` you just saw, cut at the folder boundary
+   (e.g. `00_Customers/Acme/`) — to `collections_search`, or
+   `--path-prefix` to `agnes collections search`. Prefixes match literally
+   and are case-sensitive.
+3. Read the file whole with `collection_file_read` rather than assembling an
+   answer out of search excerpts.
+
+Two names collide constantly in real corpora — a client is also a vendor
+somewhere, an advisor on someone else's deal. Check the folder a hit came
+from before treating it as that client's own document.
+
+An empty document result is a wording miss far more often than an access
+problem; read the response's `hint`. `search_query_too_broad` with
+`reason: "capped_no_match"` means the search filled its candidate limit
+before finding anything, so it read only PART of the documents in scope —
+that is NOT evidence the document is absent. Narrow the scope or use a more
+distinctive word; a plain retry fails identically.
+
+**Never offer scope you have not verified.** When you cannot find the
+document that should define a piece of work, say so and ask for it. Do not
+turn whatever the search did return into a menu of options — offering items
+pulled from an unapproved notes file as the scope reads as noise at best,
+and at worst gets an unapproved plan into a client-facing document. If you
+do use a file whose status you are unsure of, say what it is and that you
+could not confirm it.
 """
 
 #: File-delivery rails appended after :data:`DATA_ACCESS_RAILS`, ungated.
@@ -580,6 +650,7 @@ def build_profile(
     claude_md = system_prompt + DATA_ACCESS_RAILS
     if _facts_rails_enabled():
         claude_md += FACTS_ACCESS_RAILS
+    claude_md += DOCUMENT_SEARCH_RAILS
     claude_md += FILE_DELIVERY_RAILS
     claude_md += PROVENANCE_RAILS
     claude_md += _semantic_layer_section(user_email)

@@ -10,13 +10,14 @@ egress tickets must not destroy the session credential the engine still holds.
 from __future__ import annotations
 
 import base64
-import io
 import hashlib
 import hmac
+import io
 import json
 import socket
 import threading
 import time
+from datetime import UTC
 from unittest import mock
 
 import pytest
@@ -60,7 +61,7 @@ def chat_grant(seeded_app):
 @pytest.fixture
 def kai_env(kai_secrets, chat_grant):
     """The configured-and-authorized baseline: secrets set, caller granted."""
-    return None
+    return
 
 
 def _decode_segment(segment: str) -> dict:
@@ -783,8 +784,9 @@ def test_mcp_token_narrows_the_restricted_session_kinds(seeded_app, kai_env, mon
     co-session still refuses (its copresence surfaces have no engine
     equivalent yet), and a deleted agent still fails closed.
     """
-    from app.api import kai as kai_mod
     from fastapi import HTTPException
+
+    from app.api import kai as kai_mod
 
     body = _mint_session(seeded_app)
     chat_id = body["chat_id"]
@@ -1119,7 +1121,17 @@ def test_workspace_agent_persona_gets_fact_tool_guidance_when_the_switch_is_on(s
     with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
         claude_md = tar.extractfile("CLAUDE.md").read().decode("utf-8")
 
-    assert claude_md.count("fact_search") == 1
+    # Appended exactly ONCE. Asserted on the rails BLOCK rather than by
+    # counting `fact_search` occurrences inside it: a persona replaces the
+    # template, so a second copy of the guidance can only come from the
+    # block being appended twice — which this catches directly, while
+    # leaving the section free to mention a tool more than once in its own
+    # prose (it now names `fact_search` again as the route to a client's
+    # document folder).
+    from app.chat import agent_profile
+
+    assert claude_md.count(agent_profile.FACTS_ACCESS_RAILS) == 1
+    assert "fact_search" in claude_md
     assert "fact_neighbors" in claude_md
     assert "fact_claims" in claude_md
     # Additive, not a replacement — the catalog guidance is still there too,
@@ -1507,7 +1519,7 @@ def test_the_payload_does_not_change_when_the_date_rolls_over(seeded_app, kai_en
     headers = {"Authorization": f"Bearer {credential}"}
 
     class _FrozenDatetime(_dt.datetime):
-        _fixed = _dt.datetime(2026, 8, 19, 23, 59, 30, tzinfo=_dt.timezone.utc)
+        _fixed = _dt.datetime(2026, 8, 19, 23, 59, 30, tzinfo=_dt.UTC)
 
         @classmethod
         def now(cls, tz=None):
@@ -1516,7 +1528,7 @@ def test_the_payload_does_not_change_when_the_date_rolls_over(seeded_app, kai_en
     monkeypatch.setattr(claude_md_mod, "datetime", _FrozenDatetime)
     before_midnight = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
 
-    _FrozenDatetime._fixed = _dt.datetime(2026, 8, 20, 0, 0, 30, tzinfo=_dt.timezone.utc)
+    _FrozenDatetime._fixed = _dt.datetime(2026, 8, 20, 0, 0, 30, tzinfo=_dt.UTC)
     after_midnight = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
 
     assert before_midnight == after_midnight, (
@@ -1527,7 +1539,7 @@ def test_the_payload_does_not_change_when_the_date_rolls_over(seeded_app, kai_en
 
 def test_the_pinned_clock_is_the_sessions_own(monkeypatch):
     """...and the pin is the session's start, not an arbitrary constant."""
-    from datetime import datetime, timezone
+    from datetime import datetime
     from types import SimpleNamespace
 
     import app.api.kai as kai_mod
@@ -1541,7 +1553,7 @@ def test_the_pinned_clock_is_the_sessions_own(monkeypatch):
 
     monkeypatch.setattr(wp, "render_sandbox_workspace_prompt", _spy)
 
-    started = datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc)
+    started = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
     session = SimpleNamespace(user_email="owner@example.com", is_co_session=False, agent_id=None, started_at=started)
     assert kai_mod._workspace_prompt_for(session) == "# rendered\n"
     assert seen["now"] == started
@@ -1591,9 +1603,9 @@ def test_a_cancelled_tool_call_does_not_leak_the_upstream_client():
         mock.patch.object(kai_mod, "_mint_mcp_access_token", lambda _sid: "tok"),
         mock.patch.object(kai_mod, "_mcp_internal_base", lambda: "http://mcp.invalid"),
         mock.patch.object(kai_mod, "_require_scope", lambda *a, **k: None),
+        pytest.raises(asyncio.CancelledError),
     ):
-        with pytest.raises(asyncio.CancelledError):
-            asyncio.run(kai_mod.kai_mcp(request=_Request(), row={"session_id": "s1"}))
+        asyncio.run(kai_mod.kai_mcp(request=_Request(), row={"session_id": "s1"}))
 
     assert closed == [True], "the upstream client was not closed on cancellation"
 
@@ -1790,9 +1802,8 @@ def test_an_editor_prompt_beats_a_git_template_here_as_it_does_natively(seeded_a
     override mode made this route the one surface running the shipped template
     while every other surface read the admin's edit.
     """
-    import src.initial_workspace as iw
-
     import app.chat.workspace_prompt as wp
+    import src.initial_workspace as iw
 
     clone = tmp_path / "iwt"
     (clone / "workspace").mkdir(parents=True)
@@ -1875,7 +1886,7 @@ def _grant_marketplace_skill(
 
     ``full=True`` also gives it an agent, a slash command, a hook and an MCP
     server — the component types that make it a plugin rather than a skill."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from app.utils import get_marketplaces_dir
     from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
@@ -1891,11 +1902,11 @@ def _grant_marketplace_skill(
         if not conn.execute("SELECT 1 FROM marketplace_registry WHERE id = 'mkt'").fetchone():
             conn.execute(
                 "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
-                ["mkt", "MKT", "https://example.test/mkt.git", datetime.now(timezone.utc)],
+                ["mkt", "MKT", "https://example.test/mkt.git", datetime.now(UTC)],
             )
         conn.execute(
             "INSERT INTO marketplace_plugins (marketplace_id, name, version, raw, updated_at) VALUES (?, ?, ?, ?, ?)",
-            ["mkt", plugin, "1.0", json.dumps({"name": plugin, "version": "1.0"}), datetime.now(timezone.utc)],
+            ["mkt", plugin, "1.0", json.dumps({"name": plugin, "version": "1.0"}), datetime.now(UTC)],
         )
     finally:
         conn.close()

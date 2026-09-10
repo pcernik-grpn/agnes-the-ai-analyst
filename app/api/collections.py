@@ -48,8 +48,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import sqlalchemy as sa
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
@@ -67,7 +67,6 @@ from src.audit_helpers import log_safe
 from src.corpus_allowlist import classify
 from src.file_storage import delete_corpus_file, store_corpus_file
 from src.ingest.member_identity import is_reserved_member_stable_id
-from src.sql_ident import quote_ident
 from src.repositories import (
     corpus_chunks_repo,
     corpus_file_events_repo,
@@ -77,6 +76,7 @@ from src.repositories import (
     source_connections_repo,
     table_registry_repo,
 )
+from src.sql_ident import quote_ident
 
 #: What this module is, to `resource_grants.source` (src/grant_sources.py).
 GRANT_SOURCE = "collection_create"
@@ -122,8 +122,8 @@ def _clamp_file_list_offset(offset: int) -> int:
 
 class CreateCollectionRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
-    slug: Optional[str] = Field(None, max_length=100)
-    description: Optional[str] = None
+    slug: str | None = Field(None, max_length=100)
+    description: str | None = None
 
 
 class UpdateCollectionRequest(BaseModel):
@@ -136,9 +136,9 @@ class UpdateCollectionRequest(BaseModel):
     distinction the repository layer was built to keep.
     """
 
-    name: Optional[str] = Field(None, min_length=1, max_length=255)
-    slug: Optional[str] = Field(None, max_length=100)
-    description: Optional[str] = None
+    name: str | None = Field(None, min_length=1, max_length=255)
+    slug: str | None = Field(None, max_length=100)
+    description: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ async def list_collections(
     return {"items": [_collection_out(r) for r in rows]}
 
 
-def _empty_search_hint(searched: int, corpus_id: Optional[str]) -> str:
+def _empty_search_hint(searched: int, corpus_id: str | None) -> str:
     """Why an empty search is empty, in terms the caller can act on.
 
     Two different diagnoses share one empty ``results``:
@@ -398,11 +398,43 @@ def _empty_search_hint(searched: int, corpus_id: Optional[str]) -> str:
     )
 
 
+def _truncated_note(cap: int | None, source: str | None) -> str:
+    """What a capped candidate scan actually means, per candidate path.
+
+    One ``truncated`` flag covered two very different events and this note
+    described only the first, so the second read as a lie. Body path capped:
+    more PASSAGES matched the query terms than one request will rank — the
+    query is genuinely broad. Filename path capped: more FILE NAMES matched
+    than will fit, which on a real corpus a term like "ai" does on its own
+    (the match is substring, not whole word) and says nothing at all about
+    how broad the query is. Observed live: a search whose body candidates
+    numbered ZERO carried "this collection set has more than 5,000 chunks
+    matching your query terms", which told the agent to narrow a query that
+    had in fact matched no passage whatsoever.
+    """
+    from src.ingest.retrieval import BROAD_CORPUS_HINT
+
+    n = f"{cap:,}" if cap is not None else "the configured limit"
+    if source == "filename":
+        return (
+            f"More than {n} FILE NAMES in scope matched your query terms (name matching is "
+            "substring, not whole word), so the name-based fallback read only part of them. "
+            "No passage TEXT hit this limit, so this is not a sign that your query is too "
+            f"broad for the documents themselves. {BROAD_CORPUS_HINT}"
+        )
+    both = " (file-name matches hit the same limit.)" if source == "both" else ""
+    return (
+        f"This collection set has more than {n} chunks matching your query terms; the search "
+        f"ran over the {n} best of them, not the full corpus.{both} {BROAD_CORPUS_HINT}"
+    )
+
+
 @router.get("/search")
 async def search_collections(
     q: str,
     k: int = 10,
-    corpus_id: Optional[str] = None,
+    corpus_id: str | None = None,
+    path_prefix: str | None = None,
     user=Depends(get_current_user),
 ):
     """Hybrid search across the caller's accessible collections.
@@ -435,8 +467,16 @@ async def search_collections(
     chunk; narrow with ``corpus_id`` or a more specific query to search the
     excluded rest. A query with no usable term to narrow BY that still hits
     the bound is refused with a typed ``422 search_query_too_broad`` rather
-    than ranking an arbitrary slice. A search backend outage answers a
-    typed ``503 search_unavailable`` instead of an anonymous server error.
+    than ranking an arbitrary slice — and so is a capped scan that ranked
+    NOTHING (``reason: "capped_no_match"``), which used to come back as a
+    plain empty list that no caller could tell from "no such document
+    exists". A search backend outage answers a typed ``503
+    search_unavailable`` instead of an anonymous server error.
+
+    ``path_prefix`` narrows the search to files under one folder within the
+    collections in scope — a crawled bucket is routinely ONE collection
+    holding every client's documents, so ``corpus_id`` alone could not
+    express "only this engagement's folder".
     """
     from src.ingest.retrieval import (
         BROAD_CORPUS_HINT,
@@ -456,6 +496,12 @@ async def search_collections(
     corpus_id = corpus_id or None
     if corpus_id is not None:
         allowed = [c for c in allowed if c == corpus_id]
+    # Same "blank means no filter" rule as `corpus_id` above: `?path_prefix=`
+    # is what an unset optional looks like on the wire, and treating it as a
+    # real prefix would scope the search to files whose path starts with the
+    # empty string — harmless by luck rather than by design, and the
+    # opposite of harmless the day the clause changes shape.
+    path_prefix = (path_prefix or "").strip() or None
     k = max(1, min(k, 50))
     try:
         # #2151: search_with_meta does a DB fetch + pure-Python IDF/cosine
@@ -465,13 +511,25 @@ async def search_collections(
         # is this codebase's established offload idiom for exactly this
         # (e.g. `app/api/mcp/foundation_tools.py`'s
         # `facts_repo().count_visible_facts_by_type` call).
-        meta = await asyncio.to_thread(search_with_meta, allowed, q, k=k)
+        meta = await asyncio.to_thread(search_with_meta, allowed, q, k=k, path_prefix=path_prefix)
     except SearchQueryTooBroad as exc:
         raise HTTPException(
             status_code=422,
             detail={
                 "error": "search_query_too_broad",
-                "hint": BROAD_CORPUS_HINT,
+                # WHICH of the two situations this is, because the next step
+                # differs: rephrase a query that had no real word in it;
+                # narrow the SCOPE when the cap ate a query that did.
+                "reason": exc.reason,
+                "hint": (
+                    BROAD_CORPUS_HINT
+                    if exc.reason == "no_usable_term"
+                    else (
+                        "This search filled its candidate limit before finding a match, so it "
+                        "read only part of the documents in scope — an empty result here is NOT "
+                        "evidence the document is absent. " + BROAD_CORPUS_HINT
+                    )
+                ),
                 "cap": exc.cap,
                 "chunk_count": exc.chunk_count,
             },
@@ -503,7 +561,7 @@ async def search_collections(
     # commonly returns several chunks from the same collection/file.
     visible_cache: dict[str, bool] = {}
 
-    def _chunk_text_visible(corpus_id: Optional[str]) -> bool:
+    def _chunk_text_visible(corpus_id: str | None) -> bool:
         if not corpus_id:
             return True
         if corpus_id not in visible_cache:
@@ -527,11 +585,14 @@ async def search_collections(
         # this note in practice.
         payload["truncated"] = True
         payload["truncated_cap"] = meta["cap"]
-        payload["truncated_note"] = (
-            f"This collection set has more than {meta['cap']:,} chunks matching your query "
-            f"terms; the search ran over the {meta['cap']:,} best of them, not the full "
-            f"corpus. {BROAD_CORPUS_HINT}"
-        )
+        # The machine-readable half of the note. Emitting only the prose was a
+        # real gap, not a nicety: the workspace prompt's own document-search
+        # rails tell an agent to branch on `truncated_source` ("file NAMES
+        # overflowed, which says nothing about how broad your query is"), and
+        # the field was never on the wire for it to read. (Devin Review on
+        # #2420.)
+        payload["truncated_source"] = meta.get("truncated_source")
+        payload["truncated_note"] = _truncated_note(meta["cap"], payload["truncated_source"])
         payload["candidates_capped"] = True
     if not results:
         payload["searched_collections"] = len(allowed)
@@ -1215,7 +1276,7 @@ def _record_corpus_file_event(
             path=path,
             source_stable_id=source_stable_id,
         )
-    except Exception:  # noqa: BLE001 — never let this look like the real failure
+    except Exception:
         logger.debug(
             "corpus_file_events: failed to record %s for file_id=%s (upload/delete itself succeeded)",
             change,
@@ -1384,7 +1445,7 @@ def _upsert_corpus_file(
     return file_id, needs_processing, claims_purged
 
 
-def _nth_field(values: Optional[List[str]], idx: int) -> str | None:
+def _nth_field(values: list[str] | None, idx: int) -> str | None:
     """One positionally-paired form field for file ``idx``; blank -> None."""
     if not values or idx >= len(values) or not values[idx]:
         return None
@@ -1395,8 +1456,8 @@ def _preflight_source_anchored_batch(
     collection_id: str,
     *,
     n_files: int,
-    paths: Optional[List[str]],
-    source_stable_ids: Optional[List[str]],
+    paths: list[str] | None,
+    source_stable_ids: list[str] | None,
     sources_repo: Any,
     cf_repo: Any,
 ) -> None:
@@ -1468,7 +1529,7 @@ def _preflight_source_anchored_batch(
             seen_targets[target] = idx
 
 
-def source_managing_connection(collection_id: str) -> Optional[dict]:
+def source_managing_connection(collection_id: str) -> dict | None:
     """The source connection whose confirmed scope feeds ``collection_id``,
     or ``None`` for an ordinary collection.
 
@@ -1526,12 +1587,12 @@ def _refuse_source_managed(connection: dict, *, operation: str = "upload") -> No
 async def upload_files(
     collection_id: str,
     background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(...),
-    paths: Optional[List[str]] = Form(None),
-    source_stable_ids: Optional[List[str]] = Form(None),
-    source_doc_ids: Optional[List[str]] = Form(None),
-    source_sha256s: Optional[List[str]] = Form(None),
-    document_dates: Optional[List[str]] = Form(None),
+    files: list[UploadFile] = File(...),
+    paths: list[str] | None = Form(None),
+    source_stable_ids: list[str] | None = Form(None),
+    source_doc_ids: list[str] | None = Form(None),
+    source_sha256s: list[str] | None = Form(None),
+    document_dates: list[str] | None = Form(None),
     user=Depends(require_collection_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
@@ -1747,7 +1808,7 @@ async def upload_files(
 
     results = []
     any_rejected = False
-    _to_ingest: List[str] = []
+    _to_ingest: list[str] = []
 
     for idx, upload in enumerate(files):
         fname = upload.filename or "unknown"
@@ -1903,8 +1964,8 @@ async def list_files(
     collection_id: str,
     limit: int = DEFAULT_FILE_LIST_LIMIT,
     offset: int = 0,
-    q: Optional[str] = None,
-    status: Optional[str] = None,
+    q: str | None = None,
+    status: str | None = None,
     order: str = "newest",
     user=Depends(require_collection_access("{collection_id}")),
 ):
@@ -2221,8 +2282,8 @@ def _is_stale_processing(row: dict) -> bool:
     if isinstance(updated_at, str):
         updated_at = datetime.fromisoformat(updated_at)
     if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=REINGEST_STALE_PROCESSING_MINUTES)
+        updated_at = updated_at.replace(tzinfo=UTC)
+    cutoff = datetime.now(UTC) - timedelta(minutes=REINGEST_STALE_PROCESSING_MINUTES)
     return updated_at < cutoff
 
 

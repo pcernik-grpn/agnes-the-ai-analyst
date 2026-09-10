@@ -44855,7 +44855,7 @@
     },
     "/api/collections/search": {
       "get": {
-        "description": "Hybrid search across the caller's accessible collections.\n\nFail-closed: only the caller's granted collections are searched; an\noptional ``corpus_id`` narrows to one (ignored if not accessible). Declared\nbefore ``/{collection_id}`` so ``search`` isn't captured as a collection id.\n\nThe response carries ``retrieval`` (``hybrid | lexical_only``) so clients\ncan tell semantic-scored results from the lexical-only degradation that\nkicks in when the embeddings extra is not installed (#898).\n\nAn empty result also carries ``searched_collections`` and a ``hint``.\nNothing in a bare ``[]`` separates \"you cannot see any collection\" from\n\"your words are not in the text\", and an agent handed that ambiguity\npicks the scarier reading: observed live, a chat agent searched six\nways, found nothing, and told the owner of the file \"I don't have\naccess to your files or collections\" \u2014 which then became the\nconversation's permanent title. The count is what makes the difference\ncheckable, and the hint names the three engine behaviours that make a\nreasonable query miss (see ``src.ingest.retrieval``).\n\nVery large corpora are bounded server-side: candidate selection runs in\nSQL under ``min(knowledge.retrieval.max_candidate_chunks,\ncollections.search_max_chunks)`` (P0 OOM fix 2026-09 \u00d7 #2151 \u2014 see\n``src.ingest.retrieval``'s \"Scale bounds\"). When that bound is hit the\nresponse carries ``truncated: true`` (plus ``truncated_cap`` and a\n``truncated_note``) and the additive ``candidates_capped: true`` \u2014\nthe same event under both names \u2014 instead of ranking every accessible\nchunk; narrow with ``corpus_id`` or a more specific query to search the\nexcluded rest. A query with no usable term to narrow BY that still hits\nthe bound is refused with a typed ``422 search_query_too_broad`` rather\nthan ranking an arbitrary slice. A search backend outage answers a\ntyped ``503 search_unavailable`` instead of an anonymous server error.",
+        "description": "Hybrid search across the caller's accessible collections.\n\nFail-closed: only the caller's granted collections are searched; an\noptional ``corpus_id`` narrows to one (ignored if not accessible). Declared\nbefore ``/{collection_id}`` so ``search`` isn't captured as a collection id.\n\nThe response carries ``retrieval`` (``hybrid | lexical_only``) so clients\ncan tell semantic-scored results from the lexical-only degradation that\nkicks in when the embeddings extra is not installed (#898).\n\nAn empty result also carries ``searched_collections`` and a ``hint``.\nNothing in a bare ``[]`` separates \"you cannot see any collection\" from\n\"your words are not in the text\", and an agent handed that ambiguity\npicks the scarier reading: observed live, a chat agent searched six\nways, found nothing, and told the owner of the file \"I don't have\naccess to your files or collections\" \u2014 which then became the\nconversation's permanent title. The count is what makes the difference\ncheckable, and the hint names the three engine behaviours that make a\nreasonable query miss (see ``src.ingest.retrieval``).\n\nVery large corpora are bounded server-side: candidate selection runs in\nSQL under ``min(knowledge.retrieval.max_candidate_chunks,\ncollections.search_max_chunks)`` (P0 OOM fix 2026-09 \u00d7 #2151 \u2014 see\n``src.ingest.retrieval``'s \"Scale bounds\"). When that bound is hit the\nresponse carries ``truncated: true`` (plus ``truncated_cap`` and a\n``truncated_note``) and the additive ``candidates_capped: true`` \u2014\nthe same event under both names \u2014 instead of ranking every accessible\nchunk; narrow with ``corpus_id`` or a more specific query to search the\nexcluded rest. A query with no usable term to narrow BY that still hits\nthe bound is refused with a typed ``422 search_query_too_broad`` rather\nthan ranking an arbitrary slice \u2014 and so is a capped scan that ranked\nNOTHING (``reason: \"capped_no_match\"``), which used to come back as a\nplain empty list that no caller could tell from \"no such document\nexists\". A search backend outage answers a typed ``503\nsearch_unavailable`` instead of an anonymous server error.\n\n``path_prefix`` narrows the search to files under one folder within the\ncollections in scope \u2014 a crawled bucket is routinely ONE collection\nholding every client's documents, so ``corpus_id`` alone could not\nexpress \"only this engagement's folder\".",
         "operationId": "search_collections_api_collections_search_get",
         "parameters": [
           {
@@ -44891,6 +44891,22 @@
                 }
               ],
               "title": "Corpus Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path_prefix",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path Prefix"
             }
           },
           {

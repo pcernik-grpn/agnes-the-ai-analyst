@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json as json_lib
 from pathlib import Path
-from typing import Optional
 
 import typer
 
@@ -50,8 +49,8 @@ def _fmt_collection(col: dict) -> str:
 @collections_app.command("create")
 def create_collection(
     name: str = typer.Option(..., "--name", help="Collection name"),
-    description: Optional[str] = typer.Option(None, "--description", "-d", help="Description"),
-    slug: Optional[str] = typer.Option(None, "--slug", help="URL-safe slug (auto-generated if omitted)"),
+    description: str | None = typer.Option(None, "--description", "-d", help="Description"),
+    slug: str | None = typer.Option(None, "--slug", help="URL-safe slug (auto-generated if omitted)"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
     """Create a new file collection (any signed-in user; you own what you create)."""
@@ -86,14 +85,14 @@ def create_collection(
 @collections_app.command("edit")
 def edit_collection(
     collection_id: str = typer.Argument(..., help="Collection id (col_...) from `collections list`"),
-    name: Optional[str] = typer.Option(None, "--name", help="New display name"),
-    description: Optional[str] = typer.Option(
+    name: str | None = typer.Option(None, "--name", help="New display name"),
+    description: str | None = typer.Option(
         None,
         "--description",
         "-d",
         help='New description; pass an empty string ("") to clear it',
     ),
-    slug: Optional[str] = typer.Option(
+    slug: str | None = typer.Option(
         None, "--slug", help="New URL slug (normalised to [a-z0-9-]); changes the /library/<slug> URL"
     ),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
@@ -174,13 +173,29 @@ def list_collections(
 def search_collections(
     query: str = typer.Argument(..., help="Search query"),
     k: int = typer.Option(10, "--k", "--limit", help="Max results"),
-    collection_id: Optional[str] = typer.Option(None, "--collection", "-c", help="Restrict to one collection id"),
+    collection_id: str | None = typer.Option(None, "--collection", "-c", help="Restrict to one collection id"),
+    path_prefix: str | None = typer.Option(
+        None,
+        "--path-prefix",
+        help="Restrict to files under this folder path (e.g. '00_Customers/Acme/')",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
-    """Hybrid search across your accessible collections (RBAC-filtered)."""
+    """Hybrid search across your accessible collections (RBAC-filtered).
+
+    `--path-prefix` narrows to one folder inside the collections in scope. A
+    crawled bucket is routinely ONE collection holding every client's
+    documents, so `--collection` alone cannot separate them; list the files
+    first (`agnes collections show <id> --q <client>`) to see the paths.
+    """
     params: dict = {"q": query, "k": k}
     if collection_id:
         params["corpus_id"] = collection_id
+    # Blank means "no filter", never "match nothing" — same rule as `--q` on
+    # `collections show` and as `corpus_id` server-side.
+    prefix_clean = (path_prefix or "").strip()
+    if prefix_clean:
+        params["path_prefix"] = prefix_clean
     try:
         body = api_get_json("/api/collections/search", **params)
     except V2ClientError as exc:
@@ -192,7 +207,18 @@ def search_collections(
         return
     results = body.get("results", [])
     if not results:
-        typer.echo("No matches.")
+        # Name the narrowing that was in effect. The command-UX standard's
+        # "silent partial scope is forbidden" rule applies here even though
+        # the user asked for the narrowing: a bare "No matches." cannot be
+        # told apart from "your prefix matched no folder", which sends
+        # someone rewording a query when the path was the problem.
+        if prefix_clean:
+            typer.echo(f"No matches under '{prefix_clean}'.")
+            typer.echo("  (searched only files whose path starts with that prefix — it is matched")
+            typer.echo("   literally and is case-sensitive. Drop --path-prefix to search everything,")
+            typer.echo("   or `agnes collections show <id> --q <term>` to see the real paths.)")
+        else:
+            typer.echo("No matches.")
         return
     for r in results:
         loc = r.get("filename") or r.get("file_id")
@@ -209,7 +235,7 @@ def show_collection(
     collection_id: str = typer.Argument(..., help="Collection ID (e.g. col_abc123)"),
     limit: int = typer.Option(25, "--limit", help="Max files to show in this page (server clamps to 1-200)"),
     offset: int = typer.Option(0, "--offset", help="Skip this many files (for pagination)"),
-    q: Optional[str] = typer.Option(None, "--q", help="Filter files by a filename/path substring (case-insensitive)"),
+    q: str | None = typer.Option(None, "--q", help="Filter files by a filename/path substring (case-insensitive)"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
     """Show detail + a page of files for a collection.
@@ -270,8 +296,7 @@ def show_collection(
             # the line above and read as an empty collection, which is the
             # expensive thing to misdiagnose (Devin Review on #2062).
             typer.echo(
-                f"  (no files at --offset {page_offset} — the collection holds {total}; "
-                f"use --offset 0 to start over)"
+                f"  (no files at --offset {page_offset} — the collection holds {total}; use --offset 0 to start over)"
             )
         else:
             typer.echo("  (none)")
@@ -302,7 +327,7 @@ def upload_files(
         readable=True,
         help="One or more local file paths to upload",
     ),
-    logical_path: Optional[str] = typer.Option(
+    logical_path: str | None = typer.Option(
         None,
         "--path",
         help="Logical id for upsert (single file only). Re-uploading the same "

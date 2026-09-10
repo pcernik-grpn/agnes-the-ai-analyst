@@ -214,9 +214,7 @@ class TestTheCombinedHintCountsEverySearchedLeg:
     def test_a_caller_who_can_reach_something_gets_the_wording_branch(self, seeded_app):
         tok = seeded_app["admin_token"]
         _make_collection_with_file(seeded_app, tok, "Reachable", "alpha bravo")
-        r = seeded_app["client"].get(
-            "/api/knowledge/search", params={"q": "nosuchwordanywhere"}, headers=_auth(tok)
-        )
+        r = seeded_app["client"].get("/api/knowledge/search", params={"q": "nosuchwordanywhere"}, headers=_auth(tok))
         assert r.status_code == 200, r.text
         hint = r.json().get("hint", "")
         assert "NOT evidence that access is missing" in hint
@@ -316,3 +314,247 @@ class TestTheHintDoesNotOverClaimAccess:
         hint = _empty_combined_hint(0, 0, 0)
         assert "reachable from this account" in hint
         assert "not about your wording" in hint
+
+
+def _make_collection_with_paths(seeded_app, token: str, name: str, files: list[tuple[str, str, str]]) -> dict:
+    """One collection holding several files at DIFFERENT logical paths.
+
+    The shape a crawled bucket actually has — every client's folder inside
+    one collection — which `_make_collection_with_file` cannot express.
+    ``files`` is ``[(filename, logical path, body)]``.
+    """
+    c = seeded_app["client"].post("/api/collections", json={"name": name}, headers=_auth(token))
+    assert c.status_code == 201, c.text
+    col = c.json()
+    for filename, path, body in files:
+        up = seeded_app["client"].post(
+            f"/api/collections/{col['id']}/files",
+            files={"files": (filename, body.encode(), "text/markdown")},
+            data={"paths": [path]},
+            headers=_auth(token),
+        )
+        assert up.status_code == 201, up.text
+    return col
+
+
+class TestFolderScoping:
+    """`path_prefix` — one collection routinely holds every client's files.
+
+    Observed live: a search for one engagement's statement of work competed
+    with thousands of chunks of every other client's invoices, and the
+    document being asked for did not make the top 12. `corpus_id` could not
+    express "only this folder" because all of it is one collection.
+    """
+
+    def test_path_prefix_narrows_to_one_folder(self, seeded_app):
+        tok = seeded_app["admin_token"]
+        _make_collection_with_paths(
+            seeded_app,
+            tok,
+            "Customers",
+            [
+                ("acme-sow.md", "00_Customers/Acme/acme-sow.md", "statement of work and fees"),
+                ("globex-sow.md", "00_Customers/Globex/globex-sow.md", "statement of work and fees"),
+            ],
+        )
+
+        both = _search(seeded_app, tok, "statement of work")
+        assert {r["filename"] for r in both["results"]} == {"acme-sow.md", "globex-sow.md"}
+
+        scoped = _search(seeded_app, tok, "statement of work", path_prefix="00_Customers/Acme/")
+        assert {r["filename"] for r in scoped["results"]} == {"acme-sow.md"}
+
+    def test_a_blank_path_prefix_is_not_a_filter(self, seeded_app):
+        """`?path_prefix=` is what an unset optional looks like on the wire —
+        the same rule `corpus_id` already follows."""
+        tok = seeded_app["admin_token"]
+        _make_collection_with_paths(
+            seeded_app,
+            tok,
+            "Customers Blank",
+            [("acme-sow.md", "00_Customers/Acme/acme-sow.md", "statement of work and fees")],
+        )
+
+        body = _search(seeded_app, tok, "statement of work", path_prefix="")
+        assert [r["filename"] for r in body["results"]] == ["acme-sow.md"]
+
+    def test_path_prefix_cannot_reach_a_collection_the_caller_cannot_see(self, seeded_app):
+        """Scoping narrows; it never widens. The prefix is applied INSIDE the
+        caller's granted corpus set, so naming another collection's folder
+        returns nothing rather than that collection's files."""
+        tok = seeded_app["admin_token"]
+        other = _make_collection_with_paths(
+            seeded_app,
+            tok,
+            "Someone Else",
+            [("secret.md", "99_Private/secret.md", "statement of work and fees")],
+        )
+        mine = _make_collection_with_paths(
+            seeded_app,
+            tok,
+            "Mine",
+            [("ok.md", "00_Mine/ok.md", "statement of work and fees")],
+        )
+
+        body = _search(seeded_app, tok, "statement of work", corpus_id=mine["id"], path_prefix="99_Private/")
+        assert body["results"] == []
+        # ...and the other collection's file is genuinely reachable when it
+        # IS the one in scope, so the assertion above is about scoping and
+        # not about a mis-seeded fixture.
+        reachable = _search(seeded_app, tok, "statement of work", corpus_id=other["id"])
+        assert [r["filename"] for r in reachable["results"]] == ["secret.md"]
+
+
+class TestACappedScanThatMatchedNothingIsRefused:
+    """`results: []` is indistinguishable from "no such document exists".
+
+    Observed live: four of six searches in one session returned an empty
+    list with the candidate cap disclosed beside it, and the agent concluded
+    the document was absent and answered from an unrelated notes file.
+    """
+
+    def test_it_answers_422_with_an_actionable_reason(self, seeded_app, monkeypatch):
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        # Candidate SELECTION is substring-based while RANKING is whole-word,
+        # so `Riveronium` is a candidate for `riveron` and then scores zero:
+        # the cap fills with a row nothing can be made of.
+        _make_collection_with_file(seeded_app, tok, "Compounds", "Riveronium is a compound")
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+
+        r = seeded_app["client"].get("/api/collections/search", params={"q": "riveron"}, headers=_auth(tok))
+
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["error"] == "search_query_too_broad"
+        assert detail["reason"] == "capped_no_match"
+        # The one thing the caller must not conclude.
+        assert "NOT evidence the document is absent" in detail["hint"]
+
+    def test_the_no_usable_term_refusal_keeps_its_own_reason(self, seeded_app, monkeypatch):
+        """The two refusals are distinguishable — rephrase vs narrow."""
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        _make_collection_with_file(seeded_app, tok, "Stopwords", "the alpha is here and there")
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+
+        r = seeded_app["client"].get("/api/collections/search", params={"q": "the and is"}, headers=_auth(tok))
+
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["reason"] == "no_usable_term"
+
+
+class TestTheTruncationNoteSaysWhichPathFilledTheCap:
+    def test_a_filename_only_cap_does_not_claim_your_words_matched_chunks(self, seeded_app, monkeypatch):
+        """One `truncated` flag covered two events and the note described
+        only the first, so a search whose passage candidates numbered zero
+        still reported "more than N chunks matching your query terms" — the
+        cap had been filled by the FILENAME pass, where matching is
+        substring."""
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        # The file's NAME carries `alpha`; its body does not.
+        _make_collection_with_paths(
+            seeded_app, tok, "Names", [("alpha-notes.md", "docs/alpha-notes.md", "unrelated body text")]
+        )
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+
+        body = _search(seeded_app, tok, "alpha notes")
+
+        assert body.get("truncated") is True
+        note = body["truncated_note"]
+        assert "FILE NAMES" in note
+        assert "not a sign that your query is too broad" in note
+
+
+class TestTheResponseCarriesTheTruncationSourceAsAField:
+    def test_truncated_source_is_on_the_wire_not_only_in_the_prose(self, seeded_app, monkeypatch):
+        """The workspace prompt's document rails tell an agent to branch on
+        `truncated_source` — so the field has to exist for it to read.
+
+        It was computed and used only to format `truncated_note`, which made
+        that guidance point at nothing. (PR review on #2420.)
+        """
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        _make_collection_with_file(seeded_app, tok, "Sourced", "kubernetes cluster guide")
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+
+        body = _search(seeded_app, tok, "kubernetes")
+
+        assert body.get("truncated") is True
+        assert body.get("truncated_source") == "body"
+
+    def test_no_truncation_source_field_when_nothing_was_capped(self, seeded_app, monkeypatch):
+        import src.ingest.retrieval as retrieval
+
+        tok = seeded_app["admin_token"]
+        _make_collection_with_file(seeded_app, tok, "Uncapped", "kubernetes cluster guide")
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 100)
+
+        body = _search(seeded_app, tok, "kubernetes")
+
+        assert body.get("truncated") is None
+        assert "truncated_source" not in body
+
+
+class TestFolderScopingForANonAdminCaller:
+    """`path_prefix` has to compose with grant resolution, not bypass it.
+
+    Every other folder-scoping test here authenticates as an admin, and
+    admin is a god-mode short-circuit on every authorization check — so
+    those tests never exercise `accessible_collection_ids` at all. These
+    drive the same filter through a non-admin caller, where the granted set
+    is really computed. (PR review on #2420.)
+    """
+
+    def test_a_non_admin_owner_can_scope_to_a_folder(self, seeded_app):
+        tok = seeded_app["analyst_token"]
+        _make_collection_with_paths(
+            seeded_app,
+            tok,
+            "Analyst Customers",
+            [
+                ("acme-sow.md", "00_Customers/Acme/acme-sow.md", "statement of work and fees"),
+                ("globex-sow.md", "00_Customers/Globex/globex-sow.md", "statement of work and fees"),
+            ],
+        )
+
+        scoped = _search(seeded_app, tok, "statement of work", path_prefix="00_Customers/Acme/")
+
+        assert [r["filename"] for r in scoped["results"]] == ["acme-sow.md"]
+
+    def test_a_prefix_never_reaches_a_collection_the_caller_has_no_grant_on(self, seeded_app):
+        """The strong direction: naming the folder of someone else's
+        collection must not surface it. `path_prefix` narrows INSIDE the
+        caller's resolved set, so it cannot be used to probe outside it."""
+        admin = seeded_app["admin_token"]
+        analyst = seeded_app["analyst_token"]
+
+        # Owned by the admin, never granted to the analyst.
+        _make_collection_with_paths(
+            seeded_app,
+            admin,
+            "Admin Only Deal Files",
+            [("secret-sow.md", "90_Confidential/secret-sow.md", "statement of work and fees")],
+        )
+        # The analyst owns an unrelated one, so their granted set is non-empty
+        # and an empty result cannot be explained away as "no access at all".
+        _make_collection_with_paths(
+            seeded_app,
+            analyst,
+            "Analyst Own",
+            [("mine.md", "00_Mine/mine.md", "unrelated notes")],
+        )
+
+        body = _search(seeded_app, analyst, "statement of work", path_prefix="90_Confidential/")
+
+        assert body["results"] == []
+        # ...and the admin, who does own it, finds it — so the assertion
+        # above is about the grant, not a mis-seeded fixture.
+        as_admin = _search(seeded_app, admin, "statement of work", path_prefix="90_Confidential/")
+        assert [r["filename"] for r in as_admin["results"]] == ["secret-sow.md"]
