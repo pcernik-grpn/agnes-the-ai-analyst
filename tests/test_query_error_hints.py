@@ -153,3 +153,39 @@ class TestUnregisteredTableHint:
 
     def test_returns_none_for_an_unrelated_error(self):
         assert unregistered_table_hint('Binder Error: Referenced column "X" not found in FROM clause!') is None
+
+
+def test_a_relation_quoted_per_segment_resolves_to_the_relation_not_the_schema():
+    """SQL lets every segment of a qualified name carry its own quotes, so
+    `"main"."orders" o` is one reference — not a table called `main` with no
+    alias. Getting that wrong pointed the reader at `schema main`, a table
+    that does not exist, which is the failure this whole helper exists to
+    prevent."""
+    hint = column_not_found_hint(
+        'Binder Error: Table "o" does not have a column named "bad"',
+        'SELECT o.bad FROM "main"."orders" o',
+    )
+    assert hint is not None
+    assert "`orders`" in hint
+    assert "`main`" not in hint
+
+
+def test_a_bare_qualified_relation_also_reports_the_relation():
+    """Same rule when the qualification is written without quotes — a
+    catalogue or schema prefix is never a valid argument to `schema`."""
+    hint = column_not_found_hint(
+        'Binder Error: Table "t" does not have a column named "bad"',
+        "SELECT t.bad FROM analytics.public.orders t",
+    )
+    assert hint is not None
+    assert "`orders`" in hint
+
+
+def test_an_unqualified_relation_is_unchanged():
+    """The ordinary case must not move."""
+    hint = column_not_found_hint(
+        'Binder Error: Table "p" does not have a column named "bad"',
+        "SELECT p.bad FROM refh_project p",
+    )
+    assert hint is not None
+    assert "`refh_project`" in hint

@@ -48,8 +48,9 @@ _REFERENCED_COLUMN_RE = re.compile(r'Referenced column "([^"]+)" not found in FR
 
 # One FROM/JOIN clause: a table name (bare, dotted, or double-quoted) plus
 # an optional alias. Best-effort only -- see module docstring.
+_SEGMENT = r'(?:"[^"]+"|[A-Za-z_][\w$-]*)'
 _FROM_JOIN_RE = re.compile(
-    r'\b(?:FROM|JOIN)\s+(?P<table>"[^"]+"|[A-Za-z_][\w.$-]*)'
+    r'\b(?:FROM|JOIN)\s+(?P<table>' + _SEGMENT + r'(?:\s*\.\s*' + _SEGMENT + r')*)'
     r'(?:\s+(?:AS\s+)?(?P<alias>"[^"]+"|[A-Za-z_]\w*))?',
     re.IGNORECASE,
 )
@@ -81,12 +82,31 @@ _NOT_AN_ALIAS = frozenset(
 )
 
 
+def _relation_name(raw: str) -> str:
+    """The relation a qualified reference points at, as `schema` takes it.
+
+    SQL lets every segment of a qualified name carry its own quotes, so
+    ``"main"."orders" o`` is one reference, not a table called ``main``.
+    Only the last segment is a name Agnes's `schema` understands — a
+    catalogue/schema prefix is never a valid argument to it — so that is
+    what the hint reports, whether the qualification was written bare
+    (``main.orders``) or quoted per segment.
+    """
+    segments = [seg.strip().strip('"') for seg in raw.split(".")]
+    segments = [seg for seg in segments if seg]
+    return segments[-1] if segments else raw.strip().strip('"')
+
+
 def _table_aliases(sql: str) -> dict[str, str]:
     """Best-effort ``{lowercased alias-or-table-name: original-case table
     name}`` map built from every FROM/JOIN clause in ``sql``."""
     aliases: dict[str, str] = {}
     for m in _FROM_JOIN_RE.finditer(sql or ""):
-        table = m.group("table").strip('"')
+        raw = m.group("table")
+        table = _relation_name(raw)
+        # Both spellings resolve: the error may name the qualified form or
+        # the bare relation, and either has to reach the same hint.
+        aliases.setdefault(raw.strip().strip('"').lower(), table)
         aliases.setdefault(table.lower(), table)
         alias = m.group("alias")
         if alias:
@@ -101,7 +121,7 @@ def _referenced_tables(sql: str) -> list[str]:
     first-seen order."""
     seen: list[str] = []
     for m in _FROM_JOIN_RE.finditer(sql or ""):
-        table = m.group("table").strip('"')
+        table = _relation_name(m.group("table"))
         if table not in seen:
             seen.append(table)
     return seen
