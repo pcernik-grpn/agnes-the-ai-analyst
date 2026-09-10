@@ -3017,6 +3017,7 @@ KNOWN_UNTESTED = {
     "GET /admin/telemetry",
     "GET /admin/tokens",
     "GET /admin/usage",
+    "GET /admin/issues",  # queue page shell; rendering + admin gate in tests/test_issue_pages.py
     "GET /admin/users",
     "GET /admin/users/{user_id}",
     "GET /admin/workspace-prompt",
@@ -3087,6 +3088,7 @@ KNOWN_UNTESTED = {
     "GET /me/ai-connector",
     "GET /me/connections",  # per-user MCP connect page tested in tests/test_me_connections_page.py
     "GET /me/cowork",
+    "GET /me/issues",  # reporter page shell; rendering + PG gate in tests/test_issue_pages.py
     "GET /me/mcp",
     "GET /me/profile",
     "GET /me/stats",
