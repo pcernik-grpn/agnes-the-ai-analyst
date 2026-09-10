@@ -673,16 +673,27 @@ class TestDeepLinkRestoreIsNotSilent:
         assert "renderSystemNote(" in body       # and it says how to retry
 
     def test_the_failure_renderer_leaves_a_clean_pre_conversation_state(self):
+        # The state-clearing half moved into `_clearInaccessibleRestore` when a
+        # denied restore (403) needed the identical treatment with different
+        # words — same steps, one place, asserted here through the call so this
+        # test still fails if any of them is dropped.
+        cleanup = _slice(
+            _chat_js(),
+            "function _clearInaccessibleRestore() {",
+            "/** A deep-linked restore the reader is not permitted to open",
+        )
+        assert "currentChatId = null;" in cleanup
+        assert "_syncSessionUrl(null);" in cleanup   # a dead id must not survive a reload
+        assert "showCapabilities();" in cleanup
+
         body = _slice(
             _chat_js(),
             "function _renderRestoreFailure(detail) {",
             "/** Open (or resume) a chat session.",
         )
-        assert "currentChatId = null;" in body
-        assert "_syncSessionUrl(null);" in body     # a dead id must not survive a reload
+        assert "_clearInaccessibleRestore();" in body
         assert "renderSystemNote(" in body          # said IN the transcript, not only in a status pill
         assert "showToast(" in body                 # the report was explicit: "no error, no toast"
-        assert "showCapabilities();" in body
 
     def test_history_load_reports_its_outcome(self):
         body = _slice(
@@ -690,7 +701,7 @@ class TestDeepLinkRestoreIsNotSilent:
             "async function loadAndRenderHistory(chatId) {",
             "/** A deep-link restore that could not be completed",
         )
-        assert "return { ok: false, error: err.message, count: 0, authHandled };" in body
+        assert "return { ok: false, error: err.message, count: 0, authHandled, authStatus: err && err.status };" in body
         assert "return { ok: true, error: null, count: history.length };" in body
 
     def test_history_load_reports_an_auth_failure_it_already_answered(self):
@@ -715,7 +726,51 @@ class TestDeepLinkRestoreIsNotSilent:
         )
         # Still the panel for an ORDINARY restore failure (404, a 5xx) —
         # the case it was written for — and only that.
-        assert "if (!hydrated.authHandled) _renderRestoreFailure(hydrated.error);" in opener
+        assert "if (!hydrated.authHandled) {\n      _renderRestoreFailure(hydrated.error);" in opener
+        # …and the status travels with the flag, because the two handled
+        # cases need opposite treatment (see the class below).
+        assert "authStatus: err && err.status" in body
+
+    def test_a_denied_restore_ends_on_a_usable_page_not_a_blank_one(self):
+        """A 403 is TERMINAL here — no redirect is coming, because signing in
+        again cannot conjure a grant — so it is the reader's final state and
+        has to be a page they can use.
+
+        Honouring `authHandled` alone left the inaccessible id current, the
+        `?session=` URL pointing at it, its row lit in the sidebar and the
+        capability panel hidden over an empty transcript: a blank, unusable
+        chat (Devin Review on 9526b6e4). The 401 must still be left alone —
+        the page is about to be replaced and the sentence it painted is the
+        only thing the reader gets to read.
+        """
+        opener = _slice(
+            _chat_js(),
+            "  const hydrated = await loadAndRenderHistory(chatId);",
+            "  // A recovery nobody asked for must not cost the reader their transcript.",
+        )
+        assert "} else if (hydrated.authStatus !== 401) {" in opener
+        assert "_renderAccessDeniedRestore();" in opener
+
+    def test_both_terminal_restores_share_one_cleanup(self):
+        """The denied ending and the unreadable ending differ only in what
+        they SAY. Everything that makes the page usable again is one helper
+        both call, so a change to one cannot quietly leave the other on a
+        blank chat — which is the exact failure this pair of states exists to
+        avoid."""
+        js = _chat_js()
+        for fn in ("_renderAccessDeniedRestore", "_renderRestoreFailure"):
+            body = _slice(js, f"function {fn}(", "\n}")
+            assert "_clearInaccessibleRestore();" in body, f"{fn} must not hand-roll the cleanup"
+        cleanup = _slice(js, "function _clearInaccessibleRestore() {", "\n}")
+        for step in (
+            "currentChatId = null;",
+            "_syncSessionUrl(null);",
+            "markActiveSidebar(null);",
+            "_markConversationNotStarted();",
+            "setTurnInFlight(false);",
+            "showCapabilities();",
+        ):
+            assert step in cleanup, f"the shared cleanup dropped: {step}"
 
 
 class TestConcurrentOpensCannotClobberEachOther:

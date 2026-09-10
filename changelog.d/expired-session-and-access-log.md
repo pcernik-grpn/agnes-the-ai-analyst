@@ -1,7 +1,7 @@
 ### Fixed
 
 - An expired browser session no longer reads as a broken chat. A chat request answering 401 rendered as `Could not start chat: 401` — a status code and no way forward, when the actual fix was to sign in again. The chat now says the session expired and sends the reader to `/login?next=<current page>`, so signing in returns them where they were. This covers every way into a conversation, not just sending a message: the New Chat button, picking an agent, a `?agent=` link, loading a conversation's history, and re-arming its socket. Any other failure keeps its own message.
-- A revoked chat grant is no longer reported as an expired login. `require_chat_access` answers 403 to a signed-in caller whose group lost access; sending them to a login they pass and bounce straight off again is a loop. 403 now says access is missing and names who can grant it, and stays on the page.
+- A revoked chat grant is no longer reported as an expired login. `require_chat_access` answers 403 to a signed-in caller whose group lost access; sending them to a login they pass and bounce straight off again is a loop. 403 now says access is missing and names who can grant it, and stays on the page. A deep-linked conversation the reader is not allowed to open ends on a page they can still use: the inaccessible session is cleared along with the `?session=` URL and its sidebar row, and the empty-state panel comes back, rather than leaving a blank chat with that conversation still current.
 
 ### Added
 
