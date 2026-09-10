@@ -577,3 +577,30 @@ def test_raw_over_the_engine_refuses_active_content_before_any_call(
     client = _make_client(data_dir, monkeypatch, handler)
     assert client.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "page.html"}).status_code == 415
     assert minted["args"] == []
+
+
+@pytest.mark.anyio
+async def test_a_child_directory_400_is_not_swallowed() -> None:
+    """A 400 on the ROOT means "no files channel for this chat" — that is the
+    malformed-id case this module handles. A 400 on a child cannot mean that:
+    the same chat id already passed the root. Swallowing it would drop that
+    directory's files from an answer that still reports itself complete."""
+
+    from app.chat.kai_engine_files import EngineFilesUnavailable, fetch_engine_listing
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("path"):
+            return httpx.Response(400, json={"error": "bad path"})
+        return httpx.Response(
+            200,
+            json={"entries": [{"name": "reports", "type": "dir", "path": "reports"}]},
+        )
+
+    with pytest.raises(EngineFilesUnavailable):
+        await fetch_engine_listing(
+            base_url="http://engine",
+            chat_id="11111111-1111-1111-1111-111111111111",
+            token="jwt",
+            max_files=100,
+            transport=httpx.MockTransport(handler),
+        )

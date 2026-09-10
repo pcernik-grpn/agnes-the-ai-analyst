@@ -337,7 +337,10 @@ def test_list_under_kai_agent_skips_the_engine_when_no_sandbox_exists_yet(
     body = resp.json()
     assert body["files"] == []
     assert body["source"] == "engine"
-    assert body["supported"] is False
+    # Supported, not unsupported: the drawer renders supported=False as an
+    # "upgrade your engine" warning, the wrong sentence for a chat the
+    # reader opened seconds ago. Nothing here says the channel is absent.
+    assert body["supported"] is True
 
 
 def test_list_under_kai_agent_with_a_sandbox_still_reaches_the_engine(

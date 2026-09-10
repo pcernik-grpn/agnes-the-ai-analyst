@@ -112,6 +112,16 @@ _ENGINE_LISTING_FAILURE_LOGGED: OrderedDict[str, None] = OrderedDict()
 _ENGINE_LISTING_FAILURE_LOGGED_MAX = 512
 
 
+def _engine_listing_recovered(chat_id: str) -> None:
+    """Forget ``chat_id``'s suppression after a listing succeeds.
+
+    Without this the first outage silences the traceback for the rest of the
+    process: a later, unrelated failure for the same chat would log only the
+    one-line warning, and the stack that explains it would never be written.
+    """
+    _ENGINE_LISTING_FAILURE_LOGGED.pop(chat_id, None)
+
+
 def _first_engine_listing_failure(chat_id: str) -> bool:
     """``True`` the first time this chat id's listing failure is seen this
     process, ``False`` for every later call with the same id."""
@@ -724,12 +734,20 @@ async def list_session_files(
     harvested = _harvested_entries(chat_id)
     if _files_source(cfg) == "engine":
         if not getattr(session, "sandbox_id", None):
+            # `supported` answers "does this engine expose a files channel",
+            # not "are there files". A chat that has not spawned a sandbox
+            # yet establishes nothing about the engine, and the drawer
+            # renders supported=False as an operator-facing "upgrade your
+            # engine" warning — the wrong sentence for a conversation the
+            # reader opened five seconds ago. Empty and supported says what
+            # is actually true: no files here yet.
             return _merge_harvested(
-                SessionFilesResponse(files=[], truncated=False, source="engine", supported=False),
+                SessionFilesResponse(files=[], truncated=False, source="engine", supported=True),
                 harvested,
             )
         try:
             live = await _list_engine_files(user, chat_id, cfg)
+            _engine_listing_recovered(chat_id)
         except EngineFilesUnavailable:
             # The traceback is identical every poll of the same outage, so
             # only the first one for this chat id is worth its weight in

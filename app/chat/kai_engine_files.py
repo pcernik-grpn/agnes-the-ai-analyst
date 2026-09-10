@@ -189,10 +189,18 @@ async def fetch_engine_listing(
                     params={"path": dir_path} if dir_path else None,
                 )
                 requests_made += 1
-                if resp.status_code in (400, 404):
-                    if dir_path == "":
-                        return None  # no files channel for this chat
-                    continue  # a subdirectory vanished mid-walk; keep going
+                if dir_path == "" and resp.status_code in (400, 404):
+                    return None  # no files channel for this chat
+                if resp.status_code == 404:
+                    # A subdirectory vanished between the parent listing and
+                    # this call — benign in a live sandbox, keep walking.
+                    continue
+                # A 400 on a CHILD is a different animal: the malformed-id
+                # case that makes 400 mean "no files channel" is settled at
+                # the root, which this chat id already passed. Swallowing it
+                # here would drop that directory's files from an otherwise
+                # successful, untruncated answer — silence where the reader
+                # would see an outage.
                 _raise_for_engine_status(resp, chat_id=chat_id, what="listing")
                 try:
                     body = resp.json()
