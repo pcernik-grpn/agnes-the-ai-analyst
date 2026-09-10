@@ -29,6 +29,7 @@ proxy nothing uses, and a false negative leaves the app's boot gate to refuse
 chat loudly.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -105,6 +106,16 @@ def test_gate_ignores_a_commented_out_key(tmp_path):
         # NOT provision a proxy for it (Devin Review on #2417, second round).
         '"allowlist # restrict sandbox traffic"',
         "'allowlist # restrict sandbox traffic'",
+        # A doubled quote is how YAML escapes one inside a single-quoted
+        # scalar, so this loads as `allowlist' # restricted` — again an
+        # unknown mode (third round). A sed lookalike read the first quote of
+        # the pair as the closing delimiter and extracted `allowlist`.
+        "'allowlist'' # restricted'",
+        '"allowlist\\" # restricted"',
+        # The app lowercases the mode, so the host must not be
+        # case-sensitive where the app is not.
+        "ALLOWLIST",
+        "AllowList # note",
         # Other modes, with and without a comment that mentions allowlist.
         "open",
         "open # not allowlist yet",
@@ -137,6 +148,47 @@ def test_the_host_gate_and_the_app_parser_never_disagree(tmp_path, scalar):
         f"{'active' if host_active else 'inactive'}, app reads "
         f"{_parse_docker_egress_mode(yaml.safe_load(body)['chat'])!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("scalar", "expected_active"),
+    [
+        # Unambiguous plain scalars are still resolved without PyYAML.
+        ("allowlist", True),
+        ("allowlist # restrict sandbox traffic", True),
+        # Anything quoted, mixed-case, or otherwise ambiguous stays INACTIVE
+        # rather than being guessed at. These are deliberate false negatives:
+        # the app's own boot gate then refuses chat loudly, which is the
+        # documented-safe direction, whereas a false positive would provision
+        # a proxy for a mode the app might not agree with.
+        ('"allowlist"', False),
+        ('"allowlist # restrict"', False),
+        ("'allowlist'' # restricted'", False),
+        ("ALLOWLIST", False),
+        ("open", False),
+    ],
+)
+def test_the_fallback_without_pyyaml_never_guesses(tmp_path, scalar, expected_active):
+    """`python3-yaml` is installed by the VM startup script, which already
+    warns and retries the next boot when it is missing — so the fallback is a
+    real path and must fail safe rather than reintroduce a lookalike parser."""
+    state = tmp_path / f"nofallback-{abs(hash(scalar))}" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "instance.yaml").write_text(f"chat:\n  docker_egress_mode: {scalar}\n")
+    stub = tmp_path / "stub"
+    stub.mkdir(exist_ok=True)
+    # A python3 that exists but cannot import yaml — the shape the startup
+    # script's own `python3 -c 'import yaml'` guard is written for.
+    (stub / "python3").write_text("#!/bin/sh\nexit 1\n")
+    (stub / "python3").chmod(0o755)
+    rc = subprocess.run(
+        ["sh", "-c", f'. "{HELPER.resolve()}"; {GATE} "$1"', "_", str(state)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"},
+    ).returncode
+    assert (rc == 0) is expected_active, f"{scalar!r} -> rc={rc}"
 
 
 def test_an_unterminated_quote_never_provisions_a_proxy(tmp_path):

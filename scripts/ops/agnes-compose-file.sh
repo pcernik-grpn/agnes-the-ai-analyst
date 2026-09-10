@@ -91,44 +91,53 @@ agnes_tls_active() {
 agnes_chat_egress_allowlist_active() {
     _acf_sdir=$1
     [ -f "$_acf_sdir/instance.yaml" ] || return 1
-    # Same sed idiom as the database.backend read below: an indented key, so a
-    # commented-out `# docker_egress_mode:` (the shape config/
-    # instance.yaml.example ships) configures nothing, as it should.
-    _acf_egress=$(sed -n 's/^[[:space:]]*docker_egress_mode:[[:space:]]*//p' \
-        "$_acf_sdir/instance.yaml" 2>/dev/null | head -1)
-    # Resolve the scalar EXACTLY as a YAML loader would, because the whole
-    # point of this helper is that the host and the app never disagree about
-    # whether the proxy profile is required. Two shapes bite, in opposite
-    # directions, and both were real review findings on #2417:
+    # Ask PyYAML for the value, exactly as the app does. This helper exists to
+    # guarantee the host and the app never disagree about whether the proxy
+    # profile is required, and imitating YAML in sed cannot deliver that.
+    # Three rounds of review on #2417 found three different ways to break a
+    # lookalike parser: a plain inline comment (`allowlist # note`, which YAML
+    # strips, so the app reads `allowlist` and the host must too), a quoted
+    # hash (`"allowlist # note"`, which YAML keeps, so the app rejects the
+    # mode and falls back to the secure `none`), and a doubled quote inside a
+    # single-quoted scalar. Using the same parser makes the agreement
+    # structural instead of a lookalike we keep patching.
     #
-    #   docker_egress_mode: allowlist # restrict traffic
-    #     -> YAML strips the comment and the app reads `allowlist`, so the
-    #        host must too, or a configured allowlist deployment silently
-    #        runs with no proxy.
-    #   docker_egress_mode: "allowlist # restrict traffic"
-    #     -> YAML keeps the hash INSIDE the quotes, the app sees an unknown
-    #        mode and falls back to the secure `none`. Stripping it here would
-    #        manufacture `allowlist` and provision a proxy for a deployment
-    #        the app is running with no egress at all.
-    #
-    # So a `#` is a comment only OUTSIDE a quoted scalar. Handle the quoted
-    # forms by taking the quoted region itself, and only strip a comment from
-    # a plain scalar. An unterminated quote matches no branch and stays
-    # unequal, i.e. no profile — the documented-safe direction, where the
-    # app's own boot gate refuses chat loudly instead.
-    case $_acf_egress in
-        '"'*)
-            _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/^"\([^"]*\)".*$/\1/')
-            ;;
-        "'"*)
-            _acf_egress=$(printf '%s' "$_acf_egress" | sed "s/^'\([^']*\)'.*\$/\1/")
-            ;;
-        *)
-            _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]#.*$//')
-            ;;
-    esac
-    # Trim trailing whitespace a hand edit may leave behind.
-    _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]*$//')
+    # python3-yaml is not a new dependency here: the VM startup script installs
+    # it and already gates its own instance.yaml merge on `import yaml`, and
+    # agnes-state-applier.sh writes this very file through PyYAML.
+    if python3 -c 'import yaml' 2>/dev/null; then
+        _acf_egress=$(python3 - "$_acf_sdir/instance.yaml" <<'PY' 2>/dev/null
+import sys
+
+import yaml
+
+try:
+    doc = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    # Unloadable YAML: say nothing, and let the app's own boot gate be what
+    # complains, rather than provisioning on a guess.
+    sys.exit(0)
+chat = doc.get("chat") if isinstance(doc, dict) else None
+mode = (chat or {}).get("docker_egress_mode") if isinstance(chat, dict) else None
+# `.lower()` mirrors app/chat/config.py::_parse_docker_egress_mode.
+print(mode.lower() if isinstance(mode, str) else "")
+PY
+)
+    else
+        # No PyYAML (the startup script warns and retries next boot in the same
+        # situation). Fall back to the STRICT shape only: an unquoted
+        # `allowlist`, optionally followed by a comment. Anything quoted or
+        # otherwise ambiguous stays inactive — the documented-safe direction,
+        # where the app's own boot gate refuses chat loudly instead of a proxy
+        # being provisioned for a mode the app may not agree with.
+        _acf_egress=$(sed -n 's/^[[:space:]]*docker_egress_mode:[[:space:]]*//p' \
+            "$_acf_sdir/instance.yaml" 2>/dev/null | head -1)
+        _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]#.*$//' | sed 's/[[:space:]]*$//')
+        case $_acf_egress in
+            allowlist) ;;
+            *) _acf_egress="" ;;
+        esac
+    fi
     [ "$_acf_egress" = "allowlist" ]
 }
 
