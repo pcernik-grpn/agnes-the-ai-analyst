@@ -110,19 +110,48 @@ def _as_utc(dt: datetime) -> datetime:
 
 
 def _export_watermark(messages: list[ChatMessage]) -> datetime:
-    """The timestamp :func:`export_chat_session_jsonl` stamps onto the
-    written file's mtime: the newest ``created_at`` actually present among
-    *messages* -- i.e. exactly what the file's content can vouch for.
-
-    Using the file's real write-time ``os.replace`` mtime here instead
-    would race a message committed between the read above and the replace
-    below: that message is absent from the file but older than "now", so
-    ``is_chat_export_stale`` could never see the gap. Stamping the
-    watermark of what was actually read means a message that lands mid-export
-    is simply newer than the file's mtime and is caught on the very next
-    staleness check, rather than presumed exported forever."""
+    """The newest ``created_at`` actually present among *messages* -- i.e.
+    exactly what the exported file's content can vouch for. Recorded
+    alongside the file by :func:`_write_export_watermark` and read back by
+    :func:`is_chat_export_stale`, deliberately NOT via the file's own mtime
+    (see that function's docstring for why the two must stay separate)."""
     newest = max((m.created_at for m in messages if m.created_at is not None), default=None)
     return _as_utc(newest) if newest is not None else datetime.now(UTC)
+
+
+def _watermark_path(target: Path) -> Path:
+    """The sidecar file :func:`_write_export_watermark` /
+    :func:`_read_export_watermark` use to record the content watermark for
+    *target* (an exported chat jsonl), named alongside it rather than
+    reusing ``target``'s own mtime -- see :func:`is_chat_export_stale`."""
+    return target.with_name(target.name + ".watermark")
+
+
+def _write_export_watermark(target: Path, watermark: datetime) -> None:
+    """Atomically record *watermark* (:func:`_export_watermark` of the
+    messages just written to *target*) in its sidecar file. Same
+    ``.tmp`` + ``os.replace`` pattern as the jsonl write itself, so a
+    reader never observes a half-written watermark."""
+    wm_path = _watermark_path(target)
+    wm_tmp = wm_path.with_name(wm_path.name + ".tmp")
+    wm_tmp.write_text(watermark.isoformat(), encoding="utf-8")
+    os.replace(wm_tmp, wm_path)
+
+
+def _read_export_watermark(target: Path) -> datetime | None:
+    """The content watermark :func:`_write_export_watermark` recorded for
+    *target*, or ``None`` when there is no sidecar to read (an export
+    written before this mechanism existed, or one whose sidecar write
+    failed) -- the caller (:func:`is_chat_export_stale`) falls back to
+    *target*'s own mtime in that case."""
+    try:
+        text = _watermark_path(target).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(text))
+    except ValueError:
+        return None
 
 
 def _result_to_content(result: Any) -> Any:
@@ -314,12 +343,20 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     already-processed, so a repeat call from the sweep costs one write and
     no reprocessing.
 
-    The written file's mtime is stamped to :func:`_export_watermark` of the
-    messages actually read — NOT left at the wall-clock time the write
-    completed — so a message committed between the read above and the
-    ``os.replace`` below (present in neither) is newer than the stamped
-    mtime and :func:`is_chat_export_stale` catches the gap on the very next
-    check, rather than trusting a file that quietly missed it.
+    The jsonl's own mtime is left at ``os.replace``'s natural wall-clock
+    write time — ``services/session_processor_state.py::scan_unprocessed_for``
+    already gates reprocessing on that mtime advancing past a prior
+    ``processed_at``, and messages can be arbitrarily older than the moment
+    they are (re-)exported (the exact case this function's own fix for a
+    500-row-truncated backlog creates: exporting a message from an hour ago
+    must not look, to that OTHER gate, like the file was written an hour
+    ago). :func:`_export_watermark` of the messages actually read is
+    instead recorded in a separate sidecar
+    (:func:`_write_export_watermark`) that only :func:`is_chat_export_stale`
+    reads — so a message committed between the read above and the
+    ``os.replace`` below (present in neither) is newer than the recorded
+    watermark and is caught on the very next check, without perturbing the
+    unrelated mtime-based gate.
     """
     if not feature_enabled("sessions", "include_chat", env_var="AGNES_SESSIONS_INCLUDE_CHAT", default=True):
         return None
@@ -358,8 +395,7 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
                 fh.write(json.dumps(turn, default=str))
                 fh.write("\n")
         os.replace(tmp, target)
-        watermark_ts = watermark.timestamp()
-        os.utime(target, (watermark_ts, watermark_ts))
+        _write_export_watermark(target, watermark)
     except OSError:
         logger.warning("chat session export: write failed for %s", chat_id, exc_info=True)
         return None
@@ -388,25 +424,37 @@ def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime |
     stale: there is nothing to export, so re-checking on every call would
     be pointless work for a session that will never produce a file.
 
-    ``existing_path``'s mtime is trusted as a proxy for "newest message
-    this file's content can vouch for" — which only holds because
-    :func:`export_chat_session_jsonl` stamps it to
-    :func:`_export_watermark` of what it actually wrote, not to the
-    wall-clock instant the write completed. A message committed between
-    that function's read and its ``os.replace`` is therefore newer than
-    the stamped mtime even though the write finished after the message was
-    committed, and shows up as stale here on the very next call.
+    Compares against :func:`_read_export_watermark` — the newest message
+    ``export_chat_session_jsonl`` actually wrote, recorded in a sidecar file
+    alongside ``existing_path`` — rather than ``existing_path``'s own
+    mtime. The file's mtime is deliberately NOT this signal: it is left at
+    the wall-clock write time for ``services/session_processor_state.py``'s
+    own, unrelated mtime-vs-``processed_at`` invalidation gate, and a
+    message can be older than the moment it happens to get (re-)exported
+    (backfilling a previously-truncated conversation, for one). Falls back
+    to the file's mtime only when there is no sidecar to read — an export
+    written before this mechanism existed, or one whose sidecar write
+    failed — so an old export is not treated as permanently stale just
+    because it predates the sidecar.
+
+    A message committed between :func:`export_chat_session_jsonl`'s read
+    and its ``os.replace`` is absent from both the jsonl and the sidecar,
+    so it is newer than the recorded watermark and shows up as stale here
+    on the very next call — this is what actually closes the write race,
+    the file's own mtime plays no part in it.
     """
     if last_message_at is None:
         return False
     if existing_path is None or not existing_path.is_file():
         return True
-    try:
-        file_mtime = datetime.fromtimestamp(existing_path.stat().st_mtime, tz=UTC)
-    except OSError:
-        return True
-    last_active = last_message_at if last_message_at.tzinfo is not None else last_message_at.replace(tzinfo=UTC)
-    return last_active > file_mtime
+    watermark = _read_export_watermark(existing_path)
+    if watermark is None:
+        try:
+            watermark = datetime.fromtimestamp(existing_path.stat().st_mtime, tz=UTC)
+        except OSError:
+            return True
+    last_active = _as_utc(last_message_at)
+    return last_active > watermark
 
 
 @dataclass

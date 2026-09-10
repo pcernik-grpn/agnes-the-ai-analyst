@@ -360,6 +360,37 @@ class TestExportChatSessionJsonl:
         # oldest-first, nothing dropped, nothing reordered.
         assert texts == [f"message {i}" for i in range(n_messages)]
 
+    def test_export_mtime_stays_at_write_time_for_backdated_messages(self, seeded_app, tmp_path, monkeypatch):
+        """A message's own ``created_at`` can be far in the past relative to
+        the moment it finally gets (re-)exported -- exactly what happens
+        when this fix backfills a previously 500-row-truncated
+        conversation's missing tail long after those messages were sent.
+        The exported jsonl's own mtime must stay at the real write time
+        regardless: ``services/session_processor_state.py::scan_unprocessed_for``
+        gates reprocessing on a file's mtime advancing past its previously
+        recorded ``processed_at``, and a file backdated to old message
+        content would look untouched to that gate and never get
+        reprocessed, even though its content just changed."""
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = self._seed_chat_session("analyst@test.com")
+
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        backdated = datetime.now(UTC) - timedelta(hours=2)
+        conn.execute("UPDATE chat_messages SET created_at = ? WHERE session_id = ?", [backdated, chat_id])
+
+        before = datetime.now(UTC)
+        result = export_chat_session_jsonl(chat_id)
+        after = datetime.now(UTC)
+
+        assert result is not None
+        mtime = datetime.fromtimestamp(result.stat().st_mtime, tz=UTC)
+        assert before - timedelta(seconds=5) <= mtime <= after + timedelta(seconds=5), (
+            f"mtime {mtime} was not close to the real write window [{before}, {after}] "
+            f"-- looks backdated to the messages' own (2h-old) timestamp"
+        )
+
 
 class TestSessionPipelineSweep:
     def test_sweep_exports_without_explicit_call(self, seeded_app, tmp_path, monkeypatch):
