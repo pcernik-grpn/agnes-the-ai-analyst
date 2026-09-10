@@ -1,8 +1,13 @@
 ### Changed
 - **A table that has both a flat `data/<table>.parquet` and a `data/<table>/`
   partition directory now serves whichever of the two is FRESHER, and when the
-  directory wins the stale flat parquet is deleted.** Both halves are a
-  behavior change on live deployments. Previously the flat file won
+  directory wins the stale flat parquet is reclaimed by the next rebuild.**
+  Both halves are a behavior change on live deployments. The reclaim is a
+  rebuild-time step, not a read-time one: a read resolves the fresher layout
+  immediately, but the losing file stays on disk until a rebuild publishes the
+  winner and can remove it atomically, so a reader that goes to the filesystem
+  directly rather than through the manifest or the API can still find it in
+  between. Previously the flat file won
   unconditionally, which froze distribution silently whenever the directory was
   the current data: the manifest advertised the table as a single file hashed
   from the stale pre-conversion copy, so `agnes pull` downloaded it, the md5

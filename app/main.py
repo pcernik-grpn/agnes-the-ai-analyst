@@ -496,13 +496,29 @@ async def _chat_docker_egress_proxy_ok(chat_config) -> bool:
     # The value is handed to sandboxes verbatim as HTTP_PROXY, and proxy env
     # vars are conventionally accepted schemeless (`host:3128`) — so parse that
     # shape too rather than refusing a deployment that actually works.
-    parsed = urlparse(proxy_url if "//" in proxy_url else f"//{proxy_url}")
-    host, port = parsed.hostname or "", parsed.port or 3128
     fix = (
         "Start it with `docker compose --profile chat-docker-egress up -d egress-proxy` "
         "(a provisioned VM derives that profile from chat.docker_egress_mode itself), or "
         "point chat.docker_egress_proxy_url at an address this process can reach"
     )
+    try:
+        parsed = urlparse(proxy_url if "//" in proxy_url else f"//{proxy_url}")
+        host, port = parsed.hostname or "", parsed.port or 3128
+    except ValueError as exc:
+        # `.port` — not `urlparse` itself — raises for a non-numeric or
+        # out-of-range port, and it raises on ATTRIBUTE ACCESS, which is easy
+        # to miss reading this line. Unguarded it escapes the lifespan gate
+        # chain and takes the whole instance down (API, admin UI, scheduler)
+        # over a chat-only sidecar's URL — the opposite of this gate's
+        # contract, which is to refuse chat and leave the rest running.
+        log.error(
+            "chat.docker_egress_mode=allowlist but chat.docker_egress_proxy_url (%r) is not a "
+            "usable address (%s). %s; refusing to spawn ChatManager",
+            proxy_url,
+            exc,
+            fix,
+        )
+        return False
     if not host:
         log.error(
             "chat.docker_egress_mode=allowlist but chat.docker_egress_proxy_url (%r) has no "

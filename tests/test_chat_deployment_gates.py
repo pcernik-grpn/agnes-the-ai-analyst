@@ -587,6 +587,30 @@ def test_allowlist_accepts_a_reachable_egress_proxy(monkeypatch, shape):
         srv.close()
 
 
+def test_a_malformed_proxy_url_refuses_chat_instead_of_aborting_startup(monkeypatch, caplog):
+    """`urlparse(...).port` raises ValueError on ATTRIBUTE ACCESS for a
+    non-numeric or out-of-range port. Unguarded that escaped this gate — whose
+    docstring promises it never raises — and took the whole instance down (API,
+    admin UI, and the scheduler that depends on it) over a chat-only sidecar's
+    URL. The gate must refuse chat and leave everything else running
+    (Devin Review on #2417)."""
+    import asyncio
+    import logging
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    for bad in ("proxy:notaport", "proxy:99999", "http://proxy:-1"):
+        cfg = _docker_cfg(docker_egress_mode="allowlist", docker_egress_proxy_url=bad)
+        with caplog.at_level(logging.ERROR, logger="app.main"):
+            # is False, not "raises" — the point is that it returns.
+            assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is False, bad
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "refusing to spawn ChatManager" in joined, bad
+        assert "--profile chat-docker-egress" in joined, bad
+        caplog.clear()
+
+
 def test_allowlist_refuses_an_empty_proxy_url(monkeypatch, caplog):
     """`allowlist` with no proxy URL gives sandboxes no proxy env at all
     (`_egress_env` returns {}) on a network with no other route out — the same

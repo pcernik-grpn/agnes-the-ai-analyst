@@ -32,6 +32,8 @@ chat loudly.
 import subprocess
 from pathlib import Path
 
+import pytest
+
 MODULE = Path("infra/modules/customer-instance")
 HELPER = Path("scripts/ops/agnes-compose-file.sh")
 UPGRADE = Path("scripts/ops/agnes-auto-upgrade.sh")
@@ -86,6 +88,33 @@ def test_gate_ignores_a_commented_out_key(tmp_path):
     operator's overlay often carries the same shape — a comment configures
     nothing and must not provision a sidecar."""
     assert _gate(tmp_path / "cmt", "chat:\n  # docker_egress_mode: allowlist\n") == 1
+
+
+@pytest.mark.parametrize(
+    "scalar",
+    [
+        "allowlist # restrict sandbox traffic",
+        '"allowlist" # restrict sandbox traffic',
+        "allowlist\t# tab before the hash",
+    ],
+)
+def test_gate_survives_a_yaml_inline_comment(tmp_path, scalar):
+    """An inline comment is legal YAML and the app's own loader reads the
+    value as `allowlist`, so the host must too. Leaving the comment attached
+    made the shell compare `allowlist # …` against `allowlist`, omit
+    `--profile chat-docker-egress`, and leave a configured allowlist
+    deployment with no proxy — the host/app drift this resolver exists to
+    prevent (Devin Review on #2417)."""
+    assert _gate(tmp_path / scalar[:12].strip(), f"chat:\n  docker_egress_mode: {scalar}\n") == 0
+
+
+def test_an_inline_comment_does_not_turn_another_mode_into_allowlist(tmp_path):
+    """The comment strip must not be able to manufacture a match: `open` with
+    a comment that merely mentions the word stays inactive."""
+    assert (
+        _gate(tmp_path / "open-cmt", "chat:\n  docker_egress_mode: open # not allowlist yet\n")
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------

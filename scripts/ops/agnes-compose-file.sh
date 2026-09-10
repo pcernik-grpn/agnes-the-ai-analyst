@@ -95,9 +95,18 @@ agnes_chat_egress_allowlist_active() {
     # commented-out `# docker_egress_mode:` (the shape config/
     # instance.yaml.example ships) configures nothing, as it should.
     _acf_egress=$(sed -n 's/^[[:space:]]*docker_egress_mode:[[:space:]]*//p' \
-        "$_acf_sdir/instance.yaml" 2>/dev/null | tr -d '"' | tr -d "'" | head -1)
-    # Trim trailing whitespace a hand edit may leave behind.
-    _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]*$//')
+        "$_acf_sdir/instance.yaml" 2>/dev/null | head -1)
+    # Drop a YAML inline comment BEFORE unquoting. `docker_egress_mode:
+    # allowlist # restrict sandbox traffic` is legal YAML that the app's own
+    # loader reads as `allowlist`, so leaving the comment on made the host and
+    # the app disagree about whether the proxy profile is required — the exact
+    # drift this resolver exists to prevent. In YAML a `#` opens a comment only
+    # when whitespace precedes it, and unquoting first would throw away the
+    # information that tells a comment apart from a `#` inside the scalar, so
+    # the order of these two steps is load-bearing.
+    _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]#.*$//')
+    # Then unquote, and trim trailing whitespace a hand edit may leave behind.
+    _acf_egress=$(printf '%s' "$_acf_egress" | tr -d '"' | tr -d "'" | sed 's/[[:space:]]*$//')
     [ "$_acf_egress" = "allowlist" ]
 }
 
