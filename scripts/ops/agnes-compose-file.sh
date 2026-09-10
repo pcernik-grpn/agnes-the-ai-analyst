@@ -119,8 +119,12 @@ except Exception:
     sys.exit(0)
 chat = doc.get("chat") if isinstance(doc, dict) else None
 mode = (chat or {}).get("docker_egress_mode") if isinstance(chat, dict) else None
-# `.lower()` mirrors app/chat/config.py::_parse_docker_egress_mode.
-print(mode.lower() if isinstance(mode, str) else "")
+# `.strip().lower()` mirrors app/chat/config.py: _raw_str strips before
+# _parse_docker_egress_mode lowercases, so a QUOTED value with trailing
+# whitespace (which YAML preserves) is `allowlist` to the app. Without the
+# strip the host read `allowlist   `, skipped the profile, and the app then
+# refused chat for a proxy that was never started.
+print(mode.strip().lower() if isinstance(mode, str) else "")
 PY
 )
     else

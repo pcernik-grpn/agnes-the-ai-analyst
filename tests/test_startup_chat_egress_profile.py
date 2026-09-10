@@ -91,38 +91,41 @@ def test_gate_ignores_a_commented_out_key(tmp_path):
     assert _gate(tmp_path / "cmt", "chat:\n  # docker_egress_mode: allowlist\n") == 1
 
 
-@pytest.mark.parametrize(
-    "scalar",
-    [
-        # A plain scalar: YAML strips the comment, so the host must too.
+def _yaml_scalar_shapes() -> list[str]:
+    """Every scalar shape this key can plausibly carry, GENERATED rather than
+    hand-listed.
+
+    Hand-listing is what kept failing: five separate review findings on #2417
+    were all shapes I had not thought to write down (a plain comment, a quoted
+    hash, a doubled quote, case folding, and finally a QUOTED value with
+    trailing whitespace — where the app strips and YAML does not). Enumerating
+    the cross-product removes my imagination from the loop, so a new quoting
+    or spacing combination is covered before anyone reports it."""
+    values = [
         "allowlist",
-        "allowlist # restrict sandbox traffic",
-        '"allowlist"',
-        "'allowlist'",
-        '"allowlist" # restrict sandbox traffic',
-        "allowlist   ",
-        # A QUOTED hash is part of the value, not a comment: the app sees an
-        # unknown mode and falls back to the secure `none`, so the host must
-        # NOT provision a proxy for it (Devin Review on #2417, second round).
-        '"allowlist # restrict sandbox traffic"',
-        "'allowlist # restrict sandbox traffic'",
-        # A doubled quote is how YAML escapes one inside a single-quoted
-        # scalar, so this loads as `allowlist' # restricted` — again an
-        # unknown mode (third round). A sed lookalike read the first quote of
-        # the pair as the closing delimiter and extracted `allowlist`.
-        "'allowlist'' # restricted'",
-        '"allowlist\\" # restricted"',
-        # The app lowercases the mode, so the host must not be
-        # case-sensitive where the app is not.
         "ALLOWLIST",
-        "AllowList # note",
-        # Other modes, with and without a comment that mentions allowlist.
+        "AllowList",
+        "allowlist ",
+        "  allowlist",
+        "allowlist # note",
         "open",
-        "open # not allowlist yet",
         "none",
-        "none # allowlist comes later",
-    ],
-)
+        "",
+    ]
+    shapes: list[str] = []
+    for v in values:
+        shapes.append(v)  # plain
+        shapes.append(f'"{v}"')  # double-quoted: YAML keeps hash + spaces
+        shapes.append(f"'{v}'")  # single-quoted: same
+        shapes.append(f'"{v}" # trailing comment')
+        shapes.append(f"'{v}' # trailing comment")
+    # A doubled quote is how YAML escapes one inside a single-quoted scalar.
+    shapes.append("'allowlist'' # restricted'")
+    shapes.append('"allowlist\\" # restricted"')
+    return shapes
+
+
+@pytest.mark.parametrize("scalar", _yaml_scalar_shapes())
 def test_the_host_gate_and_the_app_parser_never_disagree(tmp_path, scalar):
     """The single property this resolver exists to guarantee: the shell's
     verdict matches what the app's own config parser will read from the SAME
