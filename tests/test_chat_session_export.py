@@ -1248,64 +1248,6 @@ def _session(chat_id):
     return chat_session_repo().get_session(chat_id)
 
 
-class TestDigestCheckIsNotPaidOnEveryTick:
-    """The digest pairs a watermark with its transcript, but reading and
-    hashing a whole jsonl on every check is real cost: the sweep runs this
-    over up to 200 recently-active sessions on every processor tick. The
-    sidecar therefore also records what the file looked like when it was
-    hashed, so an unchanged file skips the hash."""
-
-    def _export(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
-        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
-        target = export_chat_session_jsonl(chat_id)
-        assert target is not None
-        return chat_id, target
-
-    def test_an_unchanged_transcript_is_not_rehashed(self, seeded_app, tmp_path, monkeypatch):
-        from app.chat import session_export as mod
-
-        chat_id, target = self._export(tmp_path, monkeypatch)
-        session = _session(chat_id)
-
-        def _must_not_hash(_content):
-            raise AssertionError("hashed an unchanged transcript")
-
-        monkeypatch.setattr(mod, "_content_digest", _must_not_hash)
-        assert not mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
-
-    def test_a_transcript_replaced_under_its_sidecar_is_still_caught(self, seeded_app, tmp_path, monkeypatch):
-        """The identity token may only SAVE the hash, never replace it: a
-        file swapped under its sidecar has a different identity, so the
-        digest runs and the mismatch reports stale."""
-        from app.chat import session_export as mod
-
-        chat_id, target = self._export(tmp_path, monkeypatch)
-        session = _session(chat_id)
-        assert not mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
-
-        target.write_text(target.read_text() + json.dumps({"type": "user", "message": {}}) + "\n")
-
-        assert mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
-
-    def test_a_sidecar_without_an_identity_still_verifies_by_digest(self, seeded_app, tmp_path, monkeypatch):
-        """A sidecar written before the identity existed falls back to the
-        hash rather than trusting the pair blindly."""
-        from app.chat import session_export as mod
-
-        chat_id, target = self._export(tmp_path, monkeypatch)
-        session = _session(chat_id)
-        payload = json.loads(mod._watermark_path(target).read_text())
-        payload.pop("content_size")
-        payload.pop("content_mtime_ns")
-        mod._watermark_path(target).write_text(json.dumps(payload))
-
-        assert mod._read_export_watermark(target).content_identity is None
-        assert not mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
-        target.write_text("tampered\n")
-        assert mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
-
-
 class TestExportDoesNotPublishBackwards:
     """os.replace orders nothing. A slower writer that read fewer messages
     can still land last and replace a newer transcript with a coherent,
@@ -1457,11 +1399,10 @@ class TestTheDigestCannotBeBorrowedFromAnotherGeneration:
             # A delayed writer lands a coherent, digest-valid, SHORTER
             # generation right after the verdict — sidecar included.
             shorter = full.splitlines(keepends=True)[0]
-            identity = se._atomic_write_text(exported, shorter)
+            se._atomic_write_text(exported, shorter)
             se._write_export_watermark(
                 exported,
                 se.ExportWatermark(datetime.now(UTC), messages=1, content_sha256=se._content_digest(shorter)),
-                identity,
             )
             return verdict
 
@@ -1474,33 +1415,35 @@ class TestTheDigestCannotBeBorrowedFromAnotherGeneration:
         # the transcript that was actually verified.
         assert freshness.content_sha256 != se._content_digest(published.read_text(encoding="utf-8"))
 
-    def test_a_sidecar_never_pairs_our_digest_with_another_writers_file(self, tmp_path, monkeypatch):
-        """The identity fast path only skips the hash when it proves the
-        file is the one the sidecar hashed. Stat'ing the DESTINATION after
-        publishing gave that proof away: a writer replacing the target in
-        between left the sidecar carrying our digest and their
-        `(size, mtime_ns)`, so the fast path skipped the digest for a file
-        it does not describe — and a truncated transcript read as current
-        indefinitely. The identity must come from the staged file."""
+    def test_a_replacement_that_keeps_the_size_and_mtime_is_still_caught(self, tmp_path):
+        """The reason there is no size-and-mtime shortcut in front of the
+        digest. `(size, mtime_ns)` is not proof of identity: a replacement
+        can preserve both — routine on a filesystem whose timestamps are
+        coarse — and a shortcut keying on them would skip the digest and
+        certify the old sidecar over unrelated content for as long as the
+        metadata kept matching. Verification here is the feature; the
+        shortcut bought 0.36 s per ten-minute sweep tick."""
+        import os
+
         from app.chat import session_export as se
 
         target = tmp_path / "chat-x.jsonl"
         ours = '{"turn": 1}\n{"turn": 2}\n'
-        identity = se._atomic_write_text(target, ours)
-
-        # Another writer replaces the published transcript with a shorter
-        # one before our sidecar is written.
-        theirs = '{"turn": 1}\n'
-        target.write_text(theirs, encoding="utf-8")
-
+        target.write_text(ours, encoding="utf-8")
         se._write_export_watermark(
             target,
             se.ExportWatermark(datetime.now(UTC), messages=2, content_sha256=se._content_digest(ours)),
-            identity,
         )
+        assert not is_chat_export_stale(target, datetime.now(UTC) - timedelta(hours=1), 2)
 
-        # Our identity describes our staged bytes, not theirs, so the fast
-        # path cannot fire and the digest catches the torn pair.
-        watermark = se._read_export_watermark(target)
-        assert watermark.content_identity != se._transcript_identity(target)
-        assert se.is_chat_export_stale(target, datetime.now(UTC), 2)
+        before = target.stat()
+        # Same byte count, different content, and the metadata forced back
+        # to what it was — the collision, constructed.
+        theirs = '{"turn": 9}\n{"turn": 8}\n'
+        assert len(theirs) == len(ours)
+        target.write_text(theirs, encoding="utf-8")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert target.stat().st_size == before.st_size
+        assert target.stat().st_mtime_ns == before.st_mtime_ns
+
+        assert is_chat_export_stale(target, datetime.now(UTC) - timedelta(hours=1), 2)

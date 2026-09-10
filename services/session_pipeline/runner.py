@@ -129,15 +129,17 @@ def _sweep_chat_session_exports(effective_dir: Path, *, limit: int = 200) -> int
     per scheduler tick, so with several processors this sweep repeats
     within a single tick and every session below is checked more than once.
 
-    That repetition is only affordable while the per-session check stays
-    cheap, which is a live constraint and not a given: the candidate query
-    is capped at *limit* most-recently-active sessions, and each one's
-    check must decide "already current" without reading the transcript
-    itself. It does — ``is_chat_export_stale`` compares a small sidecar and
-    re-reads the jsonl only when the file has actually changed underneath
-    it (``app/chat/session_export.py::_transcript_identity``). Anything
-    that makes that check read or hash every transcript in full turns this
-    into *limit* × processors full file reads per tick.
+    That repetition costs *limit* × processors staleness checks per tick,
+    and each check DOES read and hash the transcript in full: it has to,
+    because a watermark that cannot be tied to the file beside it is worth
+    nothing (``app/chat/session_export.py::is_chat_export_stale``). A
+    cheaper size-and-mtime pre-check was tried and removed — it could skip
+    the verification rather than merely shorten it. Measured, the honest
+    cost is 0.36 s per tick for 200 transcripts of 2 000 turns each,
+    against a scheduler cadence of minutes. Hoisting this sweep out of
+    ``run_processor`` to once per tick is the right shape if that ever
+    stops being affordable; it is a change to this module's scheduling
+    contract, not to the check.
 
     No-ops (no repo call at all) when ``sessions.include_chat`` is off.
 

@@ -139,10 +139,6 @@ class ExportWatermark:
     #: existed, which :func:`is_chat_export_stale` cannot verify and so
     #: treats exactly as it treats a missing sidecar.
     content_sha256: str | None = None
-    #: ``(st_size, st_mtime_ns)`` of the transcript at the moment this
-    #: sidecar was written -- an identity token, NOT a staleness signal.
-    #: See :func:`_transcript_identity`.
-    content_identity: tuple[int, int] | None = None
 
 
 def _content_digest(content: str) -> str:
@@ -160,37 +156,6 @@ def _content_digest(content: str) -> str:
     the session pipeline consumes.
     """
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def _transcript_identity(target: Path) -> tuple[int, int] | None:
-    """``(st_size, st_mtime_ns)`` of *target*, or ``None`` if it cannot be
-    stat'd -- the cheap answer to "is this still the exact file the sidecar
-    beside it hashed", recorded by :func:`_write_export_watermark` and
-    re-checked by :func:`is_chat_export_stale`.
-
-    Read the boundary carefully, because this module is otherwise emphatic
-    that a transcript's mtime must play no part in freshness (it belongs to
-    ``session_processor_state.scan_unprocessed_for``'s unrelated gate, see
-    :func:`export_chat_session_jsonl`). Nothing here decides whether a
-    transcript is CURRENT -- the timestamp and count still do that, alone.
-    This decides only whether the file has been replaced since the sidecar
-    was written, and it can only ever save work: a match means the pair is
-    the one we hashed, so the digest cannot have changed and re-reading the
-    whole jsonl to prove it would be pure cost; a mismatch concludes
-    nothing at all and falls through to the digest. So a wrong answer here
-    -- a filesystem with coarse mtimes, a same-size same-instant rewrite --
-    costs a hash, never a wrong verdict.
-
-    That cost matters: the periodic sweep runs this check over up to 200
-    recently-active sessions on every processor tick, and hashing every one
-    of those transcripts in full each time is exactly the work the sweep's
-    own docstring claims it does not do.
-    """
-    try:
-        st = target.stat()
-    except OSError:
-        return None
-    return (st.st_size, st.st_mtime_ns)
 
 
 def _export_watermark(messages: list[ChatMessage], content: str) -> ExportWatermark:
@@ -226,7 +191,7 @@ def _watermark_path(target: Path) -> Path:
     return target.with_name(target.name + ".watermark")
 
 
-def _write_export_watermark(target: Path, watermark: ExportWatermark, identity: tuple[int, int] | None = None) -> None:
+def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
     """Atomically record *watermark* (:func:`_export_watermark` of the
     messages just written to *target*) in its sidecar file -- via
     :func:`_atomic_write_text`, so a reader never observes a half-written
@@ -248,19 +213,6 @@ def _write_export_watermark(target: Path, watermark: ExportWatermark, identity: 
                 "last_message_at": watermark.last_message_at.isoformat(),
                 "messages": watermark.messages,
                 "content_sha256": watermark.content_sha256,
-                # *identity* must come from the caller, taken from the
-                # STAGED transcript before it was published (see
-                # :func:`_atomic_write_text`). Stat'ing `target` here
-                # instead was wrong in a way that defeated the digest: a
-                # writer replacing the destination between the transcript's
-                # publish and that stat left this sidecar pairing OUR
-                # digest and counts with THEIR file's identity, and the
-                # identity fast path in `is_chat_export_stale` then
-                # skipped the very digest that would have caught the torn
-                # pair -- trusting a truncated transcript indefinitely.
-                # Omitted (None) is always safe: it only costs a hash.
-                "content_size": identity[0] if identity else None,
-                "content_mtime_ns": identity[1] if identity else None,
             }
         ),
     )
@@ -294,14 +246,10 @@ def _read_export_watermark(target: Path) -> ExportWatermark | None:
             return None
         try:
             digest = payload.get("content_sha256")
-            size = payload.get("content_size")
-            mtime_ns = payload.get("content_mtime_ns")
-            identity = (size, mtime_ns) if isinstance(size, int) and isinstance(mtime_ns, int) else None
             return ExportWatermark(
                 last_message_at=_as_utc(datetime.fromisoformat(raw)),
                 messages=count if isinstance(count, int) else None,
                 content_sha256=digest if isinstance(digest, str) else None,
-                content_identity=identity,
             )
         except ValueError:
             return None
@@ -312,7 +260,7 @@ def _read_export_watermark(target: Path) -> ExportWatermark | None:
         return None
 
 
-def _atomic_write_text(target: Path, content: str) -> tuple[int, int] | None:
+def _atomic_write_text(target: Path, content: str) -> None:
     """Write *content* to *target* so no reader ever observes a partial or
     interleaved file: stage under a per-call, globally-unique temp name in
     *target*'s own directory, then ``os.replace`` onto *target*.
@@ -332,25 +280,11 @@ def _atomic_write_text(target: Path, content: str) -> tuple[int, int] | None:
 
     On any failure the temp is removed and the exception propagates;
     *target* is left exactly as it was before the call.
-
-    Returns the ``(st_size, st_mtime_ns)`` of the STAGED file, stat'd before
-    the replace -- see :func:`_transcript_identity` for what that is for.
-    ``os.replace`` is a rename, so the published file carries the temp
-    file's inode and therefore exactly these values; stat'ing *target*
-    afterwards instead would return whatever another writer had replaced it
-    with in the meantime. ``None`` if the stat itself failed, which callers
-    must treat as "no identity", never as a match.
     """
     tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(content, encoding="utf-8")
-        try:
-            st = tmp.stat()
-            identity: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
-        except OSError:
-            identity = None
         os.replace(tmp, target)
-        return identity
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -611,8 +545,8 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
 
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
-        identity = _atomic_write_text(target, content)
-        _write_export_watermark(target, watermark, identity)
+        _atomic_write_text(target, content)
+        _write_export_watermark(target, watermark)
     except OSError:
         logger.warning("chat session export: write failed for %s", chat_id, exc_info=True)
         return None
@@ -701,18 +635,22 @@ def _stale_with_watermark(
     # is treated exactly like a missing one, for the reason given above.
     if watermark.content_sha256 is None:
         return True, watermark
-    # Hash only when the file might have changed under us. An unchanged
-    # `(size, mtime_ns)` means this is byte-for-byte the transcript the
-    # sidecar hashed, so the digest below cannot differ -- and re-reading
-    # every transcript in full on every sweep tick, for up to 200 sessions
-    # per processor, is the whole cost of the check. See
-    # `_transcript_identity` for why this can only save work, never decide.
-    if watermark.content_identity is None or _transcript_identity(existing_path) != watermark.content_identity:
-        try:
-            if _content_digest(existing_path.read_text(encoding="utf-8")) != watermark.content_sha256:
-                return True, watermark
-        except OSError:
+    # Always hash. A cheaper "has this file changed" pre-check was tried
+    # here and removed: `(size, mtime_ns)` is not proof of identity, so a
+    # replacement preserving both -- routine on a filesystem with
+    # coarse timestamps -- made this SKIP the digest and certify the old
+    # sidecar over unrelated content, indefinitely. An optimisation that
+    # can bypass the verification is the wrong shape in a function whose
+    # entire job is to verify, and it bought 0.36 s per ten-minute sweep
+    # tick, measured (200 transcripts of 2 000 turns). If that cost ever
+    # matters, the token has to be one a replacement cannot forge --
+    # `(st_dev, st_ino)` of the staged file, which `os.replace` carries
+    # onto the published one -- not its size and timestamp.
+    try:
+        if _content_digest(existing_path.read_text(encoding="utf-8")) != watermark.content_sha256:
             return True, watermark
+    except OSError:
+        return True, watermark
     if _as_utc(last_message_at) > watermark.last_message_at:
         return True, watermark
     # Strictly MORE messages than we wrote, at a timestamp we already have:
