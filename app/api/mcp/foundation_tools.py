@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -129,6 +130,14 @@ _ACCESS_PICTURE_LIST_CAP = 200
 #: section.
 _ACCESS_PICTURE_SECTIONS = ("all", "packages", "by_group", "unreachable")
 
+#: Mirrors `GET /api/admin/activity`'s own `since_minutes` ceiling
+#: (`le=43200`, app/api/activity.py) — 30 days. A caller asking for a wider
+#: window used to reach the server and come back as a raw 422 validation
+#: dump (live incident, 2026-09-09: three retries with `since_minutes=525600`,
+#: one per attempt, no hint at the actual limit); the `activity` tool now
+#: clamps locally and discloses the clamp instead.
+_ACTIVITY_SINCE_MINUTES_MAX = 43200
+
 
 def _stack_auto_membership() -> bool:
     """The instance's stack membership mode — a config flag, read in-process.
@@ -163,7 +172,7 @@ def _compose_access_picture(
     ``available`` grant is in a member's stack is the membership-mode fork
     ``StackResolver.stack`` applies. The tool and those pages cannot disagree.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from app.services.admin_dashboard import _DISTRIBUTABLE_QUERY_MODES
     from app.services.stack_resolver import HIDDEN_STATUSES, UNDELIVERABLE_STATUSES
@@ -448,7 +457,7 @@ def _compose_access_picture(
     out: dict[str, Any] = {
         "source": "server",
         "section": section,
-        "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "captured_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "membership_mode": "auto" if auto_membership else "classic",
         "account_total": account_total,
         "packages_truncated": packages_truncated,
@@ -792,17 +801,23 @@ _FACTS_NOT_FOUND_HINT = (
     "admin about the `facts` feature flag."
 )
 
-# Registry 404 (command-ux.md's "not found" convention) — mirrors `schema` /
-# `describe`'s hint at `agnes catalog` on the CLI side by pointing at this
-# transport's own `catalog` tool instead. Deliberately indistinguishable
-# between "no such table" and "not RBAC-visible to you" — `effective_access`
-# already only ever lists what the caller can see (§10.2), so there is
-# nothing narrower to report without turning a diagnostic tool into an
-# existence oracle for tables the caller cannot reach.
-_EFFECTIVE_ACCESS_NOT_FOUND_HINT = (
+# A table absent from the caller's effective-access list — mirrors
+# `schema` / `describe`'s hint at `agnes catalog` on the CLI side by
+# pointing at this transport's own `catalog` tool instead. Deliberately
+# indistinguishable between "no such table" and "not RBAC-visible to you"
+# — `effective_access` already only ever lists what the caller can see
+# (§10.2), so there is nothing narrower to report without turning a
+# diagnostic tool into an existence oracle for tables the caller cannot
+# reach. "You have no access to this table" is itself a complete, valid
+# answer to the question this tool exists to answer — never raised as an
+# error (a live incident, 2026-09-09: a caller asking about an ungranted
+# table got a raw tool-execution error instead of this plain no).
+_EFFECTIVE_ACCESS_NOT_GRANTED_NOTE = (
     "No effective-access entry for table {table!r}. This means one of: the id "
-    "(or name) is wrong, or you cannot access this table at all. Use the "
-    "`catalog` tool to list tables you can see, then retry with its `id`."
+    "(or name) is wrong, or you cannot access this table at all — this tool "
+    "cannot and must not tell the two apart. Use the `catalog` tool to list "
+    "tables you can see; if you believe this one should exist, ask an admin "
+    "which data package would need to grant it."
 )
 
 
@@ -2047,7 +2062,12 @@ def register_foundation_tools(
         Args:
             table: Optional registered table id or name. When given, returns
                 ONLY that table's ``{"table_id": ..., "policy": {...}}``
-                entry instead of the full list.
+                entry instead of the full list. When it resolves to NOTHING
+                you can see — a wrong id, or a real table you are not
+                granted — returns ``{"table_id": ..., "granted": false,
+                "note": ...}`` instead. That IS the answer ("you have no
+                access"), never a raised error, and it is deliberately the
+                same shape whether the table exists at all or not.
 
         Each table's ``policy`` block:
         - ``applies``: true means an access policy is attached to this
@@ -2103,16 +2123,28 @@ def register_foundation_tools(
         # catalog an agent would already have called, then retry by id.
         async with httpx.AsyncClient() as c:
             cr = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
-        if cr.status_code < 400:
-            for row in cr.json().get("tables") or []:
-                if (row.get("name") or "").lower() == table.lower():
-                    resolved_id = row.get("id")
-                    for entry in tables:
-                        if entry.get("table_id") == resolved_id:
-                            return entry
-                    break
+        # A failed catalog call is NOT the same answer as "no name match" —
+        # it means we never actually got to check, so it must surface as a
+        # failure, never as a false "not granted". A dependency error dressed
+        # up as a definitive no-access is precisely the confident wrong answer
+        # the rest of this tool exists to remove.
+        _raise_for_status_with_detail(cr)
+        for row in cr.json().get("tables") or []:
+            if (row.get("name") or "").lower() == table.lower():
+                resolved_id = row.get("id")
+                for entry in tables:
+                    if entry.get("table_id") == resolved_id:
+                        return entry
+                break
 
-        raise ValueError(_EFFECTIVE_ACCESS_NOT_FOUND_HINT.format(table=table))
+        # Absent from the list = not granted OR the id/name doesn't resolve
+        # at all — this IS the answer, not a tool failure (see the note
+        # above the constant's definition).
+        return {
+            "table_id": table,
+            "granted": False,
+            "note": _EFFECTIVE_ACCESS_NOT_GRANTED_NOTE.format(table=table),
+        }
 
     @tool(read_only=True)
     async def skills() -> dict:
@@ -2895,6 +2927,26 @@ def register_foundation_tools(
             _raise_for_status_with_detail(r)
             return r.json()
 
+    def _admin_gate_denial_reason(r: httpx.Response) -> str | None:
+        """The 403 ``detail`` naming why an admin-gated route
+        (``require_admin``, ``app/auth/access.py``) refused this call —
+        ``"Admin access required"`` for a non-admin caller,
+        ``"admin_elevation_paused"`` for an admin who has paused their own
+        elevation — or ``None`` for anything else (any other 403, or a
+        non-403, must still raise rather than be swallowed)."""
+        if r.status_code != 403:
+            return None
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            return None
+        return detail if detail in ("Admin access required", "admin_elevation_paused") else None
+
+    def _admin_required_note(reason: str) -> str:
+        if reason == "admin_elevation_paused":
+            return "You are an admin but have paused elevation for this session — re-enable admin mode to run this."
+        return "Only an admin can run this. Ask an admin to look this up for you."
+
     @tool(read_only=True)
     async def admin_source_connections_list(source_type: str = "") -> dict:
         """List named source connections (multi-project Keboola support).
@@ -2905,7 +2957,11 @@ def register_foundation_tools(
         Mirrors ``GET /api/admin/source-connections`` and
         ``agnes admin connection list``.
 
-        Requires an admin PAT.
+        Requires an admin PAT — but this tool is registered for every caller
+        (the static MCP tool list has no per-caller filtering), so a
+        non-admin caller gets a clean ``{"connections": [], "admin_required":
+        true, "reason", "note"}`` answer instead of a raised 403 (two
+        different non-admin callers hit the raw error live on 2026-09-09).
         """
         async with httpx.AsyncClient() as c:
             params = {"source_type": source_type} if source_type else {}
@@ -2915,6 +2971,14 @@ def register_foundation_tools(
                 params=params,
                 timeout=30,
             )
+            denial = _admin_gate_denial_reason(r)
+            if denial is not None:
+                return {
+                    "connections": [],
+                    "admin_required": True,
+                    "reason": denial,
+                    "note": _admin_required_note(denial),
+                }
             _raise_for_status_with_detail(r)
             return {"connections": r.json()}
 
@@ -4339,6 +4403,9 @@ def register_foundation_tools(
 
         Args:
             since_minutes: How far back to look (default 1440 = 24h, max 43200 = 30d).
+                           A value above the max is CLAMPED to it, not
+                           rejected — the response then carries
+                           ``since_minutes_clamped: {"requested", "used"}``.
             limit:         Max rows to return, newest first (default 50, max 200).
             action_prefix: Filter by action prefix, e.g. "sync." or "llm.".
             user_id:       Filter by exact user_id.
@@ -4384,7 +4451,9 @@ def register_foundation_tools(
 
         Returns ``{"rows": [{"timestamp", "trail", "source", "action",
         "resource", "user_id", "user_email", "result", "params", ...}, ...],
-        "next_cursor": {"ts", "id", "since_ts"} | null}``. Mirrors
+        "next_cursor": {"ts", "id", "since_ts"} | null}``, plus
+        ``since_minutes_clamped: {"requested", "used"}`` when ``since_minutes``
+        was above the max and got clamped (omitted otherwise). Mirrors
         ``GET /api/admin/activity`` and ``agnes admin activity``. Requires
         an admin PAT.
         """
@@ -4401,6 +4470,8 @@ def register_foundation_tools(
                 "cursor_ts and cursor_id from a prior page's next_cursor, never on a fresh "
                 "(uncursored) read."
             )
+        requested_since_minutes = since_minutes
+        since_minutes = min(since_minutes, _ACTIVITY_SINCE_MINUTES_MAX)
         params: dict[str, Any] = {"since_minutes": since_minutes, "limit": limit}
         if action_prefix:
             params["action_prefix"] = action_prefix
@@ -4424,7 +4495,13 @@ def register_foundation_tools(
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
             _raise_for_status_with_detail(r)
-            return r.json()
+            result = r.json()
+        if requested_since_minutes != since_minutes:
+            result["since_minutes_clamped"] = {
+                "requested": requested_since_minutes,
+                "used": since_minutes,
+            }
+        return result
 
     @tool(read_only=False)
     async def admin_knowledge_packaging_run() -> dict:
@@ -4626,10 +4703,16 @@ def register_foundation_tools(
                   (default) lists both.
 
         Mirrors ``GET /api/data-apps[?kind=]`` and ``agnes app list [--linked]``.
+        This tool is registered even when ``data_apps.enabled`` is off (the
+        static MCP tool list has no per-instance filtering), so it returns a
+        friendly ``data_apps_disabled`` payload (not an error) in that case,
+        like the other data-app tools below.
         """
         params = {"kind": kind} if kind else None
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/data-apps", headers=headers_fn(), params=params, timeout=30)
+            if _is_data_apps_disabled_response(r):
+                return _data_apps_disabled_payload()
             _raise_for_status_with_detail(r)
             return r.json()
 

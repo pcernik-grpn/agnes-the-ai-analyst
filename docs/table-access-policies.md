@@ -298,7 +298,7 @@ Silent row filtering is actively dangerous — an analyst (or an agent, with mor
 
 `reason` is one of `ok` / `empty_slice` / `mapping_empty` / `policy_error` / `identity_unresolvable`, each carrying a `note` explaining it (the mapping table's name and last-sync time for `mapping_empty`, for instance). This is the fastest way to answer "why does Agnes show me nothing on this table" without an admin hunting through table configuration.
 
-An agent can ask the same question mid-conversation via the `effective_access` MCP tool (issue #2147) — a read-only proxy over `GET /api/me/effective-access` with an optional `table` filter (id or name). Its docstring tells the model to call it before reporting an unexpectedly empty or small result, and how to act on each `reason`. No admin variant is exposed over MCP; auditing someone else's access stays REST-only.
+An agent can ask the same question mid-conversation via the `effective_access` MCP tool (issue #2147) — a read-only proxy over `GET /api/me/effective-access` with an optional `table` filter (id or name). Its docstring tells the model to call it before reporting an unexpectedly empty or small result, and how to act on each `reason`. No admin variant is exposed over MCP; auditing someone else's access stays REST-only. A `table` that resolves to nothing the caller can see — a wrong id, or a real table they are not granted — is answered as `{"table_id", "granted": false, "note": ...}`, never a raised tool error; the wording is deliberately identical whether the table exists at all, so the tool cannot double as an existence oracle.
 ### Shared agents
 
 Which identity `$user_email` / `$user_groups` bind to depends on *how* a caller reaches the agent — `src/access_policy.py::_resolve_identity`:
