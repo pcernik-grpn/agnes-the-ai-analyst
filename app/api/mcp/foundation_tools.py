@@ -2109,9 +2109,9 @@ def register_foundation_tools(
             cr = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
         # A failed catalog call is NOT the same answer as "no name match" —
         # it means we never actually got to check, so it must surface as a
-        # failure, never as a false "not granted" (review finding on this
-        # PR: a transient catalog error was being reported to the caller as
-        # a definitive no-access instead of the dependency failure it was).
+        # failure, never as a false "not granted". A dependency error dressed
+        # up as a definitive no-access is precisely the confident wrong answer
+        # the rest of this tool exists to remove.
         _raise_for_status_with_detail(cr)
         for row in cr.json().get("tables") or []:
             if (row.get("name") or "").lower() == table.lower():
