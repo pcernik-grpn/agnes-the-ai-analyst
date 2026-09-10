@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -74,7 +74,7 @@ class _FakeFiles:
             raise FileNotFoundError(path)
         return [_FakeEntry(name) for name in self._outputs]
 
-    async def read(self, path: str, format: str = "bytes") -> bytes:  # noqa: A002 - SDK kwarg name
+    async def read(self, path: str, format: str = "bytes") -> bytes:
         self.read_calls.append(path)
         return self._outputs[path.rsplit("/", 1)[-1]]  # type: ignore[index]
 
@@ -121,7 +121,7 @@ class _FakeArtifactsRepo:
             "size_bytes": size_bytes,
             "content_type": content_type,
             "md5": md5,
-            "created_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(UTC),
         }
 
     def get(self, id):
@@ -198,8 +198,8 @@ def _seat_live(mgr: ChatManager, chat_id: str, email: str, sink, files: _FakeFil
         user_email=email,
         state=SessionState.ACTIVE,
         handle=handle,
-        started_at=datetime.now(timezone.utc),
-        last_activity=datetime.now(timezone.utc),
+        started_at=datetime.now(UTC),
+        last_activity=datetime.now(UTC),
         surface=Surface.WEB.value,
         sinks=[SinkEntry(participant_email=email, sink=sink)],
     )
@@ -598,7 +598,14 @@ class _FakeChatRepo:
         email = self._sessions.get(chat_id)
         if email is None:
             return None
-        return SimpleNamespace(id=chat_id, user_email=email)
+        # These sessions model a conversation that already ran a turn (that
+        # is the whole point of this module: harvesting artifacts a turn
+        # produced), so ``sandbox_id`` is set even where the engine handler
+        # below then answers 404/unreachable for it — that models the
+        # sandbox having existed and since gone away, not a chat the engine
+        # has never heard of. The no-sandbox-yet gate itself is unit-tested
+        # in tests/test_chat_session_files.py.
+        return SimpleNamespace(id=chat_id, user_email=email, sandbox_id=f"kai-engine:{chat_id}")
 
 
 def _files_app(

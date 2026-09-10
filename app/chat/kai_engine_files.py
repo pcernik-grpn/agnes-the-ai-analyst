@@ -19,11 +19,23 @@ embedded provider (``kai_engine_provider.py``) uses for ``POST /api/chat``.
 Error mapping is the caller's contract, implemented here once:
 
 - Engine 404 on the LISTING = "no files channel for this chat" — an unknown
-  chat id (e.g. a pre-provider-switch ``chat_<hex>`` session) or an engine
-  build predating the sandbox-files routes. Deliberately collapsed, no body
-  sniffing: both mean the honest answer is ``supported: false``, never an
-  error. A 404 on the DOWNLOAD maps to a plain 404 (unknown path is by far
-  the common case once the listing worked).
+  chat id or an engine build predating the sandbox-files routes.
+  Deliberately collapsed, no body sniffing: both mean the honest answer is
+  ``supported: false``, never an error. A 404 on the DOWNLOAD maps to a
+  plain 404 (unknown path is by far the common case once the listing
+  worked).
+- Engine 400 = "this id cannot be served" — treated the same as a 404,
+  never as an outage. Observed live: a session minted before the instance's
+  ``chat.provider`` was switched TO ``kai-agent`` keeps its older
+  ``chat_<hex>`` id, and the engine's chat table is a Postgres ``uuid``
+  column, so that id fails at the DB layer before an existence check ever
+  runs — a 400, not the 404 an unknown-but-well-formed id gets (the exact
+  id-shape case ``KaiEngineProvider._handle`` already refuses before
+  minting a turn handle, for the identical reason). Rather than
+  pre-validating the id shape here (a second place that would have to stay
+  in sync with the engine's own rule), the response the engine actually
+  gives is trusted and folded into the same "no files channel" bucket a 404
+  already gets — no traceback, because this is not a failure to warn about.
 - Engine 401/403 = the host JWT contract is misconfigured (secret/iss/aud
   drift) — loud log, then :class:`EngineFilesUnavailable`, because "no
   files" would mask an operator problem.
@@ -154,8 +166,9 @@ async def fetch_engine_listing(
 
     Returns ``(entries, truncated)`` with entries shaped like the host
     listing's dicts (``path``/``name``/``size_bytes``; no ``modified_at`` —
-    the engine listing carries none), or ``None`` when the engine 404s the
-    listing (no files channel for this chat). Raises
+    the engine listing carries none), or ``None`` when the engine 404s or
+    400s the listing (no files channel for this chat — see the module
+    docstring for why a 400 belongs in this bucket too). Raises
     :class:`EngineFilesUnavailable` on any other failure.
     """
     collected: list[dict] = []
@@ -176,10 +189,18 @@ async def fetch_engine_listing(
                     params={"path": dir_path} if dir_path else None,
                 )
                 requests_made += 1
+                if dir_path == "" and resp.status_code in (400, 404):
+                    return None  # no files channel for this chat
                 if resp.status_code == 404:
-                    if dir_path == "":
-                        return None  # no files channel for this chat
-                    continue  # a subdirectory vanished mid-walk; keep going
+                    # A subdirectory vanished between the parent listing and
+                    # this call — benign in a live sandbox, keep walking.
+                    continue
+                # A 400 on a CHILD is a different animal: the malformed-id
+                # case that makes 400 mean "no files channel" is settled at
+                # the root, which this chat id already passed. Swallowing it
+                # here would drop that directory's files from an otherwise
+                # successful, untruncated answer — silence where the reader
+                # would see an outage.
                 _raise_for_engine_status(resp, chat_id=chat_id, what="listing")
                 try:
                     body = resp.json()
@@ -239,8 +260,10 @@ async def open_engine_download(
 
     Returns ``(byte_iterator, handle)`` — the caller must arrange for
     ``handle.aclose()`` to run after the response is sent (Starlette
-    ``BackgroundTask``) — or ``None`` when the engine 404s the path.
-    Raises :class:`EngineFilesUnavailable` on other engine failures and
+    ``BackgroundTask``) — or ``None`` when the engine 404s or 400s the path
+    (see the module docstring: a 400 means this chat id cannot be served,
+    the same "nothing here" answer as an unknown path). Raises
+    :class:`EngineFilesUnavailable` on other engine failures and
     :class:`EngineFileTooLarge` when Content-Length already exceeds
     ``max_bytes`` (a missing Content-Length is enforced inside the stream:
     it aborts past the cap, which tears the download — visible failure, the
@@ -254,7 +277,7 @@ async def open_engine_download(
             params={"path": path},
         )
         resp = await client.send(req, stream=True)
-        if resp.status_code == 404:
+        if resp.status_code in (400, 404):
             await resp.aclose()
             await client.aclose()
             return None
@@ -384,8 +407,7 @@ def _sandbox_rel(path: str) -> str:
     from app.chat.provider import SANDBOX_WORKDIR
 
     rel = path
-    if rel.startswith(SANDBOX_WORKDIR):
-        rel = rel[len(SANDBOX_WORKDIR) :]
+    rel = rel.removeprefix(SANDBOX_WORKDIR)
     return rel.lstrip("/")
 
 
@@ -402,8 +424,9 @@ async def fetch_engine_dir(
     The sibling :func:`fetch_engine_listing` walks the whole tree and drops
     the workspace template — right for a file BROWSER, wrong for the harvest,
     which wants exactly the contents of one directory (``outputs/``) and
-    nothing else. ``None`` when the engine 404s (no such dir / no files
-    channel for this chat); :class:`EngineFilesUnavailable` otherwise.
+    nothing else. ``None`` when the engine 404s or 400s (no such dir / no
+    files channel for this chat — see the module docstring for the 400
+    case); :class:`EngineFilesUnavailable` otherwise.
     """
     try:
         async with _client(base_url, token, transport) as client:
@@ -411,7 +434,7 @@ async def fetch_engine_dir(
                 f"/api/chat/{chat_id}/sandbox/files",
                 params={"path": path} if path else None,
             )
-            if resp.status_code == 404:
+            if resp.status_code in (400, 404):
                 return None
             _raise_for_engine_status(resp, chat_id=chat_id, what="listing")
             try:
@@ -459,7 +482,7 @@ class EngineFilesHandle:
         self._transport = transport
 
     @property
-    def files(self) -> "EngineFilesHandle":
+    def files(self) -> EngineFilesHandle:
         return self
 
     async def list(self, path: str) -> list[EngineEntry]:
@@ -493,7 +516,7 @@ class EngineFilesHandle:
             )
         return out
 
-    async def read(self, path: str, format: str = "bytes") -> bytes:  # noqa: A002 - mirrors the SDK kwarg name
+    async def read(self, path: str, format: str = "bytes") -> bytes:
         data = await fetch_engine_file_bytes(
             base_url=self._base_url,
             chat_id=self._chat_id,

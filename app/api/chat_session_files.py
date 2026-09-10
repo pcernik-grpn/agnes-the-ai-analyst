@@ -66,6 +66,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,77 @@ from src.repositories import agent_artifacts_repo
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+#: Chat ids whose engine-listing failure has already logged a full
+#: traceback this process. The Files panel polls a live session every few
+#: seconds, so an outage lasting minutes used to write one full traceback
+#: PER POLL for the identical stack (observed live: 8 and 3 occurrences
+#: across two sessions in one evening) — the stack carries no new
+#: information on the second poll onward, so only the first occurrence for
+#: a given chat id gets one; later polls still warn, just without repeating
+#: it. Bounded FIFO (oldest-inserted evicted first) so a long-running
+#: process accumulating many distinct failing sessions cannot grow this
+#: without limit.
+_ENGINE_LISTING_FAILURE_LOGGED: OrderedDict[str, None] = OrderedDict()
+_ENGINE_LISTING_FAILURE_LOGGED_MAX = 512
+
+
+# There used to be a per-base-URL memo here, fed by "a chat that HAS a
+# sandbox got a `None` listing ⇒ the engine lacks the files channel". It was
+# wrong: a legacy `chat_<hex>` session (minted before the instance's
+# provider switched to `kai-agent`) carries a `sandbox_id` too —
+# `KaiEngineProvider._handle` mints a (dead) handle for a malformed legacy
+# id, and the manager persists every spawned handle before the engine ever
+# creates a chat — so "this chat has a sandbox" does not mean "this `None`
+# is the ENGINE speaking about itself". It can just as easily be that one
+# chat's id, or a chat the engine has never heard of, neither of which says
+# anything about the engine's capability. One legacy chat 400ing at its
+# root used to brand the whole engine unsupported and hand every later,
+# unrelated sandboxless chat a false "upgrade your engine" warning.
+#
+# The engine's own 404 body for an unknown chat happens to be a distinct,
+# structured shape today (`{"error": {"type": "KaiError", ...}}`), which
+# looks like it could discriminate "this chat" from "this engine" without
+# relying on `sandbox_id` at all. It was deliberately not used for that:
+# sniffing an error body to prove a NEGATIVE is the same mistake relocated
+# one layer down — a future engine version that changes that shape (with no
+# reason to know this client depends on it) would misclassify a plain
+# "chat not found" as "route absent" and reintroduce this exact bug class
+# under a discriminator that looked sound today.
+#
+# The asymmetry is the actual fix: a successful listing PROVES the channel
+# exists; no failure — 400, 404, malformed id, unknown chat, or a genuinely
+# missing route — proves it does not, because nothing here can tell those
+# apart with certainty. So capability is only ever recorded in the direction
+# that can be proven, which means there is nothing left worth caching: the
+# unproven state and the "prove it" default below are the same value
+# (`True`), so a memo that could only ever agree with its own default would
+# just be a second mechanism for one fact. See `list_session_files` for what
+# an individual chat's own request still answers when IT has a sandbox and
+# ITS OWN listing fails — that per-request answer is unaffected by any of
+# this and never was the bug.
+
+
+def _engine_listing_recovered(chat_id: str) -> None:
+    """Forget ``chat_id``'s suppression after a listing succeeds.
+
+    Without this the first outage silences the traceback for the rest of the
+    process: a later, unrelated failure for the same chat would log only the
+    one-line warning, and the stack that explains it would never be written.
+    """
+    _ENGINE_LISTING_FAILURE_LOGGED.pop(chat_id, None)
+
+
+def _first_engine_listing_failure(chat_id: str) -> bool:
+    """``True`` the first time this chat id's listing failure is seen this
+    process, ``False`` for every later call with the same id."""
+    first = chat_id not in _ENGINE_LISTING_FAILURE_LOGGED
+    _ENGINE_LISTING_FAILURE_LOGGED[chat_id] = None
+    _ENGINE_LISTING_FAILURE_LOGGED.move_to_end(chat_id)
+    while len(_ENGINE_LISTING_FAILURE_LOGGED) > _ENGINE_LISTING_FAILURE_LOGGED_MAX:
+        _ENGINE_LISTING_FAILURE_LOGGED.popitem(last=False)
+    return first
+
 
 # Same resource gate as the rest of the chat API (app/api/chat.py): the caller
 # must have the "Cloud chat" feature grant (or be an Admin).
@@ -284,8 +356,15 @@ class SessionFilesResponse(BaseModel):
     #: Where the listing came from: "host" (docker session dir) or "engine"
     #: (the kai-agent engine's remote sandbox).
     source: str = "host"
-    #: False when the session's files live in an engine sandbox the connected
-    #: engine does not expose (no files channel for this chat).
+    #: False when THIS request's engine listing came back empty-handed (a
+    #: chat id the engine could not serve, or a route it does not have) —
+    #: scoped to this one response, never a claim about the engine in
+    #: general. True is the default for everything else, including a chat
+    #: with no sandbox yet: nothing available before a sandbox exists can
+    #: prove the negative, so absence of proof is reported as no warning,
+    #: not as proof of the positive either. See the block comment near
+    #: ``_ENGINE_LISTING_FAILURE_LOGGED`` for why no cross-chat memo backs
+    #: this value.
     supported: bool = True
 
 
@@ -359,6 +438,15 @@ def _owned_session_or_404(request: Request, chat_id: str, user: object) -> dict:
     """Return the caller as a plain user dict, 404-ing on any session the
     caller does not own (and 403-ing restricted principals, which have no
     single identity to own a session's files)."""
+    user, _session = _owned_session_and_row_or_404(request, chat_id, user)
+    return user
+
+
+def _owned_session_and_row_or_404(request: Request, chat_id: str, user: object) -> tuple[dict, Any]:
+    """Same ownership check as :func:`_owned_session_or_404`, but also hands
+    back the session row a caller already paid the repo round trip for —
+    e.g. ``sandbox_id``, which the engine-listing gate below reads without a
+    second lookup."""
     from app.auth.session_principal import PRINCIPAL_TYPES
 
     if isinstance(user, PRINCIPAL_TYPES) or not isinstance(user, dict) or not user.get("email"):
@@ -370,7 +458,7 @@ def _owned_session_or_404(request: Request, chat_id: str, user: object) -> dict:
     s = repo.get_session(chat_id)
     if s is None or s.user_email != user["email"]:
         raise HTTPException(status_code=404)
-    return user
+    return user, s
 
 
 def _session_dir(email: str, chat_id: str) -> Path:
@@ -623,7 +711,7 @@ async def _harvested_preview_bytes(chat_id: str, rel: str) -> bytes | None:
     return await _harvested_bytes(row)
 
 
-def _merge_harvested(live: "SessionFilesResponse", harvested: list[dict]) -> "SessionFilesResponse":
+def _merge_harvested(live: SessionFilesResponse, harvested: list[dict]) -> SessionFilesResponse:
     """Live listing + the harvested files it does not already contain.
 
     The live sandbox wins on collision: it has the fresher bytes for a file
@@ -675,23 +763,62 @@ async def list_session_files(
     existed. Sessions on an engine-sandbox provider (``kai-agent``) never
     walk the host dir — see the module docstring; they report
     ``source="engine"``.
+
+    An engine-sandbox session with no ``sandbox_id`` yet (a brand-new chat,
+    or one whose sandbox was torn down) never asks the engine at all: this
+    route is polled the instant a conversation opens, well before the first
+    turn can mint a sandbox, and the engine has no way to know a chat id it
+    has never seen — every such poll used to land a "chat not found" 404 on
+    the engine's own log for no reason. The answer is the same shape a 404
+    from the engine gives today, just without the round trip.
+
+    ``supported`` in that no-sandbox answer is always ``True`` — not a claim
+    that this engine is known to expose the files channel, but the honest
+    absence of a claim that it does not. Nothing available before a sandbox
+    exists can establish the negative (see the block comment above
+    ``_ENGINE_LISTING_FAILURE_LOGGED``), so the drawer shows "no files here
+    yet" rather than an unearned "upgrade your engine" warning. A genuinely
+    outdated engine still surfaces that warning honestly once THIS chat has
+    its own sandbox and its own listing fails — see ``_list_engine_files``.
     """
-    user = _owned_session_or_404(request, chat_id, user)
+    user, session = _owned_session_and_row_or_404(request, chat_id, user)
     cfg = _chat_config(request)
     harvested = _harvested_entries(chat_id)
     if _files_source(cfg) == "engine":
+        if not getattr(session, "sandbox_id", None):
+            # Still validate the engine URL: a provider misconfiguration
+            # (kai-agent with no kai_agent_url) is a fixed fact about this
+            # instance, not a capability guess, and must surface even before
+            # any chat has a sandbox.
+            _engine_base_url(cfg)
+            return _merge_harvested(
+                SessionFilesResponse(files=[], truncated=False, source="engine", supported=True),
+                harvested,
+            )
         try:
             live = await _list_engine_files(user, chat_id, cfg)
+            _engine_listing_recovered(chat_id)
         except EngineFilesUnavailable:
+            # The traceback is identical every poll of the same outage, so
+            # only the first one for this chat id is worth its weight in
+            # the log — see _first_engine_listing_failure.
+            loud = _first_engine_listing_failure(chat_id)
+            repeat_note = "" if loud else " (repeat poll, traceback suppressed — see the first occurrence)"
             if not harvested:
                 # Nothing of our own to serve — the outage IS the answer.
-                logger.warning("chat_session_files: engine listing unavailable for session %s", chat_id, exc_info=True)
+                logger.warning(
+                    "chat_session_files: engine listing unavailable for session %s%s",
+                    chat_id,
+                    repeat_note,
+                    exc_info=loud,
+                )
                 raise _engine_unavailable_502() from None
             logger.warning(
-                "chat_session_files: engine listing unavailable for session %s — serving %d harvested artifact(s)",
+                "chat_session_files: engine listing unavailable for session %s — serving %d harvested artifact(s)%s",
                 chat_id,
                 len(harvested),
-                exc_info=True,
+                repeat_note,
+                exc_info=loud,
             )
             live = SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
         return _merge_harvested(live, harvested)
@@ -716,6 +843,12 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
         transport=_ENGINE_TRANSPORT,
     )
     if listing is None:
+        # This chat's own listing came back empty-handed — a malformed or
+        # unknown chat id, or a genuinely absent route, and this call cannot
+        # tell those apart (see the comment above `_ENGINE_LISTING_FAILURE_
+        # LOGGED`). `supported=False` here is scoped to THIS response only:
+        # it is never written anywhere the no-sandbox branch (or any other
+        # chat) could read it back as evidence about the engine itself.
         return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
     entries, truncated = listing
     files: list[SessionFileEntry] = []

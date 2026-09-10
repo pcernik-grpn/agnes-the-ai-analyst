@@ -788,6 +788,12 @@ GET {kai_agent_url}/api/chat/{chat_id}/sandbox/files?path=<rel dir>
           (one directory level per call, engine-side filtered)
     404 → unknown chat, or an engine build without the routes — Agnes
           deliberately collapses both into supported:false, no body sniffing
+    400 → the id cannot key a chat at all — the engine's chat table is a
+          Postgres uuid column, so a session minted before this instance's
+          chat.provider was switched TO kai-agent (the older chat_<hex>
+          shape) fails at the DB layer before an existence check ever runs.
+          Agnes folds this into the same supported:false answer a 404
+          gets, not an outage — no retry, no traceback.
 
 GET {kai_agent_url}/api/chat/{chat_id}/sandbox/file/download?path=<rel path>
     Auth: same.
@@ -796,6 +802,8 @@ GET {kai_agent_url}/api/chat/{chat_id}/sandbox/file/download?path=<rel path>
           pinned to application/octet-stream) and always serves
           attachment + nosniff.
     404 → unknown chat or path.
+    400 → same id-cannot-be-served case as the listing above; maps to a
+          plain 404 here (no harvested-fallback distinction to make).
 ```
 
 ## Choosing a provider
