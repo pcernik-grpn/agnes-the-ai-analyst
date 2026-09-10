@@ -1024,7 +1024,7 @@ load-bearing.
 | Facts extraction | `connectors/sharepoint/facts_extraction.py`, `facts_prompt.py` | reads ingested markdown from collections; no source types anywhere |
 | Run observability | `extraction_runs` (PG), `app/api/admin_extraction.py` | keyed by `connection_id` only — any connector's runs land here |
 | Cooperative stop | `config.extraction.stop_requested_at`/`stop_job_id` on `source_connections` | generic column, generic endpoint mechanics |
-| Run ownership | `config.extraction.run_generation` on `source_connections` | generic counter; supersedes a zombie handler on any connector |
+| Run ownership | `config.extraction.run_generation` on `source_connections` | generic **storage** (any connector's row already has the column, no schema work), but only the SharePoint crawl claims and checks it today — another connector inherits the counter, not the protection, until its own trigger claims a generation and its own checkpoints re-check it |
 | Configuration | instance-wide `extraction.*` (timeouts, concurrency, LLM stages) | not namespaced per source |
 | Cost accounting | stage-keyed `usage` (`ner`/`ocr`/`facts`), `src/llm_pricing.py` | per run, source-blind |
 | UI | the data-sources card's Run / Run history / activity / preview panels | render the generic endpoints above |

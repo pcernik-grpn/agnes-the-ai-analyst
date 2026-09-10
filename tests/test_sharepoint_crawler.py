@@ -372,6 +372,7 @@ class FakeSourceConnectionsRepo:
         if extraction.get("stop_requested_at") != expected_stop_at:
             return False
         extraction.pop("stop_requested_at", None)
+        extraction.pop("stop_job_id", None)
         config["extraction"] = extraction
         self.connection["config"] = config
         return True
@@ -9347,6 +9348,29 @@ class TestPlannerAndShardChildrenAreSuperseded(TestAutoParallelCrawlPlanner):
             for i in range(1, n + 1)
         ]
 
+    @staticmethod
+    def _plan_shards(n: int = 2) -> list[dict[str, Any]]:
+        """``compute_shard_plan``'s own per-drive ``shards`` shape — what a
+        plan STUB hands back, as opposed to :meth:`_shard_defs` (the
+        attributed shape ``_enqueue_shard_plan`` consumes)."""
+        return [
+            {
+                "index": i,
+                "label": f"shard{i}",
+                "signal": "search",
+                "targets": [
+                    {
+                        "drive_id": "b!drive1",
+                        "root_item_id": f"folder{i}",
+                        "state_key": f"b!drive1:folder{i}",
+                        "path": f"folder{i}",
+                    }
+                ],
+                "expected": 5,
+            }
+            for i in range(1, n + 1)
+        ]
+
     def test_a_superseded_planner_neither_persists_its_plan_nor_enqueues_children(self, crawl_env, monkeypatch):
         """The zombie planner resumes after a fresh trigger has claimed the
         connection. It must refuse BEFORE its first side effect — the
@@ -9519,6 +9543,193 @@ class TestPlannerAndShardChildrenAreSuperseded(TestAutoParallelCrawlPlanner):
             _run(connection, monkeypatch, job_id="job-trigger-9")
 
         assert jobs.enqueued == []
+
+    def test_a_trigger_whose_own_claim_failed_never_reclaims_the_connection_after_planning(
+        self, crawl_env, monkeypatch
+    ):
+        """2026-09-08 review finding: ``None`` used to mean TWO incompatible
+        things. From ``run_builtin_crawl`` it meant "the claim FAILED, so
+        this run has no generation and degrades to the stop flag alone"; to
+        ``_enqueue_shard_plan`` it meant "I am a named-shard re-run that has
+        not claimed yet", so it claimed one itself — AFTER planning.
+
+        The interleaving that inverts the whole mechanism: trigger A's claim
+        fails, so it plans unprotected; trigger B then claims and starts
+        working; A finishes planning and — by claiming at the tail — becomes
+        the NEWEST owner, superseding the run that legitimately owned the
+        connection. A must stay unclaimed for its whole run instead.
+        """
+        _runs, jobs, store = self._install_env(monkeypatch)
+        connection = _connection([_drive_scope()])
+        repo = FakeSourceConnectionsRepo(connection)
+        real_claim = repo.claim_run_generation
+        claims: List[str] = []
+
+        def _claim_that_fails_the_first_time(connection_id: str):
+            claims.append(connection_id)
+            if len(claims) == 1:
+                # The trigger's OWN claim — a transient storage hiccup, the
+                # case `claim_run_generation` deliberately degrades on
+                # rather than refusing to crawl at all.
+                raise RuntimeError("transient storage failure")
+            return real_claim(connection_id)
+
+        repo.claim_run_generation = _claim_that_fails_the_first_time  # type: ignore[method-assign]
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: repo)
+
+        competing: List[int] = []
+
+        async def _plan_while_a_competing_trigger_claims(*_args, **_kwargs):
+            # Mid-enumeration: a second trigger claims the connection and
+            # its own run starts. The planner below has no generation to be
+            # superseded on, which is exactly the degraded state under test.
+            competing.append(crawler.claim_run_generation("conn1"))
+            return {
+                "signal": "search",
+                "drives": [{"drive_id": "b!drive1", "shards": self._plan_shards()}],
+            }
+
+        monkeypatch.setattr(crawler, "compute_shard_plan", _plan_while_a_competing_trigger_claims)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={"value": [_file_item("item1")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"},
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        report = crawler.run_builtin_crawl({"connection_id": "conn1", "job_id": "job-unclaimed"})
+
+        # The degraded run still crawls (that is the deliberate fallback) ...
+        assert report["mode"] == "sharded"
+        # ... but it never took ownership on the way out: the competing
+        # trigger is STILL the current generation.
+        assert competing == [1]
+        assert crawler._run_generation("conn1") == 1
+        # Its children stay unclaimed too — protection is off for this whole
+        # run, in their own key namespace, rather than borrowed from a
+        # generation the planner claimed at the tail.
+        assert [j["payload_json"]["run_generation"] for j in jobs.enqueued] == [None, None]
+        assert [j["idempotency_key"] for j in jobs.enqueued] == [
+            "corpus-extraction-shard:conn1:0:1",
+            "corpus-extraction-shard:conn1:0:2",
+        ]
+
+        # The consequence that matters: the run that legitimately owns the
+        # connection is untouched — its own shard child still crawls
+        # instead of being refused as superseded by the zombie planner.
+        child = crawler.run_shard_crawl(
+            {
+                "connection_id": "conn1",
+                "parent_run_id": "er_parent_b",
+                "shard_index": 1,
+                "run_generation": 1,
+                "shard": self._shard_defs(1)[0],
+            }
+        )
+        assert child.get("mode") != "superseded"
+        assert store.get("crawl:b!drive1:folder1", "conn1") is not None
+
+    def test_an_all_superseded_parent_is_closed_without_finalizing_the_connections_crawl_state(
+        self, crawl_env, monkeypatch
+    ):
+        """2026-09-08 review finding: the superseded branch advances the
+        parent's ``shards_done`` (so a stale parent cannot hang) but writes
+        no child run row, so an ALL-superseded parent reached its tally
+        with zero children — and the normal site finalizer then aggregated
+        nothing, wrote that empty report over the CURRENT generation's
+        connection-level ``last_run``, cleared its legacy cTag seed and
+        chained a facts pass, on behalf of a run that no longer owns the
+        connection.
+
+        A stale parent must be closed WITHOUT normal finalization: no
+        connection-level write, no facts pass — and still not left
+        ``running``, which is why the tally advances at all.
+        """
+        runs, _jobs, store = self._install_env(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        stale = crawler.claim_run_generation("conn1")
+        crawler.claim_run_generation("conn1")  # the run that now owns the connection
+
+        # Connection-level state as the CURRENT generation left it.
+        store.put("crawl", "conn1", {"last_run": {"marker": "the live run's report"}, "delta_links": {}})
+        store.items[("crawl", "conn1")] = {"ctags": {"item1": "ct1"}, "failed_items": {}, "empty_items": {}}
+        # One shard left over from the stale plan — this child completes the
+        # stale parent's tally all by itself.
+        runs.shards["er_parent1"] = {"shards_done": 0, "shards_total": 1}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("a superseded shard child must never reach Graph")
+
+        _install_graph(monkeypatch, handler)
+        facts_passes: List[str] = []
+        monkeypatch.setattr(
+            crawler,
+            "maybe_run_facts_extraction",
+            lambda connection, **_kw: facts_passes.append(str(connection.get("id"))),
+        )
+
+        report = crawler.run_shard_crawl(
+            {
+                "connection_id": "conn1",
+                "parent_run_id": "er_parent1",
+                "shard_index": 1,
+                "run_generation": stale,
+                "shard": self._shard_defs(1)[0],
+            }
+        )
+
+        assert report["mode"] == "superseded"
+        # The harm, first: the current generation's connection-level state
+        # survives intact and no facts pass ran for the stale run.
+        assert store.get("crawl", "conn1")["last_run"] == {"marker": "the live run's report"}
+        assert store.items[("crawl", "conn1")]["ctags"] == {"item1": "ct1"}
+        assert facts_passes == []
+        # The tally still advances — the reason this branch touches the
+        # parent at all is that a parent NOT force-closed by the cancel
+        # would otherwise wait forever on a child that never reports.
+        assert runs.shards["er_parent1"]["shards_done"] == 1
+        # ... and the parent is closed honestly, neither left `running` nor
+        # finalized as a completed site run.
+        final = runs.finished[-1]
+        assert final["run_id"] == "er_parent1"
+        assert final["status"] == "interrupted"
+        assert final["report"]["interrupted_reason"] == "stopped"
+
+    def test_a_child_whose_generation_went_stale_mid_crawl_also_never_finalizes_its_parent(
+        self, crawl_env, monkeypatch
+    ):
+        """The same hole one call site over: a child that started on the
+        current generation, did real work, and only THEN got superseded
+        reaches the identical finalize decision on its way out. The guard
+        lives where that decision is made, so this path is covered by
+        construction rather than by a second copy of it."""
+        runs, _jobs, store = self._install_env(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        stale = crawler.claim_run_generation("conn1")
+        crawler.claim_run_generation("conn1")
+
+        store.put("crawl", "conn1", {"last_run": {"marker": "the live run's report"}, "delta_links": {}})
+        runs.shards["er_parent1"] = {"shards_done": 0, "shards_total": 1}
+        facts_passes: List[str] = []
+        monkeypatch.setattr(
+            crawler,
+            "maybe_run_facts_extraction",
+            lambda connection, **_kw: facts_passes.append(str(connection.get("id"))),
+        )
+
+        crawler._finish_shard_and_maybe_finalize(connection, "er_parent1", run_generation=stale)
+
+        assert store.get("crawl", "conn1")["last_run"] == {"marker": "the live run's report"}
+        assert facts_passes == []
+        final = runs.finished[-1]
+        assert final["run_id"] == "er_parent1"
+        assert final["status"] == "interrupted"
 
 
 class TestFinalizeRaceAndAggregation:

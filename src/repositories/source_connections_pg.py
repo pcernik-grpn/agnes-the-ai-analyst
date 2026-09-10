@@ -279,7 +279,8 @@ class SourceConnectionsPgRepository:
         FOR UPDATE`) inside this same transaction is what makes the
         re-read and the conditional write atomic against a concurrent
         writer — Postgres needs no separate retry loop here either, same
-        as `config_patch`.
+        as `config_patch`. Clears `stop_job_id` with the timestamp for the
+        same reason the sibling does.
         """
         with self._engine.begin() as cx:
             row = cx.execute(
@@ -300,6 +301,7 @@ class SourceConnectionsPgRepository:
             if extraction.get("stop_requested_at") != expected_stop_at:
                 return False
             extraction.pop("stop_requested_at", None)
+            extraction.pop("stop_job_id", None)
             merged = {**current, "extraction": extraction}
             cx.execute(
                 sa.text("UPDATE source_connections SET config = :c WHERE id = :id"),

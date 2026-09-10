@@ -648,8 +648,9 @@ def claim_run_generation(connection_id: str) -> Optional[int]:
     gone.
 
     Called exactly once per TOP-LEVEL trigger — :func:`run_builtin_crawl`,
-    plus :func:`_enqueue_shard_plan` when that is entered directly by a
-    named-shard re-run. Every actor then carries the generation it was
+    plus ``app.api.admin_sharepoint._trigger_shard_rerun``, the named-shard
+    re-run that enters :func:`_enqueue_shard_plan` directly instead of going
+    through the planner. Every actor then carries the generation it was
     claimed under (the inline crawl and the planner as an argument, each
     shard child in its own payload) and re-checks it before side-effecting
     writes. An actor whose generation is no longer the current one is a
@@ -678,6 +679,13 @@ def claim_run_generation(connection_id: str) -> Optional[int]:
     from crawling at all. ``None`` disables the supersede check for this
     run — i.e. degrades to the cooperative stop flag alone, exactly the
     behaviour that predates this counter — and says so in the log.
+
+    That degradation lasts the WHOLE run: no later stage retries the claim.
+    Spelled out here because of a 2026-09-08 review finding on the first
+    version of this mechanism, where :func:`_enqueue_shard_plan` claimed
+    when handed ``None``. Claiming at the tail of planning made a trigger
+    whose own claim had failed the NEWEST owner, superseding whichever run
+    had legitimately claimed the connection while it planned.
     """
     from src.repositories import source_connections_repo
 
@@ -8086,8 +8094,8 @@ def _enqueue_shard_plan(
     shard_defs: List[Dict[str, Any]],
     payload: dict,
     *,
+    run_generation: Optional[int],
     recorder: Optional["_RunRecorder"] = None,
-    run_generation: Optional[int] = None,
     scope_set_hash: Optional[str] = None,
     signal: Optional[str] = None,
     min_modified: Optional[str] = None,
@@ -8115,14 +8123,30 @@ def _enqueue_shard_plan(
     all.
 
     ``run_generation`` is the generation this plan belongs to (issue
-    #2333). It is checked HERE, immediately before this function's first
-    side effect, and it is baked into every child's idempotency key. A
-    caller that has not claimed one — ``app.api.admin_sharepoint._trigger_
-    shard_rerun``, which re-runs NAMED shards from an already-persisted
-    plan and is itself a trigger — claims one now.
+    #2333) — REQUIRED, and never claimed here. It is checked immediately
+    before this function's first side effect and baked into every child's
+    idempotency key. Its claimant is always the TRIGGER:
+    :func:`run_builtin_crawl` for a planned run, ``app.api.admin_sharepoint.
+    _trigger_shard_rerun`` for a named-shard re-run (itself a trigger, so it
+    claims before calling this). ``None`` therefore means exactly ONE thing
+    here, the same thing it means everywhere else in this module: this run
+    holds no generation, so its supersede check is off and it relies on the
+    cooperative stop flag alone.
+
+    Required rather than defaulting to "claim one now" because of a
+    2026-09-08 review finding: claiming HERE let a trigger whose own claim
+    had failed become the NEWEST owner at the tail of planning and supersede
+    the run that had legitimately claimed the connection in the meantime —
+    inverting the mechanism in exactly the path it exists for. A failed
+    claim now stays unclaimed for the whole run (see
+    :func:`claim_run_generation`).
 
     Idempotency key
-    ``corpus-extraction-shard:{connection_id}:{generation}:{index}``. The
+    ``corpus-extraction-shard:{connection_id}:{generation}:{index}``, with
+    an unclaimed plan's children in namespace ``0`` — the value that
+    predates every real claim (:func:`_parse_run_generation`), so they are
+    disjoint from every generation's children without borrowing a
+    generation this plan does not hold. The
     generation is what makes two plans' children DISJOINT: before it, a
     superseded planner's Nth child and a fresh plan's Nth child shared one
     key, so whichever enqueued second silently deduped onto the first's job
@@ -8138,8 +8162,6 @@ def _enqueue_shard_plan(
     from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
 
-    if run_generation is None:
-        run_generation = claim_run_generation(connection_id)
     superseded = _superseded_reason(connection_id, run_generation)
     if superseded is not None:
         # `_plan_or_run_inline` already opened this row (phase="planning")
@@ -8201,7 +8223,7 @@ def _enqueue_shard_plan(
             child_payload,
             priority=_SHARD_JOB_PRIORITY,
             max_attempts=max_attempts,
-            idempotency_key=f"{_SHARD_JOB_KIND}:{connection_id}:{run_generation}:{index}",
+            idempotency_key=f"{_SHARD_JOB_KIND}:{connection_id}:{_parse_run_generation(run_generation)}:{index}",
         )
 
     logger.info(
@@ -8264,8 +8286,13 @@ def run_shard_crawl(payload: dict) -> dict:
         # The PARENT's tally still advances. Its row may already be
         # force-closed by the cancel, but a parent that is NOT — a plan
         # superseded before its own children ran — would otherwise wait
-        # forever on a child that is never going to report.
-        _finish_shard_and_maybe_finalize(connection, str(parent_run_id))
+        # forever on a child that is never going to report. Carrying this
+        # child's own (stale) generation is what keeps that bookkeeping from
+        # FINALIZING the stale parent as a completed site run: see
+        # `_finish_shard_and_maybe_finalize` / `_abandon_site_run`.
+        _finish_shard_and_maybe_finalize(
+            connection, str(parent_run_id), run_generation=_payload_run_generation(payload)
+        )
         return {
             "mode": "superseded",
             "connection_id": str(connection_id),
@@ -8428,7 +8455,7 @@ async def _run_shard_crawl_async(
             report=interrupted_report,
             error=f"{type(exc).__name__}: {exc}",
         )
-        _finish_shard_and_maybe_finalize(connection, parent_run_id)
+        _finish_shard_and_maybe_finalize(connection, parent_run_id, run_generation=_payload_run_generation(payload))
         # Re-raised — same posture `_run_crawl_async` already takes: the
         # SHARD job itself fails too (no auto-retry, `retry_in_seconds=
         # None`), so an operator sees it, even though the row above already
@@ -8445,15 +8472,33 @@ async def _run_shard_crawl_async(
         status = "done"
         finish_error = None
     recorder.finish(stats, status=status, report=report, error=finish_error)
-    _finish_shard_and_maybe_finalize(connection, parent_run_id)
+    _finish_shard_and_maybe_finalize(connection, parent_run_id, run_generation=_payload_run_generation(payload))
     return report
 
 
-def _finish_shard_and_maybe_finalize(connection: Dict[str, Any], parent_run_id: str) -> None:
+def _finish_shard_and_maybe_finalize(
+    connection: Dict[str, Any], parent_run_id: str, *, run_generation: Optional[int] = None
+) -> None:
     """Bump the PARENT's ``shards_done``; the child that observes
     ``shards_done == shards_total`` wins the :meth:`claim_finalize` race and
     runs :func:`_finalize_site_run` (design §4.3 — "the LAST child to
     finish finalizes the parent").
+
+    ``run_generation`` is the generation the CALLING child was planned
+    under (issue #2333), and it decides WHICH finalization the winner
+    runs: a child still on the current generation finalizes the site
+    normally, while one whose generation has been superseded closes the
+    stale parent through :func:`_abandon_site_run` instead — never the
+    normal finalizer. A 2026-09-08 review finding: the tally advances even
+    for a superseded child (so a stale parent cannot hang waiting on a
+    child that will never report), which meant an ALL-superseded parent
+    reached ``shards_done == shards_total`` with no child rows at all and
+    the normal finalizer then wrote an EMPTY aggregate over the current
+    generation's connection-level crawl state, cleared its legacy cTag
+    seed and chained a facts pass. The same guard covers the child that
+    was superseded MID-crawl and reaches this on its way out, which is why
+    it lives here rather than in the caller. ``None`` (a hand-built
+    payload, a pre-#2333 job) checks nothing, exactly as everywhere else.
 
     Never raises: called from a shard child's own finish path (success OR
     failure), and a coordination hiccup here must not turn an otherwise-
@@ -8473,7 +8518,14 @@ def _finish_shard_and_maybe_finalize(connection: Dict[str, Any], parent_run_id: 
         shards_total = result.get("shards_total")
         if shards_total is not None and result.get("shards_done", 0) >= shards_total:
             if repo.claim_finalize(parent_run_id):
-                _finalize_site_run(connection, parent_run_id)
+                # Read as LATE as possible — only the winner of the race
+                # needs the answer, and the later it is read the narrower
+                # the window between it and the write it guards.
+                superseded = _superseded_reason(str(connection.get("id") or ""), run_generation)
+                if superseded is not None:
+                    _abandon_site_run(connection, parent_run_id, reason=superseded)
+                else:
+                    _finalize_site_run(connection, parent_run_id)
     except Exception:  # noqa: BLE001 — coordination bookkeeping, never load-bearing for THIS shard
         logger.warning(
             "sharepoint crawl: shard finish/finalize bookkeeping failed for parent run %s (non-fatal)",
@@ -8594,6 +8646,63 @@ def _aggregate_child_reports(children: Sequence[Dict[str, Any]]) -> Dict[str, An
     return aggregated
 
 
+def _abandon_site_run(connection: Dict[str, Any], parent_run_id: str, *, reason: str) -> None:
+    """Close a SUPERSEDED parent run row without finalizing the site
+    (issue #2333, 2026-09-08 review finding) — the counterpart to
+    :func:`_finalize_site_run` for a parent whose generation no longer owns
+    this connection.
+
+    Deliberately does exactly one thing: mark the row ``interrupted`` /
+    ``interrupted_reason="stopped"``, the same honest, resumable outcome
+    every other superseded actor records (:data:`_STOP_REASONS`,
+    :meth:`_RunRecorder.finish_planning_as_stopped`). It must never do what
+    the finalizer does — write ``last_run`` or clear the legacy cTag seed in
+    the CONNECTION-level crawl state, or chain the facts pass — because all
+    of those belong to whichever run owns the connection NOW, and a stale
+    parent overwriting them is the corruption the run generation exists to
+    prevent. The children's own rows keep their own results; the parent
+    carries no aggregate, precisely so nothing reads a stale run's partial
+    numbers as a site's outcome.
+
+    Still closes the row rather than leaving it ``running``: "a parent
+    cannot hang" is why a superseded child advances the tally at all (see
+    :func:`_finish_shard_and_maybe_finalize`), and stopping short here would
+    just move the hang one step later. Never raises — same
+    observability-is-never-load-bearing posture as the finalizer.
+    """
+    connection_id = str(connection.get("id") or "")
+    try:
+        from src.repositories import extraction_runs_repo
+
+        extraction_runs_repo().finish(
+            parent_run_id,
+            status="interrupted",
+            report={
+                "mode": "sharded",
+                "connection_id": connection_id,
+                "interrupted": True,
+                "interrupted_reason": "stopped",
+                "reason": reason,
+            },
+            usage={},
+            skips={},
+            error=reason,
+        )
+        logger.info(
+            "sharepoint crawl: connection %s — parent run %s abandoned without finalizing (%s)",
+            connection_id,
+            parent_run_id,
+            reason,
+        )
+    except Exception:  # noqa: BLE001 — never load-bearing; see module-wide recorder posture
+        logger.warning(
+            "sharepoint crawl: could not close superseded parent run %s for connection %s (non-fatal)",
+            parent_run_id,
+            connection_id,
+            exc_info=True,
+        )
+
+
 def _finalize_site_run(connection: Dict[str, Any], parent_run_id: str) -> None:
     """Aggregate every child's report into the PARENT run row, run the
     chained facts pass ONCE, and finish the parent (design §4.3).
@@ -8601,7 +8710,10 @@ def _finalize_site_run(connection: Dict[str, Any], parent_run_id: str) -> None:
     Runs on whichever child won :meth:`ExtractionRunsPgRepository.
     claim_finalize` — by construction only ever reached once
     ``shards_done == shards_total``, so every child is terminal by the time
-    this starts; there is nothing left to wait for. Best-effort around the
+    this starts; there is nothing left to wait for — and only when that
+    child's run generation still owns the connection, since everything
+    below writes CONNECTION-level state a superseded run must not touch
+    (:func:`_abandon_site_run` closes that parent instead). Best-effort around the
     final write (never raises past this function — a caller mid-shard-
     finish must not crash on the finalizer's own bookkeeping failing), but
     the facts stage's own hard stop is recorded honestly (``status``

@@ -4382,11 +4382,18 @@ def _trigger_shard_rerun(
     (or 409-refuse) first, so a request that goes on to 404/400 on bad
     input still mutated the connection's stop flag as a side effect of a
     call that does no actual work.
+
+    Being a trigger, this also CLAIMS the connection's run generation
+    (issue #2333) itself — once, here, and never inside
+    ``_enqueue_shard_plan``, which a 2026-09-08 review finding showed would
+    let a run whose own claim had failed re-claim after its work had
+    already begun (see that function's own docstring).
     """
     from connectors.sharepoint.crawler import (
         _clear_stale_stop_for_trigger,
         _enqueue_shard_plan,
         _PreviousRunStillDraining,
+        claim_run_generation,
         load_state,
     )
 
@@ -4420,6 +4427,14 @@ def _trigger_shard_rerun(
             detail={"error": "extraction_already_running", "message": str(exc)},
         ) from exc
 
+    # ... and only THEN claim, for the same reason `run_builtin_crawl`
+    # claims after its own clear-or-refuse: a trigger that never runs must
+    # not bump the counter and supersede the children it is waiting on.
+    # `None` (the connection row vanished, or a storage hiccup) degrades
+    # this rerun to the cooperative stop flag alone rather than guessing a
+    # generation — it never re-claims later.
+    run_generation = claim_run_generation(connection_id)
+
     rerun_payload: Dict[str, Any] = {"connection_id": connection_id}
     if options.force_reprocess:
         rerun_payload["force_reprocess"] = True
@@ -4432,7 +4447,7 @@ def _trigger_shard_rerun(
     if options.timeout_s is not None:
         rerun_payload["timeout_s"] = options.timeout_s
 
-    result = _enqueue_shard_plan(connection_id, named, rerun_payload)
+    result = _enqueue_shard_plan(connection_id, named, rerun_payload, run_generation=run_generation)
     _record_extraction_dispatch(row, result["parent_run_id"])
     logger.info(
         "sharepoint connection %s: re-running %d shard(s) %s (parent run %s)",

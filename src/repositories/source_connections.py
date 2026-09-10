@@ -372,6 +372,14 @@ class SourceConnectionsRepository:
         own. Same guard shape as ``JobsRepository.heartbeat``'s
         ``lease_token`` check. Returns ``True`` iff it actually cleared
         something.
+
+        Clears the stop's ``stop_job_id`` (the job it was AIMED at — see
+        ``connectors.sharepoint.crawler.STOP_JOB_ID_KEY``) together with the
+        timestamp, never one without the other: the two are one request, and
+        a leftover target for a stop that is no longer requested makes the
+        persisted row claim an active stop it does not have (2026-09-08
+        review finding). A REFUSED clear leaves both untouched, so a fresher
+        stop keeps its own attribution.
         """
         last_err: Optional[duckdb.Error] = None
         for attempt in range(_CONFIG_PATCH_CONFLICT_RETRIES):
@@ -397,6 +405,7 @@ class SourceConnectionsRepository:
                     self.conn.execute("ROLLBACK")
                     return False
                 extraction.pop("stop_requested_at", None)
+                extraction.pop("stop_job_id", None)
                 merged = {**current, "extraction": extraction}
                 self.conn.execute(
                     "UPDATE source_connections SET config = ? WHERE id = ?",
