@@ -235,12 +235,15 @@ jobs:
                 # a witness when its creator is the Devin bot (the combined `/status`
                 # endpoint omits `creator`; the list endpoint carries it). The newest
                 # Devin-created status for the context decides: a later `pending`
-                # (re-analysis in flight) supersedes an earlier `success`.
-                analysed_at=$(gh api "repos/$REPO/commits/$head/statuses?per_page=100" \
-                  --jq '[.[] | select(.context == "Devin Review"
-                                   and .creator.type == "Bot"
-                                   and (.creator.login | IN("devin-ai-integration[bot]", "devin-ai-integration")))]
-                        | sort_by(.updated_at) | last // {} | if .state == "success" then .updated_at else "" end' 2>/dev/null || true)
+                # (re-analysis in flight) supersedes an earlier `success`. The list is
+                # every status EVENT on the commit, newest first, paginated — so all
+                # pages are read (one page could hide Devin's event behind a hundred
+                # newer ones from other workflows), like the reviews above.
+                analysed_at=$(gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" --jq '.[] | @json' 2>/dev/null \
+                  | jq -rs '[.[] | select(.context == "Devin Review"
+                                      and .creator.type == "Bot"
+                                      and (.creator.login | IN("devin-ai-integration[bot]", "devin-ai-integration")))]
+                           | sort_by(.updated_at) | last // {} | if .state == "success" then .updated_at else "" end' || true)
                 issues_at_head=$(printf '%s\n' "$reviews" | jq -rs --arg re "$issues_re" --arg head "$head" '[.[]
                     | select(.user.login == "devin-ai-integration[bot]" and .commit_id == $head and ((.body // "") | test($re)))] | length')
                 age=0
