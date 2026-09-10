@@ -132,6 +132,22 @@ def report(
         typer.echo(f"--kind must be one of: {', '.join(KINDS)}", err=True)
         raise typer.Exit(2)
 
+    # Validate the screenshot BEFORE the report is created. Checking it at the
+    # upload site meant an oversized file still filed the report, told the
+    # server to expect a screenshot — so the operator mirror waited 20 s for an
+    # upload that never came — and then exited without printing the number, so
+    # the reporter believed nothing had been filed and reported it again
+    # (#2402). Refusing up front costs nothing and leaves no orphan.
+    if screenshot is not None:
+        size = screenshot.stat().st_size
+        if size > _MAX_SCREENSHOT_BYTES:
+            typer.echo(
+                f"{screenshot.name} is {size / 1024 / 1024:.1f} MB — the limit is 3 MB. "
+                "Attach a smaller image, or report it without one. Nothing was filed.",
+                err=True,
+            )
+            raise typer.Exit(2)
+
     from cli.main import _cli_version
 
     context: dict = {
@@ -162,17 +178,6 @@ def report(
     row = resp.json()
 
     if screenshot is not None:
-        # Check the size BEFORE reading. Typer only proves the path exists, so
-        # a mistakenly chosen disk image would be pulled entirely into memory
-        # just to be refused by the server's 3 MiB cap a moment later (#2402).
-        size = screenshot.stat().st_size
-        if size > _MAX_SCREENSHOT_BYTES:
-            typer.echo(
-                f"{screenshot.name} is {size / 1024 / 1024:.1f} MB — the limit is 3 MB. "
-                "Attach a smaller image, or file the report without one.",
-                err=True,
-            )
-            raise typer.Exit(2)
         data = screenshot.read_bytes()
         put = api_put(
             f"{_ISSUES_PATH}/{row['id']}/screenshot",

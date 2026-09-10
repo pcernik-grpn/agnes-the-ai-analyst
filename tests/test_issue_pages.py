@@ -1,4 +1,6 @@
 """``/me/issues`` and ``/admin/issues`` — the reporter and admin-queue web
+
+import re
 pages for issue reports (issue reporting, step 3 of the design, pulled
 forward on its own — see docs/superpowers/specs/2026-09-09-issue-reporting-
 step1-design.md). Both are static shells: list/detail/comment/resolve are
@@ -17,6 +19,8 @@ the page render touch.
 """
 
 from __future__ import annotations
+
+import re
 
 
 def _auth_client(seeded_app, token: str):
@@ -257,3 +261,56 @@ class TestTheDialogForgetsAFailedAttempt:
         open_body = src[src.index("function open()") : src.index("function close()")]
         assert "fallback.hidden = true" in open_body
         assert 'dlg.style.display = ""' in open_body
+
+
+class TestAbandonedActionsLeaveTheControlsUsable:
+    """The drawer reuses ONE comment button and ONE resolve button for every
+    report, so an early return at the stale-generation guard must not skip
+    re-enabling them — otherwise switching reports mid-submit left the next
+    opening with a dead control until a reload (#2402)."""
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "issue_pages.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_no_guard_returns_while_the_button_is_still_disabled(self):
+        """Encoded as an ordering invariant on the source: every
+        stale-generation guard is immediately preceded by the re-enable. The
+        inverse order — guard first, restore after — is the bug, and must not
+        appear anywhere."""
+        src = self._source()
+        guard = "if (generation !== detailGeneration)"
+        restore = "btn.disabled = false;"
+
+        good = len(re.findall(re.escape(restore) + r"\s*\n\s*" + re.escape(guard), src))
+        assert good >= 4, f"expected every action guard to be preceded by a restore, found {good}"
+
+        bad = re.findall(re.escape(guard) + r" return;\s*\n\s*" + re.escape(restore), src)
+        assert not bad, "a guard returns before the shared button is re-enabled"
+
+
+class TestAnOversizedScreenshotFilesNothing:
+    """The size check runs BEFORE the report is created.
+
+    Checking it at the upload site still filed the report, told the server to
+    expect a screenshot (so the operator mirror waited 20 s for an upload that
+    never came), then exited without printing the number — leaving a report
+    the reporter did not believe existed, and would file again (#2402)."""
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "cli" / "commands" / "issue.py").read_text(encoding="utf-8")
+
+    def test_the_check_precedes_the_create_call(self):
+        src = self._source()
+        report_body = src[src.index("def report(") : src.index('@issue_app.command("list")')]
+        assert report_body.index("_MAX_SCREENSHOT_BYTES") < report_body.index("api_post("), (
+            "the size check must run before the report is created, or an oversized file leaves an orphan"
+        )
+
+    def test_the_message_says_nothing_was_filed(self):
+        assert "Nothing was filed." in self._source()

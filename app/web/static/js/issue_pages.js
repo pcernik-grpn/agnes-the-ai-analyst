@@ -418,8 +418,12 @@
     btn.disabled = true;
     postJson("/api/issues/" + encodeURIComponent(issueId) + "/comments", { body: body })
       .then(function (res) {
-        if (generation !== detailGeneration) return;
+        // Re-enable FIRST, then decide whether this response still owns the
+        // drawer. The button is shared by every report, so returning at the
+        // guard without restoring it left the next opening with a dead
+        // Comment button until a reload (#2402).
         btn.disabled = false;
+        if (generation !== detailGeneration) return;
         if (res.status !== 201) {
           toast("warn", detailMessage(res.body, "Couldn't post the comment."));
           return;
@@ -432,8 +436,8 @@
         bumpReplyCount(issueId);
       })
       .catch(function () {
-        if (generation !== detailGeneration) return;
         btn.disabled = false;
+        if (generation !== detailGeneration) return;
         toast("warn", "Couldn't post the comment.");
       });
   }
@@ -466,6 +470,9 @@
       resolution_note: (note.value || "").trim() || null,
     })
       .then(function (res) {
+        // Shared button: restore it before any early return, or the next
+        // report opens with Resolve dead (#2402).
+        btn.disabled = false;
         if (generation !== detailGeneration) {
           // The drawer moved on. The resolve DID happen, so refresh the list
           // to reflect it — just do not touch the panel now showing another
@@ -473,7 +480,6 @@
           loadList();
           return;
         }
-        btn.disabled = false;
         if (res.status !== 200) {
           // The 409 body carries the useful, specific sentence ("#42 was
           // already resolved by X at T") — surface it verbatim rather than
@@ -490,8 +496,8 @@
         toast("ok", "Resolved #" + res.body.number + ".");
       })
       .catch(function () {
-        if (generation !== detailGeneration) return;
         btn.disabled = false;
+        if (generation !== detailGeneration) return;
         toast("warn", "Couldn't resolve this report.");
       });
   }
