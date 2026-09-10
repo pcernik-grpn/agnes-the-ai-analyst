@@ -30,7 +30,6 @@ from src.ingest.convert import (
     convert_to_markdown,
 )
 
-
 pypdfium2 = pytest.importorskip("pypdfium2", reason="extraction extra not installed")
 pytest.importorskip("markitdown", reason="extraction extra not installed")
 
@@ -135,6 +134,86 @@ def _write_docx(path: Path) -> Path:
     document.add_heading("Agnes Handbook", level=1)
     document.add_paragraph("Revenue is recognised on delivery.")
     document.save(str(path))
+    return path
+
+
+#: Same VML (``w:pict``/``v:imagedata``) shape real Word writes for an
+#: embedded picture — the one mammoth's ``_read_blip``/``read_imagedata``
+#: recognizes with the fewest namespaces to hand-declare. The image bytes
+#: are never validated by mammoth (it only opens and base64-encodes them),
+#: so a placeholder body is enough; ``python-docx`` is not installed in this
+#: environment (see the module docstring), so this is always hand-written.
+def _write_docx_with_images(path: Path, sections: list[tuple[str, str]]) -> Path:
+    """A ``.docx`` with one ``Heading1`` + one embedded picture per
+    ``(heading_text, relationship_id)`` pair in ``sections``, in order."""
+    body_parts = []
+    rels_parts = []
+    for heading, rel_id in sections:
+        body_parts.append(
+            f'<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>{heading}</w:t></w:r></w:p>'
+            f'<w:p><w:r><w:pict><v:shape><v:imagedata r:id="{rel_id}"/></v:shape></w:pict></w:r></w:p>'
+        )
+        rels_parts.append(
+            f'<Relationship Id="{rel_id}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            f'Target="media/{rel_id}.png"/>'
+        )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        "<w:document "
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:v="urn:schemas-microsoft-com:vml">'
+        "<w:body>" + "".join(body_parts) + "</w:body></w:document>"
+    )
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(rels_parts)
+        + "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w") as package:
+        package.writestr("[Content_Types].xml", _CONTENT_TYPES)
+        package.writestr("_rels/.rels", _PACKAGE_RELS)
+        package.writestr("word/document.xml", document_xml)
+        package.writestr("word/_rels/document.xml.rels", rels_xml)
+        for _heading, rel_id in sections:
+            package.writestr(f"word/media/{rel_id}.png", b"not a real png; mammoth never validates the bytes")
+    return path
+
+
+def _tiny_png_bytes() -> bytes:
+    """A minimal, real 1x1 PNG. Unlike mammoth's docx image handler
+    (never inspects the bytes), python-pptx's picture part reads the PNG
+    header for native size/aspect ratio, so the pptx fixture below needs
+    genuine image bytes rather than a placeholder."""
+    import struct
+    import zlib
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x00\x00\x00")
+    return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+
+def _write_pptx_with_images(path: Path, slide_count: int) -> Path:
+    """A real ``.pptx`` (python-pptx — already a hard markitdown dependency,
+    never a new one for this test module) with one embedded picture on each
+    of ``slide_count`` slides."""
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    png = _tiny_png_bytes()
+    presentation = Presentation()
+    layout = presentation.slide_layouts[6]  # blank layout
+    for _ in range(slide_count):
+        slide = presentation.slides.add_slide(layout)
+        slide.shapes.add_picture(io.BytesIO(png), Inches(1), Inches(1))
+    presentation.save(str(path))
     return path
 
 
@@ -368,6 +447,29 @@ def test_html_routes_to_markitdown(tmp_path):
     assert "EMEA grew." in result.markdown
 
 
+def test_html_relative_image_is_not_falsely_disclosed_as_lost(tmp_path):
+    """markitdown converts ``<img src="logo.jpg">`` to ``![Logo](logo.jpg)``
+    — the IDENTICAL bare-filename shape python-pptx's OWN lost-picture
+    placeholder uses (see the module docstring's "Embedded pictures"
+    section). Nothing was dropped here: the image reference is exactly what
+    the source HTML said, and this document never showed a PowerPoint
+    slide-number marker at all. Rewriting it into "not indexed" would be a
+    FALSE disclosure — live finding 2026-09-09, the regression this test
+    guards."""
+    path = tmp_path / "page.html"
+    path.write_text(
+        '<html><body><h1>Quarterly</h1><img src="logo.jpg" alt="Logo"><p>EMEA grew.</p></body></html>',
+        encoding="utf-8",
+    )
+
+    result = convert_to_markdown(path, "text/html")
+
+    assert result.engine == "markitdown"
+    assert result.image_count == 0
+    assert "![Logo](logo.jpg)" in result.markdown
+    assert "not indexed" not in result.markdown
+
+
 # ------------------------------------------------------- legacy office (LibreOffice)
 
 
@@ -557,8 +659,9 @@ def test_libreoffice_non_zero_exit_raises_conversion_error(tmp_path, monkeypatch
 
 
 def test_libreoffice_timeout_raises_conversion_error(tmp_path, monkeypatch):
-    import src.ingest.convert as convert_module
     import subprocess
+
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "legacy.ppt"
     path.write_bytes(b"legacy office bytes")
@@ -1185,10 +1288,9 @@ class _RaisingMetaPathFinder:
         self._module_name = module_name
         self._exc = exc
 
-    def find_spec(self, fullname, path, target=None):  # noqa: ANN001, ANN201
+    def find_spec(self, fullname, path, target=None):
         if fullname == self._module_name:
             raise self._exc
-        return None
 
 
 @pytest.mark.parametrize(
@@ -1478,3 +1580,238 @@ def test_legacy_office_runs_on_a_per_process_profile_and_serializes(tmp_path, mo
     assert profiles[0] == live._libreoffice_profile_dir()
     assert os.getpid() in live._LIBREOFFICE_PROFILES
     assert live._LIBREOFFICE_LOCK is not None
+
+
+# ------------------------------------------------------ embedded-picture disclosure
+#
+# The live finding these tests pin (2026-09-09): a reader asked about content
+# that lives in a picture inside a Word/PowerPoint file, and the answer was
+# assembled from prose instead — without being told the picture existed. Two
+# separate defects, both in markitdown's OWN image handling that this module
+# had never touched before: a docx picture came back as a literal
+# ``![](data:image/png;base64...)`` (markitdown's own truncation of a payload
+# this module never keeps either), and a pptx picture came back as
+# ``![](Picture3.jpg)`` — a name that repeats across slides and, worse,
+# across two entirely unrelated documents, reading like a stable, fetchable
+# filename when it is neither. These tests assert the READER-VISIBLE
+# behaviour (what ends up in the indexed markdown, and the count a caller
+# gets back) — never `markitdown`'s or `mammoth`'s internal call shape.
+
+
+def test_docx_embedded_picture_placeholder_is_disclosed_not_base64(tmp_path):
+    path = _write_docx_with_images(tmp_path / "sow.docx", [("Phase 1 Roadmap", "rId2")])
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    assert result.engine == "markitdown"
+    assert result.image_count == 1
+    assert "base64" not in result.markdown
+    assert "data:image" not in result.markdown
+    assert "[image 1 of 1 in this document — not indexed" in result.markdown
+    assert 'section "Phase 1 Roadmap"' in result.markdown
+
+
+def test_docx_without_images_reports_zero_image_count_and_is_unaffected(tmp_path):
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    assert result.image_count == 0
+    assert "Agnes Handbook" in result.markdown
+    assert "Revenue is recognised on delivery." in result.markdown
+    assert "not indexed" not in result.markdown
+
+
+def test_pptx_embedded_picture_placeholder_is_disclosed_not_a_collidable_filename(tmp_path):
+    path = _write_pptx_with_images(tmp_path / "deck.pptx", slide_count=1)
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+    assert result.engine == "markitdown"
+    assert result.image_count == 1
+    # no PictureN.jpg-shaped name survives — the whole point is that it is no
+    # longer readable as a filename that could (wrongly) be fetched or
+    # cross-referenced against another document's own "PictureN".
+    assert ".jpg" not in result.markdown
+    assert "[image 1 of 1 in this document — not indexed, slide 1]" in result.markdown
+
+
+def test_pptx_multiple_slides_number_images_and_locate_each_one(tmp_path):
+    path = _write_pptx_with_images(tmp_path / "deck.pptx", slide_count=3)
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+    assert result.image_count == 3
+    assert "[image 1 of 3 in this document — not indexed, slide 1]" in result.markdown
+    assert "[image 2 of 3 in this document — not indexed, slide 2]" in result.markdown
+    assert "[image 3 of 3 in this document — not indexed, slide 3]" in result.markdown
+
+
+def test_legacy_office_markitdown_output_also_gets_image_disclosure(tmp_path, monkeypatch):
+    """The rewrite is keyed off the resulting ENGINE, not the caller's route:
+    a legacy ``.doc`` resaved to docx and handed to the SAME markitdown call
+    (``libreoffice+markitdown``) must be disclosed identically to a direct
+    ``.docx`` upload — a reader should never learn less from a document that
+    happened to need a LibreOffice resave first."""
+    import src.ingest.convert as convert_module
+
+    path = tmp_path / "legacy.doc"
+    path.write_bytes(b"legacy office bytes")
+    _stub_soffice(monkeypatch, convert_module)
+
+    def _fake_markitdown(converted_path, filename, *, file_extension=None):
+        return "# Q3 Notes\n\n![](data:image/png;base64...)"
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _fake_markitdown)
+
+    result = convert_to_markdown(path, "application/octet-stream")
+
+    assert result.engine == "libreoffice+markitdown"
+    assert result.image_count == 1
+    assert "base64" not in result.markdown
+    assert 'section "Q3 Notes"' in result.markdown
+
+
+def test_disclose_image_placeholders_is_a_noop_on_plain_text():
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "just some prose with no images at all"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert rewritten == text
+    assert count == 0
+
+
+def test_disclose_image_placeholders_mixed_docx_and_pptx_shapes_in_one_pass():
+    """A synthetic mix of both marker shapes in one pass — exercises both
+    regex branches, not a realistic single document (a real one is either
+    pptx-with-jpg-names or docx-with-base64, never both). Once a slide
+    marker has been seen, it wins over ANY later heading for every image
+    after it, including a base64 (docx-shaped) one — see
+    ``test_disclose_image_placeholders_slide_number_wins_over_a_later_heading``
+    for the realistic single-slide case this generalizes."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 1 -->\n![](Picture3.jpg)\n# A Heading\n![alt text](data:image/jpeg;base64...)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 2
+    assert "Picture3.jpg" not in rewritten
+    assert "base64" not in rewritten
+    assert "[image 1 of 2 in this document — not indexed, slide 1]" in rewritten
+    assert "[image 2 of 2 in this document — not indexed, slide 1]" in rewritten
+    assert "in section" not in rewritten
+    # the slide/heading markers themselves are preserved verbatim — only the
+    # image markdown is rewritten
+    assert "<!-- Slide number: 1 -->" in rewritten
+    assert "# A Heading" in rewritten
+
+
+def test_disclose_image_placeholders_slide_number_wins_over_a_later_heading():
+    """A pptx slide's own title becomes a ``#`` heading right after that
+    slide's number comment (see the module docstring) — a titled slide must
+    keep its own slide number, never fall back to "in section <title>" just
+    because the heading was the more RECENT marker (live finding
+    2026-09-09: this exact ordering lost the slide number)."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 4 -->\n# Architecture\n![](Picture1.jpg)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    assert "[image 1 of 1 in this document — not indexed, slide 4]" in rewritten
+    assert "in section" not in rewritten
+
+
+def test_disclose_image_placeholders_new_slide_resets_a_stale_heading():
+    """A heading tracked on one slide must not leak onto the NEXT slide's
+    own images once a new slide marker has been seen — the slide number
+    still wins regardless, but the reset keeps the two pieces of state
+    honest independently of that priority."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 1 -->\n# First Slide\n<!-- Slide number: 2 -->\n![](Picture1.jpg)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    assert "[image 1 of 1 in this document — not indexed, slide 2]" in rewritten
+    assert "First Slide" not in rewritten.split("[image")[-1]
+
+
+def test_disclose_image_placeholders_word_heading_untouched_by_the_slide_gate():
+    """A Word document never emits a slide-number comment at all — the
+    heading-tracking path (unchanged by the slide/heading split) is what a
+    docx picture's location still comes from."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "# Q3 Notes\n\n![](data:image/png;base64...)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    assert '[image 1 of 1 in this document — not indexed, in section "Q3 Notes"]' in rewritten
+
+
+def test_disclose_image_placeholders_bare_jpg_name_without_a_slide_marker_is_left_alone():
+    """The bare ``name.jpg`` shape is markitdown's OWN pptx lost-picture
+    convention, but the identical markdown is also what an ordinary,
+    un-lost HTML relative image reference converts to (see
+    ``test_html_relative_image_is_not_falsely_disclosed_as_lost``). Without
+    a PowerPoint slide-number marker anywhere in the document, this is not a
+    lost picture — left completely unchanged, not counted (live finding
+    2026-09-09)."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "# Quarterly\n\n![Logo](logo.jpg)\n\nEMEA grew.\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 0
+    assert rewritten == text
+
+
+def test_disclose_image_placeholders_truncates_a_very_long_heading():
+    from src.ingest.convert import _disclose_image_placeholders
+
+    heading_text = "x" * 200
+    text = f"# {heading_text}\n![](data:image/png;base64...)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    disclosure_line = next(line for line in rewritten.splitlines() if line.startswith("[image"))
+    assert len(disclosure_line) < 150
+
+
+def test_slide_text_that_looks_like_markdown_is_left_alone():
+    """Every converted deck carries slide markers, so "this document has
+    slides" cannot tell markitdown's own picture placeholder from words the
+    deck's author typed. A text box saying `Deploy with ![status](logo.jpg)`
+    is slide content: rewriting it would delete real text and announce a
+    picture that never existed."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = (
+        "<!-- Slide number: 1 -->\n\n"
+        "Deploy with ![status](logo.jpg) before the release\n\n"
+        "<!-- Slide number: 2 -->\n\n"
+        "![image.png](Picture2.jpg)\n"
+    )
+    out, count = _disclose_image_placeholders(text)
+    assert "![status](logo.jpg)" in out, "the author's own words must survive"
+    assert count == 1, "only markitdown's standalone placeholder counts"
+    assert "[image 1 of 1 in this document — not indexed, slide 2]" in out
+
+
+def test_a_standalone_placeholder_on_a_titled_slide_is_still_disclosed():
+    """The narrowing must not cost the case the branch exists for."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 4 -->\n\n# Architecture\n\n![image.png](Picture3.jpg)\n"
+    out, count = _disclose_image_placeholders(text)
+    assert count == 1
+    assert "slide 4" in out

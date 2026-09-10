@@ -165,6 +165,7 @@ class FakeIngestor:
         filename: str,
         markdown: str,
         source_sha256: str,
+        image_count: int = 0,
     ):
         self.ingested.append(
             {
@@ -174,6 +175,7 @@ class FakeIngestor:
                 "filename": filename,
                 "markdown": markdown,
                 "source_sha256": source_sha256,
+                "image_count": image_count,
             }
         )
         was_new = stable_id not in FakeIngestor._collection_of
@@ -206,9 +208,10 @@ class FakeIngestor:
 
 
 class ConvertResult:
-    def __init__(self, markdown: str, engine: str = "fake") -> None:
+    def __init__(self, markdown: str, engine: str = "fake", image_count: int = 0) -> None:
         self.markdown = markdown
         self.engine = engine
+        self.image_count = image_count
 
 
 class AnonymizeResult:
@@ -3344,6 +3347,69 @@ class TestConvertChildMemoryLimit:
                 pool.convert(0, f, "application/octet-stream")
         finally:
             pool.shutdown()
+
+    def test_prepare_document_threads_image_count_from_convert_to_the_prepared_document(self, tmp_path, monkeypatch):
+        """`_prepare_document` must carry `ConvertResult.image_count` onto
+        its own `_PreparedDocument.image_count` — the crawler-side half of
+        threading the disclosure count through to `ingest_file` (see
+        `src.ingest.runner`'s `test_ingest_preloaded_text_records_the_
+        callers_image_count`). Without this, a crawled document's markdown
+        already carried the `[image N of TOTAL ... not indexed]` disclosure
+        text while `processing_detail.image_count` stayed `0` (live finding
+        2026-09-09) — the SAME bug on the two ends of one pipe, so it is
+        tested on both.
+
+        Exercises the INLINE (``convert_pool=None``) route directly, and
+        the pooled route below re-proves it crosses the pipe intact.
+        """
+        monkeypatch.setattr(
+            crawler,
+            "convert_to_markdown",
+            lambda path, mime, **_kw: ConvertResult("# Slide 1\n\n[image 1 of 2 ...]", image_count=2),
+        )
+        f = self._write(tmp_path, "deck.pptx", b"fake pptx bytes")
+        prepared = crawler._prepare_document(
+            f,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            path="deck.pptx",
+            name="deck.pptx",
+            anonymize=False,
+            anonymization_key=None,
+            detector=None,
+            convert_pool=None,
+        )
+        assert prepared.outcome == "ok"
+        assert prepared.image_count == 2
+
+    def test_prepare_document_threads_image_count_across_the_conversion_pool(self, tmp_path, monkeypatch):
+        """Same contract as the inline test above, but through the REAL
+        ``_ConvertProcessPool`` — proving ``image_count`` survives the
+        pickled ``_ConvertOutcome``/``_ConvertReply`` round trip over the
+        multiprocessing pipe, not just a same-process attribute copy."""
+        monkeypatch.setattr(
+            crawler,
+            "convert_to_markdown",
+            lambda path, mime, **_kw: ConvertResult("# Slide 1\n\n[image 1 of 3 ...]", image_count=3),
+        )
+        pool = crawler._ConvertProcessPool(1)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "deck.pptx", b"fake pptx bytes")
+            prepared = crawler._prepare_document(
+                f,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                path="deck.pptx",
+                name="deck.pptx",
+                anonymize=False,
+                anonymization_key=None,
+                detector=None,
+                convert_pool=pool,
+                convert_slot=0,
+            )
+        finally:
+            pool.shutdown()
+        assert prepared.outcome == "ok"
+        assert prepared.image_count == 3
 
     def test_prepare_document_words_a_memory_guard_failure_attributably(self, tmp_path):
         """`_prepare_document` must never reuse `_convert_crash_detail`'s

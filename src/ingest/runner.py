@@ -9,7 +9,6 @@ indexed | needs_review | rejected. Idempotent: re-ingesting a document replaces 
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from src.ingest.chunking import chunk_text
 from src.ingest.tabular import EmptyExtraction, UnsupportedTabular, ingest_tabular
@@ -26,7 +25,7 @@ TABULAR_EXTS = {"csv", "tsv", "parquet", "json", "jsonl", "xlsx", "xls"}
 IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp"}
 
 
-def _ext_of(filename: str, file_type: Optional[str]) -> str:
+def _ext_of(filename: str, file_type: str | None) -> str:
     if file_type and "/" not in file_type:
         return file_type.lower().lstrip(".")
     if "." in filename:
@@ -81,7 +80,7 @@ def _chunk_embed_store(corpus_id: str, file_id: str, source) -> tuple[int, bool]
     return n, embedded
 
 
-def ingest_file(file_id: str, *, preloaded_text: Optional[str] = None) -> str:
+def ingest_file(file_id: str, *, preloaded_text: str | None = None, image_count: int = 0) -> str:
     """Ingest one uploaded file. Returns the final ``processing_status``.
 
     ``preloaded_text`` lets a caller that already holds the document's TEXT
@@ -96,6 +95,18 @@ def ingest_file(file_id: str, *, preloaded_text: Optional[str] = None) -> str:
     caller's preloaded text for any other extension is ignored and the
     normal disk read runs, since e.g. the HTML branch still needs
     ``_strip_html`` applied.
+
+    ``image_count`` is the SAME ``src.ingest.convert.ConvertResult.
+    image_count`` a disk-read ``extract_text`` call would have picked up on
+    its own office branch — but a ``preloaded_text`` caller converted the
+    document itself, BEFORE this function ever sees it, so there is no
+    ``ExtractResult`` here to carry that count unless the caller hands it
+    over explicitly (live finding 2026-09-09: the SharePoint crawl's
+    preloaded-text path recorded ``image_count: 0`` on every document,
+    even one whose disclosed-image markdown was sitting right there in
+    ``preloaded_text``). Ignored for every other branch — they build their
+    own ``ExtractResult`` via ``extract_text``, which already carries its
+    own count.
     """
     cf_repo = corpus_files_repo()
     row = cf_repo.get(file_id)
@@ -180,9 +191,15 @@ def ingest_file(file_id: str, *, preloaded_text: Optional[str] = None) -> str:
         # `_strip_html`), so a mismatched `preloaded_text` there is ignored
         # rather than risking un-transformed content reaching storage.
         if preloaded_text is not None and (ext in _PLAIN_EXTS or ext == ""):
-            result: "ExtractResult | str" = ExtractResult(full_text=preloaded_text)
+            result: ExtractResult | str = ExtractResult(full_text=preloaded_text, image_count=image_count)
         else:
             result = extract_text(storage_path, file_type)
+        # 0 for every non-office reader (plain text, HTML, .eml, .epub, PDF)
+        # — none of them can ever embed a picture markitdown drops; see
+        # `ExtractResult.image_count`'s docstring for why this is the one
+        # field this function reads off `result` before handing it to
+        # `_chunk_embed_store`, which only wants `full_text`/`elements`.
+        image_count = result.image_count if isinstance(result, ExtractResult) else 0
         n, embedded = _chunk_embed_store(corpus_id, file_id, result)
         if n == 0:
             cf_repo.set_status(
@@ -194,7 +211,7 @@ def ingest_file(file_id: str, *, preloaded_text: Optional[str] = None) -> str:
         cf_repo.set_status(
             file_id,
             status="indexed",
-            detail={"tier": 1, "kind": "document", "chunk_count": n, "embedded": embedded},
+            detail={"tier": 1, "kind": "document", "chunk_count": n, "embedded": embedded, "image_count": image_count},
         )
         return "indexed"
 

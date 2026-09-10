@@ -3199,6 +3199,7 @@ class _Ingestor:
         filename: str,
         markdown: str,
         source_sha256: str,
+        image_count: int = 0,
     ) -> Tuple[str, bool]:
         """Store + upsert + (re)ingest one converted document.
 
@@ -3221,6 +3222,14 @@ class _Ingestor:
         regardless of what delta reports, exactly like a download or convert
         failure, until it either succeeds or exhausts
         :data:`_MAX_ITEM_RETRY_ATTEMPTS`.
+
+        ``image_count`` mirrors ``src.ingest.convert.ConvertResult.
+        image_count`` (via :class:`_PreparedDocument`) — passed on to
+        ``ingest_file(..., image_count=...)`` so the picture-loss count this
+        crawl already disclosed IN the markdown also lands in the indexed
+        row's ``processing_detail.image_count`` (live finding 2026-09-09:
+        without this, the preloaded-text ingest path had no count of its
+        own to record and always wrote ``0``).
         """
         from app.api.collections import _upsert_corpus_file
         from src.file_storage import store_corpus_bytes
@@ -3254,7 +3263,7 @@ class _Ingestor:
             # `store_corpus_bytes` just wrote — a redundant full-size copy of
             # the converted markdown, on a parent thread, that this crawl's
             # own memory-pressure finding named as a contributor.
-            status = ingest_file(file_id, preloaded_text=markdown)
+            status = ingest_file(file_id, preloaded_text=markdown, image_count=image_count)
             if status == "rejected":
                 from src.repositories import corpus_files_repo
 
@@ -3457,6 +3466,12 @@ class _ConvertOutcome:
     this child caught had no opinion (a bare ``Exception`` the worker never
     taught to classify). Same "fixed, small vocabulary" reasoning as
     ``rescue``: never document content, never scope-gated.
+
+    ``image_count`` (only meaningful when ``ok``) mirrors ``src.ingest.
+    convert.ConvertResult.image_count`` — how many embedded pictures the
+    conversion found and disclosed in-band (see that attribute's docstring).
+    An integer count, never document content, so — like ``rescue`` — it
+    needs no anonymize-scope gating either.
     """
 
     ok: bool
@@ -3465,6 +3480,7 @@ class _ConvertOutcome:
     detail_message: str = ""
     rescue: str = ""
     error_class: str = ""
+    image_count: int = 0
 
 
 @dataclass
@@ -3796,6 +3812,7 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
             converted = convert_to_markdown(Path(tmp_path_str), mime, source_path=source_path)
             markdown = str(getattr(converted, "markdown", "") or "")
             rescue = str(getattr(converted, "rescue", "") or "")
+            image_count = int(getattr(converted, "image_count", 0) or 0)
         except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
             outcome = _ConvertOutcome(
                 ok=False,
@@ -3825,7 +3842,10 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
                 continue
         try:
             conn.send(
-                _ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown, rescue=rescue), rss_bytes=_growth())
+                _ConvertReply(
+                    outcome=_ConvertOutcome(ok=True, markdown=markdown, rescue=rescue, image_count=image_count),
+                    rss_bytes=_growth(),
+                )
             )
         except OSError:
             return
@@ -4383,6 +4403,15 @@ class _PreparedDocument:
     #: Unlike ``detail`` this is never scope-gated: it is one of a fixed,
     #: small set of class names, never document content.
     error_class: str = ""
+    #: How many embedded pictures :func:`convert_to_markdown` found and
+    #: disclosed in-band, on an ``"ok"`` outcome — ``0`` for every other
+    #: outcome and for a document with none. Mirrors ``src.ingest.convert.
+    #: ConvertResult.image_count``; the caller (:func:`_process_item`) hands
+    #: it to ``ingestor.ingest`` so the SAME count that the disclosure text
+    #: names also lands in ``corpus_files.processing_detail.image_count`` —
+    #: without this, the preloaded-text ingest path had no count to record
+    #: at all (live finding 2026-09-09).
+    image_count: int = 0
 
 
 def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
@@ -4598,6 +4627,7 @@ def _prepare_document(
     )
 
     rescue = ""
+    image_count = 0
     try:
         if convert_pool is not None:
             # Size-scaled per-item timeout (see `conversion_budget_seconds`'s
@@ -4631,10 +4661,12 @@ def _prepare_document(
                 return _PreparedDocument("convert_failed", detail=detail, error_class=error_class)
             markdown = outcome.markdown
             rescue = outcome.rescue
+            image_count = outcome.image_count
         else:
             converted = convert_to_markdown(tmp_path, mime, source_path=path)
             markdown = str(getattr(converted, "markdown", "") or "")
             rescue = str(getattr(converted, "rescue", "") or "")
+            image_count = int(getattr(converted, "image_count", 0) or 0)
     except UnsupportedConversionFormat as exc:
         # Only reachable via the non-pool (inline) path above — the pool
         # path never raises here, it reports `outcome.ok=False` instead
@@ -4702,7 +4734,13 @@ def _prepare_document(
     else:
         out_path, out_filename = path, f"{Path(name).stem or name}.md"
     return _PreparedDocument(
-        "ok", markdown=markdown, source_sha256=source_sha256, path=out_path, filename=out_filename, rescue=rescue
+        "ok",
+        markdown=markdown,
+        source_sha256=source_sha256,
+        path=out_path,
+        filename=out_filename,
+        rescue=rescue,
+        image_count=image_count,
     )
 
 
@@ -5292,6 +5330,7 @@ async def _process_item(
                 filename=prepared.filename,
                 markdown=prepared.markdown,
                 source_sha256=prepared.source_sha256,
+                image_count=prepared.image_count,
             )
         except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
             status_code = getattr(exc, "status_code", None)
