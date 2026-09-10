@@ -4134,7 +4134,9 @@ class ExtractionRunOptions(BaseModel):
             "field above (except `resync`/`force_reprocess`/`retry_failed`/`retry_empty`, "
             "which still fan out to the re-run shards) is ignored when this is set. 404 "
             "`no_shard_plan` when the connection has never sharded; 400 "
-            "`unknown_shard_index` for an index the last plan doesn't have."
+            "`unknown_shard_index` for an index the last plan doesn't have; 409 "
+            "`stale_shard_plan` when the last plan predates the remainder-scope fix "
+            "and cannot be executed safely - trigger an ordinary run to re-plan."
         ),
     )
 
@@ -4355,6 +4357,13 @@ def _trigger_shard_rerun(
     run scoped to only these shards; never re-plans (a genuine re-plan is
     what an ordinary trigger, or ``resync``, already does).
 
+    Refuses ``409 stale_shard_plan`` when the persisted plan predates the
+    remainder-scope fix — see the guard below for why the whole plan goes,
+    not the named shards. Like the index validation described further down,
+    it is decided BEFORE the clear-or-refuse call, for the same reason: a
+    request that ends in a refusal must not have moved the stop flag on its
+    way there.
+
     This entry point never runs through ``run_builtin_crawl`` — it calls
     ``_enqueue_shard_plan`` directly from the request handler — so it must
     clear a stale cooperative-stop flag itself; otherwise a rerun right
@@ -4392,6 +4401,7 @@ def _trigger_shard_rerun(
     from connectors.sharepoint.crawler import (
         _clear_stale_stop_for_trigger,
         _enqueue_shard_plan,
+        _predates_remainder_scope_fix,
         _PreviousRunStillDraining,
         claim_run_generation,
         load_state,
@@ -4401,6 +4411,24 @@ def _trigger_shard_rerun(
     persisted_shards = ((state.get("shard_plan") or {}).get("shards")) or []
     if not persisted_shards:
         raise HTTPException(status_code=404, detail={"error": "no_shard_plan", "connection_id": connection_id})
+
+    # The SAME staleness rule an ordinary trigger applies through
+    # `_reusable_shard_plan`. That one is reached only from
+    # `_plan_or_run_inline`, so without this the named-shard path was the one
+    # way a pre-remainder-scope-fix plan could still be executed verbatim:
+    # picking its folder scope's remainder by index would crawl the entire
+    # drive, which is precisely the bug this branch exists to stop.
+    #
+    # Rejected as a WHOLE plan rather than per named index. Indices are
+    # positional into this exact list, so serving some of it while refusing
+    # the rest would hand back shard numbers that mean something different
+    # from the ones the operator is reading off the run they are retrying.
+    # An ordinary trigger re-plans and clears this.
+    if any(_predates_remainder_scope_fix(shard) for shard in persisted_shards):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "stale_shard_plan", "connection_id": connection_id},
+        )
 
     total = len(persisted_shards)
     wanted = set(indices)

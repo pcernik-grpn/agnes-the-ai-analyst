@@ -4927,7 +4927,7 @@
                 "type": "null"
               }
             ],
-            "description": "Re-run ONLY these 1-based shard indices from this connection's last persisted shard plan, instead of an ordinary trigger \u2014 the supported way to retry a shard that failed without re-planning or re-crawling the whole site (design \u00a74.4, replaces the retired manual-split 're-run one clone' escape hatch). Opens a fresh parent run covering only the named shards. Every other field above (except `resync`/`force_reprocess`/`retry_failed`/`retry_empty`, which still fan out to the re-run shards) is ignored when this is set. 404 `no_shard_plan` when the connection has never sharded; 400 `unknown_shard_index` for an index the last plan doesn't have.",
+            "description": "Re-run ONLY these 1-based shard indices from this connection's last persisted shard plan, instead of an ordinary trigger \u2014 the supported way to retry a shard that failed without re-planning or re-crawling the whole site (design \u00a74.4, replaces the retired manual-split 're-run one clone' escape hatch). Opens a fresh parent run covering only the named shards. Every other field above (except `resync`/`force_reprocess`/`retry_failed`/`retry_empty`, which still fan out to the re-run shards) is ignored when this is set. 404 `no_shard_plan` when the connection has never sharded; 400 `unknown_shard_index` for an index the last plan doesn't have; 409 `stale_shard_plan` when the last plan predates the remainder-scope fix and cannot be executed safely - trigger an ordinary run to re-plan.",
             "title": "Shards"
           },
           "timeout_s": {

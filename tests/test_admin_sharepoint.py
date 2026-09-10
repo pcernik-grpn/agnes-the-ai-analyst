@@ -3320,6 +3320,81 @@ class TestExtractionTriggerShardRerun:
         row = source_connections_repo().get(conn_id)
         assert (row["config"].get("extraction") or {}).get("stop_requested_at") == stamp
 
+    def test_409_stale_shard_plan_when_the_persisted_plan_predates_the_fix(self, seeded_app, monkeypatch):
+        """A named re-run must apply the SAME staleness rule an ordinary
+        trigger does (`_reusable_shard_plan`), or it becomes the one door
+        left open onto a pre-fix plan: shard 2 here is a FOLDER scope's
+        remainder still pointing at the drive root, so running it by index
+        would crawl the whole drive instead of that folder's leftovers.
+
+        The scope id carries the kind structurally (`_scope_kind`): "f!..."
+        has no comma and no "b!" prefix, so it is a folder — unlike the
+        "b!drive1" used by the sibling tests, whose remainder legitimately
+        has `root_item_id=None` too and must keep working. That negative
+        control is not repeated here: `test_named_shards_are_enqueued_as_a
+        _fresh_parent_run` below re-runs exactly such a drive-scope
+        remainder by index, so a guard that over-matched would fail it.
+        """
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-stale")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_pre_fix_parent",
+                    "shards_total": 2,
+                    "shards": [
+                        {
+                            "scope_id": "f!folder1",
+                            "label": "part 1/2",
+                            "expected": 10,
+                            "exclude_prefixes": [],
+                            "targets": [
+                                {
+                                    "drive_id": "b!drive1",
+                                    "root_item_id": "f!folder1",
+                                    "state_key": "b!drive1:f!folder1",
+                                    "path": "Shared/A",
+                                }
+                            ],
+                        },
+                        {
+                            # The pre-fix shape: a FOLDER scope's remainder
+                            # scoped to the drive root instead of the folder.
+                            "scope_id": "f!folder1",
+                            "label": "remainder",
+                            "expected": 0,
+                            "exclude_prefixes": ["Shared/A"],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}
+                            ],
+                        },
+                    ],
+                },
+            },
+        )
+
+        # Even shard 1, which is itself well-formed: indices are positional
+        # into a plan that is no longer trustworthy as a whole.
+        for named in ([2], [1], [1, 2]):
+            r = c.post(
+                self.EXTRACT.format(base=BASE, cid=conn_id),
+                json={"shards": named},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            assert r.status_code == 409, (named, r.text)
+            assert r.json()["detail"]["error"] == "stale_shard_plan"
+            assert r.json()["detail"]["connection_id"] == conn_id
+
     def test_named_shards_are_enqueued_as_a_fresh_parent_run(self, seeded_app, monkeypatch):
         # NOTE: `use_pg()` is deliberately left at this test app's default
         # (DuckDB) -- `_trigger_shard_rerun` bypasses `_plan_or_run_inline`
