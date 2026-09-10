@@ -469,7 +469,7 @@ _NON_SQL_QUOTED_FAMILIES: list[tuple[str, str]] = [
     ),
     (r"^app/web/setup_instructions\.py:", "copy-paste CLI instructions and their placeholder tokens"),
     (
-        r"current_location = f\'in section \"\{heading_text\}\"\'",
+        r"current_location = f\'in section \"\{current_heading\}\"\'",
         "ingest image-loss disclosure text (src/ingest/convert.py's _disclose_image_placeholders) — a markdown section heading quoted for a human-readable message, never a SQL identifier",
     ),
 ]
