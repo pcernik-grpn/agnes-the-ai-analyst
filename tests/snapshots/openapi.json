@@ -16438,6 +16438,56 @@
         ]
       }
     },
+    "/admin/issues": {
+      "get": {
+        "description": "The issue-report queue across every reporter \u2014 step 3 of the issue-\nreporting design, pulled forward on its own (see ``/me/issues`` above and\ndocs/superpowers/specs/2026-09-09-issue-reporting-step1-design.md).\n\nSame static-shell shape as ``/me/issues``: list, filter, detail, reply\nand resolve all run against the EXISTING JSON API (``GET\n/api/admin/issues``, ``GET /api/issues/{id}``, ``POST\n/api/issues/{id}/comments``, ``POST /api/admin/issues/{id}/resolve``) via\n``issue_pages.js`` in its admin mode \u2014 no new REST surface. Same\nPostgres-only gate as ``/me/issues``: a DuckDB-backed instance redirects\nhome rather than rendering a queue that would 501 on load.",
+        "operationId": "admin_issues_page_admin_issues_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Issues Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/knowledge-digests": {
       "get": {
         "description": "List page for admin-defined maintained digests.",
@@ -68942,6 +68992,56 @@
           }
         },
         "summary": "Me Mcp Redirect",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/me/issues": {
+      "get": {
+        "description": "A reporter's own \"Report a problem\" filings \u2014 step 3 of the issue-\nreporting design, pulled forward on its own (see\ndocs/superpowers/specs/2026-09-09-issue-reporting-step1-design.md).\n\nThe page itself is a static shell: list, filter and detail are all\nfetched client-side from the EXISTING JSON API (``GET /api/issues/mine``,\n``GET /api/issues/{id}``, ``POST /api/issues/{id}/comments``) by\n``issue_pages.js`` \u2014 no new REST surface. Gated the same way the rail's\n\"Report a problem\" button and dialog are: issue reports are a\nPostgres-only table pair (A3 PG-first ratchet), so a DuckDB-backed\ninstance redirects home rather than rendering a page that fetches a\n501 on load.",
+        "operationId": "me_issues_page_me_issues_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Me Issues Page",
         "tags": [
           "web"
         ]

@@ -74,7 +74,7 @@ def _headings(html: str) -> list[str]:
     call itself something else entirely."""
     out: list[str] = []
     for pattern in (r"<h1[^>]*>(.*?)</h1>", r"<title[^>]*>(.*?)</title>"):
-        out.extend(re.findall(pattern, html, re.S | re.I))
+        out.extend(re.findall(pattern, html, re.DOTALL | re.IGNORECASE))
     # The hero renders through a macro, so also accept the raw set value that
     # `base_page.html` consumes — present in the served HTML as the heading.
     return [" ".join(re.sub(r"<[^>]+>", " ", h).split()) for h in out]
@@ -91,6 +91,13 @@ def _normalize(text: str) -> str:
 def test_sidebar_row_and_its_page_agree_on_the_name(seeded_app, monkeypatch, label, href):
     for flag in _FLAGS:
         monkeypatch.setenv(flag, "1")
+    # `can_report_issue` ("Issue reports" / /admin/issues) is the one `when`
+    # flag that is NOT a simple env-var feature switch — it is the A3
+    # PG-first ratchet (`src.repositories.use_pg()`), which this DuckDB-backed
+    # harness can never make true for real. Patched directly, the same way
+    # tests/test_issue_dialog_template.py does for the same gate; harmless for
+    # every other row.
+    monkeypatch.setattr("app.web.router._issue_reporting_available", lambda: True)
 
     resp = seeded_app["client"].get(href, headers=_auth(seeded_app["admin_token"]))
     assert resp.status_code == 200, f"{href} did not render: {resp.status_code}"
