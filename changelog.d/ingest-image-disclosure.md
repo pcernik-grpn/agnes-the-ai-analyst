@@ -24,3 +24,4 @@
 - An HTML document's ordinary, un-lost relative image reference (e.g.
   `<img src="logo.jpg">`) is no longer mistaken for a dropped PowerPoint
   picture and rewritten into a false "not indexed" disclosure.
+- A picture placeholder is only disclosed when it stands alone on its line. Every converted deck carries slide markers, so that alone could not tell markitdown's own output from Markdown-looking text an author typed into a slide — rewriting the latter deleted real slide text and announced a picture that never existed.

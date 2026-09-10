@@ -615,6 +615,25 @@ _IMAGE_MARKER_RE = re.compile(
 _MAX_LOCATION_HEADING_CHARS = 80
 
 
+def _match_is_the_whole_line(text: str, m: "re.Match[str]") -> bool:
+    """Is this match the entire line it sits on?
+
+    markitdown emits a pptx picture placeholder as a paragraph of its own
+    (`<!-- Slide number: 1 -->\n\n![image.png](Picture1.jpg)`), while text
+    the deck's author typed sits inside a sentence. A slide's text box may
+    legitimately contain Markdown-looking text — `Deploy with
+    ![status](logo.jpg)` — and rewriting that would delete real slide
+    content and announce a picture that never existed. The document having
+    slides is not enough to tell those apart, because every converted deck
+    has slide markers; the placeholder standing alone is what distinguishes
+    markitdown's own output from the author's words.
+    """
+    line_start = text.rfind("\n", 0, m.start()) + 1
+    line_end = text.find("\n", m.end())
+    line_end = len(text) if line_end == -1 else line_end
+    return text[line_start:line_end].strip() == m.group(0).strip()
+
+
 def _disclose_image_placeholders(text: str) -> tuple[str, int]:
     """Rewrite markitdown's image-loss placeholders into an honest,
     per-document, located disclosure. Never OCR, never a vision call — see
@@ -658,8 +677,11 @@ def _disclose_image_placeholders(text: str) -> tuple[str, int]:
     def _is_disclosable_image(m: re.Match[str]) -> bool:
         if m.group("slide") is not None or m.group("heading") is not None:
             return False
-        if m.group("jpgname") is not None and not saw_slide_marker:
-            return False  # an ordinary HTML image link, not a lost picture
+        if m.group("jpgname") is not None:
+            if not saw_slide_marker:
+                return False  # an ordinary HTML image link, not a lost picture
+            if not _match_is_the_whole_line(text, m):
+                return False  # the deck author's own words, not a placeholder
         return True
 
     total = sum(1 for m in matches if _is_disclosable_image(m))
@@ -684,9 +706,10 @@ def _disclose_image_placeholders(text: str) -> tuple[str, int]:
             current_heading = heading_text
             out.append(m.group(0))
             continue
-        if m.group("jpgname") is not None and not saw_slide_marker:
-            # Not a lost picture — see `saw_slide_marker` above. Left as
-            # markitdown emitted it.
+        if m.group("jpgname") is not None and not _is_disclosable_image(m):
+            # Not a lost picture: either the document has no slides at all
+            # (an ordinary HTML image link) or this one sits inside a line of
+            # slide text. Left exactly as markitdown emitted it.
             out.append(m.group(0))
             continue
         # An image marker: neither the slide nor the heading branch matched,

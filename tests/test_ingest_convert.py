@@ -1785,3 +1785,33 @@ def test_disclose_image_placeholders_truncates_a_very_long_heading():
     assert count == 1
     disclosure_line = next(line for line in rewritten.splitlines() if line.startswith("[image"))
     assert len(disclosure_line) < 150
+
+
+def test_slide_text_that_looks_like_markdown_is_left_alone():
+    """Every converted deck carries slide markers, so "this document has
+    slides" cannot tell markitdown's own picture placeholder from words the
+    deck's author typed. A text box saying `Deploy with ![status](logo.jpg)`
+    is slide content: rewriting it would delete real text and announce a
+    picture that never existed."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = (
+        "<!-- Slide number: 1 -->\n\n"
+        "Deploy with ![status](logo.jpg) before the release\n\n"
+        "<!-- Slide number: 2 -->\n\n"
+        "![image.png](Picture2.jpg)\n"
+    )
+    out, count = _disclose_image_placeholders(text)
+    assert "![status](logo.jpg)" in out, "the author's own words must survive"
+    assert count == 1, "only markitdown's standalone placeholder counts"
+    assert "[image 1 of 1 in this document — not indexed, slide 2]" in out
+
+
+def test_a_standalone_placeholder_on_a_titled_slide_is_still_disclosed():
+    """The narrowing must not cost the case the branch exists for."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 4 -->\n\n# Architecture\n\n![image.png](Picture3.jpg)\n"
+    out, count = _disclose_image_placeholders(text)
+    assert count == 1
+    assert "slide 4" in out
