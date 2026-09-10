@@ -150,6 +150,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_STUDIO_ENABLED",
         "yaml_path": "studio.enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "news_enabled",
@@ -157,6 +162,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_NEWS_ENABLED",
         "yaml_path": "features.news_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "knowledge_digests_ui_enabled",
@@ -164,6 +174,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_KNOWLEDGE_DIGESTS_ENABLED",
         "yaml_path": "features.knowledge_digests_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "contribute_skill_enabled",
@@ -171,6 +186,11 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_CONTRIBUTE_SKILL_ENABLED",
         "yaml_path": "features.contribute_skill_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
     },
     {
         "key": "store_moderation_enabled",
@@ -178,6 +198,26 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_STORE_MODERATION_ENABLED",
         "yaml_path": "features.store_moderation_enabled",
         "default": False,
+        # Switch-backed, so a PRESENT env var wins even when empty — see
+        # `_source_for`. It matters here even though the coerced False equals
+        # this row's default: with the feature turned ON in yaml, `AGNES_X=`
+        # still forces it off, and the source is `env`, not `default`.
+        "env_empty_overrides": True,
+    },
+    {
+        # `default` is True and must stay in step with the switch's own
+        # default: `_source_for` infers `yaml` from `current != default`, so a
+        # mismatch here would report onboarding nobody configured as
+        # deliberately set (the trap documented on `studio_enabled` above).
+        "key": "onboarding_enabled",
+        "resolver": "get_onboarding_enabled",
+        "env_var": "AGNES_ONBOARDING_ENABLED",
+        "yaml_path": "features.onboarding_enabled",
+        "default": True,
+        # `switch_value` honours a present-but-empty AGNES_ONBOARDING_ENABLED
+        # as an overriding False, so presence is what makes the source `env`
+        # here — see `_source_for`.
+        "env_empty_overrides": True,
     },
     {
         "key": "agent_profiles_enabled",
@@ -185,6 +225,10 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_AGENT_PROFILES_ENABLED",
         "yaml_path": "agent_profiles.enabled",
         "default": True,
+        # Same as `onboarding_enabled` below/above: the resolver goes through
+        # `feature_enabled`, which honours a PRESENT env var even when empty and
+        # coerces it to False — so presence is what makes the source `env`.
+        "env_empty_overrides": True,
     },
     # Onboarding & /home
     {
@@ -200,6 +244,10 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_HOME_SHOW_AUTOMODE",
         "yaml_path": "instance.home.show_automode",
         "default": True,
+        # Same as `onboarding_enabled` below/above: the resolver goes through
+        # `feature_enabled`, which honours a PRESENT env var even when empty and
+        # coerces it to False — so presence is what makes the source `env`.
+        "env_empty_overrides": True,
     },
     {
         "key": "home_status_frame_visibility",
@@ -207,6 +255,10 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "env_var": "AGNES_HOME_SHOW_STATUS_FRAME",
         "yaml_path": "instance.home.show_status_frame",
         "default": True,
+        # Same as `onboarding_enabled` below/above: the resolver goes through
+        # `feature_enabled`, which honours a PRESENT env var even when empty and
+        # coerces it to False — so presence is what makes the source `env`.
+        "env_empty_overrides": True,
     },
     {
         "key": "instance_overview",
@@ -297,6 +349,7 @@ def _source_for(
     current_value: Any,
     default: Any,
     cache_busted: bool = False,
+    env_empty_overrides: bool = False,
 ) -> str:
     """Determine which tier supplied current_value: env, yaml, or default.
 
@@ -316,7 +369,29 @@ def _source_for(
     suffix that no declarable default can match, so it is stripped from both
     sides before comparing. Without that, such a knob would report ``yaml`` on
     an instance that configured nothing.
+
+    ``env_empty_overrides`` says a knob's resolver treats a PRESENT env var as
+    an override even when it is empty, so presence — not content — is what
+    makes the source ``env``. The two families really do differ, and the
+    default is the majority one:
+
+    - Switch-backed bools go through ``feature_enabled``, which takes any
+      present value and coerces ``""`` to ``False``. An ``AGNES_X=`` line — a
+      rendered ``.env`` with nothing filled in — therefore turns the feature
+      OFF, and without this flag a knob defaulting to ``True`` reports that
+      ``False`` as ``yaml``, sending an operator to look for a config line
+      that does not exist. Set the flag on those rows.
+    - String and select knobs read ``os.environ.get(X) or get_value(...)``, so
+      an empty value is ignored and the yaml tier still decides. Presence
+      would mislabel those as ``env`` when the environment contributed
+      nothing, which is why this is opt-in per row rather than the rule for
+      everything (Devin Review on #2419 recommended making it global; it was
+      right about the bug and wrong about the remedy — verified against
+      ``get_home_route``, ``get_infra_repo_url`` and ``get_instance_theme``,
+      all of which ignore an empty override).
     """
+    if env_var and env_empty_overrides and os.environ.get(env_var) is not None:
+        return "env"
     if env_var and os.environ.get(env_var, "").strip():
         return "env"
     if cache_busted:
@@ -349,6 +424,7 @@ def _build_knobs() -> list[dict[str, Any]]:
             current_value,
             entry["default"],
             cache_busted=bool(entry.get("cache_busted")),
+            env_empty_overrides=bool(entry.get("env_empty_overrides")),
         )
         out.append(
             {

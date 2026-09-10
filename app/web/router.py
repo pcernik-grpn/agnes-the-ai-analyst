@@ -53,6 +53,7 @@ from app.instance_config import (
     get_knowledge_digests_ui_enabled,
     get_mcp_connector_ui_enabled,
     get_news_enabled,
+    get_onboarding_enabled,
     get_privacy_policy_url,
     get_store_moderation_enabled,
     get_studio_enabled,
@@ -388,6 +389,45 @@ def _journey_rail(user_id: object) -> object:
 
 templates.env.globals["journey_rail"] = _journey_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
+
+
+def _onboarding_enabled() -> bool:
+    """Whether the unattended onboarding layer renders at all
+    (``features.onboarding_enabled``, the ``onboarding`` switch).
+
+    A Jinja global for the same reason `data_apps_enabled` above is: the three
+    surfaces it gates live in `_app_rail.html` and `_app_scripts.html`, shared
+    by both context builders (`_build_context` for `base.html`, `_chrome_ctx`
+    for `base_ds.html`/`base_page.html`), so threading it per-route would gate
+    one layout and miss the other.
+
+    Off hides the checklist card, its popover, the profile menu's "Start over
+    onboarding" entry, and stamps `window._agOnboardingEnabled = false` — which
+    is what stops `tour.js` launching or resuming a tour and
+    `chat_onboarding.js` painting the checklist. Nothing server-side is
+    disabled: `/api/chat/journey` keeps recording steps, so flipping the switch
+    back on resumes each user where they were.
+
+    Delegates to `instance_config.get_onboarding_enabled` rather than reading
+    the switch itself: `/api/admin/config-surface` resolves the same knob
+    through that function, and a second read path here is how the pages and
+    the operator-facing inventory come to disagree.
+
+    Re-read per call (not cached at import) so an admin flipping it in
+    /admin/server-config takes effect without a process restart — and so the
+    env-var override the tests set applies immediately.
+
+    True on any failure: onboarding is the pre-switch behaviour, and a config
+    read that throws must not silently retire a surface every instance has.
+    """
+    try:
+        return get_onboarding_enabled()
+    except Exception:
+        logger.warning("rail: onboarding switch unreadable — leaving onboarding on", exc_info=True)
+        return True
+
+
+templates.env.globals["onboarding_enabled"] = _onboarding_enabled
 
 
 def _is_paper_theme() -> bool:

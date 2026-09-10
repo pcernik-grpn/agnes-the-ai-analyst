@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 import duckdb
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from app.auth.access import require_admin, require_admin_all_surface
@@ -1630,6 +1630,22 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "builder is the supported path. Both POST handlers carry the gate "
                 "too, so a stale external button gets a redirect home rather than "
                 "a silent publish."
+            ),
+        },
+        "onboarding_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "onboarding_enabled", True),
+            "hint": (
+                "The unattended ANALYST onboarding layer: the four guided "
+                "coach-mark tours (the welcome walkthrough on /chat, the /agents "
+                "and Connect cards, the skill-builder mark) and the analyst "
+                "checklist card in the rail foot, with its popover, its replay "
+                'control and the profile menu\'s "Start over onboarding" entry. '
+                "ON by default — a kill switch for an instance whose users already "
+                "know the product, not a new feature. The ADMIN setup chain is a "
+                "different card and is not affected. Hides UI only: "
+                "/api/chat/journey keeps serving and keeps recording steps, so "
+                "turning this back on resumes every user exactly where they were."
             ),
         },
         "store_moderation_enabled": {
@@ -5541,8 +5557,14 @@ def _discover_bigquery(dataset: str | None) -> dict[str, Any]:
         )
 
 
+# Bound automatic dashboard reads across tabs without changing the contract
+# of ordinary CLI/UI/MCP reads. Polls opt into fast rejection and retry.
+_registry_read_lock = threading.Lock()
+
+
 @router.get("/registry")
-async def list_registry(
+def list_registry(
+    request: Request,
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -5585,6 +5607,17 @@ async def list_registry(
         never disagrees with (or is more expensive than) what a real query
         through the policy would do. Absent entirely on an unpolicied row.
     """
+    if request.headers.get("X-Agnes-Registry-Poll") != "1":
+        return _read_registry()
+    if not _registry_read_lock.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Registry read already in progress", headers={"Retry-After": "3"})
+    try:
+        return _read_registry()
+    finally:
+        _registry_read_lock.release()
+
+
+def _read_registry():
     repo = table_registry_repo()
     tables = repo.list_all()
 

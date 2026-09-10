@@ -360,8 +360,29 @@ async function markUseAnywhereDone() {
 
 let _active = null; // { id, steps, index, overlay, popover, spotlight }
 
+// The operator's kill switch: `features.onboarding_enabled`, stamped on every
+// page by `_app_scripts.html` and read here.
+//
+// Gated at the THREE exported entry points rather than at the call sites,
+// because there are five call sites across four files (chat_onboarding.js's
+// unattended launch, its checklist rows and its "↻" replay, agents.html,
+// skills.html) plus base_ds.html's resume boot — and a sixth added later would
+// silently escape a per-call-site gate. Every path into a tour goes through
+// `launchTour`, `autoLaunchTour` or `resumePendingTour`, so gating those three
+// is exhaustive by construction.
+//
+// UNDEFINED MEANS ON. The flag is absent on a page rendered before this switch
+// existed, in a unit test that imports the module with no DOM chrome, and in
+// any embedding that does not include `_app_scripts.html` — none of which is
+// an operator turning onboarding off. Only an explicit `false` disables, so
+// the switch can never be triggered by a missing global.
+function _onboardingEnabled() {
+  return window._agOnboardingEnabled !== false;
+}
+
 /** Public: launch a named tour at the given step index (default 0). */
 export function launchTour(id, index = 0) {
+  if (!_onboardingEnabled()) return;
   const steps = TOURS[id];
   if (!steps || !steps.length) return;
 
@@ -391,6 +412,7 @@ export function launchTour(id, index = 0) {
  * the journey for that); this only decides whether the tour has run before.
  */
 export function autoLaunchTour(id) {
+  if (!_onboardingEnabled()) return false;
   if (!TOURS[id] || isSeen(id) || _active || _pendingResumesHere()) return false;
   launchTour(id, 0);
   return true;
@@ -1144,6 +1166,12 @@ function _removeListeners() {
  * Returns true if a tour was resumed, false otherwise.
  */
 export function resumePendingTour() {
+  // Clear the record as well as refusing: a cross-page hop stashed mid-tour
+  // survives in sessionStorage, and leaving it behind would make every
+  // subsequent page load of this tab re-enter here for the next 12 seconds,
+  // and re-suppress an unrelated coach-mark through `_pendingResumesHere` if
+  // the switch went back on inside that window.
+  if (!_onboardingEnabled()) { clearPending(); return false; }
   const pending = getPending();
   if (!pending) return false;
 
