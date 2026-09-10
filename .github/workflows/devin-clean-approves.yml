@@ -95,6 +95,7 @@ on:
 permissions:
   pull-requests: write
   contents: read   # compare API ("is the head ahead of the reviewed commit?")
+  statuses: read   # commit statuses ("did Devin analyse this head?") — without it the lookup 403s
 
 concurrency:
   # ONE group for every run, scheduled or dispatched: two runs looking at the
@@ -239,7 +240,14 @@ jobs:
                 # every status EVENT on the commit, newest first, paginated — so all
                 # pages are read (one page could hide Devin's event behind a hundred
                 # newer ones from other workflows), like the reviews above.
-                analysed_at=$(gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" --jq '.[] | @json' 2>/dev/null \
+                # The lookup's failure must be VISIBLE (a missing `statuses: read` made
+                # it silently read as "Devin never analysed this head" once); it still
+                # fails closed — an empty witness keeps the findings open.
+                status_err=$(mktemp)
+                statuses_json=$(gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" --jq '.[] | @json' 2>"$status_err" || true)
+                if [ -s "$status_err" ]; then echo "#$n: commit status lookup for ${head:0:9} failed: $(tr '\n' ' ' < "$status_err")"; fi
+                rm -f "$status_err"
+                analysed_at=$(printf '%s\n' "$statuses_json" \
                   | jq -rs '[.[] | select(.context == "Devin Review"
                                       and .creator.type == "Bot"
                                       and (.creator.login | IN("devin-ai-integration[bot]", "devin-ai-integration")))]
