@@ -54,15 +54,23 @@ In:
   `list_my_issues`, not SQL. Widening that binding is a shared decision
   across every internal table and is deliberately out of scope here.
 - **Admin queue** on CLI and MCP (`agnes admin issue …`, `issue_queue_list`
-  / `issue_reply` / `issue_resolve`). No admin web page in step 1.
+  / `issue_reply` / `issue_resolve`).
+- **Two pages to read what was filed** — `/me/issues` (a reporter's own
+  reports, their captured context, screenshot and comment thread) and
+  `/admin/issues` (the queue across every reporter, with reply and resolve).
+  PULLED FORWARD from step 3 during review: a channel you can file into but
+  not read from reads as half a feature, and both pages are HTML shells over
+  the JSON API above — no new REST surface, so no new review surface either.
+  What stays in step 3 is the part that needs new state: the unread badge.
 
 Out (later steps, named so nobody builds them here):
 
 - Step 2: the `support` agent profile opened from the dialog with the
   captured context, resolve-first triage, `report_issue` as its tool.
-- Step 3: `/me/issues` and `/admin/issues` pages, unread badge, comments and
-  status flowing back from Linear/Jira/email, `semantic_feedback` folded in
-  as `kind='wrong_answer'`, the "shipped in vX" notice.
+- Step 3: unread badge, comments and status flowing back from
+  Linear/Jira/email, `semantic_feedback` folded in as `kind='wrong_answer'`,
+  the "shipped in vX" notice. (The two pages that were listed here shipped in
+  step 1 — see "Two pages to read what was filed" above.)
 - Slack/Telegram *intake* commands, screenshot annotation, session replay,
   attachments other than the one screenshot.
 
@@ -392,7 +400,7 @@ route each tool self-calls (`report_issue` → `issue.report`, list/get →
 - Step 2 adds an agent profile `support` and a `POST /api/issues` caller
   inside it; the dialog grows an "Ask the support agent first" path that
   opens `/chat?session=` with the envelope as the first message.
-- Step 3 adds `/me/issues`, `/admin/issues`, an unread badge computed from
+- Step 3 adds an unread badge computed from
   `last_activity_at` vs a per-subscriber `last_read_at`, external-tracker
   callbacks (Linear/Jira webhooks) writing comments and status, and folds
   `semantic_feedback` in as `kind='wrong_answer'` with the old routes kept

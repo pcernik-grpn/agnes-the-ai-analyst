@@ -198,9 +198,21 @@
     content.hidden = true;
     dlg.hidden = false;
     dlg.classList.add("is-open");
+    // The panel ships `aria-hidden="true"` so it is out of the accessibility
+    // tree while closed; clearing `hidden` and adding the class does not undo
+    // that, so a screen-reader user got a drawer they could see nothing of
+    // (Devin review on #2402).
+    dlg.setAttribute("aria-hidden", "false");
     document.body.style.overflow = "hidden";
 
     getJson("/api/issues/" + encodeURIComponent(id)).then(function (res) {
+      // Ignore a response whose issue is no longer the open one. Two rows
+      // clicked in quick succession start two fetches, and the first to
+      // ARRIVE is not necessarily the one asked for last — without this the
+      // drawer could show issue A's text while every action on it (comment,
+      // resolve) still addressed issue B, because those read
+      // `currentDetailId` (Devin review on #2402).
+      if (currentDetailId !== id) return;
       loading.hidden = true;
       if (res.status !== 200) {
         document.getElementById("iss-detail-title").textContent = "Not found";
@@ -217,6 +229,7 @@
     var dlg = document.getElementById("iss-detail");
     dlg.classList.remove("is-open");
     dlg.hidden = true;
+    dlg.setAttribute("aria-hidden", "true");
     document.body.style.overflow = "";
     currentDetailId = null;
     currentDetailRow = null;

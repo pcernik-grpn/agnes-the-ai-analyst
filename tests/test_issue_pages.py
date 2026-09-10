@@ -126,3 +126,68 @@ class TestAdminNavEntry:
             assert 'href="/admin/issues"' not in resp_off.text
         finally:
             client.cookies.clear()
+
+
+class TestTheDetailDrawerSurvivesFastClicking:
+    """Two rows opened in quick succession must not cross their responses.
+
+    `openDetail` starts a fetch per click and the first to ARRIVE is not
+    necessarily the one asked for last. Without a guard the drawer could show
+    issue A's text while the comment box and Resolve button still addressed
+    issue B, because those read `currentDetailId` (Devin review on #2402).
+    """
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "issue_pages.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_a_stale_response_is_dropped(self):
+        src = self._source()
+        assert "if (currentDetailId !== id) return;" in src, (
+            "openDetail must ignore a response whose issue is no longer the open one"
+        )
+
+    def test_the_guard_precedes_any_rendering(self):
+        """The bail-out has to come BEFORE the handler touches the DOM —
+        after `loading.hidden = false` it would already have flickered the
+        wrong state onto the active drawer."""
+        src = self._source()
+        handler = src[
+            src.index("getJson('/api/issues/")
+            if "getJson('/api/issues/" in src
+            else src.index('getJson("/api/issues/') :
+        ]
+        body = handler[: handler.index("});")]
+        guard = body.index("currentDetailId !== id")
+        assert guard < body.index("loading.hidden = true")
+
+
+class TestTheDrawerIsReachableByAssistiveTech:
+    """The panel ships `aria-hidden="true"` so it is out of the accessibility
+    tree while closed. Clearing `hidden` and adding `is-open` does not undo
+    that, so the state has to be flipped explicitly both ways — otherwise a
+    screen-reader user gets a drawer they can see nothing of (Devin review on
+    #2402)."""
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "issue_pages.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_opening_exposes_it_and_closing_hides_it_again(self):
+        src = self._source()
+        assert 'setAttribute("aria-hidden", "false")' in src
+        assert 'setAttribute("aria-hidden", "true")' in src
+
+    def test_the_closed_markup_starts_hidden(self):
+        from pathlib import Path
+
+        drawer = (
+            Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "_issue_detail_drawer.html"
+        ).read_text(encoding="utf-8")
+        assert 'aria-hidden="true"' in drawer

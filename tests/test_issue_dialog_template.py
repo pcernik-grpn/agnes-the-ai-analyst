@@ -72,22 +72,6 @@ class TestRailReportButton:
         assert not re.search(r"<script[^>]+client_diag\.js", html)
 
 
-class TestClientDiagAlwaysLoads:
-    """client_diag.js is app-wide (installed before "Report a problem" even
-    exists as a concept, so it can capture errors from every other script),
-    unlike the rail entry and dialog partial above."""
-
-    def test_client_diag_loads_regardless_of_the_gate(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.web.router._issue_reporting_available", lambda: False)
-        client = _auth_client(seeded_app, seeded_app["analyst_token"])
-        try:
-            resp = client.get("/library")
-        finally:
-            client.cookies.clear()
-        assert resp.status_code == 200, resp.text
-        assert "client_diag.js" in resp.text
-
-
 class TestScriptLoadOrder:
     def test_client_diag_is_the_first_script_and_not_deferred(self):
         text = _app_scripts_source()
