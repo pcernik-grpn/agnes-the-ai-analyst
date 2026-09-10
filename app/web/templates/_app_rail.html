@@ -842,7 +842,12 @@
     </div>
     {% endif %}
 
-    {% if can_chat and not _admin_page %}
+    {# `onboarding_enabled()` (features.onboarding_enabled) is the operator's
+       kill switch: off, this whole card goes — not hidden with a class, not
+       left for the script to retire, simply not rendered. The rail foot's
+       height positions every row above it, so an empty-but-present card would
+       reserve 62px for a surface the operator turned off. #}
+    {% if can_chat and not _admin_page and onboarding_enabled() %}
     {# Onboarding row — the last thing in the bottom zone, under Admin and
        directly above the profile; that zone's position/order is unchanged
        by icon mode. SAME anatomy as every other rail destination
@@ -1088,7 +1093,12 @@
                    the same dead control the switch above fixes everywhere else,
                    and here the honest fix is not to offer it. It returns on any
                    app page. #}
-                {% if can_chat and not _admin_page %}
+                {# `onboarding_enabled()` joins the gate for the reason the
+                   note above gives: with onboarding off there is no checklist
+                   to start over, so the entry would reset journey state and
+                   show nothing — exactly the dead control this gate exists to
+                   avoid, in a new place. #}
+                {% if can_chat and not _admin_page and onboarding_enabled() %}
                 <button type="button" class="app-user-menu-item app-user-menu-btn"
                         role="menuitem" id="rail-restart-onboarding">Start over onboarding</button>
                 {% endif %}
@@ -1160,7 +1170,12 @@
    per page. NOT loaded on an admin page: the card it writes into isn't rendered
    there (see the note on `.rail-getstarted` above), so the module would fetch
    /api/chat/journey to update a ring that doesn't exist. #}
-{% if can_chat and not _admin_page %}
+{# Same `onboarding_enabled()` gate as the card this mounts into: with the
+   card gone there is no #chat-journey to fill, so loading the module would
+   fetch /api/chat/journey to paint nothing. `mountJourneyPanel` refuses on its
+   own too (the flag is stamped in _app_scripts.html) — this just saves the
+   fetch. #}
+{% if can_chat and not _admin_page and onboarding_enabled() %}
 <script type="module">
   if (!document.body.classList.contains("chat-page-body")) {
     import("{{ static_url('js/chat_onboarding.js') }}")

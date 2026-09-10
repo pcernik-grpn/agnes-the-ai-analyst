@@ -1003,6 +1003,41 @@ def get_store_moderation_enabled() -> bool:
     )
 
 
+def get_onboarding_enabled() -> bool:
+    """Whether the unattended ANALYST onboarding layer is exposed: the four
+    guided coach-mark tours (the welcome walkthrough on ``/chat``, the
+    ``/agents`` and Connect cards, the skill-builder mark) and the analyst
+    checklist card in the rail foot, with its popover, its replay control and
+    the profile menu's "Start over onboarding" entry.
+
+    **On by default** — a kill switch for a surface every instance already
+    has, so an upgrade changes nothing and only an explicit ``false``
+    disables. The ADMIN setup chain is a different rail card and is not
+    affected: an operator silencing the analyst walkthrough keeps their own
+    instance-setup progress.
+
+    Gates UI only. ``/api/chat/journey`` keeps serving and keeps recording
+    steps, so turning this back on resumes every user exactly where they were
+    rather than restarting them. Also outside the switch, deliberately: the
+    chat's own greeting and the empty-Stack question that recommends data
+    packages, which answer a user's question rather than narrating over it.
+
+    Resolution: ``AGNES_ONBOARDING_ENABLED`` env > ``features.onboarding_enabled``
+    in instance.yaml (static base + ``/admin/server-config`` overlay) > ``True``
+    — delegated to the ``onboarding`` entry in :data:`app.switches.SWITCHES`,
+    so the default and the env-var name are declared once there instead of
+    restated here.
+
+    THE canonical read. `app/web/router.py`'s `onboarding_enabled` Jinja
+    global and `/api/admin/config-surface` both come through this function, so
+    the operator-facing inventory and the pages cannot disagree about whether
+    onboarding is on.
+    """
+    from app.switches import switch_value
+
+    return bool(switch_value("onboarding"))
+
+
 def get_agent_profiles_enabled() -> bool:
     """Whether the Agent profiles surface (``/agents`` builder, the
     ``/api/v1/agents*`` management + runtime API, and the ``agnes agent`` /

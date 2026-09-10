@@ -202,6 +202,32 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="onboarding",
+        config_keys=("features", "onboarding_enabled"),
+        env_var="AGNES_ONBOARDING_ENABLED",
+        kind="bool",
+        default=True,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The unattended ANALYST onboarding layer: all four guided coach-mark "
+            "tours (the welcome walkthrough on /chat, the /agents and Connect cards, "
+            "the skill-builder mark) and the analyst checklist card in the rail foot, "
+            "with its popover, its replay control and the profile menu's 'Start over "
+            "onboarding' entry. The ADMIN setup chain is a different card and is not "
+            "affected — an operator silencing the walkthrough keeps their own "
+            "instance-setup progress. ON by default — this is a kill switch for an "
+            "instance whose users already know the product, or one whose operator "
+            "would rather introduce it their own way, not a new feature. Off gates "
+            "UI only: /api/chat/journey keeps serving and keeps recording steps, so "
+            "progress is intact and flipping it back on resumes each user exactly "
+            "where they were. Deliberately NOT covered: the chat's own greeting and "
+            "the empty-Stack question that recommends data packages, which answer a "
+            "user's question rather than narrating over it."
+        ),
+    ),
+    Switch(
         name="guardrails",
         config_keys=("guardrails", "enabled"),
         env_var="AGNES_GUARDRAILS_ENABLED",

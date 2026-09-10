@@ -9,6 +9,17 @@
       window._agLucideSpriteUrl = "{{ static_url('vendor/lucide-sprite.svg') }}";
       window._agMermaidUrl = "{{ static_url('vendor/mermaid.min.js') }}";
       window._agTourUrl = "{{ static_url('js/tour.js') }}";
+      {# The onboarding kill switch (features.onboarding_enabled), read by
+         tour.js's entry points and chat_onboarding.js's checklist. Stamped
+         HERE because this partial is included from both base.html and
+         base_ds.html, so every page carries it — tour.js is imported from
+         four places (chat_onboarding.js, agents.html, skills.html, and
+         base_ds.html's resume boot) and a flag missing on any one of them
+         would leave that page's tour running after the operator turned
+         onboarding off. Absent (an unrendered page, a test fixture) is
+         treated as ON by the readers, so the switch can only ever be an
+         explicit `false`. #}
+      window._agOnboardingEnabled = {{ onboarding_enabled() | tojson }};
     </script>
     <!-- Lucide sprite loader (#1503) — injects vendor/lucide-sprite.svg inline
          so `ds.icon()` / `iconEl()` can use SAME-DOCUMENT <use href="#name">

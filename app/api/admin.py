@@ -1632,6 +1632,22 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "a silent publish."
             ),
         },
+        "onboarding_enabled": {
+            "kind": "bool",
+            "default": _flag_default("features", "onboarding_enabled", True),
+            "hint": (
+                "The unattended ANALYST onboarding layer: the four guided "
+                "coach-mark tours (the welcome walkthrough on /chat, the /agents "
+                "and Connect cards, the skill-builder mark) and the analyst "
+                "checklist card in the rail foot, with its popover, its replay "
+                'control and the profile menu\'s "Start over onboarding" entry. '
+                "ON by default — a kill switch for an instance whose users already "
+                "know the product, not a new feature. The ADMIN setup chain is a "
+                "different card and is not affected. Hides UI only: "
+                "/api/chat/journey keeps serving and keeps recording steps, so "
+                "turning this back on resumes every user exactly where they were."
+            ),
+        },
         "store_moderation_enabled": {
             "kind": "bool",
             "default": _flag_default("features", "store_moderation_enabled", False),

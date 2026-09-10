@@ -333,9 +333,31 @@ function runStep(key) {
   if (step.href) window.location.href = step.href;
 }
 
+// The operator's kill switch: `features.onboarding_enabled`, stamped on every
+// page by `_app_scripts.html`. Mirrors `_onboardingEnabled` in tour.js,
+// including the rule that UNDEFINED MEANS ON — only an explicit `false`
+// disables, so a page or test that never rendered the flag keeps the
+// pre-switch behaviour.
+//
+// Scope is deliberate: the checklist and the guided tour go, the chat's own
+// greeting and the empty-Stack package recommendation stay. Those answer the
+// user's question rather than narrating over it, so an operator who silences
+// the walkthrough is not asking to lose them.
+function onboardingEnabled() {
+  return window._agOnboardingEnabled !== false;
+}
+
 function renderJourneyPanel() {
   const el = document.getElementById("chat-journey");
   if (!el) return;
+  // Onboarding off: hide rather than merely skip. The container ships `hidden`
+  // and the rail does not render it at all when the switch is off, but a
+  // repaint triggered after the panel was already filled (a step landing, a
+  // refresh event) must not leave the last painted checklist on screen.
+  if (!onboardingEnabled()) {
+    el.hidden = true;
+    return;
+  }
   if (!ready || dismissed) {
     el.hidden = true;
     return;
@@ -718,6 +740,10 @@ function tourModule() {
 }
 
 function maybeAutoLaunchTour() {
+  // tour.js refuses every launch on its own when the switch is off — this is
+  // the cheap half of the same gate: it keeps the module fetch itself off the
+  // first-visit path an operator has turned off.
+  if (!onboardingEnabled()) return;
   if (!chatMode) return; // the first step anchors on /chat's composer
   if (!isNewcomer()) return;
   // An admin whose instance is not set up yet is not the audience for this.
@@ -1219,6 +1245,10 @@ export async function initChatOnboarding(h) {
 // the "?" replay is omitted (chatMode stays false). Safe to call when there is
 // no #chat-journey (no-op via renderJourneyPanel's guard).
 export async function mountJourneyPanel() {
+  // Before any wiring or fetch: with onboarding off there is no card to mount
+  // into and no menu entry to wire, so this is a no-op rather than two DOM
+  // lookups and a /api/chat/journey round trip on every rail page.
+  if (!onboardingEnabled()) return;
   wireRestartOnboardingMenuItem();
   wireRefreshListener();
   if (ready) {
