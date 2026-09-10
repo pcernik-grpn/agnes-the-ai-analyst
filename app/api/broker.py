@@ -1005,6 +1005,18 @@ def _record_completion(
         # non-streaming call (only `text/event-stream` sets it), so nothing
         # but a real interrupted stream can land here.
         incomplete = not failed and summary.stream_complete is False
+        if status_code == 200 and not usage:
+            # A 200 from the Messages API always carries usage, so "none
+            # parsed" means the body did not read as one — and the row below
+            # is about to report a real, billed call as costing nothing.
+            # That silence is how the Brotli forward above stayed invisible:
+            # the ledger looked complete, it was just wrong.
+            logger.warning(
+                "broker: 200 completion with no readable usage (session %s, upstream %s) — "
+                "recording a zero-cost row; the response body did not parse",
+                context.session_id,
+                upstream,
+            )
         record = build_record(
             kind="completion",
             context=context,
@@ -1256,8 +1268,25 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in ("host", "authorization", "content-length", "x-api-key")
+        if k.lower() not in ("host", "authorization", "content-length", "accept-encoding", "x-api-key")
     }
+    # Two halves, exactly as the MCP relay spells them out (`app/api/kai.py`):
+    # this forward never sends `content-encoding` downstream (only
+    # `_FORWARDED_RESPONSE_HEADERS` survive), so what it hands the sandbox has
+    # to be DECODED — and dropping the sandbox's own `accept-encoding` alone is
+    # a trap, because `build_request` re-adds httpx's default. Ask for
+    # `identity` so nothing between here and the provider compresses at all.
+    #
+    # The in-sandbox SDK asks for `br, gzip, deflate`, and this proxy used to
+    # forward that verbatim while httpx (no `brotli` installed, so its decoder
+    # table is gzip/deflate only) left the Brotli body untouched. Every
+    # NON-streaming completion therefore arrived as opaque bytes: the sandbox
+    # got a body it could not read, and `parse_usage` could not read it either
+    # — so a real, billed call landed in `llm_calls` as 0 tokens / $0.00, and
+    # its tokens never reached the turn counters or an agent's monthly budget.
+    # Streamed completions were never affected (SSE comes back uncompressed),
+    # which is precisely why a turn showed two honest rows and eight blind ones.
+    headers["Accept-Encoding"] = "identity"
 
     upstream_path = request.url.path[len("/api/broker/anthropic") :] or "/"
     # Normalized ONCE and reused for both the policy gate below and the
