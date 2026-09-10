@@ -1857,3 +1857,75 @@ class TestCollectionGetBudget:
         out = self._get(mod, detail, files_page)
         assert "truncated" not in out or out.get("truncated") is False
         assert out["files_total"] == 1
+
+    def _files(self, n: int) -> list[dict]:
+        return [
+            {
+                "file_id": f"cf_{i}",
+                "corpus_id": "col_1",
+                "filename": f"f{i}.pdf",
+                "sha256": "x",
+                "file_type": "pdf",
+                "size_bytes": 10,
+                "processing_status": "rejected",
+                "processing_detail": ("error: could not parse the document. " * 200),
+                "created_at": None,
+            }
+            for i in range(n)
+        ]
+
+    def test_dropped_files_expose_a_continuation_offset_past_what_was_kept(self):
+        """The compacted page keeps a PREFIX of the requested files —
+        retrying the SAME offset with a smaller `limit` (the previous
+        wording) would return exactly the files already seen, a loop with
+        no exit (Devin review on #2426). The continuation must skip past
+        what was actually kept, and this is true even though the server's
+        own `files_truncated` (computed before compaction, on the full
+        100-file page) reads False — the last page can still be compacted."""
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {"files": self._files(100), "total": 100, "limit": 100, "offset": 0}
+        out = self._get(mod, detail, files_page)
+        kept = len(out["files"])
+        assert 0 < kept < 100
+        assert out["files_truncated"] is False
+        assert out["files_next_offset"] == kept
+        assert "same offset" not in out["truncated_note"]
+
+    def test_continuation_offset_accounts_for_server_truncation_too(self):
+        """Mid-collection page: both more files beyond the server page AND
+        this page itself compacted. `files_next_offset` must reflect the
+        actual kept count relative to the REAL (server-clamped) offset, not
+        just the requested one."""
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {"files": self._files(100), "total": 500, "limit": 100, "offset": 200}
+        out = self._get(mod, detail, files_page)
+        kept = len(out["files"])
+        assert 0 < kept < 100
+        assert out["files_truncated"] is True
+        assert out["files_next_offset"] == 200 + kept
+
+    def test_next_offset_is_none_once_nothing_remains(self):
+        mod = _import_mod()
+        detail = {"id": "col_1", "slug": "col-1", "name": "Col", "description": "d"}
+        files_page = {
+            "files": [
+                {
+                    "file_id": "cf_1",
+                    "corpus_id": "col_1",
+                    "filename": "f.pdf",
+                    "sha256": "x",
+                    "file_type": "pdf",
+                    "size_bytes": 10,
+                    "processing_status": "ready",
+                    "processing_detail": None,
+                    "created_at": None,
+                }
+            ],
+            "total": 1,
+            "limit": 25,
+            "offset": 0,
+        }
+        out = self._get(mod, detail, files_page)
+        assert out["files_next_offset"] is None

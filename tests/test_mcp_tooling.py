@@ -731,6 +731,25 @@ class TestPaginateTextResponse:
         out = paginate_text_response(text, 0, self._assemble, budget=0)
         assert out["content"] == text
 
+    def test_escape_heavy_text_still_fits_within_budget(self):
+        """A page of nothing but backslashes: JSON-escaping doubles every
+        character's wire cost (each ``\\`` becomes ``\\\\`` on the wire), so
+        ``overshoot`` exceeds the raw page length and the naive
+        ``shrink_to = len(page) - overshoot - 8`` goes negative. The old
+        code treated that as "give up" and returned the still-oversized
+        page — exactly the failure this helper exists to prevent. The fix
+        must retry from a small positive floor instead."""
+        text = "\\" * 50_000
+        out = paginate_text_response(text, 0, self._assemble, budget=2_000)
+        assert wire_size(out) <= 2_000
+
+    def test_control_character_heavy_text_still_fits_within_budget(self):
+        """Worse than a backslash: an unescaped control character costs SIX
+        characters on the wire (``\\u00XX``), a ~6x overshoot ratio."""
+        text = "\x01\x02\x03\x04\x05\x06\x07" * 10_000
+        out = paginate_text_response(text, 0, self._assemble, budget=2_000)
+        assert wire_size(out) <= 2_000
+
 
 # ── fact-graph compaction (fact_edges, fact_neighbors) ────────────────────────
 
@@ -805,3 +824,44 @@ class TestCompactGraphResult:
         snapshot = json.dumps(payload, sort_keys=True)
         compact_graph_result(payload, "fact_edges", budget=3_000, next_step="n/a")
         assert json.dumps(payload, sort_keys=True) == snapshot
+
+    def test_required_root_with_no_edges_survives_compaction(self):
+        """`fact_neighbors` always seeds `nodes` with the queried root, even
+        when it has no visible edges. Deriving kept nodes purely from
+        surviving edge endpoints drops it — the caller asked about that
+        exact fact and gets back an empty graph. The root must be kept
+        regardless of edge survival."""
+        root = {
+            "id": "root1",
+            "type": "person",
+            "aliases": [],
+            "attrs": {"bio": "x" * 20_000},
+            "claim_count": 1,
+            "quote_count": 1,
+        }
+        payload = {"nodes": [root], "edges": [], "truncated": {"depth": False, "fanout": False, "result": False}}
+        assert wire_size(payload) > 3_000
+        out = compact_graph_result(
+            payload, "fact_neighbors", budget=3_000, next_step="n/a", required_node_ids={"root1"}
+        )
+        assert [n["id"] for n in out["nodes"]] == ["root1"]
+
+    def test_required_root_survives_alongside_edge_derived_nodes(self):
+        """The root is additive on top of edge-derived nodes, not a
+        replacement for them — a fitting graph keeps both."""
+        payload = _graph_payload(20, quote_len=1_500)
+        root_id = payload["edges"][0]["src"]
+        out = compact_graph_result(
+            payload, "fact_neighbors", budget=20_000, next_step="n/a", required_node_ids={root_id}
+        )
+        assert root_id in {n["id"] for n in out["nodes"]}
+
+    def test_required_node_id_absent_from_payload_is_ignored(self):
+        """A required id that never appears in `payload["nodes"]` must not
+        invent a node out of thin air."""
+        payload = _graph_payload(20, quote_len=1_500)
+        out = compact_graph_result(
+            payload, "fact_neighbors", budget=3_000, next_step="n/a", required_node_ids={"does-not-exist"}
+        )
+        assert "does-not-exist" not in {n["id"] for n in out["nodes"]}
+        assert wire_size(out) <= 3_000

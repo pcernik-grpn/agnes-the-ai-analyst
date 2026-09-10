@@ -975,13 +975,20 @@ def register_foundation_tools(
         The file list is paginated, not exhaustive — a crawled collection can
         hold thousands of files, far more than fits in a model's context.
         This returns at most ``limit`` files starting at ``offset``; read
-        ``files_total`` (the true count, after any ``q`` filter) and
-        ``files_truncated`` (``files_total`` greater than the files returned)
-        before treating ``files`` as the whole collection. When
-        ``files_truncated`` is true, call again with
-        ``offset=<this call's offset + len(files)>`` (or a larger ``limit``,
-        capped at 200 server-side) to reach the rest — ``files_limit`` and
-        ``files_offset`` on the response say exactly what page you just saw.
+        ``files_total`` (the true count, after any ``q`` filter) before
+        treating ``files`` as the whole collection. ``files_next_offset`` is
+        the exact offset to pass next — ``null`` once nothing remains,
+        otherwise call again with ``offset=files_next_offset`` (same
+        ``limit``). Prefer it over hand-computing ``offset + len(files)``:
+        it is correct whether more files exist beyond this page
+        (``files_truncated``) OR this page itself was too large for the tool
+        output budget and had files dropped from its own tail — two
+        different reasons that both mean "there is more to fetch", and
+        ``files_truncated`` alone only ever reports the first one (it is
+        computed on the page BEFORE compaction, so it can read false on the
+        very last page even though that page was itself compacted).
+        ``files_limit`` and ``files_offset`` say exactly what page you just
+        saw.
 
         ``q`` filters files by a case-insensitive SUBSTRING match over the
         filename OR path — this is NOT the whole-word content search
@@ -1037,7 +1044,7 @@ def register_foundation_tools(
         # `files_truncated` above (more files exist beyond this page) — this
         # is "this page itself didn't fit" and never claims the two mean the
         # same thing.
-        return compact_listing(
+        result = compact_listing(
             detail,
             "collection_get",
             list_field="files",
@@ -1045,12 +1052,23 @@ def register_foundation_tools(
             envelope_fields=("description",),
             shortened_note="{shortened} of {total} files in this page carry a shortened processing_detail",
             dropped_note=(
-                "{dropped} of {total} files in this page were dropped for size — pass limit={kept} "
-                "(same offset) to get the rest of this page within budget"
+                "{dropped} of {total} files in this page were dropped for size — see "
+                "`files_next_offset` on this response to continue exactly where this page left off"
             ),
             next_step="lower `limit`, or narrow with `q`.",
             item_noun="file",
         )
+        # The offset to continue from, accounting for whatever ACTUALLY came
+        # back in `files` — whether it is shorter than `limit` because the
+        # server ran out of files (`files_truncated`) or because compaction
+        # above dropped some for size. `offset + limit` (same reasoning as
+        # `files_truncated`'s own clamp comment) would silently re-serve
+        # files already returned when compaction shortened this page; this
+        # is why it is computed from the FINAL, possibly-compacted list.
+        kept_files = result.get("files", [])
+        more_remains = total > (effective_offset + len(kept_files))
+        result["files_next_offset"] = (effective_offset + len(kept_files)) if more_remains else None
+        return result
 
     @tool(read_only=True)
     async def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict:
@@ -1889,6 +1907,10 @@ def register_foundation_tools(
                 "Lower `limit`/`fanout`, pass `edge_types` to narrow the traversal, or call "
                 "`fact_claims(subject_id=...)` for one node/edge's full evidence."
             ),
+            # The queried root is always in `result["nodes"]`, even with zero
+            # visible edges — never let output-budget compaction drop the
+            # exact fact the caller asked about.
+            required_node_ids={subject_id},
         )
 
     @tool(read_only=True)

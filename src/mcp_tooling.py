@@ -25,7 +25,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterable, MutableMapping
 from typing import Any
 
 import pydantic_core
@@ -564,6 +564,18 @@ def paginate_text_response(
     (``text``, ``offset``, ``next_offset``, ``total_chars``, ``truncated``)
     and returns the tool's own response shape built around it. A ``budget``
     of ``0`` disables the check (same as :func:`paginate_text`).
+
+    The ``shrink_to = len(page) - overshoot - 8`` estimate below assumes
+    escaping/wrapper overhead is small relative to the raw page — true for
+    ordinary prose, where it converges in one or two retries. A page dense
+    with characters that escape expensively (a backslash costs two on the
+    wire, a control character six) can make ``overshoot`` exceed the raw
+    page length, driving that estimate to zero or negative. Giving up at
+    that point would return the still-oversized page — the exact failure
+    this helper exists to prevent — so a degenerate estimate instead falls
+    back to halving the current page length (a small positive floor that
+    always makes forward progress) and keeps retrying within the same
+    bounded budget.
     """
     effective = search_max_chars() if budget is None else budget
     page = paginate_text(text, offset, budget=effective)
@@ -574,18 +586,28 @@ def paginate_text_response(
         overshoot = wire_size(result) - effective
         if overshoot <= 0:
             return result
+        raw_len = len(page["text"])
         # Shave off at least the overshoot, plus a little extra so the
         # (slightly shorter) re-assembled wrapper's own field widths
         # (fewer digits in `next_offset`, etc.) don't reopen the gap.
-        shrink_to = len(page["text"]) - overshoot - 8
-        if shrink_to >= len(page["text"]) or shrink_to < 0:
-            break
+        shrink_to = raw_len - overshoot - 8
+        if shrink_to <= 0 or shrink_to >= raw_len:
+            shrink_to = raw_len // 2
+            if shrink_to <= 0:
+                break
         page = paginate_text(text, offset, budget=shrink_to)
         result = assemble(page)
     return result
 
 
-def compact_graph_result(payload: Any, tool_name: str, *, budget: int | None = None, next_step: str) -> Any:
+def compact_graph_result(
+    payload: Any,
+    tool_name: str,
+    *,
+    budget: int | None = None,
+    next_step: str,
+    required_node_ids: Iterable[str] | None = None,
+) -> Any:
     """Fit a ``{"nodes": [...], "edges": [...], "truncated": {...}}``
     fact-graph response (``fact_edges``, ``fact_neighbors``) into the tool
     output budget.
@@ -602,6 +624,14 @@ def compact_graph_result(payload: Any, tool_name: str, *, budget: int | None = N
     SURVIVING edge still references, so a caller never sees a dangling
     reference.
 
+    ``required_node_ids`` (e.g. ``fact_neighbors``'s queried root, which
+    ``facts_repo().neighbors`` always seeds into ``nodes`` even when the
+    subject has zero visible edges) are retained ADDITIVELY on top of the
+    edge-derived set, regardless of whether any surviving edge still
+    references them — a node the caller explicitly asked about must never
+    be the one compaction drops. An id not actually present in
+    ``payload["nodes"]`` is silently ignored rather than inventing an entry.
+
     Disclosure rides the EXISTING ``truncated`` dict ``fact_edges``/
     ``fact_neighbors`` already return (``depth``/``fanout``/``result``/
     ``claims`` keys) — this only ever ADDS an ``"output"`` key to it, never
@@ -616,6 +646,9 @@ def compact_graph_result(payload: Any, tool_name: str, *, budget: int | None = N
     nodes = payload.get("nodes")
     if not isinstance(edges, list) or not isinstance(nodes, list) or wire_size(payload) <= effective:
         return payload
+
+    node_ids = {n["id"] for n in nodes if isinstance(n, dict) and n.get("id") is not None}
+    required_ids = set(required_node_ids or ()) & node_ids
 
     total_edges = len(edges)
 
@@ -647,7 +680,7 @@ def compact_graph_result(payload: Any, tool_name: str, *, budget: int | None = N
         shortened_edges, shortened_count = _shorten_claim_quotes(kept_edges)
         referenced = {
             e[k] for e in shortened_edges if isinstance(e, dict) for k in ("src", "dst") if e.get(k) is not None
-        }
+        } | required_ids
         kept_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id") in referenced]
         dropped_edges = total_edges - len(kept_edges)
         dropped_nodes = len(nodes) - len(kept_nodes)

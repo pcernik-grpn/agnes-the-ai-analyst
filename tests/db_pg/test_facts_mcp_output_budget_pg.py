@@ -217,6 +217,39 @@ class TestFactNeighborsOutputBudget:
         assert isinstance(out["truncated"], dict)
         assert "depth" in out["truncated"] and "fanout" in out["truncated"]
 
+    def test_root_survives_when_output_budget_drops_every_edge(self, repo, mcp_call, monkeypatch):
+        """A budget small enough that EVERY edge gets dropped for size must
+        still return the queried root as its own node — `neighbors()`
+        always seeds `nodes` with the root, and deriving kept nodes purely
+        from surviving edge endpoints would drop it once no edge survives
+        (the caller asked about exactly this fact and got an empty graph
+        back — Devin review on #2426)."""
+        owner_id, owner_email = _make_owner_with_grant(CORPUS_A)
+        _seed_collection(collection_id=CORPUS_A, created_by=owner_id)
+        _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_budget_a")
+        token = _token(owner_id, owner_email)
+
+        hub = repo.create_fact(type="person")
+        repo.add_claim(fact_id=hub, corpus_file_id="cf_budget_a", corpus_id=CORPUS_A, file_sha256="sha1", quote="hub.")
+        for i in range(20):
+            leaf = repo.create_fact(type="person")
+            repo.add_claim(
+                fact_id=leaf, corpus_file_id="cf_budget_a", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"leaf {i}."
+            )
+            edge_id = repo.create_edge(src=hub, type="knows", dst=leaf)
+            repo.add_claim(
+                edge_id=edge_id,
+                corpus_file_id="cf_budget_a",
+                corpus_id=CORPUS_A,
+                file_sha256="sha1",
+                quote=("Evidence text for this relationship. " * 200)[:1_800],
+            )
+
+        monkeypatch.setenv("AGNES_MCP_SEARCH_MAX_CHARS", "300")
+        out = mcp_call("fact_neighbors", token, subject_id=hub, limit=500, fanout=100, include_claims=1)
+        assert out["edges"] == []
+        assert [n["id"] for n in out["nodes"]] == [hub]
+
 
 class TestFactClaimsOutputBudget:
     def test_oversized_claims_are_shortened_then_dropped_with_disclosure(self, repo, mcp_call, monkeypatch):
