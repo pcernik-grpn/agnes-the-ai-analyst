@@ -1447,3 +1447,72 @@ class TestTheDigestCannotBeBorrowedFromAnotherGeneration:
         assert target.stat().st_mtime_ns == before.st_mtime_ns
 
         assert is_chat_export_stale(target, datetime.now(UTC) - timedelta(hours=1), 2)
+
+
+class TestTheSharedJsonlParserStaysStreaming:
+    """`parse_jsonl` is the shared path for uploaded CLI session
+    transcripts — `services/session_processors/usage.py` and
+    `verification.py` call it three times between them, per session per
+    processor tick, on files that can be tens of MB. It briefly delegated
+    to the text parser added for the admin transcript route, which turned
+    it into a whole-file read plus a list of every line. These pin both
+    halves of the contract: the file parser streams, and the text parser
+    splits on real newlines only."""
+
+    def test_the_file_parser_never_reads_the_whole_file(self, tmp_path, monkeypatch):
+        import builtins
+
+        from services.session_pipeline.lib import parse_jsonl
+
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"a": 1}\n{"b": 2}\n', encoding="utf-8")
+
+        real_open = builtins.open
+
+        class _NoBuffering:
+            """A file that can be iterated but refuses to be slurped."""
+
+            def __init__(self, fh):
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._fh.close()
+                return False
+
+            def __iter__(self):
+                return iter(self._fh)
+
+            def read(self, *a, **kw):
+                raise AssertionError("parse_jsonl must stream, not buffer the whole transcript")
+
+        def _guarded_open(*args, **kwargs):
+            return _NoBuffering(real_open(*args, **kwargs))
+
+        monkeypatch.setattr(builtins, "open", _guarded_open)
+
+        assert parse_jsonl(f) == [{"a": 1}, {"b": 2}]
+
+    def test_a_line_separator_inside_a_string_does_not_split_the_record(self):
+        """`str.splitlines()` breaks on U+2028 and friends; JSON allows them
+        raw inside a quoted string, so a record carrying one would become
+        two invalid fragments and vanish. Both parsers must agree, and both
+        must keep the record."""
+        from services.session_pipeline.lib import parse_jsonl_text
+
+        raw = '{"type": "user", "message": {"content": "first second"}}\n'
+
+        assert len(raw.splitlines()) == 2  # the trap this guards
+        assert parse_jsonl_text(raw) == [{"type": "user", "message": {"content": "first second"}}]
+
+    def test_the_two_parsers_agree_on_the_same_content(self, tmp_path):
+        from services.session_pipeline.lib import parse_jsonl, parse_jsonl_text
+
+        raw = '{"a": 1}\r\n{"b": "x y"}\n\n{"c": 3}\n'
+        f = tmp_path / "session.jsonl"
+        f.write_text(raw, encoding="utf-8", newline="")
+
+        assert parse_jsonl(f) == parse_jsonl_text(raw)
+        assert len(parse_jsonl_text(raw)) == 3
