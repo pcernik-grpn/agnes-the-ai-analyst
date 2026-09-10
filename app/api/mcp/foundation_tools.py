@@ -2107,14 +2107,19 @@ def register_foundation_tools(
         # catalog an agent would already have called, then retry by id.
         async with httpx.AsyncClient() as c:
             cr = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
-        if cr.status_code < 400:
-            for row in cr.json().get("tables") or []:
-                if (row.get("name") or "").lower() == table.lower():
-                    resolved_id = row.get("id")
-                    for entry in tables:
-                        if entry.get("table_id") == resolved_id:
-                            return entry
-                    break
+        # A failed catalog call is NOT the same answer as "no name match" —
+        # it means we never actually got to check, so it must surface as a
+        # failure, never as a false "not granted" (review finding on this
+        # PR: a transient catalog error was being reported to the caller as
+        # a definitive no-access instead of the dependency failure it was).
+        _raise_for_status_with_detail(cr)
+        for row in cr.json().get("tables") or []:
+            if (row.get("name") or "").lower() == table.lower():
+                resolved_id = row.get("id")
+                for entry in tables:
+                    if entry.get("table_id") == resolved_id:
+                        return entry
+                break
 
         # Absent from the list = not granted OR the id/name doesn't resolve
         # at all — this IS the answer, not a tool failure (see the note

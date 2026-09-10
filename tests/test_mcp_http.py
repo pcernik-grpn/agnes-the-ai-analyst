@@ -851,6 +851,30 @@ class TestEffectiveAccessTool:
             "totally-made-up", "X"
         )
 
+    def test_catalog_lookup_failure_surfaces_the_failure_not_a_false_negative(self):
+        """A direct id miss falls through to a `/api/v2/catalog` call to try
+        resolving `table` as a human name. If THAT call itself fails (a
+        transient REST error, not "no such table"), the tool must raise —
+        never answer `granted: false`, which would tell the caller a
+        definitive "you do not have access" for something this tool never
+        actually managed to check."""
+        import httpx
+
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            effective_access_resp = _mock_resp(_effective_access_payload())
+            catalog_failure_resp = _mock_resp({}, status=500)
+            catalog_failure_resp.text = "internal error"
+            catalog_failure_resp.reason_phrase = "Internal Server Error"
+            catalog_failure_resp.request = httpx.Request("GET", "http://server/api/v2/catalog")
+            MC.return_value.__aenter__.return_value.get = AsyncMock(
+                side_effect=[effective_access_resp, catalog_failure_resp]
+            )
+            with pytest.raises(httpx.HTTPStatusError, match="internal error"):
+                _run(mod.effective_access(table="bi_chargeability"))
+
 
 # ── stack tools (issue #621) ──────────────────────────────────────────────────────
 
