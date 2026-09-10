@@ -97,16 +97,28 @@ Two call shapes, one protocol:
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "atomic_publish",
     "atomic_publish_finalize",
     "atomic_publish_temp_path",
+    "partition_dir_supersedes_flat",
+    "retire_superseded_parquet",
 ]
+
+#: Characters a table-derived path segment may never contain. A `*`/`?`/`[`
+#: matters beyond path building: sibling code INTERPOLATES the same name into
+#: glob patterns (`app/utils.py::_is_safe_table_segment` documents the full
+#: case), so a metacharacter stops naming one table and starts matching an
+#: arbitrary one.
+_UNSAFE_SEGMENT_CHARS = frozenset({"/", "\\", "\x00", "*", "?", "[", "]"})
 
 
 def atomic_publish_temp_path(dest: Path | str) -> Path:
@@ -195,3 +207,176 @@ def atomic_publish(dest: Path | str) -> Iterator[Path]:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def partition_dir_supersedes_flat(flat: Path | str, table_dir: Path | str) -> bool:
+    """Does the ``data/<table>/`` partition directory supersede the flat
+    ``data/<table>.parquet`` sitting beside it? (#1339)
+
+    ONE definition of the layout-collision verdict, imported by BOTH sites that
+    must agree on it — `src/orchestrator.py::_update_sync_state` (what the
+    manifest advertises, i.e. what `agnes pull` ships) and `app/utils.py`'s
+    `resolve_local_parquet_glob` / `local_parquet_size_bytes` /
+    `resolve_local_layout_target` (what `/api/v2/schema`, `/api/v2/scan`,
+    `/api/v2/sample`, the catalog and the profiler read). It is a shared symbol
+    rather than a rule written down twice because two copies of a comparator is
+    exactly how the manifest and the read surfaces come to serve different data
+    with nothing to say so.
+
+    The collision is reached by a `sync_strategy` flip, which writes the new
+    layout and leaves the old one in place — nothing in the tree removes the
+    other layout, in EITHER direction. So the question is not "which shape do
+    we prefer" but "which one is the current data", and the answer is
+    **freshness**: ``True`` when at least one part under *table_dir* has an
+    mtime ``>=`` *flat*'s.
+
+    - ``any(part >= flat)`` is equivalent to ``max(parts) >= flat``, and the
+      early exit is what keeps the common (fresher-directory) case from
+      stat-ing the whole directory.
+    - ``>=``, not ``>``: a real flip can land the flat file and the first part
+      inside one filesystem timestamp tick, and the tie must resolve to the
+      directory — that is the direction #1339 was filed for.
+    - An empty directory never supersedes: no part means pending-first-sync,
+      not fresher data, and letting it win would unpublish a healthy
+      single-file table.
+    - No flat file means there is no collision to arbitrate (``False``).
+
+    **mtime is a heuristic, not a clock, and this does not pretend otherwise.**
+    A coarse-granularity or network filesystem, a restored backup, a `cp`
+    without ``-p``, a stray ``touch``, or a clock step can all make the older
+    bytes look newer. There is no total order available here — the extract
+    layout records no per-layout version — so this is the best available
+    evidence, not proof. When it is wrong it picks the wrong layout for the
+    manifest AND the read surfaces (they stay consistent with each other,
+    which is the property that matters most), and the loser is deleted only in
+    the direction where the directory won: a flat file wrongly judged stale is
+    reclaimed, while a directory wrongly judged fresh leaves the flat file
+    untouched. An operator who suspects a wrong verdict can re-run the extract
+    for that table, which rewrites the winning layout with a current mtime.
+
+    Never raises — it is consulted on a hot read path and inside the rebuild's
+    per-source loop; an unreadable part is skipped, an unreadable tree is
+    ``False``.
+    """
+    flat = Path(flat)
+    table_dir = Path(table_dir)
+    try:
+        flat_mtime = flat.stat().st_mtime
+    except OSError:
+        return False
+    try:
+        for part in table_dir.rglob("*.parquet"):
+            try:
+                if part.stat().st_mtime >= flat_mtime:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
+
+
+def retire_superseded_parquet(dest: Path | str, *, root: Path | str) -> bool:
+    """Remove a parquet that a fresher layout has superseded, the same way
+    `atomic_publish` lands one: through ONE ``os.replace`` onto a name no
+    reader resolves or globs.
+
+    The case this exists for (#1339): a table can carry both a flat
+    ``data/<table>.parquet`` and a ``data/<table>/`` partition directory —
+    a `sync_strategy: partitioned` flip writes the parts and nothing removed
+    the previous strategy's flat file. When the directory is the fresher one
+    (`partition_dir_supersedes_flat`, the comparator both precedence sites
+    share) it wins on the manifest side
+    (`src/orchestrator.py::_update_sync_state`) and on the read surfaces
+    (`app/utils.py::resolve_local_parquet_glob`), so the flat sibling has to
+    GO — a reader that reaches the extracts tree without going through those
+    resolvers (an operator's own query, a future call site, an object-store
+    mirror walking the directory) would otherwise still find it.
+
+    Only ever called for the LOSER of that comparison, and only in that one
+    direction. In the mirror direction (a stale directory beside a fresher flat
+    file) nothing is deleted at all: reclaiming the fresher flat file would put
+    the table in a loop — the extractor rewrites it, the next rebuild removes
+    it again — and it is the only copy of the current data.
+
+    Returns ``True`` when *dest* no longer exists on return — including when
+    it was already absent, so a second rebuild over the same table is not
+    reported as a persisting collision — and ``False`` when it was left in
+    place, which the caller must treat as "the collision persists" and
+    surface. Never raises: this runs inside the rebuild's per-source loop,
+    where an exception would skip sync_state for every remaining table in the
+    source.
+
+    Ordering is the caller's half of the protocol and it is not optional:
+    call this only AFTER the superseding data has been published (its parts
+    written into the manifest). Reclaiming first would leave a window with
+    neither layout published anywhere.
+
+    **What the atomicity does and does not buy.** The name ``dest``
+    disappears in a single ``os.replace``, so no reader ever observes a
+    truncated or half-removed file, and a descriptor already open on it keeps
+    reading the whole old inode to completion (POSIX). What no filesystem
+    primitive can give is a reader that resolved the path and has not opened
+    it yet: it gets ``ENOENT``. That window is why the resolvers flip in the
+    same change — after the flip no read surface hands out this path once the
+    directory has parts — and why a plain in-place ``unlink`` was not enough
+    on its own. A hard kill between the replace and the unlink leaves the
+    staged ``.tmp`` file, which is inert: no reader's ``*.parquet`` glob
+    matches it (same property `atomic_publish`'s temp relies on). It is not
+    swept by glob here — deleting by pattern in a directory another writer may
+    be mid-publish into is exactly what the module docstring forbids.
+
+    **Containment.** ``dest``'s last segment is built from a table name that
+    comes from the ``table_registry``, which is fed by connector output — so
+    validate AND contain, per the security playbook. Refused (``False``, real
+    file untouched): a name that is not one safe segment, a name that is not a
+    ``.parquet``, a parent that does not resolve to *root*, a symlink (renaming
+    the link would leave the target — which a resolver following the link
+    READ — in place, so it is not chased), and anything that is not a regular
+    file. *root* itself may be a symlink (an operator pointing a source's
+    ``data/`` at another volume is deployment layout, not an escape): both
+    sides are resolved before comparison.
+    """
+    dest = Path(dest)
+    root = Path(root)
+    name = dest.name
+    if not name or name in (".", "..") or set(name) & _UNSAFE_SEGMENT_CHARS:
+        logger.warning("Refusing to retire %r — not a single safe path segment", str(dest))
+        return False
+    if not name.endswith(".parquet"):
+        logger.warning("Refusing to retire %s — not a .parquet", dest)
+        return False
+    try:
+        # Containment BEFORE the already-absent shortcut below: a path outside
+        # *root* must be refused, not reported gone. "Gone" is the caller's cue
+        # that the collision resolved, and it may not be earned by a path this
+        # function never established it was allowed to look at.
+        if os.path.realpath(dest.parent) != os.path.realpath(root):
+            logger.warning("Refusing to retire %s — outside %s", dest, root)
+            return False
+        if dest.is_symlink():
+            logger.warning("Refusing to retire %s — it is a symlink", dest)
+            return False
+        if not dest.exists():
+            return True
+        if not dest.is_file():
+            logger.warning("Refusing to retire %s — not a regular file", dest)
+            return False
+        # Distinct from `atomic_publish_temp_path`'s name on purpose: a
+        # concurrent publish to this same dest in this same process must not
+        # find its in-flight temp replaced by the file we are retiring.
+        staged = dest.parent / f"{name}.{os.getpid()}.stale.tmp"
+        os.replace(dest, staged)
+    except (OSError, ValueError) as e:
+        logger.warning("Could not retire superseded parquet %s: %s", dest, e)
+        return False
+    try:
+        staged.unlink(missing_ok=True)
+    except OSError as e:
+        # The replace already landed, so *dest* — the only name any reader
+        # resolves — is gone and the collision IS resolved; reporting a
+        # failure here would flag a healthy table forever. All that is left is
+        # the inert `.tmp` residue no reader globs, same as after a hard kill
+        # between the two steps.
+        logger.warning("Retired %s but could not reclaim %s: %s", dest, staged, e)
+    return True

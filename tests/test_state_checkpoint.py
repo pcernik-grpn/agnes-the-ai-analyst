@@ -59,8 +59,16 @@ def test_checkpoint_failure_is_nonfatal(system_db, monkeypatch, caplog):
     conn, _ = system_db
 
     class _RaisingConn:
+        """The CHECKPOINT executes on a cursor, outside `_system_db_lock` (#2352)."""
+
+        def cursor(self):
+            return self
+
         def execute(self, *_a, **_k):
             raise RuntimeError("Cannot CHECKPOINT: there are other transactions active")
+
+        def close(self):
+            return None
 
     import src.db as db_mod
 

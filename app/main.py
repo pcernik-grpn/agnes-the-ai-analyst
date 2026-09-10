@@ -433,6 +433,133 @@ async def _chat_docker_sandbox_ok(chat_config) -> bool:
     return True
 
 
+#: Connect attempts (and the seconds between them) the allowlist gate below
+#: gives the egress proxy. Compose creates `app` and `egress-proxy` at the same
+#: time, so a single attempt would race the proxy's own bind on a cold boot;
+#: three cheap attempts cover that without turning a genuinely absent sidecar
+#: into a long stall (an unstarted container's name does not resolve at all, so
+#: those attempts fail in milliseconds).
+_EGRESS_PROXY_PROBE_ATTEMPTS = 3
+_EGRESS_PROXY_PROBE_INTERVAL = 1.0
+_EGRESS_PROXY_PROBE_TIMEOUT = 2.0
+
+
+async def _chat_docker_egress_proxy_ok(chat_config) -> bool:
+    """Refuse ``chat.docker_egress_mode=allowlist`` without a reachable proxy.
+
+    Allowlist mode is two halves that must both be running: the app puts every
+    sandbox on an ``internal: true`` network with no route off the host, and
+    the ``services/egress_proxy`` sidecar — behind the ``chat-docker-egress``
+    compose profile — is the only way out of it. Missing the sidecar is
+    fail-CLOSED for security, but it used to be *silent*: sandboxes came up
+    with zero egress, package installs and allowlisted APIs failed one by one
+    inside users' sessions, and nothing named the cause. With the profile
+    inactive compose does not even manage the container, so a proxy that
+    exited stayed exited and invisible to ``docker compose up -d`` (#1250).
+
+    So an instance configured for allowlist mode must not come up serving chat
+    without it. Probed with a TCP connect, not an HTTP request: the proxy
+    speaks raw CONNECT/absolute-form and serves no health path — the same
+    reason its compose healthcheck is a connect (tests/test_compose_hardening).
+
+    Also the single place the ``egress_compose_mismatches`` warnings are
+    emitted for a docker deployment: they answer *which knob is wrong*, which
+    is precisely what an operator needs when the probe then refuses, so they
+    must precede the refusal rather than only reach the happy path.
+
+    Never raises: a probe failure is a refusal with an actionable log line,
+    mirroring the other chat boot gates.
+    """
+    log = logging.getLogger("app.main")
+    if not chat_config.enabled:
+        return True
+    if chat_config.provider != "docker":
+        return True
+
+    from app.chat.config import egress_compose_mismatches
+
+    for _mismatch in egress_compose_mismatches(chat_config):
+        log.warning("chat egress: %s", _mismatch)
+
+    if chat_config.docker_egress_mode != "allowlist":
+        # `open` (plain bridge) and `none` (internal, by design no way out)
+        # have no sidecar in the picture at all — nothing to probe, nothing
+        # this gate can say. The default instance never reaches the probe.
+        return True
+    if os.environ.get("TESTING", "").lower() in ("1", "true"):
+        return True
+
+    import asyncio
+    from urllib.parse import urlparse
+
+    proxy_url = (getattr(chat_config, "docker_egress_proxy_url", "") or "").strip()
+    # The value is handed to sandboxes verbatim as HTTP_PROXY, and proxy env
+    # vars are conventionally accepted schemeless (`host:3128`) — so parse that
+    # shape too rather than refusing a deployment that actually works.
+    fix = (
+        "Start it with `docker compose --profile chat-docker-egress up -d egress-proxy` "
+        "(a provisioned VM derives that profile from chat.docker_egress_mode itself), or "
+        "point chat.docker_egress_proxy_url at an address this process can reach"
+    )
+    try:
+        parsed = urlparse(proxy_url if "//" in proxy_url else f"//{proxy_url}")
+        host, port = parsed.hostname or "", parsed.port or 3128
+    except ValueError as exc:
+        # `.port` — not `urlparse` itself — raises for a non-numeric or
+        # out-of-range port, and it raises on ATTRIBUTE ACCESS, which is easy
+        # to miss reading this line. Unguarded it escapes the lifespan gate
+        # chain and takes the whole instance down (API, admin UI, scheduler)
+        # over a chat-only sidecar's URL — the opposite of this gate's
+        # contract, which is to refuse chat and leave the rest running.
+        log.error(
+            "chat.docker_egress_mode=allowlist but chat.docker_egress_proxy_url (%r) is not a "
+            "usable address (%s). %s; refusing to spawn ChatManager",
+            proxy_url,
+            exc,
+            fix,
+        )
+        return False
+    if not host:
+        log.error(
+            "chat.docker_egress_mode=allowlist but chat.docker_egress_proxy_url (%r) has no "
+            "host — every sandbox would run with no egress at all. %s; refusing to spawn "
+            "ChatManager",
+            proxy_url,
+            fix,
+        )
+        return False
+
+    detail = ""
+    for _attempt in range(max(1, _EGRESS_PROXY_PROBE_ATTEMPTS)):
+        if _attempt:
+            await asyncio.sleep(_EGRESS_PROXY_PROBE_INTERVAL)
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=_EGRESS_PROXY_PROBE_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — classify, never break the lifespan
+            detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            continue
+        writer.close()
+        # The connect already answered the question; a teardown hiccup is not
+        # the proxy being down.
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        return True
+
+    log.error(
+        "chat.docker_egress_mode=allowlist but the egress proxy at %s:%s is unreachable (%s). "
+        "In allowlist mode the sandbox network is internal — the proxy is the ONLY route out — "
+        "so every session would come up with no egress at all. %s; refusing to spawn ChatManager",
+        host,
+        port,
+        detail or "no answer",
+        fix,
+    )
+    return False
+
+
 class _SelectiveGZipMiddleware:
     """GZipMiddleware wrapper that skips a set of path prefixes.
 
@@ -1842,9 +1969,14 @@ async def lifespan(app):
             elif not _chat_docker_rails_url_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.
                 app.state.chat_manager = None
-            # Last of the gates: the only one that does network I/O.
+            # The last two gates are the ones that do network I/O.
             elif not await _chat_docker_sandbox_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.
+                app.state.chat_manager = None
+            elif not await _chat_docker_egress_proxy_ok(app.state.chat_config):
+                # Fatal already logged inside the helper. Ordered last: it is
+                # the gate whose answer depends on another container being up,
+                # so every cheaper, purely local certainty is settled first.
                 app.state.chat_manager = None
             else:
                 from typing import Optional
@@ -1974,14 +2106,10 @@ async def lifespan(app):
                         egress_proxy_url=app.state.chat_config.docker_egress_proxy_url,
                         max_total_sandboxes=app.state.chat_config.docker_max_total_sandboxes,
                     )
-                    # Allowlist mode fails silently and totally when the app's
-                    # config and the compose-owned proxy sidecar disagree, so
-                    # say which knob is wrong at startup instead of leaving an
-                    # operator to work back from "no egress at all".
-                    from app.chat.config import egress_compose_mismatches
-
-                    for _mismatch in egress_compose_mismatches(app.state.chat_config):
-                        logger.warning("chat egress: %s", _mismatch)
+                    # (The "which knob is wrong" mismatch warnings are
+                    # emitted by _chat_docker_egress_proxy_ok, one gate up:
+                    # they are needed MOST on the path where that gate
+                    # refuses, which never reaches this branch.)
                 else:  # kai-agent — the allowlist above guarantees membership
                     from app.chat.kai_engine_provider import KaiEngineProvider
 

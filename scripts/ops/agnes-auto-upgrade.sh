@@ -570,6 +570,17 @@ if [ "$APPS_PROFILE_WANTED" = "1" ] && [[ " ${PROFILE_ARGS[*]-} " != *" apps "* 
     PROFILE_ARGS+=( --profile apps )
 fi
 
+# Chat egress proxy: same flag-not-COMPOSE_PROFILES rule, derived from the
+# configured mode through the shared gate (sourced above) so this tick can
+# never disagree with the boot script — or with the app, which reads its
+# ChatConfig from the same instance.yaml. Without the profile every `docker
+# compose up -d` below simply ignores the sidecar, which is how an exited
+# proxy stayed down and unnoticed while sandboxes lost all egress (#1250).
+if agnes_chat_egress_allowlist_active "$STATE_DIR" \
+    && [[ " ${PROFILE_ARGS[*]-} " != *" chat-docker-egress "* ]]; then
+    PROFILE_ARGS+=( --profile chat-docker-egress )
+fi
+
 # --scale extraction-worker=N (TCRD-296 gap #76): threaded through every
 # BARE `docker compose up -d` below (the ones that recreate the whole
 # resolved stack, not a single named service) so a routine recreate never
@@ -640,6 +651,22 @@ if [[ ":$COMPOSE_FILE:" == *":docker-compose.kai-agent.yml:"* ]]; then
     if [ -z "$(docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} ps -q --status running kai-agent 2>/dev/null)" ]; then
         docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d kai-agent >/dev/null 2>&1 \
             || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to start; retrying next tick"
+    fi
+fi
+
+# The egress proxy gets the same every-tick down-retry, for a sharper reason:
+# in allowlist mode it is the sandboxes' only route out, so every session runs
+# with no egress while it is down (fail-closed, but broken), and the app only
+# re-evaluates its own boot gate on a restart. `restart: unless-stopped` does
+# not rescue a process that exited on a config error rather than crashing, and
+# the drift-gated recreate below never fires on a quiet box — which together
+# are exactly how one container sat Exited for five days (#1250). Gated on the
+# profile being active so a non-allowlist VM never names a service its
+# resolved compose config does not define.
+if [[ " ${PROFILE_ARGS[*]-} " == *" chat-docker-egress "* ]]; then
+    if [ -z "$(docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} ps -q --status running egress-proxy 2>/dev/null)" ]; then
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d egress-proxy >/dev/null 2>&1 \
+            || logger -t agnes-auto-upgrade "WARN: egress-proxy sidecar failed to start; chat sandboxes have no egress until it does — retrying next tick"
     fi
 fi
 

@@ -4,6 +4,7 @@ Provides get_system_db() for the system state database
 and get_analytics_db() for the analytics database with parquet views.
 """
 
+import contextlib
 import logging
 import math
 import os
@@ -2822,34 +2823,41 @@ def close_singleton_connections() -> None:
     """
     global _system_db_conn, _analytics_db_conn, _operational_db_conn
 
-    # Same handshake as close_system_db() (#1294): this path also closes
-    # _system_db_conn, so an in-flight rolling-snapshot EXPORT on a child
-    # cursor must be interrupted and drained first, not closed out from under.
-    if not interrupt_rolling_snapshot_export(
-        _ROLLING_SNAPSHOT_INTERRUPT_TIMEOUT_S, caller="close_singleton_connections"
-    ):
-        logger.warning(
-            "close_singleton_connections: rolling-snapshot export still running after "
-            "being interrupted; closing system.duckdb anyway"
-        )
+    # Same handshake as close_system_db() (#1294, #2352): this path also closes
+    # _system_db_conn AND _operational_db_conn, so any long statement in flight
+    # on a child cursor of either — the rolling-snapshot EXPORT, a periodic
+    # CHECKPOINT — must be interrupted and drained first, not closed out from
+    # under. `_barring_child_statements` covers the other half: no publisher
+    # may be admitted between the drain and the closes below. It is taken
+    # FIRST, before _system_db_lock, which is the lock order every publisher
+    # uses too (see its definition) — so the two can never form a cycle.
+    with _barring_child_statements("close_singleton_connections"):
+        if not interrupt_inflight_singleton_statements(
+            _INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S, caller="close_singleton_connections"
+        ):
+            logger.warning(
+                "close_singleton_connections: a singleton statement is still running after "
+                "being interrupted; closing the DuckDB singletons anyway"
+            )
 
-    with _system_db_lock:
-        if _system_db_conn is not None:
-            try:
-                _system_db_conn.close()
-            except Exception:
-                pass
-            _system_db_conn = None
-        # The operational DuckDB (cli_auth_codes / Slack binding codes) is a
-        # third long-lived singleton, guarded by the same _system_db_lock. On a
-        # Postgres instance it is the ONLY written DuckDB file, so its exclusive
-        # file lock must also be released before a migrator subprocess spawns.
-        if _operational_db_conn is not None:
-            try:
-                _operational_db_conn.close()
-            except Exception:
-                pass
-            _operational_db_conn = None
+        with _system_db_lock:
+            if _system_db_conn is not None:
+                try:
+                    _system_db_conn.close()
+                except Exception:
+                    pass
+                _system_db_conn = None
+            # The operational DuckDB (cli_auth_codes / Slack binding codes) is
+            # a third long-lived singleton, guarded by the same
+            # _system_db_lock. On a Postgres instance it is the ONLY written
+            # DuckDB file, so its exclusive file lock must also be released
+            # before a migrator subprocess spawns.
+            if _operational_db_conn is not None:
+                try:
+                    _operational_db_conn.close()
+                except Exception:
+                    pass
+                _operational_db_conn = None
     with _analytics_db_lock:
         if _analytics_db_conn is not None:
             try:
@@ -9512,49 +9520,67 @@ def close_system_db() -> None:
     we still proceed to close — the recovery path in ``_try_open_system_db``
     plus the longer ``stop_grace_period`` in compose are the safety nets.
 
-    **Rolling-snapshot handoff (#1294):** if ``refresh_rolling_snapshot`` is
-    mid-``EXPORT DATABASE`` on a cursor derived from this connection —
-    reachable when its ``to_thread_drain_on_cancel`` caller (the
-    checkpoint/rolling-snapshot loop in ``app.main``) abandoned that thread
-    because the export outlived the shared shutdown drain budget — closing
-    the parent connection out from under that still-executing child cursor
-    is the exact wedge the drain helper exists to prevent. So before doing
-    anything else, interrupt that cursor and wait (bounded by
-    ``_ROLLING_SNAPSHOT_INTERRUPT_TIMEOUT_S``) for it to actually finish.
-    The wait is polled rather than a single ``interrupt()`` call because
-    ``interrupt()`` only cancels whatever is *currently* executing on the
-    cursor — if it lands in the gap between the export's own ``CHECKPOINT``
-    and ``EXPORT DATABASE`` statements it is a no-op, so we keep re-issuing
-    it until the export thread reports itself idle or the bound elapses.
-    This never blocks indefinitely: once the bound is spent we log and
-    proceed to close anyway, same fallback philosophy as the CHECKPOINT
-    best-effort below.
+    **In-flight-statement handoff (#1294, #2352):** if a long statement is
+    still executing on a cursor derived from this connection — the
+    rolling-snapshot ``EXPORT DATABASE`` (#1294), or the periodic
+    ``CHECKPOINT`` since #2352 moved it off ``_system_db_lock`` and therefore
+    onto a child cursor — closing the parent out from under it is the exact
+    wedge ``to_thread_drain_on_cancel`` exists to prevent. Both are reachable:
+    that helper abandons its thread once the statement outlives the shared
+    shutdown drain budget, and a WAL flush measured 7.1 s on a 942 MB WAL. So
+    before doing anything else, interrupt every such cursor and wait (bounded
+    by ``_INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S``) for them to actually
+    finish. The wait is polled rather than a single ``interrupt()`` call
+    because ``interrupt()`` only cancels whatever is *currently* executing on
+    the cursor — if it lands in the gap between the export's own
+    ``CHECKPOINT`` and ``EXPORT DATABASE`` statements it is a no-op, so we
+    keep re-issuing it until every publisher reports itself idle or the bound
+    elapses. This never blocks indefinitely: once the bound is spent we log
+    and proceed to close anyway, same fallback philosophy as the CHECKPOINT
+    best-effort below — which also means an interrupted periodic CHECKPOINT
+    costs nothing, since that best-effort re-runs it on the parent.
+
+    Interrupting what is already published only covers half of it, so the
+    whole close runs inside :func:`_barring_child_statements`: a publisher
+    that has taken a cursor but not registered it yet is invisible to the
+    drain, and admitting one after the drain concluded the registry was empty
+    would put a fresh statement on a child of the connection we are closing.
     """
     global _system_db_conn, _system_db_path
 
-    if not interrupt_rolling_snapshot_export(_ROLLING_SNAPSHOT_INTERRUPT_TIMEOUT_S, caller="close_system_db"):
-        logger.warning(
-            "close_system_db: rolling-snapshot export still running %.1fs after being "
-            "interrupted; closing system.duckdb anyway",
-            _ROLLING_SNAPSHOT_INTERRUPT_TIMEOUT_S,
-        )
+    with _barring_child_statements("close_system_db"):
+        if not interrupt_inflight_singleton_statements(
+            _INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S, caller="close_system_db"
+        ):
+            logger.warning(
+                "close_system_db: a singleton statement is still running %.1fs after being "
+                "interrupted; closing system.duckdb anyway",
+                _INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S,
+            )
 
-    if _system_db_conn:
-        try:
-            _system_db_conn.execute("CHECKPOINT")
-            logger.debug("close_system_db: CHECKPOINT ok")
-        except Exception as exc:
-            # Log + proceed — CHECKPOINT failure is not fatal (recovery path
-            # in _try_open_system_db handles a dirty WAL on next open), but
-            # we want operators to see WHY the safety net was needed if a
-            # WAL-replay failure does surface later.
-            logger.warning("close_system_db: CHECKPOINT failed (%s); proceeding to close", exc)
-        try:
-            _system_db_conn.close()
-        except Exception as exc:
-            logger.debug("close_system_db: close raised (%s); ignoring", exc)
-        _system_db_conn = None
-        _system_db_path = None
+        if _system_db_conn:
+            try:
+                _system_db_conn.execute("CHECKPOINT")
+                logger.debug("close_system_db: CHECKPOINT ok")
+            except Exception as exc:
+                # Log + proceed — CHECKPOINT failure is not fatal (recovery path
+                # in _try_open_system_db handles a dirty WAL on next open), but
+                # we want operators to see WHY the safety net was needed if a
+                # WAL-replay failure does surface later.
+                logger.warning("close_system_db: CHECKPOINT failed (%s); proceeding to close", exc)
+            try:
+                _system_db_conn.close()
+            except Exception as exc:
+                logger.debug("close_system_db: close raised (%s); ignoring", exc)
+            _system_db_conn = None
+            _system_db_path = None
+
+
+#: Above this, a successful state-DB CHECKPOINT is logged at INFO with its
+#: duration instead of DEBUG. A WAL flush is the one statement on the
+#: checkpoint tick that can run for seconds (#2352), and an operator
+#: diagnosing state-DB latency needs to see that it happened at all.
+_SLOW_CHECKPOINT_LOG_THRESHOLD_S = 1.0
 
 
 def checkpoint_system_db() -> bool:
@@ -9574,94 +9600,302 @@ def checkpoint_system_db() -> bool:
     "there are other transactions active"); refusal is expected under
     load and simply means the next tick retries.
 
-    Holds ``_system_db_lock`` for the read-and-execute, like every other
-    accessor of the ``_system_db_conn`` global — without it a tick can
-    race the DATA_DIR-reopen branch in ``get_system_db()`` and execute
-    on an already-closed native connection.
+    **Locking discipline (#2352):** ``_system_db_lock`` is held only long
+    enough to read the singleton global and take a cursor off it — the
+    CHECKPOINT itself executes OUTSIDE the lock, exactly as
+    :func:`refresh_rolling_snapshot` runs its ``EXPORT DATABASE``. The lock
+    guards that global's lifecycle (open/close/replace), not query
+    execution; DuckDB does not serialize sibling cursors, and every request
+    already runs on its own cursor without holding it. Executing under the
+    lock is what made a manual sync look like a full outage: flushing a
+    grown WAL is a multi-second statement (measured: 7.1 s for a 942 MB
+    WAL), and ``get_system_db()`` takes the same lock on every call, so
+    every authed request — plus ``get_operational_db()`` — parked for the
+    flush's entire duration instead of the ~1.5 ms a lookup costs. Taking
+    the cursor under the lock keeps the original guarantee: a tick can no
+    longer race the DATA_DIR-reopen branch in ``get_system_db()`` into
+    executing on an already-closed native connection.
+
+    Taking the cursor and PUBLISHING it happen together inside
+    :func:`_admitting_child_statement`, so a close path cannot land between
+    the two and close the parent while believing nothing is in flight; the
+    CHECKPOINT then executes outside that handshake as well as outside
+    ``_system_db_lock``.
     """
-    with _system_db_lock:
-        if _system_db_conn is None:
+    with _admitting_child_statement("checkpoint_system_db") as admitted, _system_db_lock:
+        if not admitted:
+            return False
+        conn = _system_db_conn
+        if conn is None:
             return False
         try:
-            _system_db_conn.execute("CHECKPOINT")
-            logger.debug("checkpoint_system_db: CHECKPOINT ok")
-            return True
+            cur = conn.cursor()
         except Exception as exc:
-            # Concurrent transactions make DuckDB refuse a plain CHECKPOINT;
-            # deliberately NOT `FORCE CHECKPOINT`, which would abort them.
-            logger.warning("checkpoint_system_db: CHECKPOINT failed (%s); will retry next tick", exc)
+            # close_system_db() raced us and closed the singleton between the
+            # None-check and here — same "no open singleton" outcome.
+            logger.debug("checkpoint_system_db: no usable cursor (%s)", exc)
             return False
+        token = _register_interruptible_cursor(cur)
+    try:
+        started = time.monotonic()
+        cur.execute("CHECKPOINT")
+        elapsed = time.monotonic() - started
+        # A REFUSED checkpoint is loud (WARNING, below) but returns in well
+        # under a millisecond; the expensive case is the one that SUCCEEDS on
+        # a grown WAL, and at DEBUG it left no trace at all — which is why a
+        # multi-second state-DB flush was invisible in the logs of the
+        # incident that motivated #2352. Surface the slow ones only, so a
+        # steady-state tick stays silent.
+        if elapsed >= _SLOW_CHECKPOINT_LOG_THRESHOLD_S:
+            logger.info("checkpoint_system_db: CHECKPOINT ok, took %.1fs (WAL flush)", elapsed)
+        else:
+            logger.debug("checkpoint_system_db: CHECKPOINT ok in %.3fs", elapsed)
+        return True
+    except Exception as exc:
+        # Concurrent transactions make DuckDB refuse a plain CHECKPOINT;
+        # deliberately NOT `FORCE CHECKPOINT`, which would abort them. An
+        # interrupt from a close path lands here too — also best-effort, and
+        # that path re-CHECKPOINTs on the parent before closing.
+        logger.warning("checkpoint_system_db: CHECKPOINT failed (%s); will retry next tick", exc)
+        return False
+    finally:
+        # Unpublish BEFORE closing the cursor, never after: a waiting close
+        # path unblocks on the idle Event, not on close() completing.
+        _unregister_interruptible_cursor(token)
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 _ROLLING_SNAPSHOT_DIRNAME = "system.duckdb.rolling-snapshot"
 _ROLLING_SNAPSHOT_DEFAULT_INTERVAL_HOURS = 6.0
 
-#: Bounds how long close_system_db() waits for an in-flight rolling-snapshot
-#: EXPORT to unwind after being interrupted (#1294 — see refresh_rolling_snapshot
-#: and close_system_db below). A safety bound, not the expected wait: DuckDB's
-#: interrupt() is checked at operator boundaries and returns in well under a
-#: second even mid-EXPORT of a multi-million-row table (measured).
-_ROLLING_SNAPSHOT_INTERRUPT_TIMEOUT_S = 5.0
+#: Bounds how long a close path waits for an in-flight interruptible statement
+#: on a singleton-derived cursor to unwind after being interrupted (#1294,
+#: #2352 — see :func:`_register_interruptible_cursor` and
+#: :func:`close_system_db` below). Also bounds how long it waits for the
+#: child-statement admission handshake (:func:`_barring_child_statements`).
+#: A safety bound, not the expected wait:
+#: DuckDB's interrupt() is checked at operator boundaries and returns in well
+#: under a second even mid-EXPORT of a multi-million-row table (measured).
+_INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S = 5.0
 
-# Tracks the cursor (if any) currently running the rolling-snapshot EXPORT, so
-# close_system_db() can interrupt + wait for it instead of closing the parent
-# connection out from under a still-executing child cursor (#1294) — the exact
-# wedge `to_thread_drain_on_cancel` exists to prevent, reachable here because a
-# full-DB EXPORT can outlive that helper's shared shutdown drain budget.
+# Cursors derived from the system / operational singletons that are currently
+# executing a statement long enough to outlive `to_thread_drain_on_cancel`'s
+# shared shutdown drain budget, so a close path can interrupt + wait for them
+# instead of closing the parent connection out from under a still-executing
+# child cursor — the exact wedge that drain helper exists to prevent. Two kinds
+# qualify, both driven by the one checkpoint/rolling-snapshot loop in
+# `app.main` (which is also the FIRST task the lifespan cancels):
 #
-# A DEDICATED lock, not `_system_db_lock`: close_system_db() holds this only
-# long enough to read the cursor reference, then waits on the Event *unlocked*.
-# refresh_rolling_snapshot's own cleanup needs this same lock (briefly, in its
-# `finally`) to clear the cursor and set the Event — holding it across the wait
-# would deadlock the two against each other.
-_rolling_snapshot_export_lock = threading.Lock()
-_rolling_snapshot_export_cursor: duckdb.DuckDBPyConnection | None = None
-_rolling_snapshot_export_idle = threading.Event()
-_rolling_snapshot_export_idle.set()  # no export in flight by default
+#   * the rolling-snapshot `EXPORT DATABASE` (#1294), and
+#   * the periodic `CHECKPOINT`s, whose WAL flush measured 7.1 s on a 942 MB
+#     WAL — the statement #2352 moved off `_system_db_lock` and therefore onto
+#     a child cursor, which is what brings it under this contract.
+#
+# A REGISTRY, not the single slot this started as: the two kinds are separate
+# callers of the same lifecycle, and a second publisher sharing one slot would
+# clear the first one's cursor/idle state — the very state the close paths key
+# their close decision on. (`_rolling_snapshot_refresh_lock` below still
+# guards the export's OTHER single-slot resource, its fixed `.tmp` scratch
+# dir, which a registry does not make safe to share.)
+#
+# A DEDICATED lock, not `_system_db_lock`: a close path holds this only long
+# enough to copy the cursor references, then waits on the Event *unlocked*. A
+# publisher's own cleanup needs the same lock to unpublish and set the Event —
+# holding it across the wait would deadlock the two against each other.
+#
+# Known gap, deliberately not widened here: the DATA_DIR-reopen branches in
+# `get_system_db()` / `get_operational_db()` also close a parent, under
+# `_system_db_lock`, without this handshake. That is pre-existing for the
+# export cursor and only reachable when DATA_DIR changes mid-process, i.e. in
+# tests.
+_inflight_cursor_lock = threading.Lock()
+_inflight_cursors: dict[int, duckdb.DuckDBPyConnection] = {}
+_inflight_cursor_seq = 0
+_inflight_cursors_idle = threading.Event()
+_inflight_cursors_idle.set()  # nothing in flight by default
 
-# Serializes whole refresh_rolling_snapshot() runs. The machinery above is
-# single-slot (one published cursor, one fixed `.tmp` scratch path), so two
-# overlapping refreshes would clear each other's cursor/idle state — the very
-# state close_system_db() keys its close decision on — and rmtree each other's
+# Serializes whole refresh_rolling_snapshot() runs. Its `.tmp` scratch path is
+# single-slot, so two overlapping refreshes would rmtree each other's
 # in-progress export (Devin on #1294). Today the only production caller is the
 # checkpoint-loop tick, so overlap needs a second caller (a future CLI/force
 # surface); guard it structurally rather than by convention.
 _rolling_snapshot_refresh_lock = threading.Lock()
 
+# Makes "admit a new child statement on a DuckDB state singleton" and "begin
+# closing that singleton's parent connection" mutually exclusive. Publishing
+# the cursor is not enough on its own: a publisher takes the cursor under
+# `_system_db_lock`, releases that lock, and only THEN registers — and a close
+# path landing in that gap finds `_inflight_cursors` empty, concludes nothing
+# is in flight, and closes the parent out from under the child statement the
+# publisher is about to run. That is the #1294 hazard again through a narrower
+# window, so the window is closed by construction instead: a publisher holds
+# this across (read the singleton global -> take the child cursor -> publish
+# it) and a close path holds it across (interrupt + drain -> close the
+# parent), so a close either SEES the publication or BARS it.
+#
+# Execution stays OUTSIDE it, exactly as it stays outside `_system_db_lock`
+# (#2352): a multi-second WAL flush must not park anything, and
+# `get_system_db()` never touches this lock at all, so request latency is
+# untouched either way.
+#
+# Every acquisition is BOUNDED, which is what makes a hang impossible whatever
+# the interleaving: a publisher TRY-acquires and skips its tick when a close
+# holds it (its statement is best-effort, and that close runs its own final
+# CHECKPOINT on the parent anyway), while a close path waits at most
+# `_INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S` and then proceeds regardless —
+# same best-effort philosophy as the drain it guards.
+#
+# Lock ORDER, one-directional and never the reverse: this one, then
+# `_system_db_lock`, then the leaf `_inflight_cursor_lock`. No close path takes
+# it while holding `_system_db_lock` (`close_singleton_connections` takes it
+# first, exactly where its interrupt already was), and the leaf is never held
+# across acquiring either of the other two.
+_singleton_child_admission_lock = threading.Lock()
 
-def interrupt_rolling_snapshot_export(wait_s: float = 0.0, *, caller: str = "") -> bool:
-    """Interrupt an in-flight rolling-snapshot ``EXPORT DATABASE`` (#1294).
 
-    ``interrupt()`` only cancels the statement *currently* executing on the
-    cursor — landing in the gap between the refresh's ``CHECKPOINT`` and
-    ``EXPORT DATABASE`` is a no-op — so it is re-issued on a short poll until
-    the export thread reports itself idle or ``wait_s`` elapses. Callers that
-    must not block (``begin_shutdown``) pass ``wait_s=0``: one interrupt shot,
-    no wait; the refresh's own pre-EXPORT ``is_shutdown_started()`` gate
-    covers the between-statements window for that caller.
+@contextlib.contextmanager
+def _admitting_child_statement(caller: str):
+    """Hold the admission handshake while a publisher takes AND publishes a cursor.
 
-    Returns True when no export is in flight (anymore), False when the bound
-    elapsed with the export still running.
+    Yields True when admitted. Yields False when a close path is closing a
+    singleton parent right now, in which case the caller must not execute
+    anything on a child cursor — it skips, and that close path's own final
+    ``CHECKPOINT`` covers the durability the skipped tick would have provided.
+    Non-blocking on purpose: contention means the parent is going away, so
+    waiting for it would only spend the shared shutdown drain budget to
+    produce a statement that is about to be interrupted anyway.
     """
-    with _rolling_snapshot_export_lock:
-        cur = _rolling_snapshot_export_cursor
-    if cur is None:
-        return True
+    admitted = _singleton_child_admission_lock.acquire(blocking=False)
+    if not admitted:
+        logger.debug("%s: a singleton parent is being closed; skipping this tick", caller)
+    try:
+        yield admitted
+    finally:
+        if admitted:
+            _singleton_child_admission_lock.release()
+
+
+@contextlib.contextmanager
+def _barring_child_statements(caller: str):
+    """Hold the admission handshake for the duration of a parent close.
+
+    ONE domain covers both singletons on purpose: in production every caller
+    closes both, so splitting the registry would only give the two a way to
+    drift. The cost is that a close of one interrupts published statements on
+    the other — harmless while every caller is a shutdown path, and worth
+    revisiting if either close ever gains a non-shutdown caller
+    (2026-09-08 review note).
+
+    Bars a publisher from taking a fresh child cursor off a singleton while
+    this close is interrupting, draining and closing its parent — so no
+    publication can land right after the drain concluded the registry was
+    empty. Bounded, then proceeds anyway: shutdown must never wedge behind a
+    publisher, and a publisher only ever holds this across a ``.cursor()``
+    call.
+    """
+    held = _singleton_child_admission_lock.acquire(timeout=_INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S)
+    if not held:
+        logger.warning(
+            "%s: a publisher held the child-statement handshake for %.1fs; closing anyway",
+            caller,
+            _INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S,
+        )
+    try:
+        yield
+    finally:
+        if held:
+            _singleton_child_admission_lock.release()
+
+
+def _register_interruptible_cursor(cur: duckdb.DuckDBPyConnection) -> int:
+    """Publish *cur* as interruptible; returns the token that unpublishes it.
+
+    Everything that executes a potentially multi-second statement on a cursor
+    derived from a long-lived singleton publishes it here, so
+    :func:`interrupt_inflight_singleton_statements` can reach it. The
+    registration must happen inside the caller's
+    :func:`_admitting_child_statement` block, together with taking the cursor:
+    publishing after that block has ended re-opens the window that block
+    exists to close.
+    """
+    global _inflight_cursor_seq
+    with _inflight_cursor_lock:
+        _inflight_cursor_seq += 1
+        token = _inflight_cursor_seq
+        _inflight_cursors[token] = cur
+        _inflight_cursors_idle.clear()
+    return token
+
+
+def _unregister_interruptible_cursor(token: int) -> None:
+    """Unpublish the cursor *token* named and, if it was the last one in
+    flight, set the idle Event an interrupting close path waits on.
+
+    Callers that also ``close()`` the cursor must do so AFTER this: a waiter
+    is keyed on the Event, not on ``close()`` completing.
+    """
+    with _inflight_cursor_lock:
+        _inflight_cursors.pop(token, None)
+        if not _inflight_cursors:
+            _inflight_cursors_idle.set()
+
+
+def interrupt_inflight_singleton_statements(wait_s: float = 0.0, *, caller: str = "") -> bool:
+    """Interrupt every in-flight interruptible singleton statement (#1294, #2352).
+
+    ``interrupt()`` only cancels the statement *currently* executing on a
+    cursor — landing in the gap between the rolling-snapshot refresh's
+    ``CHECKPOINT`` and its ``EXPORT DATABASE`` is a no-op — so it is re-issued
+    on a short poll until every publisher reports itself idle or ``wait_s``
+    elapses. Callers that must not block (``begin_shutdown``) pass
+    ``wait_s=0``: one interrupt shot, no wait; the refresh's own pre-EXPORT
+    ``is_shutdown_started()`` gate covers the between-statements window for
+    that caller.
+
+    Interrupting a *periodic* CHECKPOINT on the shutdown path costs no
+    durability: ``close_system_db()`` / ``close_operational_db()`` each run
+    their own final CHECKPOINT on the parent connection, so the WAL still
+    folds — the interrupt only stops the periodic one from spending the shared
+    drain budget the later drains need.
+
+    The registry is re-read on every poll iteration rather than snapshotted
+    once, so a statement published while this is already waiting is not missed.
+
+    One registry spans both DuckDB state singletons, so a caller closing only
+    one of them also interrupts a statement in flight on the other. Deliberate,
+    and free: in production the only callers close BOTH (the lifespan runs
+    ``close_system_db()`` then ``close_operational_db()``;
+    ``close_singleton_connections()`` does both itself), and every publisher is
+    a best-effort maintenance statement that the next tick simply retries. A
+    per-singleton registry would buy nothing but a way for the two to drift.
+
+    Returns True when nothing is in flight (anymore), False when the bound
+    elapsed with a statement still running.
+    """
+    with _inflight_cursor_lock:
+        if not _inflight_cursors:
+            return True
     deadline = time.monotonic() + wait_s
-    while not _rolling_snapshot_export_idle.is_set():
-        try:
-            cur.interrupt()
-        except Exception as exc:
-            logger.debug(
-                "%s: interrupting in-flight rolling-snapshot export failed (%s)",
-                caller or "interrupt_rolling_snapshot_export",
-                exc,
-            )
+    while not _inflight_cursors_idle.is_set():
+        with _inflight_cursor_lock:
+            cursors = list(_inflight_cursors.values())
+        for cur in cursors:
+            try:
+                cur.interrupt()
+            except Exception as exc:
+                logger.debug(
+                    "%s: interrupting an in-flight singleton statement failed (%s)",
+                    caller or "interrupt_inflight_singleton_statements",
+                    exc,
+                )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        _rolling_snapshot_export_idle.wait(timeout=min(remaining, 0.05))
-    return _rolling_snapshot_export_idle.is_set()
+        _inflight_cursors_idle.wait(timeout=min(remaining, 0.05))
+    return _inflight_cursors_idle.is_set()
 
 
 def _rolling_snapshot_interval_hours() -> float:
@@ -9817,8 +10051,6 @@ def refresh_rolling_snapshot(*, force: bool = False) -> bool:
 
 def _refresh_rolling_snapshot_locked(*, force: bool) -> bool:
     """Body of :func:`refresh_rolling_snapshot`; caller holds the refresh lock."""
-    global _rolling_snapshot_export_cursor
-
     from app.api.health_probes import is_shutdown_started
 
     if is_shutdown_started():
@@ -9868,7 +10100,11 @@ def _refresh_rolling_snapshot_locked(*, force: bool) -> bool:
 
     tmp_dir = state_dir / f"{_ROLLING_SNAPSHOT_DIRNAME}.tmp"
 
-    with _system_db_lock:
+    with _admitting_child_statement("refresh_rolling_snapshot") as admitted, _system_db_lock:
+        if not admitted:
+            # A close path is closing the parent right now; a fresh export
+            # would only be interrupted, and the snapshot is best-effort.
+            return False
         conn = _system_db_conn
         if conn is None:
             # Never open a second connection to system.duckdb just to
@@ -9877,7 +10113,9 @@ def _refresh_rolling_snapshot_locked(*, force: bool) -> bool:
         # Take a dedicated cursor and run the export OUTSIDE the lock. The
         # lock guards the singleton GLOBAL's lifecycle (open/close/replace),
         # not query execution — every request already runs on its own cursor
-        # without holding it, and DuckDB serializes cursors internally. A
+        # without holding it, and a cursor is a sibling connection with its
+        # own MVCC transaction context: DuckDB does NOT serialize statement
+        # execution across cursors of one connection (measured, #2352). A
         # full-DB EXPORT can take whole seconds on a grown system.duckdb;
         # holding the lock across it would stall get_system_db() — and with
         # it every authed request — for the export's entire duration (Devin
@@ -9891,10 +10129,15 @@ def _refresh_rolling_snapshot_locked(*, force: bool) -> bool:
             # the None-check and here — same "no open singleton" outcome.
             logger.debug("refresh_rolling_snapshot: no usable cursor (%s)", exc)
             return False
-
-    with _rolling_snapshot_export_lock:
-        _rolling_snapshot_export_cursor = cur
-        _rolling_snapshot_export_idle.clear()
+        # Published INSIDE the admission handshake, together with taking the
+        # cursor: a close path that landed between the two would find the
+        # registry empty and close the parent out from under the export that
+        # is about to start. The publication itself has to outlive this block
+        # — it spans this function's CHECKPOINT and EXPORT DATABASE and its
+        # own `finally`, which is what makes the interrupt poll's "landed
+        # between the two statements" no-op case survivable — so it uses the
+        # primitives and unpublishes in that `finally`.
+        export_token = _register_interruptible_cursor(cur)
 
     try:
         # A crashed prior attempt can leave a stale tmp export behind;
@@ -9958,9 +10201,7 @@ def _refresh_rolling_snapshot_locked(*, force: bool) -> bool:
         # close_system_db()'s wait (#1294) is keyed on the event, not on
         # cur.close() completing, so this is what lets an interrupted wait
         # unblock as soon as we're done issuing statements on the cursor.
-        with _rolling_snapshot_export_lock:
-            _rolling_snapshot_export_cursor = None
-            _rolling_snapshot_export_idle.set()
+        _unregister_interruptible_cursor(export_token)
         try:
             cur.close()
         except Exception:
@@ -10045,18 +10286,44 @@ def checkpoint_operational_db() -> bool:
     Returns True when a CHECKPOINT ran, False when skipped (no open singleton —
     never opens one implicitly) or when DuckDB refused; refusal is expected
     under load and simply means the next tick retries. Mirrors
-    ``checkpoint_system_db()``.
+    ``checkpoint_system_db()`` — including its cursor-under-the-lock,
+    execute-outside-the-lock discipline, the interruptible-cursor publication
+    that discipline requires and the admission handshake that keeps a close
+    path out of the gap before it (#2352), but not its slow-flush INFO
+    log: everything in this file is short-TTL verification codes, so its WAL
+    has no growth path to a flush worth reporting. That matters more here than
+    the shared-lock naming suggests: this singleton is guarded by
+    ``_system_db_lock`` too, so executing the flush under it stalled
+    ``get_system_db()`` as well — and on a Postgres-state instance, where
+    this is the only arm of the checkpoint loop that does anything, it
+    stalled every ``get_operational_db()`` caller, i.e. CLI login and Slack
+    identity binding.
     """
-    with _system_db_lock:
-        if _operational_db_conn is None:
+    with _admitting_child_statement("checkpoint_operational_db") as admitted, _system_db_lock:
+        if not admitted:
+            return False
+        conn = _operational_db_conn
+        if conn is None:
             return False
         try:
-            _operational_db_conn.execute("CHECKPOINT")
-            logger.debug("checkpoint_operational_db: CHECKPOINT ok")
-            return True
+            cur = conn.cursor()
         except Exception as exc:
-            logger.warning("checkpoint_operational_db: CHECKPOINT failed (%s); will retry next tick", exc)
+            logger.debug("checkpoint_operational_db: no usable cursor (%s)", exc)
             return False
+        token = _register_interruptible_cursor(cur)
+    try:
+        cur.execute("CHECKPOINT")
+        logger.debug("checkpoint_operational_db: CHECKPOINT ok")
+        return True
+    except Exception as exc:
+        logger.warning("checkpoint_operational_db: CHECKPOINT failed (%s); will retry next tick", exc)
+        return False
+    finally:
+        _unregister_interruptible_cursor(token)
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 def close_operational_db() -> None:
@@ -10068,17 +10335,37 @@ def close_operational_db() -> None:
     that the next process must replay on open — and unlike the system DuckDB
     there is no salvage-reopen recovery path here, so a failed replay would wedge
     CLI login + Slack binding until the file is deleted.
+
+    Also mirrors that function's in-flight-statement handoff (#1294, #2352) —
+    interrupt-and-drain inside the same ``_barring_child_statements`` handshake,
+    so a publisher can neither be closed out from under nor admitted after the
+    drain. Reachable for the same reason: the lifespan cancels the checkpoint
+    loop, ``to_thread_drain_on_cancel`` abandons the thread once the statement
+    outlives the shared drain budget, and this runs a few steps later — so an
+    abandoned ``checkpoint_operational_db()`` can still be executing on a
+    cursor derived from this connection when we close it.
     """
     global _operational_db_conn, _operational_db_path
-    if _operational_db_conn:
-        try:
-            _operational_db_conn.execute("CHECKPOINT")
-            logger.debug("close_operational_db: CHECKPOINT ok")
-        except Exception as exc:
-            logger.warning("close_operational_db: CHECKPOINT failed (%s); proceeding to close", exc)
-        try:
-            _operational_db_conn.close()
-        except Exception as exc:
-            logger.debug("close_operational_db: close raised (%s); ignoring", exc)
-        _operational_db_conn = None
-        _operational_db_path = None
+
+    with _barring_child_statements("close_operational_db"):
+        if not interrupt_inflight_singleton_statements(
+            _INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S, caller="close_operational_db"
+        ):
+            logger.warning(
+                "close_operational_db: a singleton statement is still running %.1fs after being "
+                "interrupted; closing operational.duckdb anyway",
+                _INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S,
+            )
+
+        if _operational_db_conn:
+            try:
+                _operational_db_conn.execute("CHECKPOINT")
+                logger.debug("close_operational_db: CHECKPOINT ok")
+            except Exception as exc:
+                logger.warning("close_operational_db: CHECKPOINT failed (%s); proceeding to close", exc)
+            try:
+                _operational_db_conn.close()
+            except Exception as exc:
+                logger.debug("close_operational_db: close raised (%s); ignoring", exc)
+            _operational_db_conn = None
+            _operational_db_path = None

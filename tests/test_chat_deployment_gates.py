@@ -505,3 +505,194 @@ def test_docker_sandbox_probe_survives_an_unreachable_sidecar(monkeypatch):
 
     monkeypatch.setattr("app.chat.sandbox_runner_client.SandboxRunnerClient", _BoomClient)
     assert asyncio.run(main_mod._chat_docker_sandbox_ok(_docker_cfg())) is False
+
+
+# ---------------------------------------------------------------------------
+# chat.docker_egress_mode=allowlist ↔ the egress-proxy sidecar (#1250)
+#
+# Allowlist mode splits enforcement across two owners: the app puts every
+# sandbox on an `internal: true` network with no route out, and the
+# compose-owned egress-proxy sidecar is the ONLY way off it. That is
+# fail-CLOSED for security, but it used to be silent: the sidecar sits behind
+# the `chat-docker-egress` compose profile, so a stack brought up without that
+# profile ran every sandbox with zero egress and nothing said so — and with the
+# profile inactive `docker compose up -d` does not even manage (recreate,
+# restart, health-check) a proxy container that already exited.
+#
+# The gate below is the app's half of the coupling: a deployment configured for
+# allowlist mode refuses to spawn the ChatManager when the proxy is unreachable,
+# naming the profile to enable. The provisioning half (the host scripts
+# activating that profile from the configured mode) is
+# tests/test_startup_chat_egress_profile.py.
+# ---------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_allowlist_refuses_when_the_egress_proxy_is_unreachable(monkeypatch, caplog):
+    """Configured for allowlist, no proxy answering → chat is refused loudly
+    with the compose profile named, not booted with sandboxes that silently
+    have no egress at all."""
+    import asyncio
+    import logging
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    # One attempt: this test is about the refusal, not the boot-race retries.
+    monkeypatch.setattr(main_mod, "_EGRESS_PROXY_PROBE_ATTEMPTS", 1)
+    cfg = _docker_cfg(
+        docker_egress_mode="allowlist",
+        docker_egress_proxy_url=f"http://127.0.0.1:{_free_port()}",
+    )
+    with caplog.at_level(logging.ERROR, logger="app.main"):
+        assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is False
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "--profile chat-docker-egress" in joined, "the refusal must name the profile to enable"
+    assert "refusing to spawn ChatManager" in joined
+
+
+@pytest.mark.parametrize("shape", ["http://127.0.0.1:{port}", "127.0.0.1:{port}"])
+def test_allowlist_accepts_a_reachable_egress_proxy(monkeypatch, shape):
+    """The supported shape — proxy listening — still comes up.
+
+    Both spellings of the URL count: the value is handed to sandboxes verbatim
+    as HTTP_PROXY, where a schemeless `host:port` is conventionally accepted,
+    so the gate must not refuse a deployment that actually works.
+    """
+    import asyncio
+    import socket
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    try:
+        cfg = _docker_cfg(
+            docker_egress_mode="allowlist",
+            docker_egress_proxy_url=shape.format(port=srv.getsockname()[1]),
+        )
+        assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is True
+    finally:
+        srv.close()
+
+
+def test_a_malformed_proxy_url_refuses_chat_instead_of_aborting_startup(monkeypatch, caplog):
+    """`urlparse(...).port` raises ValueError on ATTRIBUTE ACCESS for a
+    non-numeric or out-of-range port. Unguarded that escaped this gate — whose
+    docstring promises it never raises — and took the whole instance down (API,
+    admin UI, and the scheduler that depends on it) over a chat-only sidecar's
+    URL. The gate must refuse chat and leave everything else running
+    (Devin Review on #2417)."""
+    import asyncio
+    import logging
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    for bad in ("proxy:notaport", "proxy:99999", "http://proxy:-1"):
+        cfg = _docker_cfg(docker_egress_mode="allowlist", docker_egress_proxy_url=bad)
+        with caplog.at_level(logging.ERROR, logger="app.main"):
+            # is False, not "raises" — the point is that it returns.
+            assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is False, bad
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "refusing to spawn ChatManager" in joined, bad
+        assert "--profile chat-docker-egress" in joined, bad
+        caplog.clear()
+
+
+def test_allowlist_refuses_an_empty_proxy_url(monkeypatch, caplog):
+    """`allowlist` with no proxy URL gives sandboxes no proxy env at all
+    (`_egress_env` returns {}) on a network with no other route out — the same
+    zero-egress state, from a different knob."""
+    import asyncio
+    import logging
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    cfg = _docker_cfg(docker_egress_mode="allowlist", docker_egress_proxy_url="")
+    with caplog.at_level(logging.ERROR, logger="app.main"):
+        assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is False
+    assert "--profile chat-docker-egress" in " ".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("mode", ["open", "none"])
+def test_non_allowlist_modes_never_probe_a_proxy(monkeypatch, mode):
+    """`open` (and the `none` default) have no proxy in the picture at all —
+    they must be completely unaffected, including when the configured proxy URL
+    points at nothing."""
+    import asyncio
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    probed = []
+    cfg = _docker_cfg(
+        docker_egress_mode=mode,
+        docker_egress_proxy_url=f"http://127.0.0.1:{_free_port()}",
+    )
+
+    async def _boom(*a, **kw):  # pragma: no cover — must never run
+        probed.append(a)
+        raise AssertionError("non-allowlist mode must not probe the egress proxy")
+
+    monkeypatch.setattr("asyncio.open_connection", _boom)
+    assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is True
+    assert probed == []
+
+
+def test_egress_gate_skipped_for_other_providers_and_when_chat_is_off(monkeypatch):
+    """The gate is docker-provider-specific: a kai-agent deployment (whose
+    sandboxes Agnes does not create) and a disabled chat must not be refused
+    for lacking a sidecar this instance never uses."""
+    import asyncio
+
+    import app.main as main_mod
+    from app.chat.config import ChatConfig
+
+    monkeypatch.delenv("TESTING", raising=False)
+    assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(ChatConfig(enabled=True, provider="kai-agent"))) is True
+    assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(_docker_cfg(enabled=False))) is True
+
+
+def test_egress_gate_surfaces_the_config_mismatches_before_refusing(monkeypatch, caplog):
+    """The mismatch collector shipped in #1282 answers "which knob is wrong",
+    which is exactly what an operator needs when the probe then refuses — so it
+    must be emitted on the refusal path, not only on the happy path where the
+    ChatManager is built."""
+    import asyncio
+    import logging
+
+    import app.main as main_mod
+
+    monkeypatch.delenv("TESTING", raising=False)
+    # One attempt: this test is about the refusal, not the boot-race retries.
+    monkeypatch.setattr(main_mod, "_EGRESS_PROXY_PROBE_ATTEMPTS", 1)
+    cfg = _docker_cfg(
+        docker_egress_mode="allowlist",
+        docker_network="custom",
+        docker_egress_proxy_url=f"http://127.0.0.1:{_free_port()}",
+    )
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        assert asyncio.run(main_mod._chat_docker_egress_proxy_ok(cfg)) is False
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "chat.docker_network" in joined
+
+
+def test_the_lifespan_gate_chain_includes_the_egress_gate():
+    """A helper nothing calls guards nothing — pin the wiring."""
+    from pathlib import Path
+
+    body = Path("app/main.py").read_text()
+    assert "elif not await _chat_docker_egress_proxy_ok(app.state.chat_config):" in body

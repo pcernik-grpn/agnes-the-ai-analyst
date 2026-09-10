@@ -66,6 +66,7 @@ def _add_scope(
     access_mode: str = "mirrored",
     display_path: "str | None" = None,
     excluded_subtrees: "list | None" = None,
+    anonymize: bool = False,
 ) -> None:
     from src.repositories import source_connections_repo
 
@@ -76,7 +77,7 @@ def _add_scope(
     scope = {
         "source_scope_id": source_scope_id,
         "display_path": display_path or source_scope_id,
-        "anonymize": False,
+        "anonymize": anonymize,
         "collection_id": collection_id,
         "drive_id": drive_id,
         "access_mode": access_mode,
@@ -701,3 +702,140 @@ class TestRetroactiveCleanup:
         last_run = _last_run(conn_id)
         assert last_run["removed_files"] == 1
         assert last_run["dissolved_zones"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Retroactive cleanup on an ANONYMIZE-MARKED scope (#2011).
+#
+# The admin's exclusion/zone config carries the REAL folder path, while an
+# anonymize-marked scope's `corpus_files.path` is the per-segment-redacted
+# one the crawl stored (`crawler._anonymize_identity`). The cleanup has to
+# derive the second from the first through the SAME segment anonymization or
+# a folder exclusion / a freshly promoted zone never reaches anything already
+# ingested into such a scope.
+#
+# The seam these tests stub is `crawler.anonymize_markdown` — the one the
+# crawl itself goes through (tests/test_sharepoint_crawler.py's own anonymize
+# tests stub exactly this), so a row seeded below with `REDACTED[...]`
+# segments carries the shape a real anonymize-marked crawl would have written.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def anonymize_seam(monkeypatch):
+    """Deterministic stand-in for the anonymizer: it WRAPS rather than
+    replaces, so an assertion can see that each path segment went through it
+    separately (never the whole path as one string)."""
+    from connectors.sharepoint import crawler
+    from src.anonymization import AnonymizeResult
+
+    monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unit-test-key")
+    monkeypatch.setattr(
+        crawler,
+        "anonymize_markdown",
+        lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]", 1),
+    )
+    return crawler
+
+
+def _install_single_child_sweep(monkeypatch, *, flag: "bool | None", name: str = "Secret") -> None:
+    """Graph fakes for a scope root with exactly one child folder.
+
+    ``flag=True`` — broken inheritance, so the folder is promoted to its own
+    permission zone and the cleanup matches that ACTIVE zone's ``rel_path``
+    against the PARENT collection's rows (re-homing is a COPY; the parent copy
+    must die too). ``flag=None`` — unknown probe signal, so the folder is
+    excluded outright (``kind="folder"``, fail-closed) and never descended.
+    """
+    monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+    async def fake_children(token, drive_id, item_id):
+        if item_id == "root":
+            return [{"id": name, "name": name, "is_folder": True, "child_count": 0}]
+        if item_id == name:
+            return []  # the promoted zone root itself, childless
+        raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+    async def fake_probe(token, drive_id, item_ids):
+        return {} if flag is None else {i: flag for i in item_ids}
+
+    monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+    monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+
+class TestRetroactiveCleanupAnonymizedScope:
+    def test_folder_exclusion_purges_the_anonymized_rows(self, sweep_env, monkeypatch, anonymize_seam):
+        conn_id = _make_connection()
+        col_id = _make_collection("Anon Excl Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root", anonymize=True)
+
+        _add_corpus_file(col_id, path="REDACTED[Secret]/REDACTED[a].docx")
+        _add_corpus_file(col_id, path="REDACTED[open]/REDACTED[keep].docx")
+
+        _install_single_child_sweep(monkeypatch, flag=None)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        entry = _connection_scope(conn_id, "root")["excluded_subtrees"][0]
+        assert (entry["kind"], entry["rel_path"]) == ("folder", "Secret"), "the config side stays REAL, never redacted"
+        assert _corpus_file_paths(col_id) == {"REDACTED[open]/REDACTED[keep].docx"}
+        assert _last_run(conn_id)["removed_files"] == 1
+
+    def test_active_zone_purges_the_anonymized_parent_side_rows(self, sweep_env, monkeypatch, anonymize_seam):
+        conn_id = _make_connection()
+        col_id = _make_collection("Anon Zone Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root", anonymize=True)
+
+        _add_corpus_file(col_id, path="REDACTED[Secret]/REDACTED[a].docx")
+        _add_corpus_file(col_id, path="REDACTED[open]/REDACTED[keep].docx")
+
+        _install_single_child_sweep(monkeypatch, flag=True)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        zone = next(z for z in _zones(conn_id) if z["zone_item_id"] == "Secret")
+        assert (zone["status"], zone["rel_path"]) == ("active", "Secret")
+        assert _corpus_file_paths(col_id) == {"REDACTED[open]/REDACTED[keep].docx"}
+        assert _last_run(conn_id)["removed_files"] == 1
+
+    def test_a_row_ingested_before_the_scope_was_marked_is_still_purged(self, sweep_env, monkeypatch, anonymize_seam):
+        """Matching an anonymize-marked scope is ADDITIVE, never a swap: a
+        scope switched to ``anonymize`` after it was first crawled still holds
+        rows carrying the REAL path, and an exclusion must reach those too."""
+        conn_id = _make_connection()
+        col_id = _make_collection("Anon Mixed Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root", anonymize=True)
+
+        _add_corpus_file(col_id, path="Secret/pre-flip.docx")  # ingested before the flag was set
+        _add_corpus_file(col_id, path="REDACTED[Secret]/REDACTED[a].docx")
+        _add_corpus_file(col_id, path="REDACTED[open]/REDACTED[keep].docx")
+
+        _install_single_child_sweep(monkeypatch, flag=None)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        assert _corpus_file_paths(col_id) == {"REDACTED[open]/REDACTED[keep].docx"}
+        assert _last_run(conn_id)["removed_files"] == 2
+
+    def test_an_unmarked_scope_never_matches_a_redacted_path(self, sweep_env, monkeypatch, anonymize_seam):
+        """The gate is the scope's own ``anonymize`` flag: a scope that does
+        NOT anonymize keeps matching real paths only, so a redacted-looking
+        row under it is left alone — this fix must not widen matching for a
+        scope it does not apply to."""
+        conn_id = _make_connection()
+        col_id = _make_collection("Plain Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root", anonymize=False)
+
+        _add_corpus_file(col_id, path="Secret/real.docx")
+        _add_corpus_file(col_id, path="REDACTED[Secret]/REDACTED[a].docx")
+
+        _install_single_child_sweep(monkeypatch, flag=None)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        assert _corpus_file_paths(col_id) == {"REDACTED[Secret]/REDACTED[a].docx"}
+        assert _last_run(conn_id)["removed_files"] == 1

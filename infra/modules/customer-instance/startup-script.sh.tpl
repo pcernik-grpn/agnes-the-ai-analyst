@@ -801,9 +801,14 @@ if [ -f "$APP_DIR/scripts/ops/agnes-compose-file.sh" ]; then
     fi
 else
     rm -f "$APP_DIR/.gcp-logging-ok"
-    # Stub the gate so section 4's append below stays a clean "no" instead
-    # of a command-not-found.
+    # Stub the gates so section 4's / section 5's appends below stay a clean
+    # "no" instead of a command-not-found.
     agnes_gcp_logging_active() { false; }
+    # No profile for the chat egress proxy either. Fail-safe in the direction
+    # that surfaces itself: an allowlist instance then boots WITHOUT the
+    # sidecar, and the app's own gate refuses the ChatManager with the fix in
+    # the log line rather than serving sessions that silently cannot egress.
+    agnes_chat_egress_allowlist_active() { false; }
     echo "WARNING: $APP_DIR/scripts/ops/agnes-compose-file.sh missing from this image (AGNES_TAG predates the shared resolver?) — Cloud Logging overlay disabled" >&2
 fi
 
@@ -2042,6 +2047,29 @@ fi
 # upgrade tick keeps the sidecar running.
 COMPOSE_PROFILES_ARG="$COMPOSE_PROFILES_ARG --profile apps"
 %{ endif ~}
+
+# The egress proxy's profile is DERIVED from the configured egress mode rather
+# than from a Terraform flag of its own: chat.docker_egress_mode lives in the
+# applier-owned /data/state/instance.yaml that the app itself reads, so a
+# second copy in .tf could only drift from it. agnes_chat_egress_allowlist_active
+# (scripts/ops/agnes-compose-file.sh, sourced in section 3 above) is the one
+# gate this boot and the 5-minute auto-upgrade tick share.
+#
+# It matters because allowlist mode makes that sidecar the sandboxes' ONLY
+# route off the host: without it every chat session runs with no egress at
+# all, and with the profile inactive `docker compose up -d` does not even
+# manage the container — an exited proxy stayed exited, invisible, for five
+# days (#1250). A flag, not COMPOSE_PROFILES in .env, for the same reason as
+# `apps` above.
+#
+# Deliberately NOT gated on chat_provider: the mode only means anything for
+# the docker provider, but instance.yaml is authoritative for the provider too
+# (an instance.yaml-only `docker` provider is a supported shape), so following
+# the configured mode alone is what keeps the two in step. Unconfigured,
+# `open` and `none` instances render no flag at all.
+if agnes_chat_egress_allowlist_active "$DATA_MNT/state"; then
+    COMPOSE_PROFILES_ARG="$COMPOSE_PROFILES_ARG --profile chat-docker-egress"
+fi
 
 # Honor COMPOSE_FILE from /opt/agnes/.env. The .env write above sets the
 # full list ``docker-compose.yml:docker-compose.prod.yml:docker-compose.postgres.yml:docker-compose.host-mount.yml``

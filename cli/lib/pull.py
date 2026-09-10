@@ -48,6 +48,7 @@ from cli.config import get_sync_state, save_sync_state
 from cli.snapshot_meta import list_snapshots
 from src.distribution import CONTENT_MD5_HEADER
 from src.object_store import OBJECT_STORE_MD5_METADATA_HEADER
+from src.parquet_publish import retire_superseded_parquet
 from src.sql_ident import quote_ident
 
 logger = logging.getLogger(__name__)
@@ -711,8 +712,14 @@ def _drop_stale_layout(parquet_dir: Path, tid: str, *, partitioned: bool) -> Non
     rows. Called after a successful sync in each direction.
     """
     if partitioned:
-        # Now a directory of parts → drop the stale single-file copy.
-        (parquet_dir / f"{tid}.parquet").unlink(missing_ok=True)
+        # Now a directory of parts → drop the stale single-file copy, through
+        # the shared reclaim primitive rather than a bare `unlink` (#1339).
+        # The server side has the identical transition to make, and one
+        # variant is what keeps client and server behaviour from drifting;
+        # `tid` also arrives from the SERVER's manifest, so the containment
+        # this brings (single safe segment, parent resolving to
+        # ``parquet_dir``, symlinks refused) applies here too.
+        retire_superseded_parquet(parquet_dir / f"{tid}.parquet", root=parquet_dir)
     else:
         # Now a single file → drop the stale parts directory.
         stale_dir = parquet_dir / tid

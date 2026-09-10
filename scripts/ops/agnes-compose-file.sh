@@ -60,6 +60,91 @@ agnes_tls_active() {
         && [ -s "$_acf_cdir/Caddyfile" ]
 }
 
+# agnes_chat_egress_allowlist_active <state_dir>
+#
+# True (exit 0) when this instance is configured for
+# `chat.docker_egress_mode: allowlist`, i.e. when the `chat-docker-egress`
+# compose profile MUST be active.
+#
+# In allowlist mode chat sandboxes join an `internal: true` network with no
+# route off the host and the services/egress_proxy sidecar is their only way
+# out. That sidecar sits behind a compose profile, so before this gate the
+# profile was a step an operator had to remember: a deployment could configure
+# allowlist mode and simply never run the process enforcing it. Worse, with the
+# profile inactive `docker compose up -d` does not create, recreate, restart or
+# health-check the proxy at all — a container that had already exited just sat
+# there outside compose's view, which is how one stayed down for five days with
+# nothing surfacing it (#1250).
+#
+# So the profile is DERIVED from the configured mode, here, once, for every
+# caller that brings the stack up (the boot startup script and the 5-minute
+# auto-upgrade tick) — exactly like agnes_resolve_compose_file derives the
+# postgres overlays from database.backend, and read from the same file: the
+# applier-owned <state_dir>/instance.yaml is what app/main.py loads its
+# ChatConfig from, so the profile and the app's own mode cannot disagree. Never
+# from .env, which the boot script rewrites and no admin edit ever touches.
+#
+# Both directions of a wrong answer here fail safe: a false positive starts a
+# proxy nothing uses, and a false negative leaves the app's own boot gate to
+# refuse chat loudly (app/main.py::_chat_docker_egress_proxy_ok) rather than
+# serve sessions with no egress.
+agnes_chat_egress_allowlist_active() {
+    _acf_sdir=$1
+    [ -f "$_acf_sdir/instance.yaml" ] || return 1
+    # Ask PyYAML for the value, exactly as the app does. This helper exists to
+    # guarantee the host and the app never disagree about whether the proxy
+    # profile is required, and imitating YAML in sed cannot deliver that.
+    # Three rounds of review on #2417 found three different ways to break a
+    # lookalike parser: a plain inline comment (`allowlist # note`, which YAML
+    # strips, so the app reads `allowlist` and the host must too), a quoted
+    # hash (`"allowlist # note"`, which YAML keeps, so the app rejects the
+    # mode and falls back to the secure `none`), and a doubled quote inside a
+    # single-quoted scalar. Using the same parser makes the agreement
+    # structural instead of a lookalike we keep patching.
+    #
+    # python3-yaml is not a new dependency here: the VM startup script installs
+    # it and already gates its own instance.yaml merge on `import yaml`, and
+    # agnes-state-applier.sh writes this very file through PyYAML.
+    if python3 -c 'import yaml' 2>/dev/null; then
+        _acf_egress=$(python3 - "$_acf_sdir/instance.yaml" <<'PY' 2>/dev/null
+import sys
+
+import yaml
+
+try:
+    doc = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    # Unloadable YAML: say nothing, and let the app's own boot gate be what
+    # complains, rather than provisioning on a guess.
+    sys.exit(0)
+chat = doc.get("chat") if isinstance(doc, dict) else None
+mode = (chat or {}).get("docker_egress_mode") if isinstance(chat, dict) else None
+# `.strip().lower()` mirrors app/chat/config.py: _raw_str strips before
+# _parse_docker_egress_mode lowercases, so a QUOTED value with trailing
+# whitespace (which YAML preserves) is `allowlist` to the app. Without the
+# strip the host read `allowlist   `, skipped the profile, and the app then
+# refused chat for a proxy that was never started.
+print(mode.strip().lower() if isinstance(mode, str) else "")
+PY
+)
+    else
+        # No PyYAML (the startup script warns and retries next boot in the same
+        # situation). Fall back to the STRICT shape only: an unquoted
+        # `allowlist`, optionally followed by a comment. Anything quoted or
+        # otherwise ambiguous stays inactive — the documented-safe direction,
+        # where the app's own boot gate refuses chat loudly instead of a proxy
+        # being provisioned for a mode the app may not agree with.
+        _acf_egress=$(sed -n 's/^[[:space:]]*docker_egress_mode:[[:space:]]*//p' \
+            "$_acf_sdir/instance.yaml" 2>/dev/null | head -1)
+        _acf_egress=$(printf '%s' "$_acf_egress" | sed 's/[[:space:]]#.*$//' | sed 's/[[:space:]]*$//')
+        case $_acf_egress in
+            allowlist) ;;
+            *) _acf_egress="" ;;
+        esac
+    fi
+    [ "$_acf_egress" = "allowlist" ]
+}
+
 # agnes_gcp_logging_active <compose_dir>
 #
 # True (exit 0) when the GCP Cloud Logging overlay

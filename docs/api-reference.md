@@ -2318,8 +2318,15 @@ column the extraction dispatch bookkeeping already lives in, carried forward
 on every generic connection edit. The crawl polls this flag at the same
 quiescent points its own `extraction.timeout_s` ceiling already checks
 (unconditionally between delta pages, every 10 completed items between
-files) and stops there exactly like a timeout — `interrupted_reason:
-"stopped"`, a run that is resumable, state saved. Unlike the four routes
+files) — and, since the shard planner got a checkpoint of its own, during a
+large site's minutes-long shard planning too — stopping there exactly like a
+timeout: `interrupted_reason: "stopped"`, a run that is resumable, state
+saved. The flag also records `stop_job_id`, the connection's in-flight
+`corpus-extraction` job at the moment Stop was pressed, which is how a run
+starting later tells a stop aimed at itself (pressed while its own job was
+still queued or still planning) apart from one left over from an earlier run
+— by identity, never by comparing two wall clocks written by two different
+roles. Unlike the four routes
 above, this one touches no `extraction_runs` row, so it answers `202` on
 BOTH app-state backends (`source_connections`/`config_patch` predate the A3
 Postgres-only ratchet) even though the run-state reads next to it are
@@ -2409,9 +2416,16 @@ finds it false, and stops extending, no separate worker-side mechanism
 required; (3) closes the `extraction_runs` row immediately as `interrupted`
 with `interrupted_reason: "cancelled"` — never waiting on the crawl to
 notice. A zombie handler thread may keep running a while longer (Python
-cannot force-kill a thread), but its eventual `complete()`/`fail()` call
-carries the now-stale lease token and is a guaranteed no-op, so it can never
-resurrect the state this call just wrote. Returns `{connection_id, ...}` —
+cannot force-kill a thread): its eventual `complete()`/`fail()` call carries
+the now-stale lease token and is a guaranteed no-op, so it can never
+resurrect the state this call just wrote — and its *crawl-side* side effects
+(file walks, crawl-state writes, shard-child enqueues) are bounded by the
+connection's **run generation**, a monotonic counter every trigger claims
+atomically and every actor re-checks at its own checkpoints. The next trigger
+claims a newer one, at which point the zombie raises `CrawlSuperseded` and
+stops; its shard children carry the generation they were planned under, in
+their idempotency key as well as their payload, so they can neither run for a
+superseded plan nor collide with the fresh run's children. Returns `{connection_id, ...}` —
 the rest is the run's new projection, same shape as every other run read in
 this module, so the caller repaints without a second fetch. `404
 run_not_found` for an unknown run id; `409 run_not_active` when the run's

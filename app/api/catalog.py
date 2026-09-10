@@ -166,7 +166,7 @@ def refresh_profile(
     # Check table-level access
     if not can_access_table(user, table_name, conn):
         raise HTTPException(status_code=403, detail=f"Access denied to table '{table_name}'")
-    from app.utils import resolve_local_parquet, resolve_local_partition_dir
+    from app.utils import resolve_local_layout_target
     from src.profiler import profile_table, TableInfo
 
     # The single-file lookup goes through `resolve_local_parquet` rather than a
@@ -183,7 +183,15 @@ def refresh_profile(
     # `profile_table` takes the directory as-is (it builds a recursive `**`
     # read expression from it), which is exactly what the scheduled profiling
     # run already passes — only this manual refresh could not reach it.
-    target = resolve_local_parquet(table_name) or resolve_local_partition_dir(table_name)
+    #
+    # `resolve_local_layout_target` rather than
+    # `resolve_local_parquet(...) or resolve_local_partition_dir(...)`: that
+    # hand-written expression was a third copy of the layout precedence (flat
+    # always wins), so a table holding BOTH layouts (#1339) got profiled from
+    # whichever one the read surfaces were not serving. The helper applies the
+    # shared freshness comparator and, absent a collision, resolves exactly as
+    # the expression did — including across sources.
+    target = resolve_local_layout_target(table_name)
     if target is None:
         raise HTTPException(status_code=404, detail=f"No parquet for '{table_name}'")
 

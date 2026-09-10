@@ -1327,10 +1327,13 @@ def test_a_trigger_right_after_a_cancel_clears_the_stale_stop_flag(tmp_path, mon
     assert _stop_requested(conn_id) is None
 
 
-def test_a_stop_requested_after_the_triggering_job_still_survives_the_clear(tmp_path, monkeypatch, pg_engine):
-    """The race: a stop written AFTER the triggering job's own `created_at`
-    (an admin's Stop click landing while that job was still starting) must
-    not be wiped by that same job's own start-up clear."""
+def test_a_stop_aimed_at_the_triggering_job_survives_that_jobs_own_clear(tmp_path, monkeypatch, pg_engine):
+    """The race: a stop pressed while the triggering job was still queued
+    (or still planning) must not be wiped by that same job's own start-up
+    clear. Issue #2333 finding (3): the flag names the job it was aimed at,
+    so this no longer depends on the flag's timestamp and the job row's
+    `created_at` — written by the `api` and `worker`/`scheduler` roles
+    respectively — being comparable at all."""
     from connectors.sharepoint.crawler import _clear_stale_stop_for_trigger, _stop_requested, request_stop
 
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
@@ -1339,11 +1342,75 @@ def test_a_stop_requested_after_the_triggering_job_still_survives_the_clear(tmp_
     from src.repositories import jobs_repo
 
     job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
-    stamp = request_stop(conn_id)  # strictly after job["created_at"]
+    stamp = request_stop(conn_id, job_id=job["id"])
 
     _clear_stale_stop_for_trigger(conn_id, job["id"])
 
     assert _stop_requested(conn_id) == stamp
+
+    # ... and the SAME flag is stale for the connection's NEXT, unrelated
+    # trigger, whatever the two clocks say.
+    other = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id}, idempotency_key="second-trigger")
+    _clear_stale_stop_for_trigger(conn_id, other["id"])
+
+    assert _stop_requested(conn_id) is None
+
+
+def test_cancel_aims_the_stop_flag_at_the_cancelled_runs_own_job(tmp_path, monkeypatch, pg_engine):
+    """`POST …/runs/{id}/cancel` records the run's OWNING job as the flag's
+    target (issue #2333), which is what keeps a cancel from reaching
+    forward into this connection's next trigger."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-aim")
+
+    from src.repositories import jobs_repo, source_connections_repo
+
+    job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
+    run_id = _repo().start(connection_id=conn_id, job_id=job["id"])
+
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+
+    extraction = (source_connections_repo().get(conn_id)["config"] or {})["extraction"]
+    assert extraction["stop_job_id"] == job["id"]
+
+
+def test_a_retrigger_supersedes_a_cancelled_runs_zombie_handler(tmp_path, monkeypatch, pg_engine):
+    """The whole point of the run generation, end to end on Postgres: after
+    a cancel the handler thread may still be running, and a retrigger
+    legitimately clears the stop flag out from under it. The generation is
+    what still stops it — a checkpoint made by the cancelled run's own
+    watcher must raise once the retrigger has claimed the connection."""
+    import pytest
+
+    from connectors.sharepoint.crawler import (
+        CrawlSuperseded,
+        _StopWatcher,
+        _clear_stale_stop_for_trigger,
+        _stop_requested,
+        claim_run_generation,
+    )
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-zombie-supersede")
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
+    generation = claim_run_generation(conn_id)
+    zombie = _StopWatcher(conn_id, generation=generation)
+    zombie.check_page_boundary()  # still the owner
+
+    run_id = _repo().start(connection_id=conn_id, job_id=job["id"])
+    assert client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token)).status_code == 200
+
+    retrigger = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id}, idempotency_key="retrigger")
+    _clear_stale_stop_for_trigger(conn_id, retrigger["id"])
+    assert _stop_requested(conn_id) is None, "precondition: the retrigger really does clear the cancel's flag"
+    claim_run_generation(conn_id)
+
+    with pytest.raises(CrawlSuperseded):
+        zombie.check_page_boundary()
 
 
 def test_cancel_stops_the_heartbeat_loop_via_the_cleared_lease(tmp_path, monkeypatch, pg_engine):

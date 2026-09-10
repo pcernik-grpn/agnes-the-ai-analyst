@@ -5,6 +5,8 @@ import logging
 import os
 from pathlib import Path
 
+from src.parquet_publish import partition_dir_supersedes_flat
+
 logger = logging.getLogger(__name__)
 
 
@@ -262,33 +264,123 @@ def resolve_local_parquet_glob(
     return None
 
 
+def _colliding_partition_dir(single: Path, table_id: str) -> Path | None:
+    """The `<table_id>/` partition directory COLLIDING with the flat parquet
+    *single*, or ``None`` when there is none (#1339).
+
+    A table can carry both a flat `<table_id>.parquet` file and a sibling
+    `<table_id>/` partition directory at once — the sibling of the "directory
+    holding both layouts" case documented in
+    :func:`_resolve_local_parquet_glob_one`, one level up. Reached by a
+    `sync_strategy` flip: it writes the new layout and nothing removes the old
+    one, in either direction.
+
+    Detection only — which of the two WINS is
+    :func:`~src.parquet_publish.partition_dir_supersedes_flat`'s answer, see
+    :func:`_local_layout_winner`.
+
+    Only ever a TRUE sibling (`single`'s own directory). A same-named directory
+    under a different extract source is a different table's storage, not a
+    fresher copy of this one, so cross-source resolution is left exactly as it
+    was. Requires a part actually on disk: an empty `<table_id>/` is the
+    pending-first-sync case, not a competing layout, and letting it win would
+    resolve a healthy single-file table to a glob that matches nothing.
+    Contained like every other resolved candidate, so a `<table_id>/` symlink
+    out of the extracts tree cannot become the served target.
+    """
+    sibling = single.parent / table_id
+    extracts = get_data_dir() / "extracts"
+    try:
+        if not sibling.is_dir() or not _contained(sibling, extracts):
+            return None
+        if next(sibling.rglob("*.parquet"), None) is None:
+            return None
+    except OSError:
+        return None
+    return sibling
+
+
+def _local_layout_winner(single: Path, table_id: str, *, log: bool = False) -> Path:
+    """Which layout this table's data actually lives in: the flat parquet
+    *single*, or its sibling partition directory (#1339).
+
+    The FRESHER of the two wins, decided by the one comparator both precedence
+    sites share — `src/parquet_publish.py::partition_dir_supersedes_flat`, whose
+    docstring carries the mtime caveats (it is evidence, not a clock: coarse
+    filesystem granularity, a restored backup or a stray ``touch`` can invert
+    it) and the `>=` tie rule. This MUST stay identical to
+    `src/orchestrator.py::_update_sync_state`, which decides what the manifest
+    advertises; if the two disagree the read surfaces and `agnes pull` serve
+    different data, which is worse than either layout being stale. Sharing the
+    comparator rather than restating the rule is what makes that impossible —
+    and when mtime is wrong, both sides are wrong TOGETHER.
+
+    This never DELETES the loser. Reclaiming the stale flat sibling belongs to
+    the rebuild, which holds the rebuild lock and publishes before it reclaims;
+    a request-scoped resolver holds no lock, runs concurrently with everything
+    and can be called for a table mid-extract, so deleting from here is how you
+    unlink a file another request is about to open. (In the mirror direction —
+    stale directory, fresher flat file — nothing is deleted anywhere.)
+
+    ``log`` is opt-in so ONE request that consults both this and the size helper
+    does not report the same collision twice; the resolver owns the message.
+    The collision is logged in BOTH directions: the mirror one is not
+    self-healing (the rebuild only ever reclaims a flat sibling), so it must
+    stay visible rather than resolve silently.
+    """
+    colliding = _colliding_partition_dir(single, table_id)
+    if colliding is None:
+        return single
+    dir_wins = partition_dir_supersedes_flat(single, colliding)
+    if log:
+        logger.error(
+            "Table %r has BOTH a flat parquet (%s) and a partition directory "
+            "(%s) — serving the %s (it is the fresher of the two by mtime)%s. "
+            "See #1339.",
+            table_id,
+            single,
+            colliding,
+            "partition directory" if dir_wins else "flat parquet",
+            "; the stale flat parquet is reclaimed by the next rebuild"
+            if dir_wins
+            else "; the stale partition directory is left in place",
+        )
+    return colliding if dir_wins else single
+
+
+def _partition_dir_read_target(d: Path) -> str | None:
+    """A `read_parquet` target for the partition directory *d*, or ``None``
+    when it holds no part yet. Shared so the both-layouts winner is read with
+    exactly the same rule as a directory-only table — see the flat-then-
+    recursive reasoning at the call site in
+    :func:`_resolve_local_parquet_glob_one`."""
+    if any(d.glob("*.parquet")):
+        return str(d / "*.parquet")
+    if any(d.rglob("*.parquet")):
+        return str(d / "**" / "*.parquet")
+    return None
+
+
 def _resolve_local_parquet_glob_one(table_id: str, source_type: str | None) -> str | None:
     """:func:`resolve_local_parquet_glob` for ONE filename key — see there.
 
-    #1339: a table can ALSO have both a flat `<table_id>.parquet` file and a
-    sibling `<table_id>/` partition directory at once — the sibling of the
-    "directory holding both layouts" case documented in the loop below, one
-    level up. The flat file wins here too (unchanged), but that collision is
-    now logged at ERROR — see the check right after `single` resolves.
-    TODO(#1339): flipping the precedence, or deleting the stale sibling, are
-    open human decisions this fix does not make.
+    #1339: when a flat `<table_id>.parquet` and a `<table_id>/` partition
+    directory are both present, the FRESHER one wins — see
+    :func:`_local_layout_winner` for the comparator, and for why this function
+    does not delete the loser. This is the surface that owns the collision's
+    ERROR log (``log=True``).
     """
     single = resolve_local_parquet(table_id, source_type)
     if single is not None:
-        # One cheap `is_dir()` check — no glob — so this stays cheap on a hot
-        # read path. `single`'s own directory is where a colliding partition
-        # directory for the same table_id would live.
-        sibling_dir = single.parent / table_id
-        if sibling_dir.is_dir():
-            logger.error(
-                "Table %r has BOTH a flat parquet (%s) and a partition "
-                "directory (%s) — serving the flat file (precedence "
-                "unchanged), which may be stale relative to the partitioned "
-                "data. See #1339.",
-                table_id,
-                single,
-                sibling_dir,
-            )
+        winner = _local_layout_winner(single, table_id, log=True)
+        if winner != single:
+            # `target` is never None here (`_colliding_partition_dir` already
+            # found a part), but fall back to the flat file rather than to
+            # "no data at all" if a concurrent write empties the directory
+            # between the two scans.
+            target = _partition_dir_read_target(winner)
+            if target is not None:
+                return target
         return str(single)
     for d in _partition_dir_candidates(table_id, source_type):
         # Flat first, recursive only as a fallback — NOT interchangeable with an
@@ -308,10 +400,9 @@ def _resolve_local_parquet_glob_one(table_id: str, source_type: str | None) -> s
         # returns every row but drops the `month` column pure-hive tables expose
         # — i.e. the fix is per-layout read options, not one shared expression,
         # and that is a contract change rather than a one-line swap.
-        if any(d.glob("*.parquet")):
-            return str(d / "*.parquet")
-        if any(d.rglob("*.parquet")):
-            return str(d / "**" / "*.parquet")
+        target = _partition_dir_read_target(d)
+        if target is not None:
+            return target
     return None
 
 
@@ -343,15 +434,47 @@ def local_parquet_size_bytes(
     disagreement recorded in that function's docstring, where a size hint was
     published for a table those surfaces then 404-ed on. The two lookups are
     a pair; they must agree on what "this table's data" means.
+
+    That pairing is also why the both-layouts collision (#1339) is arbitrated by
+    the same comparator here (:func:`_local_layout_winner`): whichever layout is
+    fresher. Left unflipped, the catalog would publish the STALE layout's size
+    for a table the read surfaces serve from the other one.
     """
     for key in _physical_key_candidates(table_id, registry_name):
         single = resolve_local_parquet(key, source_type)
         if single is not None:
-            return single.stat().st_size
+            winner = _local_layout_winner(single, key)
+            if winner == single:
+                return single.stat().st_size
+            return sum(p.stat().st_size for p in winner.rglob("*.parquet"))
         part_dir = resolve_local_partition_dir(key, source_type)
         if part_dir is not None:
             return sum(p.stat().st_size for p in part_dir.rglob("*.parquet"))
     return None
+
+
+def resolve_local_layout_target(table_id: str, source_type: str | None = None) -> Path | None:
+    """The on-disk PATH a table's data actually lives at — the flat parquet or
+    the partition directory — or ``None`` when neither exists.
+
+    The `Path`-returning sibling of :func:`resolve_local_parquet_glob` (which
+    returns a `read_parquet` target string). Exists for the profiler:
+    `src/profiler.py::profile_table` takes either a single parquet or a
+    directory and builds its own recursive read expression, so
+    `app/api/catalog.py::refresh_profile` needs the winner as a path.
+
+    That call site was a THIRD precedence site expressing the old rule by hand
+    (``resolve_local_parquet(...) or resolve_local_partition_dir(...)`` — flat
+    wins). Routing it through the shared comparator is what stops a manual
+    profile refresh from computing statistics off the layout the read surfaces
+    do not serve. Cross-source resolution is unchanged: only a TRUE sibling
+    competes (see :func:`_colliding_partition_dir`), and with no collision this
+    resolves exactly as that expression did.
+    """
+    single = resolve_local_parquet(table_id, source_type)
+    if single is not None:
+        return _local_layout_winner(single, table_id)
+    return resolve_local_partition_dir(table_id, source_type)
 
 
 def get_marketplaces_dir() -> Path:

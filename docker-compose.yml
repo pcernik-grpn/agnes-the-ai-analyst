@@ -327,6 +327,28 @@ services:
   # out). Sandboxes point HTTP(S)_PROXY here; the proxy enforces the
   # hostname allowlist with a post-resolution IP re-check
   # (services/egress_proxy/authz.py — DNS-rebinding/metadata protection).
+  #
+  # The `chat-docker-egress` profile below is NOT an optional extra an
+  # operator remembers alongside the mode — allowlist mode without this
+  # container means sandboxes with no egress AT ALL, and an inactive profile
+  # also puts the container outside compose's view entirely: `up -d` will not
+  # create, recreate, restart or health-check it, so one that exited stays
+  # exited (#1250). Both halves of the deployment therefore derive the profile
+  # from the configured mode instead:
+  #   - host scripts: scripts/ops/agnes-compose-file.sh's
+  #     agnes_chat_egress_allowlist_active reads chat.docker_egress_mode from
+  #     /data/state/instance.yaml, and VM boot
+  #     (infra/modules/customer-instance/startup-script.sh.tpl) plus every
+  #     agnes-auto-upgrade.sh tick pass `--profile chat-docker-egress`;
+  #   - the app: app/main.py::_chat_docker_egress_proxy_ok refuses to spawn
+  #     the ChatManager when the mode is allowlist and nothing answers on
+  #     chat.docker_egress_proxy_url, naming this profile in the refusal.
+  # A hand-run stack still needs the flag (`docker compose --profile
+  # chat-docker-egress up -d`) — the app's refusal is what says so.
+  #
+  # NOT wired with depends_on: compose rejects the WHOLE project when an
+  # enabled service depends on one whose profile is inactive ("depends on
+  # undefined service"), which would break every default `docker compose up`.
   egress-proxy:
     build: .
     command: python -m services.egress_proxy

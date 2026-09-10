@@ -426,13 +426,18 @@ it is not a guarantee that nothing identifying survived — which is what the
 preview panel is for: check a real sample of *your* documents before
 trusting a crawl over thousands of them.
 
-**Retroactive folder-exclusion/zone cleanup doesn't reach an anonymized
-scope's already-ingested files.** The ACL sweep that retroactively purges
-content under a newly excluded folder or a dissolved permission zone
+**Retroactive folder-exclusion/zone cleanup is exact only on the regex
+detector tier.** The ACL sweep that retroactively purges content under a
+newly excluded folder or a newly promoted permission zone
 (`connectors.sharepoint.acl_sync._cleanup_connection_content`) matches on
-the STORED `corpus_files.path` — which is the anonymized path for a marked
-scope, and can never prefix-match the admin's real, un-anonymized exclusion
-folder or zone path. A file-kind exclusion (matched by the Graph item's
-stable id, not its path) is unaffected; only folder-kind exclusions and
-zone dissolutions lose their retroactive reach. Known, tracked (#2011), not
-yet fixed — see the comments at the match site in that module.
+the STORED `corpus_files.path`, which for a marked scope is the anonymized
+one — so for such a scope it derives the comparison prefix by running the
+admin's real folder path through the crawl's own per-segment anonymization
+(`crawler.anonymize_path_prefix`, same instance key and detector) and
+matches both forms (#2011). That derivation is exactly reproducible on the
+deterministic **regex** tier. On the **LLM** tier — or after an operator
+edits the custom-term list — a folder segment whose redaction depended on a
+detection that does not reproduce identically yields a prefix that no longer
+matches, so those files survive the pass: a missed purge, never a wrong one.
+A file-kind exclusion is matched by the Graph item's stable id rather than
+its path and is exact on every tier.
