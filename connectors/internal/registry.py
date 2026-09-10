@@ -272,7 +272,7 @@ def ensure_internal_package_seeded(*, newly_registered: Collection[str] | None =
     example questions do not. An instance created before a release that adds
     an internal table gains the table as a member but keeps the older wording,
     so its description can under-count the tables it now carries (raised by
-    Devin review on #2402 for ``agnes_issues``/``agnes_issue_comments``).
+    #2402 for ``agnes_issues``/``agnes_issue_comments``).
 
     That is deliberate, and it is the fifth "never" of the four above: those
     fields are admin-editable (``PATCH /api/admin/data-packages/{id}``), so a

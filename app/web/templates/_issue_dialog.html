@@ -30,7 +30,7 @@
    the legacy `base.html` does NOT, and it renders the same rail — so without
    this import the dialog raised `'ds' is undefined` on every page still
    extending it. Importing here shadows the parent's identical binding and
-   costs nothing (Devin review on #2402). #}
+   costs nothing (#2402). #}
 {% import '_components.html' as ds %}
 <div id="issue-dialog" class="modal-backdrop modal-overlay" role="dialog"
      aria-modal="true" aria-labelledby="issue-dialog-title">

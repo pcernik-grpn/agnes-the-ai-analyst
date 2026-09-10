@@ -51,7 +51,7 @@
        base_ds.html. This legacy base still renders `_app_rail.html`, which
        carries the report button, so it must carry the dialog too: without it
        the button rendered on every page extending this layout and clicking it
-       did nothing (Devin review on #2402). #}
+       did nothing (#2402). #}
     {% if can_report_issue %}
     <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
     <link rel="stylesheet" href="{{ static_url('css/issue_dialog.css') }}">

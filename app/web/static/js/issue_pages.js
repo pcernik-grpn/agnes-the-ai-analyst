@@ -40,6 +40,14 @@
 
   var state = { status: "open" };
   var currentDetailId = null;
+  //: Which OPENING of the drawer is current. The id alone is not enough to
+  //: identify a response's owner: close a report while its GET is in flight
+  //: and reopen the same one, and the stale response matches `currentDetailId`
+  //: again — then lands its older snapshot over whatever the second opening
+  //: has since fetched or the user has since posted (#2402). Bumped on every
+  //: open and on close, so a response is only ever applied to the opening
+  //: that asked for it.
+  var detailGeneration = 0;
   // The full row last rendered in the drawer, `comments` included — kept so
   // a resolve response (which carries no `comments` key: it's `repo.get()`,
   // not the `GET /api/issues/{id}` shape) can be MERGED onto it rather than
@@ -189,6 +197,7 @@
 
   function openDetail(id) {
     currentDetailId = id;
+    var generation = ++detailGeneration;
     var dlg = document.getElementById("iss-detail");
     var loading = document.getElementById("iss-detail-loading");
     var content = document.getElementById("iss-detail-content");
@@ -201,18 +210,19 @@
     // The panel ships `aria-hidden="true"` so it is out of the accessibility
     // tree while closed; clearing `hidden` and adding the class does not undo
     // that, so a screen-reader user got a drawer they could see nothing of
-    // (Devin review on #2402).
+    // (#2402).
     dlg.setAttribute("aria-hidden", "false");
     document.body.style.overflow = "hidden";
 
     getJson("/api/issues/" + encodeURIComponent(id)).then(function (res) {
-      // Ignore a response whose issue is no longer the open one. Two rows
-      // clicked in quick succession start two fetches, and the first to
+      // Ignore a response that does not belong to the CURRENT opening. Two
+      // rows clicked in quick succession start two fetches, and the first to
       // ARRIVE is not necessarily the one asked for last — without this the
       // drawer could show issue A's text while every action on it (comment,
-      // resolve) still addressed issue B, because those read
-      // `currentDetailId` (Devin review on #2402).
-      if (currentDetailId !== id) return;
+      // resolve) still addressed issue B. Keyed on the opening rather than
+      // the id, so closing and reopening the same report does not let the
+      // abandoned request through either (#2402).
+      if (generation !== detailGeneration) return;
       loading.hidden = true;
       if (res.status !== 200) {
         document.getElementById("iss-detail-title").textContent = "Not found";
@@ -231,6 +241,7 @@
     dlg.hidden = true;
     dlg.setAttribute("aria-hidden", "true");
     document.body.style.overflow = "";
+    detailGeneration++;
     currentDetailId = null;
     currentDetailRow = null;
   }

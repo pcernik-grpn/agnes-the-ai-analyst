@@ -1546,7 +1546,7 @@ CATALOG: dict[str, AuditEvent] = {
     # ui_support noise, but an admin opening the queue or a single report is
     # reading another person's report body, their identity and the page they
     # were on — the cross-user read CONTRIBUTING.md wants on the record
-    # (Devin review on #2402).
+    # (#2402).
     "issue.queue_read": AuditEvent(
         "issue.queue_read", "read", "An admin read the issue-report queue across every reporter"
     ),

@@ -118,7 +118,7 @@ class TestARestrictedPrincipalDoesNotCrash:
 
     Indexing it (`user["id"]`) raised a TypeError -> 500 on every reporter
     route, including the in-sandbox `report_issue` tool this channel was
-    built for (Devin review on #2402). These pin the decision each principal
+    built for (#2402). These pin the decision each principal
     kind now gets, at the unit level: the routes themselves are covered on
     Postgres, and what matters here is that no shape reaches an index.
     """
@@ -226,7 +226,7 @@ class TestTheContextCapCountsBytes:
     """`_MAX_CONTEXT_BYTES` is named in bytes; Python string length is not.
 
     One emoji is four UTF-8 bytes, so counting code points accepted a context
-    several times over the promised limit (Devin review on #2402).
+    several times over the promised limit (#2402).
     """
 
     def test_multibyte_context_over_the_cap_is_refused(self):

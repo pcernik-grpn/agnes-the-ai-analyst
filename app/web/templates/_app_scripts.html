@@ -11,7 +11,7 @@
          instance where reporting is unavailable (DuckDB app-state backend)
          there is nothing that could ever read the buffer, so wrapping every
          `fetch` on every page would be instrumentation with no consumer
-         (Devin review on #2402). The flag comes from `_chrome_ctx`; a page
+         (#2402). The flag comes from `_chrome_ctx`; a page
          rendered without it simply does not load the script, which is the
          same outcome as the dialog not rendering. -->
     {% if can_report_issue %}<script src="{{ static_url('js/client_diag.js') }}"></script>{% endif %}

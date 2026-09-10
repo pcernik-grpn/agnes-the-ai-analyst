@@ -317,7 +317,7 @@ class TestAHashPrefixedNumberReachesTheServer:
     """`#42` is documented in every issue tool's docstring.
 
     Interpolated raw it starts a URI fragment, so the path was truncated to
-    `/api/issues/` and the server saw no id at all (Devin review on #2402).
+    `/api/issues/` and the server saw no id at all (#2402).
     Both transports normalize the reference before building the URL.
     """
 

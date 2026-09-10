@@ -3792,7 +3792,7 @@ def register_foundation_tools(
 
         The `#` the tool docstrings invite a caller to type starts a URI
         fragment, so interpolating it raw truncated the path and the server
-        saw no id at all (Devin review on #2402). Percent-encoding what is
+        saw no id at all (#2402). Percent-encoding what is
         left also keeps a stray `/` or `?` from re-shaping the request.
         """
         from urllib.parse import quote
@@ -3941,7 +3941,7 @@ def register_foundation_tools(
         own report simply leaves an ordinary reporter comment. Calling it on
         somebody else's report is what requires admin — and that is enforced
         by the endpoint, not by which of the two tool names you picked
-        (Devin review on #2402, which flagged the docstring's "admin only"
+        (#2402, which flagged the docstring's "admin only"
         as a promise the tool could not keep).
 
         Args:

@@ -176,7 +176,7 @@ def report(
     # ALWAYS predates it — the operator mirror is a background task that has
     # not run yet, and with a screenshot it waits on purpose — so reading
     # `webhook_delivered_at` here reported "no operator channel confirmed
-    # delivery" even when the message landed a second later (Devin review on
+    # delivery" even when the message landed a second later (review on
     # #2402). What is true at this point is that the report is stored; whether
     # the chat copy went out is `agnes issue show` a moment later.
     typer.echo(f"Follow it: agnes issue show {row['number']}")

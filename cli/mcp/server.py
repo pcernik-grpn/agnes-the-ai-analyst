@@ -697,7 +697,7 @@ _ISSUE_HEADERS = {"X-Agnes-Client": "mcp"}
 def _issue_ref(issue_id: str) -> str:
     """Normalize `#42` / `42` / `iss_…` into a safe URL path segment — the
     `#` these tools document starts a URI fragment and would truncate the
-    path (Devin review on #2402)."""
+    path (#2402)."""
     from urllib.parse import quote
 
     return quote(str(issue_id).strip().lstrip("#"), safe="")

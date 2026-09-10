@@ -134,7 +134,7 @@ class TestTheDetailDrawerSurvivesFastClicking:
     `openDetail` starts a fetch per click and the first to ARRIVE is not
     necessarily the one asked for last. Without a guard the drawer could show
     issue A's text while the comment box and Resolve button still addressed
-    issue B, because those read `currentDetailId` (Devin review on #2402).
+    issue B, because those read `currentDetailId` (#2402).
     """
 
     def _source(self) -> str:
@@ -146,9 +146,21 @@ class TestTheDetailDrawerSurvivesFastClicking:
 
     def test_a_stale_response_is_dropped(self):
         src = self._source()
-        assert "if (currentDetailId !== id) return;" in src, (
-            "openDetail must ignore a response whose issue is no longer the open one"
+        assert "if (generation !== detailGeneration) return;" in src, (
+            "openDetail must ignore a response that does not belong to the current opening"
         )
+
+    def test_the_guard_is_keyed_on_the_opening_not_the_issue_id(self):
+        """Keyed on the id alone, closing and reopening the SAME report let an
+        abandoned request back in: its id matches again, so it could land its
+        older snapshot over what the second opening had already fetched, or
+        over a comment posted since (#2402)."""
+        src = self._source()
+        assert "var generation = ++detailGeneration;" in src
+        # close() must move the counter too, or a response outstanding when
+        # the drawer closed is still "current" for the next opening.
+        assert "detailGeneration++;" in src
+        assert "currentDetailId !== id" not in src, "the id-keyed guard is the one this replaced"
 
     def test_the_guard_precedes_any_rendering(self):
         """The bail-out has to come BEFORE the handler touches the DOM —
@@ -161,7 +173,7 @@ class TestTheDetailDrawerSurvivesFastClicking:
             else src.index('getJson("/api/issues/') :
         ]
         body = handler[: handler.index("});")]
-        guard = body.index("currentDetailId !== id")
+        guard = body.index("generation !== detailGeneration")
         assert guard < body.index("loading.hidden = true")
 
 
@@ -169,7 +181,7 @@ class TestTheDrawerIsReachableByAssistiveTech:
     """The panel ships `aria-hidden="true"` so it is out of the accessibility
     tree while closed. Clearing `hidden` and adding `is-open` does not undo
     that, so the state has to be flipped explicitly both ways — otherwise a
-    screen-reader user gets a drawer they can see nothing of (Devin review on
+    screen-reader user gets a drawer they can see nothing of (review on
     #2402)."""
 
     def _source(self) -> str:

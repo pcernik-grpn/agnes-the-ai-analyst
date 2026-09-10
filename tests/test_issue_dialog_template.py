@@ -66,7 +66,7 @@ class TestRailReportButton:
         assert "css/issue_dialog.css" not in html
         # The diagnostics ring buffer follows the same gate: with no dialog
         # nothing could ever read it, so instrumenting every fetch on every
-        # page would have no consumer (Devin review on #2402). Matched as a
+        # page would have no consumer (#2402). Matched as a
         # SCRIPT TAG, not a substring — `_app_scripts.html` names the file in
         # an HTML comment that ships with every page either way.
         assert not re.search(r"<script[^>]+client_diag\.js", html)
@@ -116,7 +116,7 @@ class TestTheLegacyBaseCarriesTheDialogToo:
     also include the dialog the button opens — otherwise the button appears
     and clicking it does nothing, because `issue_report.js` returns early
     when `#issue-dialog` is absent. Three live catalog detail pages still
-    extend `base.html` (Devin review on #2402).
+    extend `base.html` (#2402).
     """
 
     def _sources(self) -> tuple[str, str]:

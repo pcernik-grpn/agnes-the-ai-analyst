@@ -220,7 +220,7 @@ def test_unconfigured_webhook_leaves_delivery_null(state_backend, seeded_app_bot
 
 
 # ---------------------------------------------------------------------------
-# Devin review on #2402 — the three defects it found, each pinned by a test
+# #2402 — the three defects it found, each pinned by a test
 # that fails on the code as reviewed.
 # ---------------------------------------------------------------------------
 
@@ -393,7 +393,7 @@ def test_the_409_names_who_actually_resolved_it(state_backend, seeded_app_both):
 
     The conflict used to be formatted from the row read while the report was
     still open, so it omitted exactly the two facts it exists to carry
-    (Devin review on #2402).
+    (#2402).
     """
     if state_backend != "pg":
         pytest.skip("PG-only feature — the DuckDB contract is the typed 501")
