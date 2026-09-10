@@ -24,6 +24,12 @@ class MetadataRequest:
     table_id: str
     bucket: str
     source_table: str
+    # The row's own BigQuery project, from `bq_row_target` (issue #343).
+    # `None` means "use the source's configured project" — the pre-v51
+    # behaviour, and the reason this defaults rather than being required:
+    # non-BQ providers never set it and existing construction sites keep
+    # working unchanged.
+    project: str | None = None
 
 
 @dataclass

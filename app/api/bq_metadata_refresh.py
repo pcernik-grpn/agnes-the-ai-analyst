@@ -137,9 +137,16 @@ def refresh_one(row: dict[str, Any]) -> dict[str, Any]:
     t0 = time.monotonic()
     fetch_ms: Optional[int] = None
 
+    from connectors.bigquery.access import bq_row_target
+
     table_id = row["id"]
-    bucket = row.get("bucket") or ""
-    source_table = row.get("source_table") or table_id
+    # The row's own `bq_fqn` wins over `bucket` + `source_table` + the
+    # configured project (issue #343) — the same resolver every other BQ
+    # path uses. Without it a cross-project row refreshed against
+    # `<configured-project>.<bucket>`, so its catalog entity/row-count cache
+    # stayed empty and `agnes catalog` showed a bare "-" forever.
+    bucket, source_table, row_project = bq_row_target(row)
+    source_table = source_table or table_id
     repo = bq_metadata_cache_repo()
 
     if not (validate_quoted_identifier(bucket, "bucket") and validate_quoted_identifier(source_table, "source_table")):
@@ -156,6 +163,7 @@ def refresh_one(row: dict[str, Any]) -> dict[str, Any]:
         table_id=table_id,
         bucket=bucket,
         source_table=source_table,
+        project=row_project,
     )
     fetch_t0 = time.monotonic()
     try:

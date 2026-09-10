@@ -341,12 +341,12 @@ class TestPolicyBuilderColumns:
         monkeypatch.setattr(
             v2_schema,
             "_fetch_bq_schema",
-            lambda bq, dataset, table: [
+            lambda bq, dataset, table, **kw: [
                 {"name": "revenue", "type": "FLOAT64", "nullable": True, "description": ""},
                 {"name": "cost_center", "type": "STRING", "nullable": True, "description": ""},
             ],
         )
-        monkeypatch.setattr(v2_schema, "_fetch_bq_table_options", lambda bq, dataset, table: {})
+        monkeypatch.setattr(v2_schema, "_fetch_bq_table_options", lambda bq, dataset, table, **kw: {})
 
         conn = get_system_db()
         try:
@@ -385,7 +385,7 @@ class TestPolicyBuilderColumns:
         from src.db import get_system_db
         from src.repositories.table_registry import TableRegistryRepository
 
-        def _boom(bq, dataset, table):
+        def _boom(bq, dataset, table, **kw):
             raise RuntimeError("BQ token expired")
 
         monkeypatch.setattr(v2_schema, "_fetch_bq_schema", _boom)

@@ -147,13 +147,17 @@ def _sanitize_for_json(obj):
     return obj
 
 
-def _fetch_bq_sample(bq, dataset: str, table: str, n: int) -> list[dict]:
+def _fetch_bq_sample(bq, dataset: str, table: str, n: int, *, project: str | None = None) -> list[dict]:
     """Fetch up to `n` sample rows from a BQ table via the DuckDB BQ extension.
 
     `bq.duckdb_session()` provides a DuckDB conn with the bigquery extension
     loaded + auth secret installed. SQL here is server-constructed (validated
     identifiers + LIMIT n) — a BQ BadRequest means registry corruption, not
     user fault, so it surfaces as `bq_upstream_error` (HTTP 502).
+
+    `project` overrides the configured data project for one call — the row's
+    own, from `bq_row_target` (issue #343). `None` keeps the legacy
+    behaviour for pre-v51 rows.
     """
     from connectors.bigquery.access import translate_bq_error
     from src.identifier_validation import validate_quoted_identifier
@@ -169,8 +173,10 @@ def _fetch_bq_sample(bq, dataset: str, table: str, n: int) -> list[dict]:
     # endpoints are downstream of admin REST writes that might bypass that
     # gate. A `source_table` containing a backtick would otherwise break
     # out of the `…` quoted identifier and execute arbitrary BQ SQL.
+    data_project = project or bq.projects.data
+
     if not (
-        validate_quoted_identifier(bq.projects.data, "BQ project")
+        validate_quoted_identifier(data_project, "BQ project")
         and validate_quoted_identifier(dataset, "BQ dataset")
         and validate_quoted_identifier(table, "BQ source_table")
     ):
@@ -183,7 +189,7 @@ def _fetch_bq_sample(bq, dataset: str, table: str, n: int) -> list[dict]:
     # above) fails closed before reaching here for a policied table's
     # non-admin caller, so this remains reachable only for a non-policied
     # table or an admin bypass -- never silently for a filtered caller.
-    bq_sql = f"SELECT * FROM `{bq.projects.data}.{dataset}.{table}` LIMIT {int(n)}"
+    bq_sql = f"SELECT * FROM `{data_project}.{dataset}.{table}` LIMIT {int(n)}"
     with bq.duckdb_session() as conn:
         try:
             df = conn.execute(
@@ -401,7 +407,14 @@ def build_sample(
                 raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
             if bq_relation.policied:
                 raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": table_id})
-        rows = _fetch_bq_sample(bq, row.get("bucket") or "", row.get("source_table") or table_id, n)
+        # Same single resolver the execution paths use (issue #343): a
+        # cross-project row sampled `<configured-project>.<bucket>.<table>`,
+        # a path that does not exist, so `agnes describe` 502'd on a table
+        # `agnes query --remote` reads fine.
+        from connectors.bigquery.access import bq_row_target
+
+        _ds, _tbl, _proj = bq_row_target(row)
+        rows = _fetch_bq_sample(bq, _ds, _tbl or table_id, n, project=_proj)
     elif (row.get("query_mode") or "") == "remote":
         # Non-BQ remote rows: live sample through the analytics view — the
         # parity twin of the BQ branch above (these rows used to be refused

@@ -44,6 +44,18 @@ from connectors.bigquery.access import (
 logger = logging.getLogger(__name__)
 
 
+def _req_project(bq, req: MetadataRequest) -> str:
+    """The project this request's table actually lives in.
+
+    ``req.project`` carries the row's own ``bq_fqn`` project (issue #343);
+    ``None`` means the row predates it and the configured data project is
+    correct. Every path builder below goes through here so a cross-project
+    row cannot be half-resolved — its columns read from one project and its
+    row count from another.
+    """
+    return req.project or bq.projects.data
+
+
 def fetch(req: MetadataRequest) -> TableMetadata | None:
     try:
         bq = get_bq_access()
@@ -54,7 +66,7 @@ def fetch(req: MetadataRequest) -> TableMetadata | None:
         return None
 
     rows_size = _fetch_rows_and_size(bq, req)
-    columns = fetch_bq_columns_full(bq, req.bucket, req.source_table)
+    columns = fetch_bq_columns_full(bq, req.bucket, req.source_table, project=_req_project(bq, req))
     part_clust = _derive_partition_cluster(columns) if columns else None
     entity_type = _fetch_entity_type(bq, req)
     known_columns = [c["name"] for c in columns] if columns else None
@@ -117,13 +129,13 @@ def _fetch_entity_type(bq, req: MetadataRequest) -> str | None:
     """
     try:
         bq_sql = (
-            f"SELECT table_type FROM `{bq.projects.data}.{req.bucket}.INFORMATION_SCHEMA.TABLES` WHERE table_name = ?"
+            f"SELECT table_type FROM `{_req_project(bq, req)}.{req.bucket}.INFORMATION_SCHEMA.TABLES` WHERE table_name = ?"
         )
         row = _run_bq_sql(bq, bq_sql, [req.source_table])
     except Exception as e:
         logger.warning(
             "BQ INFORMATION_SCHEMA.TABLES lookup failed for %s.%s.%s: %s",
-            bq.projects.data,
+            _req_project(bq, req),
             req.bucket,
             req.source_table,
             e,
@@ -184,7 +196,7 @@ def _resolve_bq_location(bq, req: MetadataRequest) -> str | None:
     if cfg_location:
         return cfg_location
     try:
-        ds = bq.client().get_dataset(f"{bq.projects.data}.{req.bucket}")
+        ds = bq.client().get_dataset(f"{_req_project(bq, req)}.{req.bucket}")
         return ds.location
     except Exception as e:
         logger.warning(
@@ -193,7 +205,7 @@ def _resolve_bq_location(bq, req: MetadataRequest) -> str | None:
             "where the SA lacks bigquery.datasets.get), set "
             "data_source.bigquery.location in /admin/server-config to the "
             "dataset's region (e.g. 'us-central1' or 'EU').",
-            bq.projects.data,
+            _req_project(bq, req),
             req.bucket,
             e,
         )
@@ -224,7 +236,7 @@ def _fetch_via_table_storage(bq, req: MetadataRequest, location: str) -> dict | 
         bq_sql = (
             f"SELECT total_rows, "
             f"IFNULL(active_logical_bytes, 0) + IFNULL(long_term_logical_bytes, 0) "
-            f"FROM `{bq.projects.data}.region-{location}.INFORMATION_SCHEMA.TABLE_STORAGE` "
+            f"FROM `{_req_project(bq, req)}.region-{location}.INFORMATION_SCHEMA.TABLE_STORAGE` "
             f"WHERE table_schema = ? AND table_name = ?"
         )
         # `location=` pins the SDK job to the region the region-scoped
@@ -234,7 +246,7 @@ def _fetch_via_table_storage(bq, req: MetadataRequest, location: str) -> dict | 
     except Exception as e:
         logger.warning(
             "BQ TABLE_STORAGE fetch failed for %s.%s.%s: %s",
-            bq.projects.data,
+            _req_project(bq, req),
             req.bucket,
             req.source_table,
             e,
@@ -256,12 +268,12 @@ def _fetch_via_legacy_tables(bq, req: MetadataRequest) -> dict | None:
     # `validate_quoted_identifier` before MetadataRequest construction;
     # safe to interpolate into the backtick-quoted path here.
     try:
-        bq_sql = f"SELECT row_count, size_bytes FROM `{bq.projects.data}.{req.bucket}.__TABLES__` WHERE table_id = ?"
+        bq_sql = f"SELECT row_count, size_bytes FROM `{_req_project(bq, req)}.{req.bucket}.__TABLES__` WHERE table_id = ?"
         row = _run_bq_sql(bq, bq_sql, [req.source_table])
     except Exception as e:
         logger.warning(
             "BQ __TABLES__ fetch failed for %s.%s.%s: %s",
-            bq.projects.data,
+            _req_project(bq, req),
             req.bucket,
             req.source_table,
             e,

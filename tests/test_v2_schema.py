@@ -54,14 +54,14 @@ class TestSchemaEndpoint:
         # Stub the BQ schema fetch to avoid hitting real BQ
         monkeypatch.setattr(
             v2_schema, "_fetch_bq_schema",
-            lambda bq, dataset, table: [
+            lambda bq, dataset, table, **kw: [
                 {"name": "event_date", "type": "DATE", "nullable": False, "description": ""},
                 {"name": "country_code", "type": "STRING", "nullable": True, "description": ""},
             ],
         )
         monkeypatch.setattr(
             v2_schema, "_fetch_bq_table_options",
-            lambda bq, dataset, table: {"partition_by": "event_date", "clustered_by": []},
+            lambda bq, dataset, table, **kw: {"partition_by": "event_date", "clustered_by": []},
         )
 
         conn = reload_db.get_system_db()
@@ -247,13 +247,13 @@ class TestBqAccessErrors:
         # Strict path returns real schema.
         monkeypatch.setattr(
             v2_schema, "_fetch_bq_schema",
-            lambda bq, dataset, table: [
+            lambda bq, dataset, table, **kw: [
                 {"name": "event_date", "type": "DATE", "nullable": False, "description": ""},
                 {"name": "country_code", "type": "STRING", "nullable": True, "description": ""},
             ],
         )
         # Best-effort path returns `{}` (the documented swallow-all output).
-        monkeypatch.setattr(v2_schema, "_fetch_bq_table_options", lambda bq, dataset, table: {})
+        monkeypatch.setattr(v2_schema, "_fetch_bq_table_options", lambda bq, dataset, table, **kw: {})
 
         conn = reload_db.get_system_db()
         try:

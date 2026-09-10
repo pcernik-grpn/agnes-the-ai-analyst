@@ -801,7 +801,49 @@ class BqAccess:
             yield conn
 
 
-def _fetch_bq_columns_full_impl(bq, dataset: str, table: str) -> list[dict]:
+def bq_row_target(row: dict) -> tuple[str, str, str | None]:
+    """Resolve a BQ registry row to ``(dataset, table, project_override)``.
+
+    ``bq_fqn`` (v51, issue #343) pins a row's own ``project.dataset.table``
+    and overrides all three legs of the legacy configured-project +
+    ``bucket`` + ``source_table`` convention. ``bucket`` is a UX/RBAC label
+    that need not equal the physical dataset. ``project_override`` is
+    ``None`` for pre-v51 rows, meaning "use the configured data project".
+
+    Malformed values degrade to the legacy triplet rather than raising:
+    registration validates ``bq_fqn`` at the API boundary, so a bad value
+    here means the row was written out-of-band, and one such row must not
+    500 every surface that merely lists a sibling table.
+
+    Lives here rather than beside a single caller because every path that
+    addresses a BigQuery row needs the identical answer — execution
+    (``app/api/query.py``, ``app/api/v2_scan.py``) and metadata
+    (``app/api/v2_schema.py``, ``app/api/v2_sample.py``, this module's
+    column fetch, ``connectors/bigquery/metadata.py``). The two families
+    resolving it differently is exactly the split this consolidates.
+    """
+    from connectors.bigquery.extractor import parse_bq_fqn
+
+    legacy = (row.get("bucket") or "", row.get("source_table") or "", None)
+    raw = row.get("bq_fqn")
+    if not raw:
+        return legacy
+    try:
+        parsed = parse_bq_fqn(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring malformed bq_fqn on registry row %r, falling back to "
+            "the configured project. Re-register the row to fix.",
+            row.get("id") or row.get("name"),
+        )
+        return legacy
+    if parsed is None:
+        return legacy
+    project, dataset, table = parsed
+    return dataset, table, project
+
+
+def _fetch_bq_columns_full_impl(bq, dataset: str, table: str, *, project: str | None = None) -> list[dict]:
     """Implementation that raises on BQ errors. Returns the column list
     or raises the original BQ exception. Validates identifiers; raises
     ``ValueError`` on bad shape. Sentinel-config (``bq.projects.data == ""``)
@@ -810,14 +852,24 @@ def _fetch_bq_columns_full_impl(bq, dataset: str, table: str) -> list[dict]:
     Used by callers that need typed exceptions for HTTP status
     classification — currently only ``app/api/v2_schema._fetch_bq_schema``
     via ``translate_bq_error``.
+
+    ``project`` overrides the configured data project for one call — the
+    row's own, from ``bq_row_target`` (issue #343). ``None`` keeps the
+    legacy behaviour, so pre-v51 rows are unaffected. Without it a row
+    living in another project read its columns from
+    ``<configured-project>.<dataset>``, which is either a hard error, an
+    empty column list, or another object's schema depending on what
+    happens to sit at that address.
     """
     from src.identifier_validation import validate_quoted_identifier
 
     if not bq.projects.data:
         bq.client()  # raises BqAccessError(not_configured)
 
+    data_project = project or bq.projects.data
+
     if not (
-        validate_quoted_identifier(bq.projects.data, "BQ project")
+        validate_quoted_identifier(data_project, "BQ project")
         and validate_quoted_identifier(dataset, "BQ dataset")
         and validate_quoted_identifier(table, "BQ source_table")
     ):
@@ -826,7 +878,7 @@ def _fetch_bq_columns_full_impl(bq, dataset: str, table: str) -> list[dict]:
     bq_sql = (
         f"SELECT column_name, data_type, is_nullable, "
         f"       is_partitioning_column, clustering_ordinal_position "
-        f"FROM `{bq.projects.data}.{dataset}.INFORMATION_SCHEMA.COLUMNS` "
+        f"FROM `{data_project}.{dataset}.INFORMATION_SCHEMA.COLUMNS` "
         f"WHERE table_name = ? ORDER BY ordinal_position"
     )
     with bq.duckdb_session() as conn:
@@ -847,19 +899,21 @@ def _fetch_bq_columns_full_impl(bq, dataset: str, table: str) -> list[dict]:
     ]
 
 
-def fetch_bq_columns_full(bq, dataset: str, table: str) -> list[dict] | None:
+def fetch_bq_columns_full(bq, dataset: str, table: str, *, project: str | None = None) -> list[dict] | None:
     """Best-effort wrapper around ``_fetch_bq_columns_full_impl`` — returns
     ``None`` on any failure (sentinel-unconfigured, unsafe identifier, BQ
     query exception). Does NOT raise. For callers that don't need typed
     exceptions (the metadata provider; the partition/cluster path of
     v2_schema).
+
+    ``project`` is forwarded verbatim; see the impl's docstring.
     """
     try:
-        return _fetch_bq_columns_full_impl(bq, dataset, table)
+        return _fetch_bq_columns_full_impl(bq, dataset, table, project=project)
     except Exception as e:
         logger.warning(
             "BQ COLUMNS fetch failed for %s.%s.%s: %s",
-            bq.projects.data,
+            project or bq.projects.data,
             dataset,
             table,
             e,

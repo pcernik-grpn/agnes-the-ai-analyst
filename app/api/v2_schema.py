@@ -38,7 +38,7 @@ _BQ_DIALECT_HINTS = {
 }
 
 
-def _fetch_bq_schema(bq, dataset: str, table: str) -> list[dict]:
+def _fetch_bq_schema(bq, dataset: str, table: str, *, project: str | None = None) -> list[dict]:
     """Fetch column list via the shared ``_fetch_bq_columns_full_impl`` helper.
 
     Pre-#155 this had its own INFORMATION_SCHEMA.COLUMNS query; consolidating
@@ -52,7 +52,7 @@ def _fetch_bq_schema(bq, dataset: str, table: str) -> list[dict]:
     from connectors.bigquery.access import _fetch_bq_columns_full_impl, translate_bq_error, BqAccessError
 
     try:
-        rows = _fetch_bq_columns_full_impl(bq, dataset, table)
+        rows = _fetch_bq_columns_full_impl(bq, dataset, table, project=project)
     except (ValueError, BqAccessError):
         # ValueError ("unsafe identifier") and BqAccessError propagate
         # unchanged — the endpoint's existing handlers expect those types.
@@ -73,7 +73,7 @@ def _fetch_bq_schema(bq, dataset: str, table: str) -> list[dict]:
     ]
 
 
-def _fetch_bq_table_options(bq, dataset: str, table: str) -> dict:
+def _fetch_bq_table_options(bq, dataset: str, table: str, *, project: str | None = None) -> dict:
     """Best-effort fetch of partition/cluster info via the shared
     `fetch_bq_columns_full` helper.
 
@@ -83,7 +83,7 @@ def _fetch_bq_table_options(bq, dataset: str, table: str) -> dict:
     """
     from connectors.bigquery.access import fetch_bq_columns_full
 
-    rows = fetch_bq_columns_full(bq, dataset, table)
+    rows = fetch_bq_columns_full(bq, dataset, table, project=project)
     if not rows:
         return {}
 
@@ -334,10 +334,20 @@ def build_schema_uncached(
     # local-parquet branch for any materialized source regardless of
     # `source_type` — the parquet is the source of truth.
     elif source_type == "bigquery" and query_mode != "materialized":
-        dataset = row.get("bucket") or ""
-        source_table = row.get("source_table") or table_id
-        columns = _fetch_bq_schema(bq, dataset, source_table)
-        opts = _fetch_bq_table_options(bq, dataset, source_table)
+        # `bq_row_target` (issue #343) is the single resolver the execution
+        # paths already use. Reading `bucket` + the configured project here
+        # instead is what made a cross-project row report the columns of
+        # whatever happened to sit at `<configured-project>.<bucket>` — and
+        # since `/api/v2/scan` validates `select`/`where`/`order_by` against
+        # this very payload (`v2_scan._resolve_schema`), it also rejected
+        # real columns as unknown on a table its own SQL builder addresses
+        # correctly.
+        from connectors.bigquery.access import bq_row_target
+
+        dataset, source_table, row_project = bq_row_target(row)
+        source_table = source_table or table_id
+        columns = _fetch_bq_schema(bq, dataset, source_table, project=row_project)
+        opts = _fetch_bq_table_options(bq, dataset, source_table, project=row_project)
         payload = {
             "table_id": table_id,
             "source_type": source_type,

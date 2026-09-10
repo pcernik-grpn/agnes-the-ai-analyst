@@ -90,7 +90,7 @@ class TestSampleEndpoint:
         monkeypatch.setattr(
             v2_sample,
             "_fetch_bq_sample",
-            lambda bq, dataset, table, n: [
+            lambda bq, dataset, table, n, **kw: [
                 {"event_date": "2026-04-27", "country_code": "CZ"},
                 {"event_date": "2026-04-26", "country_code": "SK"},
             ],
@@ -110,7 +110,7 @@ class TestSampleEndpoint:
 
         captured = {}
 
-        def fake_fetch(bq, dataset, table, n):
+        def fake_fetch(bq, dataset, table, n, **kw):
             captured["n"] = n
             return []
 
@@ -135,7 +135,7 @@ class TestSampleEndpoint:
         monkeypatch.setattr(
             v2_sample,
             "_fetch_bq_sample",
-            lambda bq, dataset, table, n: [
+            lambda bq, dataset, table, n, **kw: [
                 {"col": float("nan"), "ok": 1.0},
                 {"col": float("inf"), "ok": 2.0},
                 {"col": float("-inf"), "ok": 3.0},

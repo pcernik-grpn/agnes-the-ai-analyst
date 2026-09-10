@@ -2498,39 +2498,12 @@ def _build_materialized_hint(row: dict) -> str:
     )
 
 
-def _bq_row_target(row: dict) -> tuple[str, str, str | None]:
-    """Resolve a BQ registry row to ``(dataset, table, project_override)``.
-
-    ``bq_fqn`` (v51, issue #343) pins a row's own ``project.dataset.table``
-    and overrides all three legs of the legacy configured-project +
-    ``bucket`` + ``source_table`` convention. ``bucket`` is a UX/RBAC label
-    that need not equal the physical dataset. ``project_override`` is
-    ``None`` for pre-v51 rows, meaning "use the configured data project".
-
-    Malformed values degrade to the legacy triplet rather than raising:
-    registration validates ``bq_fqn`` at the API boundary, so a bad value
-    here means the row was written out-of-band, and one such row must not
-    500 every query that merely mentions a sibling table.
-    """
-    from connectors.bigquery.extractor import parse_bq_fqn
-
-    legacy = (row.get("bucket") or "", row.get("source_table") or "", None)
-    raw = row.get("bq_fqn")
-    if not raw:
-        return legacy
-    try:
-        parsed = parse_bq_fqn(raw)
-    except ValueError:
-        logger.warning(
-            "Ignoring malformed bq_fqn on registry row %r, falling back to "
-            "the configured project. Re-register the row to fix.",
-            row.get("id") or row.get("name"),
-        )
-        return legacy
-    if parsed is None:
-        return legacy
-    project, dataset, table = parsed
-    return dataset, table, project
+# `_bq_row_target` now lives in `connectors/bigquery/access.py` — the
+# metadata paths (schema / sample / catalog refresh) need the identical
+# answer, and the two families resolving a row differently is exactly the
+# split that consolidation closes. Re-exported here so this module's call
+# sites and their tests keep their existing name.
+from connectors.bigquery.access import bq_row_target as _bq_row_target
 
 
 def _bq_guardrail_inputs(
