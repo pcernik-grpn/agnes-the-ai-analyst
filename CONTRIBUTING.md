@@ -61,7 +61,8 @@ that lists issues. What follows from that, for an agent or a person:
   reviewer asks for it — not on every `main` move.
 - **Waiting on a gate is a `BLOCKER` with an owner, not a wait.** Name the gate
   and who opens it — for a member's PR that is Devin's verdict (fix what it
-  flagged, or wait for the re-review after a push); for an outside
+  flagged, resolve the threads, and push or wait for Devin to analyse the
+  head — a rebase counts once Devin's status lands on the new head); for an outside
   collaborator's or the cut PR, a named human approver — in the PR or the
   issue, and re-ping that person every two hours until it moves. Two long autonomous runs lost 18 h and 33 h each modelling
   "needs an approving review" for a badge that was never the gate (#2295).
@@ -70,7 +71,8 @@ that lists issues. What follows from that, for an agent or a person:
   has an owner from the first minute.
 - **Bypass is the exception, with a stated reason.** `internal` members can
   merge around the queue (`gh pr merge <N> --merge --admin`) for a hotfix, the
-  cut PR, or a PR Devin never re-reviewed and so never approved; required CI
+  cut PR, or a PR Devin never analysed after its last push (no "Devin Review"
+  status on the head) and so never approved; required CI
   still applies. Say why in the merge commit or a comment. Everything else is
   queued.
 - **The hand-driven merge trains are retired.** CHANGELOG fragments removed
