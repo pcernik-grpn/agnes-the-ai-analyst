@@ -28,7 +28,10 @@ Covers:
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from app.api.admin_sessions import _render_transcript
 from app.chat.session_export import (
@@ -42,19 +45,19 @@ from services.session_pipeline.lib import parse_jsonl
 
 
 def _msg(**kw) -> ChatMessage:
-    base = dict(
-        id="msg_1",
-        session_id="chat_1",
-        role="user",
-        content="",
-        tool_calls=None,
-        tokens_in=None,
-        tokens_out=None,
-        model=None,
-        created_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-        sender_email=None,
-        parts=None,
-    )
+    base = {
+        "id": "msg_1",
+        "session_id": "chat_1",
+        "role": "user",
+        "content": "",
+        "tool_calls": None,
+        "tokens_in": None,
+        "tokens_out": None,
+        "model": None,
+        "created_at": datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+        "sender_email": None,
+        "parts": None,
+    }
     base.update(kw)
     return ChatMessage(**base)
 
@@ -432,9 +435,115 @@ class TestSessionPipelineSweep:
         assert not session_dir.exists()
 
 
+class TestConcurrentExportsNeverInterleave:
+    """Every writer of a chat session's exported jsonl -- the periodic
+    sweep, the kill/archive teardown hooks, and the on-demand admin
+    transcript route -- can race the SAME target file, potentially from
+    different processes with no cross-process lock between them. The fix
+    is a per-call, globally-unique temp name (see
+    ``session_export._atomic_write_text``), never a fixed ``<target>.tmp``.
+
+    Modeled without real OS threads/processes, matching
+    ``tests/test_parquet_publish.py::test_two_concurrent_writers_do_not_
+    clobber_each_others_temp`` (incident #1274) -- two "writers" are
+    distinguished by a mocked ``uuid.uuid4()`` rather than real concurrent
+    execution, which is deterministic and exercises exactly the same
+    code path a genuine race would."""
+
+    def test_two_concurrent_writers_do_not_share_or_clobber_a_temp_file(self, tmp_path, monkeypatch):
+        from app.chat import session_export
+
+        target = tmp_path / "chat-abc123.jsonl"
+
+        # Writer A starts and is mid-write -- its temp exists on disk but it
+        # has not yet called os.replace.
+        monkeypatch.setattr(session_export.uuid, "uuid4", lambda: uuid.UUID(int=1))
+        tmp_a = target.with_name(f"{target.name}.{uuid.UUID(int=1).hex}.tmp")
+        tmp_a.write_text("A-IN-FLIGHT", encoding="utf-8")
+
+        # Writer B (a different racer -- e.g. the on-demand transcript route
+        # firing while the sweep is also mid-export) starts and finishes
+        # cleanly while A's temp is still sitting on disk.
+        monkeypatch.setattr(session_export.uuid, "uuid4", lambda: uuid.UUID(int=2))
+        session_export._atomic_write_text(target, "B-CONTENT\n")
+
+        assert target.read_text(encoding="utf-8") == "B-CONTENT\n"
+        assert tmp_a.read_text(encoding="utf-8") == "A-IN-FLIGHT", "writer B's publish touched writer A's temp"
+
+        # Writer A now completes. Its commit is a full, independent write --
+        # never a merge with B's bytes -- and replaces `target` cleanly.
+        monkeypatch.setattr(session_export.uuid, "uuid4", lambda: uuid.UUID(int=1))
+        session_export._atomic_write_text(target, "A-CONTENT\n")
+        assert target.read_text(encoding="utf-8") == "A-CONTENT\n"
+
+        # No stray temp left behind by either writer.
+        assert list(target.parent.glob(f"{target.name}.*.tmp")) == []
+
+    def test_a_failed_writer_only_cleans_up_its_own_temp(self, tmp_path, monkeypatch):
+        """The #1274 bug this mirrors: a shared temp name let one writer's
+        failure-cleanup delete the OTHER writer's already-published file.
+        Unique-per-call names make that structurally impossible -- a
+        failure here must remove only its own temp and leave a
+        concurrently-published `target` untouched."""
+        from app.chat import session_export
+
+        target = tmp_path / "chat-abc123.jsonl"
+
+        monkeypatch.setattr(session_export.uuid, "uuid4", lambda: uuid.UUID(int=2))
+        session_export._atomic_write_text(target, "B-CONTENT\n")
+        assert target.read_text(encoding="utf-8") == "B-CONTENT\n"
+
+        monkeypatch.setattr(session_export.uuid, "uuid4", lambda: uuid.UUID(int=1))
+        tmp_a = target.with_name(f"{target.name}.{uuid.UUID(int=1).hex}.tmp")
+
+        def _broken_write_text(self, content, encoding="utf-8"):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(type(tmp_a), "write_text", _broken_write_text)
+        with pytest.raises(OSError):
+            session_export._atomic_write_text(target, "A-CONTENT\n")
+
+        assert not tmp_a.exists()
+        assert target.read_text(encoding="utf-8") == "B-CONTENT\n", "a failed writer must not touch B's publish"
+
+    def test_export_chat_session_jsonl_leaves_no_stray_temp_across_two_calls(self, seeded_app, tmp_path, monkeypatch):
+        """End-to-end: two exports of the SAME chat (e.g. the sweep and the
+        on-demand admin route racing each other) each get their own temp
+        name and neither leaves litter behind, whichever finishes last."""
+        from app.chat import session_export
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        seen_uuids = []
+        real_uuid4 = uuid.uuid4
+
+        def _tracked_uuid4():
+            u = real_uuid4()
+            seen_uuids.append(u)
+            return u
+
+        monkeypatch.setattr(session_export.uuid, "uuid4", _tracked_uuid4)
+
+        first = session_export.export_chat_session_jsonl(chat_id)
+        second = session_export.export_chat_session_jsonl(chat_id)
+
+        assert first is not None
+        assert second is not None
+        assert len(seen_uuids) == len(set(seen_uuids)), "every write must mint its own unique temp name"
+        assert list(first.parent.glob(f"{first.name}*.tmp")) == []
+        # The published file itself is intact, valid jsonl.
+        for line in first.read_text(encoding="utf-8").splitlines():
+            json.loads(line)
+
+
 class TestIsChatExportStale:
     """The one staleness rule shared by the periodic sweep and the
-    on-demand admin transcript viewer."""
+    on-demand admin transcript viewer. Coverage is read from the sidecar
+    ``.watermark`` file :func:`session_export._write_export_watermark`
+    writes beside the export -- NOT the export's own mtime, which means
+    "when was this written" to a different reader
+    (``session_processor_state.scan_unprocessed_for``'s prefilter)."""
 
     def test_missing_file_is_stale(self, tmp_path):
         assert is_chat_export_stale(tmp_path / "nope.jsonl", datetime.now(UTC))
@@ -442,15 +551,48 @@ class TestIsChatExportStale:
     def test_no_last_message_at_is_never_stale(self, tmp_path):
         assert not is_chat_export_stale(tmp_path / "nope.jsonl", None)
 
-    def test_file_newer_than_last_message_is_current(self, tmp_path):
+    def test_watermark_at_or_after_last_message_is_current(self, tmp_path):
+        from app.chat import session_export
+
         f = tmp_path / "f.jsonl"
         f.write_text("x")
+        session_export._write_export_watermark(f, datetime.now(UTC))
         assert not is_chat_export_stale(f, datetime.now(UTC) - timedelta(hours=1))
 
-    def test_file_older_than_last_message_is_stale(self, tmp_path):
+    def test_watermark_before_last_message_is_stale(self, tmp_path):
+        from app.chat import session_export
+
         f = tmp_path / "f.jsonl"
         f.write_text("x")
+        session_export._write_export_watermark(f, datetime.now(UTC) - timedelta(hours=2))
         assert is_chat_export_stale(f, datetime.now(UTC) + timedelta(hours=1))
+
+    def test_file_present_without_a_watermark_sidecar_is_stale(self, tmp_path):
+        """No coverage marker at all (a pre-this-change export, or a
+        sidecar that failed to write) -- treated as unknown coverage,
+        which is the safe direction: one extra re-export, never a file
+        trusted with no way to vouch for its content."""
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        assert is_chat_export_stale(f, datetime.now(UTC) - timedelta(hours=1))
+
+    def test_backdated_file_mtime_does_not_fool_staleness(self, tmp_path):
+        """The regression this class guards against: an export's mtime
+        must play no role in the staleness decision at all -- only the
+        watermark sidecar does. A file whose mtime is set far in the past
+        (mirroring the OLD stamp-mtime-to-content behavior) is still
+        correctly read as current once its watermark covers the message."""
+        import os
+
+        from app.chat import session_export
+
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        last_message_at = datetime.now(UTC) - timedelta(hours=1)
+        session_export._write_export_watermark(f, last_message_at)
+        old = (datetime.now(UTC) - timedelta(days=30)).timestamp()
+        os.utime(f, (old, old))
+        assert not is_chat_export_stale(f, last_message_at)
 
 
 class TestExportRaceWithConcurrentInsert:
@@ -525,6 +667,127 @@ class TestExportRaceWithConcurrentInsert:
 
         assert freshness.path is not None
         assert "raced in mid-export" in freshness.path.read_text()
+
+
+class TestReexportSurvivesPipelinePrefilter:
+    """``session_processor_state.scan_unprocessed_for`` uses a jsonl's mtime
+    as a cheap "already processed" prefilter, comparing it against a stored
+    ``processed_at``. An earlier version of ``export_chat_session_jsonl``
+    stamped that mtime with a CONTENT watermark (the newest message's
+    ``created_at``) instead of leaving it at the real write time -- so a
+    re-export whose watermark happened to predate an earlier processing
+    pass's ``processed_at`` (which is always a real wall-clock instant,
+    hence normally later than any message it covers) looked untouched to
+    the prefilter even though the file's bytes had just changed, and the
+    usage rollups it feeds stayed truncated forever. The fix leaves mtime
+    alone as the write time and carries coverage in a separate sidecar
+    (see ``session_export._write_export_watermark``), so this can no
+    longer happen regardless of how old the messages inside the file are.
+    """
+
+    def test_reexport_with_backdated_messages_is_not_hidden_from_the_scan(self, seeded_app, tmp_path, monkeypatch):
+        from src.db import get_system_db
+        from src.repositories.session_processor_state import SessionProcessorStateRepository
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        conn = get_system_db()
+        # Backdate every message in the session far into the past -- the
+        # coverage watermark this export carries is therefore old too, even
+        # though the export itself is about to happen right now.
+        conn.execute(
+            "UPDATE chat_messages SET created_at = TIMESTAMP '2020-01-01 00:00:00' WHERE session_id = ?",
+            [chat_id],
+        )
+
+        result = export_chat_session_jsonl(chat_id)
+        assert result is not None
+        session_file = f"{result.parent.name}/{result.name}"
+
+        state = SessionProcessorStateRepository(conn)
+        # A prior processing pass recorded its own ``processed_at`` well
+        # after those (backdated) messages -- exactly what a state row
+        # looks like once a real pipeline run has processed this export.
+        state.mark_processed(
+            "usage",
+            session_file,
+            result.parent.name,
+            1,
+            "deadbeef",
+            read_at=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+
+        unprocessed = state.scan_unprocessed_for("usage", session_dir)
+        matches = [p for _, p in unprocessed if p == result]
+        assert matches, "a re-exported file must still be surfaced even when its messages are old"
+
+    def test_reexport_end_to_end_through_run_processor(self, seeded_app, tmp_path, monkeypatch):
+        """Same gap, exercised through the real pipeline entry point rather
+        than the repository directly: a session already marked processed
+        gets new (backdated) content and the next tick must still pick it
+        up and update the usage rollup, not skip it."""
+        from services.session_pipeline.runner import run_processor
+        from services.session_processors.usage import UsageProcessor
+        from src.db import get_system_db
+        from src.repositories import chat_message_repo, usage_repo
+        from src.repositories.session_processor_state import SessionProcessorStateRepository
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        conn = get_system_db()
+        run_processor(conn, UsageProcessor(), session_data_dir=session_dir)
+
+        result = export_chat_session_jsonl(chat_id)
+        assert result is not None
+        session_file = f"{result.parent.name}/{result.name}"
+        summary_before = usage_repo().get_session_summary(session_file)
+        assert summary_before is not None
+        assert summary_before["output_tokens"] == 2
+
+        # A new message arrives, then gets backdated (mirrors a session
+        # whose true last message predates when the state row was written
+        # -- the truncated-then-corrected-export scenario this closes).
+        chat_message_repo().append_message(
+            session_id=chat_id,
+            role="assistant",
+            content="more",
+            model="claude-sonnet-5",
+            tokens_in=5,
+            tokens_out=7,
+            parts=[{"type": "text", "text": "more"}],
+        )
+        conn.execute(
+            "UPDATE chat_messages SET created_at = TIMESTAMP '2020-01-01 00:00:00' WHERE session_id = ?",
+            [chat_id],
+        )
+
+        # Force the existing state row's processed_at to postdate every
+        # (backdated) message -- what a real prior pipeline run's
+        # wall-clock ``processed_at`` looks like relative to old content.
+        # ``version`` must match the real processor's declared version, or
+        # the version-mismatch branch alone would force a reprocess and the
+        # test would pass without ever exercising the mtime-vs-processed_at
+        # comparison this closes.
+        SessionProcessorStateRepository(conn).mark_processed(
+            "usage",
+            session_file,
+            result.parent.name,
+            summary_before["output_tokens"],
+            "deadbeef",
+            read_at=datetime(2024, 1, 1, tzinfo=UTC),
+            version=UsageProcessor().version,
+        )
+
+        export_chat_session_jsonl(chat_id)
+        stats = run_processor(conn, UsageProcessor(), session_data_dir=session_dir)
+        assert stats["processed"] >= 1
+
+        summary_after = usage_repo().get_session_summary(session_file)
+        assert summary_after["output_tokens"] == 9  # 2 + 7, the reprocess picked up the new message
 
 
 class TestOnDemandTranscriptFreshness:

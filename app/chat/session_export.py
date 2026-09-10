@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -129,21 +130,26 @@ def _watermark_path(target: Path) -> Path:
 
 def _write_export_watermark(target: Path, watermark: datetime) -> None:
     """Atomically record *watermark* (:func:`_export_watermark` of the
-    messages just written to *target*) in its sidecar file. Same
-    ``.tmp`` + ``os.replace`` pattern as the jsonl write itself, so a
-    reader never observes a half-written watermark."""
-    wm_path = _watermark_path(target)
-    wm_tmp = wm_path.with_name(wm_path.name + ".tmp")
-    wm_tmp.write_text(watermark.isoformat(), encoding="utf-8")
-    os.replace(wm_tmp, wm_path)
+    messages just written to *target*) in its sidecar file -- via
+    :func:`_atomic_write_text`, so a reader never observes a half-written
+    watermark AND two writers racing the same sidecar (see that function's
+    docstring) can't interleave or clobber each other either."""
+    _atomic_write_text(_watermark_path(target), watermark.isoformat())
 
 
 def _read_export_watermark(target: Path) -> datetime | None:
     """The content watermark :func:`_write_export_watermark` recorded for
     *target*, or ``None`` when there is no sidecar to read (an export
     written before this mechanism existed, or one whose sidecar write
-    failed) -- the caller (:func:`is_chat_export_stale`) falls back to
-    *target*'s own mtime in that case."""
+    failed). :func:`is_chat_export_stale` treats ``None`` as unconditionally
+    stale rather than falling back to *target*'s own mtime: that mtime is
+    reserved for ``session_processor_state.scan_unprocessed_for``'s own,
+    unrelated gate (see :func:`export_chat_session_jsonl`'s docstring), and
+    trusting it here whenever the sidecar is merely missing would silently
+    reopen the exact race a failed sidecar write can produce -- a message
+    committed between the jsonl read and its replace is absent from the
+    file either way, and a stale sidecar write is the only thing that would
+    have caught it. One extra, harmless re-export costs less than that."""
     try:
         text = _watermark_path(target).read_text(encoding="utf-8").strip()
     except OSError:
@@ -152,6 +158,36 @@ def _read_export_watermark(target: Path) -> datetime | None:
         return _as_utc(datetime.fromisoformat(text))
     except ValueError:
         return None
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Write *content* to *target* so no reader ever observes a partial or
+    interleaved file: stage under a per-call, globally-unique temp name in
+    *target*'s own directory, then ``os.replace`` onto *target*.
+
+    A chat session's export (and its watermark sidecar) can be written from
+    several places racing each other -- the periodic sweep, the kill/archive
+    teardown hooks, and the on-demand admin transcript route, potentially
+    from different processes and with no cross-process lock between them. A
+    FIXED temp name (``<target>.tmp``) let two concurrent writers share one
+    buffer and interleave into a corrupt file, and let one writer's cleanup
+    delete the other's still-in-flight temp out from under it (the exact
+    incident class ``src/parquet_publish.py`` documents for the
+    analytics-extract writers, which this mirrors). A per-call ``uuid4``
+    name means two overlapping writers never touch the same temp file at
+    all: the worst case is "the writer that finishes last wins", never a
+    merged or truncated result.
+
+    On any failure the temp is removed and the exception propagates;
+    *target* is left exactly as it was before the call.
+    """
+    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _result_to_content(result: Any) -> Any:
@@ -319,8 +355,8 @@ def messages_to_turns(chat_id: str, messages: list[ChatMessage]) -> list[dict]:
 
 def export_chat_session_jsonl(chat_id: str) -> Path | None:
     """Write ``chat_id``'s messages to
-    ``${SESSION_DATA_DIR}/<users.id>/chat-<chat_id>.jsonl`` (atomic:
-    ``.tmp`` then ``os.replace``) and return the path — or ``None``,
+    ``${SESSION_DATA_DIR}/<users.id>/chat-<chat_id>.jsonl`` (atomically —
+    see :func:`_atomic_write_text`) and return the path — or ``None``,
     never raising, when:
 
       - ``sessions.include_chat`` is off,
@@ -387,14 +423,10 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     watermark = _export_watermark(messages)
     target_dir = _session_data_dir() / owner["id"]
     target = target_dir / f"chat-{chat_id}.jsonl"
-    tmp = target.with_name(target.name + ".tmp")
+    content = "".join(json.dumps(turn, default=str) + "\n" for turn in turns)
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
-        with tmp.open("w", encoding="utf-8") as fh:
-            for turn in turns:
-                fh.write(json.dumps(turn, default=str))
-                fh.write("\n")
-        os.replace(tmp, target)
+        _atomic_write_text(target, content)
         _write_export_watermark(target, watermark)
     except OSError:
         logger.warning("chat session export: write failed for %s", chat_id, exc_info=True)
@@ -426,16 +458,18 @@ def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime |
 
     Compares against :func:`_read_export_watermark` — the newest message
     ``export_chat_session_jsonl`` actually wrote, recorded in a sidecar file
-    alongside ``existing_path`` — rather than ``existing_path``'s own
-    mtime. The file's mtime is deliberately NOT this signal: it is left at
-    the wall-clock write time for ``services/session_processor_state.py``'s
+    alongside ``existing_path`` — never ``existing_path``'s own mtime. The
+    file's mtime is deliberately NOT this signal: it is left at the
+    wall-clock write time for ``services/session_processor_state.py``'s
     own, unrelated mtime-vs-``processed_at`` invalidation gate, and a
     message can be older than the moment it happens to get (re-)exported
-    (backfilling a previously-truncated conversation, for one). Falls back
-    to the file's mtime only when there is no sidecar to read — an export
-    written before this mechanism existed, or one whose sidecar write
-    failed — so an old export is not treated as permanently stale just
-    because it predates the sidecar.
+    (backfilling a previously-truncated conversation, for one). A missing
+    or unreadable sidecar (an export written before this mechanism existed,
+    or one whose sidecar write itself failed) is unconditionally stale
+    rather than falling back to mtime: that fallback would silently reopen
+    the exact write race this mechanism exists to close whenever the
+    sidecar write is the thing that failed, so the one-time cost of
+    re-exporting a still-good legacy file is the safer trade.
 
     A message committed between :func:`export_chat_session_jsonl`'s read
     and its ``os.replace`` is absent from both the jsonl and the sidecar,
@@ -449,10 +483,7 @@ def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime |
         return True
     watermark = _read_export_watermark(existing_path)
     if watermark is None:
-        try:
-            watermark = datetime.fromtimestamp(existing_path.stat().st_mtime, tz=UTC)
-        except OSError:
-            return True
+        return True
     last_active = _as_utc(last_message_at)
     return last_active > watermark
 
