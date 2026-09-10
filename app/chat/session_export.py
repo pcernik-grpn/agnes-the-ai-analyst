@@ -226,7 +226,7 @@ def _watermark_path(target: Path) -> Path:
     return target.with_name(target.name + ".watermark")
 
 
-def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
+def _write_export_watermark(target: Path, watermark: ExportWatermark, identity: tuple[int, int] | None = None) -> None:
     """Atomically record *watermark* (:func:`_export_watermark` of the
     messages just written to *target*) in its sidecar file -- via
     :func:`_atomic_write_text`, so a reader never observes a half-written
@@ -241,7 +241,6 @@ def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
     old shape, so an instance upgrading in place keeps its existing exports
     instead of re-exporting every session at once.
     """
-    identity = _transcript_identity(target)
     _atomic_write_text(
         _watermark_path(target),
         json.dumps(
@@ -249,10 +248,17 @@ def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
                 "last_message_at": watermark.last_message_at.isoformat(),
                 "messages": watermark.messages,
                 "content_sha256": watermark.content_sha256,
-                # Stat'd from `target` here rather than carried on the
-                # watermark, because it only exists once the transcript is
-                # on disk -- and it is deliberately the LAST thing written,
-                # so it describes the file the digest above vouches for.
+                # *identity* must come from the caller, taken from the
+                # STAGED transcript before it was published (see
+                # :func:`_atomic_write_text`). Stat'ing `target` here
+                # instead was wrong in a way that defeated the digest: a
+                # writer replacing the destination between the transcript's
+                # publish and that stat left this sidecar pairing OUR
+                # digest and counts with THEIR file's identity, and the
+                # identity fast path in `is_chat_export_stale` then
+                # skipped the very digest that would have caught the torn
+                # pair -- trusting a truncated transcript indefinitely.
+                # Omitted (None) is always safe: it only costs a hash.
                 "content_size": identity[0] if identity else None,
                 "content_mtime_ns": identity[1] if identity else None,
             }
@@ -306,7 +312,7 @@ def _read_export_watermark(target: Path) -> ExportWatermark | None:
         return None
 
 
-def _atomic_write_text(target: Path, content: str) -> None:
+def _atomic_write_text(target: Path, content: str) -> tuple[int, int] | None:
     """Write *content* to *target* so no reader ever observes a partial or
     interleaved file: stage under a per-call, globally-unique temp name in
     *target*'s own directory, then ``os.replace`` onto *target*.
@@ -326,11 +332,25 @@ def _atomic_write_text(target: Path, content: str) -> None:
 
     On any failure the temp is removed and the exception propagates;
     *target* is left exactly as it was before the call.
+
+    Returns the ``(st_size, st_mtime_ns)`` of the STAGED file, stat'd before
+    the replace -- see :func:`_transcript_identity` for what that is for.
+    ``os.replace`` is a rename, so the published file carries the temp
+    file's inode and therefore exactly these values; stat'ing *target*
+    afterwards instead would return whatever another writer had replaced it
+    with in the meantime. ``None`` if the stat itself failed, which callers
+    must treat as "no identity", never as a match.
     """
     tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(content, encoding="utf-8")
+        try:
+            st = tmp.stat()
+            identity: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            identity = None
         os.replace(tmp, target)
+        return identity
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -591,8 +611,8 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
 
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(target, content)
-        _write_export_watermark(target, watermark)
+        identity = _atomic_write_text(target, content)
+        _write_export_watermark(target, watermark, identity)
     except OSError:
         logger.warning("chat session export: write failed for %s", chat_id, exc_info=True)
         return None
@@ -607,13 +627,25 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     return target
 
 
-def is_chat_export_stale(
+def _stale_with_watermark(
     existing_path: Path | None,
     last_message_at: datetime | None,
     message_count: int | None = None,
-) -> bool:
+) -> tuple[bool, ExportWatermark | None]:
     """True when a chat session's exported jsonl is missing, unreadable, or
-    older than the session's last message.
+    older than the session's last message -- AND the watermark that answer
+    was reached from, ``None`` when there was none to validate.
+
+    The second half exists for a caller that goes on to CERTIFY the
+    transcript: it must take the digest from the very read this verdict was
+    computed on, never re-read the sidecar afterwards. Those are two
+    different generations the moment anything republishes the file in
+    between, and a digest fetched by that later read describes a generation
+    nothing ever compared against the session -- which the certifying
+    caller would then report as verified. See
+    ``ChatTranscriptFreshness.content_sha256``. Callers that want only the
+    verdict use :func:`is_chat_export_stale`, the plain-boolean face of
+    this.
 
     The ONE staleness rule shared by the periodic sweep
     (``services/session_pipeline/runner.py::_sweep_chat_session_exports``)
@@ -654,12 +686,12 @@ def is_chat_export_stale(
     the question either way; every caller in this repo passes it.
     """
     if last_message_at is None:
-        return False
+        return False, None
     if existing_path is None or not existing_path.is_file():
-        return True
+        return True, None
     watermark = _read_export_watermark(existing_path)
     if watermark is None:
-        return True
+        return True, None
     # The pair has to belong together. Each file is replaced atomically, the
     # PAIR is not, so two overlapping writers can leave one writer's
     # transcript beside the other's watermark -- and a watermark vouching
@@ -668,7 +700,7 @@ def is_chat_export_stale(
     # export heals it. A sidecar predating the digest cannot be checked and
     # is treated exactly like a missing one, for the reason given above.
     if watermark.content_sha256 is None:
-        return True
+        return True, watermark
     # Hash only when the file might have changed under us. An unchanged
     # `(size, mtime_ns)` means this is byte-for-byte the transcript the
     # sidecar hashed, so the digest below cannot differ -- and re-reading
@@ -678,16 +710,32 @@ def is_chat_export_stale(
     if watermark.content_identity is None or _transcript_identity(existing_path) != watermark.content_identity:
         try:
             if _content_digest(existing_path.read_text(encoding="utf-8")) != watermark.content_sha256:
-                return True
+                return True, watermark
         except OSError:
-            return True
+            return True, watermark
     if _as_utc(last_message_at) > watermark.last_message_at:
-        return True
+        return True, watermark
     # Strictly MORE messages than we wrote, at a timestamp we already have:
     # the tie above. Never `!=` — a count that has drifted low (nothing in
     # this repo deletes chat messages, but a restore or a manual fix could)
     # would otherwise re-export the same session on every sweep tick.
-    return message_count is not None and watermark.messages is not None and message_count > watermark.messages
+    if message_count is not None and watermark.messages is not None and message_count > watermark.messages:
+        return True, watermark
+    return False, watermark
+
+
+def is_chat_export_stale(
+    existing_path: Path | None,
+    last_message_at: datetime | None,
+    message_count: int | None = None,
+) -> bool:
+    """The ONE staleness rule -- see :func:`_stale_with_watermark`, which
+    this is the plain-boolean face of. Every caller that only needs the
+    verdict uses this; a caller that then CERTIFIES the transcript must use
+    the underlying helper instead, so the digest it reports comes from the
+    same read as the verdict.
+    """
+    return _stale_with_watermark(existing_path, last_message_at, message_count)[0]
 
 
 @dataclass
@@ -805,39 +853,26 @@ def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
     # that is already several I/O calls old" — confirm against a current
     # read before certifying, and when the session has moved on, fall
     # through and export rather than merely labelling the file behind.
-    if (
-        existing.is_file()
-        and not is_chat_export_stale(existing, session.last_message_at, session.message_count)
-        and not _is_stale_against_a_fresh_read(chat_id, existing)
-    ):
-        freshness.path = existing
-        freshness.content_sha256 = _verified_generation(existing)
-        return freshness
+    if existing.is_file() and not is_chat_export_stale(existing, session.last_message_at, session.message_count):
+        behind, validated = _is_stale_against_a_fresh_read(chat_id, existing)
+        if not behind:
+            freshness.path = existing
+            # The digest comes from the read that produced `behind`, never
+            # from a fresh look at the sidecar afterwards: a writer
+            # publishing between the two would hand us the digest of a
+            # generation nothing had compared against the session, and the
+            # route would then repeat THIS verdict over those bytes.
+            freshness.content_sha256 = validated.content_sha256 if validated else None
+            return freshness
 
     freshness.path = export_chat_session_jsonl(chat_id)
     if freshness.path is not None:
-        freshness.raced = _is_stale_against_a_fresh_read(chat_id, freshness.path)
-        freshness.content_sha256 = _verified_generation(freshness.path)
+        freshness.raced, validated = _is_stale_against_a_fresh_read(chat_id, freshness.path)
+        freshness.content_sha256 = validated.content_sha256 if validated else None
     return freshness
 
 
-def _verified_generation(target: Path) -> str | None:
-    """The digest recorded for the export at *target* -- the generation any
-    verdict about it refers to.
-
-    Read back from the sidecar rather than remembered from a write, because
-    the endings above reach this differently: one wrote the file, another
-    found it already current, and the publish-order guard in
-    :func:`export_chat_session_jsonl` deliberately publishes nothing at all.
-    Reading covers every case with one rule. ``None`` when there is nothing
-    to pin to, which a caller must treat as "cannot confirm these are the
-    bytes I verified", never as a match.
-    """
-    watermark = _read_export_watermark(target)
-    return watermark.content_sha256 if watermark is not None else None
-
-
-def _is_stale_against_a_fresh_read(chat_id: str, exported: Path) -> bool:
+def _is_stale_against_a_fresh_read(chat_id: str, exported: Path) -> tuple[bool, ExportWatermark | None]:
     """True when *exported* is already behind ``chat_id`` as of a session
     row read right now.
 
@@ -865,9 +900,11 @@ def _is_stale_against_a_fresh_read(chat_id: str, exported: Path) -> bool:
         latest = chat_session_repo().get_session(chat_id)
     except Exception:
         # We could not check. Saying "current" would be a claim we did not
-        # verify; saying "raced" is the honest, conservative reading.
+        # verify; saying "raced" is the honest, conservative reading -- and
+        # with no validated watermark to hand back, a caller cannot certify
+        # any generation either.
         logger.warning("chat transcript freshness: post-export re-check failed for %s", chat_id, exc_info=True)
-        return True
+        return True, None
     if latest is None:
-        return False
-    return is_chat_export_stale(exported, latest.last_message_at, latest.message_count)
+        return False, _read_export_watermark(exported)
+    return _stale_with_watermark(exported, latest.last_message_at, latest.message_count)

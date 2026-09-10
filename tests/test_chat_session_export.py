@@ -1426,3 +1426,81 @@ class TestAVerdictBelongsToOneGeneration:
 
         assert resp.status_code == 200
         assert resp.json()["freshness"] == {"verified": True}
+
+
+class TestTheDigestCannotBeBorrowedFromAnotherGeneration:
+    """Two ways the pairing digest could end up describing a generation
+    nothing verified — both of them a read-then-act gap opened by fixing
+    the previous one, which is why they are pinned rather than reasoned
+    about.
+    """
+
+    def test_the_certified_digest_comes_from_the_read_that_verified_it(self, seeded_app, tmp_path, monkeypatch):
+        """`ensure_chat_transcript_current` used to fetch the digest with a
+        FRESH sidecar read after deciding the export was current. A writer
+        publishing between the two hands it the digest of a generation
+        nothing compared against the session — and the route, matching the
+        bytes it then reads against that digest, reports `verified` over a
+        transcript that was never checked."""
+        from app.chat import session_export as se
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        published = se.export_chat_session_jsonl(chat_id)
+        assert published is not None
+        full = published.read_text(encoding="utf-8")
+
+        real = se._is_stale_against_a_fresh_read
+
+        def _verify_then_republish_something_older(cid, exported):
+            verdict = real(cid, exported)
+            # A delayed writer lands a coherent, digest-valid, SHORTER
+            # generation right after the verdict — sidecar included.
+            shorter = full.splitlines(keepends=True)[0]
+            identity = se._atomic_write_text(exported, shorter)
+            se._write_export_watermark(
+                exported,
+                se.ExportWatermark(datetime.now(UTC), messages=1, content_sha256=se._content_digest(shorter)),
+                identity,
+            )
+            return verdict
+
+        monkeypatch.setattr(se, "_is_stale_against_a_fresh_read", _verify_then_republish_something_older)
+
+        freshness = se.ensure_chat_transcript_current(chat_id)
+
+        # Whatever else it says, it must not certify the generation that
+        # landed after the check: the digest it carries has to belong to
+        # the transcript that was actually verified.
+        assert freshness.content_sha256 != se._content_digest(published.read_text(encoding="utf-8"))
+
+    def test_a_sidecar_never_pairs_our_digest_with_another_writers_file(self, tmp_path, monkeypatch):
+        """The identity fast path only skips the hash when it proves the
+        file is the one the sidecar hashed. Stat'ing the DESTINATION after
+        publishing gave that proof away: a writer replacing the target in
+        between left the sidecar carrying our digest and their
+        `(size, mtime_ns)`, so the fast path skipped the digest for a file
+        it does not describe — and a truncated transcript read as current
+        indefinitely. The identity must come from the staged file."""
+        from app.chat import session_export as se
+
+        target = tmp_path / "chat-x.jsonl"
+        ours = '{"turn": 1}\n{"turn": 2}\n'
+        identity = se._atomic_write_text(target, ours)
+
+        # Another writer replaces the published transcript with a shorter
+        # one before our sidecar is written.
+        theirs = '{"turn": 1}\n'
+        target.write_text(theirs, encoding="utf-8")
+
+        se._write_export_watermark(
+            target,
+            se.ExportWatermark(datetime.now(UTC), messages=2, content_sha256=se._content_digest(ours)),
+            identity,
+        )
+
+        # Our identity describes our staged bytes, not theirs, so the fast
+        # path cannot fire and the digest catches the torn pair.
+        watermark = se._read_export_watermark(target)
+        assert watermark.content_identity != se._transcript_identity(target)
+        assert se.is_chat_export_stale(target, datetime.now(UTC), 2)
