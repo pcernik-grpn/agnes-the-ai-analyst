@@ -164,6 +164,48 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     ),
 }
 
+# A different shape of the same A3 divergence: `/me/issues` and `/admin/issues`
+# (issue reporting, step 3 of the design, pulled forward) are PAGE routes, not
+# JSON API routes — they gate on the SAME flag as their JSON siblings above
+# (`_issue_reporting_available()` == `use_pg()`), but a page that redirects
+# home rather than 501s reads better than one whose every client-side fetch
+# fails after the shell has already rendered (same reasoning `/news` and
+# `/admin/news` already apply to their own off-by-default flags). So their
+# clean-failure shape on DuckDB is "redirects to /" (302), not the typed 501
+# `_PG_ONLY_ROUTE_EXEMPTIONS` / `assert_pg_only_exemptions_fail_clean` prove —
+# hence a second, purpose-built exemption dict with its own proof just below,
+# rather than stretching that mechanism to cover a status it was not built for.
+_PG_ONLY_PAGE_REDIRECT_EXEMPTIONS: dict[str, str] = {
+    "GET /me/issues": (
+        "gated on _issue_reporting_available() (A3 ratchet, issue_reports is "
+        "Postgres-only) -- redirects home on DuckDB rather than rendering a "
+        "shell whose fetches would all 501"
+    ),
+    "GET /admin/issues": (
+        "gated on _issue_reporting_available() (A3 ratchet, issue_reports is "
+        "Postgres-only) -- redirects home on DuckDB rather than rendering a "
+        "shell whose fetches would all 501"
+    ),
+}
+
+
+def _assert_page_redirect_exemptions_fail_clean(duck: dict[str, int], exempt: dict[str, str]) -> None:
+    """Sibling of ``assert_pg_only_exemptions_fail_clean`` for the redirect
+    shape: every exempted page must actually redirect (302) on DuckDB, not
+    silently 200 (which would mean the gate regressed) or crash."""
+    bad = {}
+    for key, reason in exempt.items():
+        if not reason or not reason.strip():
+            bad[key] = "exemption has no reason recorded"
+            continue
+        got = duck.get(key)
+        if got != 302:
+            bad[key] = f"expected a clean 302 redirect on DuckDB, got {got}"
+    assert not bad, (
+        "PG-only page-redirect exemption(s) did not fail clean on DuckDB "
+        "(expected a 302 redirect home):\n" + "\n".join(f"  {k}: {v}" for k, v in sorted(bad.items()))
+    )
+
 
 def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
     # facts.enabled defaults OFF (the router-level 404 gate would otherwise
@@ -179,6 +221,7 @@ def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engin
     # so re-querying `duck_client` after that point would silently exercise
     # Postgres repos through DuckDB-configured routes.
     assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
+    _assert_page_redirect_exemptions_fail_clean(duck, _PG_ONLY_PAGE_REDIRECT_EXEMPTIONS)
 
     # The fail-clean check MUST run before the pg client is built:
     # build_seeded_client("pg", ...) sets AGNES_DB_URL, and use_pg() reads it
@@ -192,7 +235,7 @@ def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engin
     pg_client, pg_token = build_seeded_client("pg", tmp_path / "pg", monkeypatch, pg_engine)
     pg = collect_statuses(pg_client, pg_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
 
-    divergences = diff_statuses(duck, pg, exempt=_PG_ONLY_ROUTE_EXEMPTIONS)
+    divergences = diff_statuses(duck, pg, exempt={**_PG_ONLY_ROUTE_EXEMPTIONS, **_PG_ONLY_PAGE_REDIRECT_EXEMPTIONS})
     assert not divergences, "GET status diverges between DuckDB and Postgres (backend-split):\n" + "\n".join(
         f"  {k}: duck={d} pg={g}" for k, (d, g) in sorted(divergences.items())
     )

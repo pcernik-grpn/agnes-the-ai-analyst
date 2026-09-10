@@ -1,0 +1,73 @@
+{#
+  /me/issues — a reporter's own "Report a problem" filings (issue reporting,
+  step 3 of the design — docs/superpowers/specs/2026-09-09-issue-reporting-
+  step1-design.md — pulled forward on its own; the rest of step 3 — unread
+  badge, external-tracker callbacks, semantic_feedback fold-in — stays out).
+
+  A static shell: list, filter and detail (including the comment thread and
+  the "add a comment" box) are all fetched client-side from the EXISTING
+  JSON API by js/issue_pages.js in its "mine" mode — no new REST surface.
+  Route: app/web/router.py::me_issues_page, gated on `can_report_issue`
+  (the same A3 PG-first-ratchet flag the rail's "Report a problem" button
+  and dialog use — see _issue_reporting_available()).
+#}
+{% extends "base_page.html" %}
+
+{% block title %}My reports — {{ instance_brand or 'Agnes' }}{% endblock %}
+
+{% set page_hero_eyebrow = "Account" %}
+{% set page_hero_title = "My reports" %}
+{% set page_hero_subtitle = "Bugs, wrong answers, missing features and questions you've reported through “Report a problem”." %}
+{% set page_hero_plain = True %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/issue_pages.css') }}">
+{% endblock %}
+
+{% block toolbar %}
+<div class="fbar" id="iss-filter-bar">
+  <div class="fbar-seg" role="tablist" aria-label="Status" id="iss-status-filter">
+    <button type="button" class="fbar-seg__btn is-active" data-status="open" role="tab" aria-selected="true">Open</button>
+    <button type="button" class="fbar-seg__btn" data-status="resolved" role="tab" aria-selected="false">Resolved</button>
+    <button type="button" class="fbar-seg__btn" data-status="all" role="tab" aria-selected="false">All</button>
+  </div>
+  <span class="iss-toolbar-gap"></span>
+  {% if can_report_issue %}
+  {{ ds.button('Report a problem', variant='primary', id='iss-new-report') }}
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block page %}
+<div id="iss-page" data-mode="mine">
+  <div id="iss-loading" class="iss-loading">Loading…</div>
+  <div id="iss-empty" class="empty-state" hidden>
+    <p>You haven't reported anything yet.</p>
+    <p>Click <strong>Report a problem</strong> above, in the rail, or in your account menu to file one.</p>
+  </div>
+  <div class="data-table-wrap" id="iss-table-wrap" hidden>
+    <table class="data-table" id="iss-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Kind</th>
+          <th>Status</th>
+          <th>Replies</th>
+          <th>Age</th>
+          <th>Title</th>
+        </tr>
+      </thead>
+      <tbody id="iss-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+{% set is_admin_queue = False %}
+{% include "_issue_detail_drawer.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script defer src="{{ static_url('js/issue_pages.js') }}"></script>
+{% endblock %}

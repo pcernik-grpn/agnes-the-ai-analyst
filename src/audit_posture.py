@@ -1394,6 +1394,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/groups": "exempt:ui_support",
     "GET /admin/groups/{group_id}": "exempt:ui_support",
     "GET /admin/initial-workspace": "exempt:ui_support",
+    # Renders a static shell; list/detail/reply/resolve all run client-side
+    # against the ALREADY-declared /api/issues* and /api/admin/issues* routes
+    # above, which carry their own posture.
+    "GET /admin/issues": "exempt:ui_support",
     "GET /admin/knowledge-digests": "exempt:ui_support",
     "GET /admin/linked-apps": "exempt:ui_support",
     "GET /admin/linked-apps/new": "exempt:ui_support",
@@ -1486,6 +1490,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /me/ai-connector": "exempt:ui_support",
     "GET /me/connections": "exempt:ui_support",
     "GET /me/cowork": "exempt:ui_support",
+    # Renders a static shell; list/detail/comment all run client-side against
+    # the ALREADY-declared /api/issues* routes above, which carry their own
+    # posture (GET /api/issues/mine, GET /api/issues/{issue_id}, …).
+    "GET /me/issues": "exempt:ui_support",
     "GET /me/mcp": "exempt:ui_support",
     "GET /me/memory-mining": "exempt:ui_support",
     "GET /me/profile": "exempt:ui_support",

@@ -1105,6 +1105,11 @@
                 {% if can_report_issue %}
                 <button type="button" class="app-user-menu-item app-user-menu-btn"
                         role="menuitem" id="rail-report-issue-menu">Report a problem</button>
+                {# The reporter's OWN door onto their filings (/me/issues) —
+                   same gate as the button just above (issue reports are a
+                   Postgres-only pair; a DuckDB instance shows neither). #}
+                <a class="app-user-menu-item {% if _path.startswith('/me/issues') %}is-active{% endif %}"
+                   role="menuitem" href="/me/issues">My reports</a>
                 {% endif %}
                 {# `not _admin_page` as well as `can_chat`, matching the card
                    this re-arms: the analyst row is deliberately absent on admin

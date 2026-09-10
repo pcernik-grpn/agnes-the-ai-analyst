@@ -71,6 +71,12 @@ who receives it:
 - `/admin/store/lint` — advisory quality findings on published skills (body
   size, weak trigger phrasing, likely duplicates). Never blocks publication.
   No sidebar row — reached from the Submissions queue's toolbar.
+- `/admin/issues` — the "Report a problem" queue across every reporter:
+  filter by status, open a report to see its auto-captured context and
+  screenshot, reply, and Resolve with an optional note. Requires the
+  Postgres app-state backend (issue reports are a Postgres-only table
+  pair) — no sidebar row and the page redirects home on a DuckDB-backed
+  instance.
 - `/admin/corporate-memory` — corporate-memory domains and their content.
 
 Four pages in this section are **hidden by default** — they redirect home and

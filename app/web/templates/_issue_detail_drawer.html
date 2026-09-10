@@ -1,0 +1,77 @@
+{#
+  Shared "one report" detail drawer for /me/issues and /admin/issues (issue
+  reporting, step 3 of the design — docs/superpowers/specs/2026-09-09-issue-
+  reporting-step1-design.md — pulled forward on its own).
+
+  Populated ENTIRELY client-side by js/issue_pages.js from the existing JSON
+  API (`GET /api/issues/{id}`, `POST /api/issues/{id}/comments` and, in the
+  admin queue, `POST /api/admin/issues/{id}/resolve`) — no server-rendered
+  data here, so the same markup serves both pages. `is_admin_queue` (set by
+  the including template before this include) only toggles copy and whether
+  the Resolve section exists at all; the JS reads the SAME flag off
+  `#iss-page`'s `data-mode` attribute rather than trusting a second source.
+
+  Chrome follows the shared `.ds-drawer` right-side panel (drawer.css) — the
+  same head/body anatomy every admin editor drawer already uses
+  (js/components/group_drawer.js is the reference implementation for the
+  open/close mechanics this page's JS mirrors).
+#}
+<div class="ds-drawer" id="iss-detail" hidden aria-hidden="true">
+  <div class="ds-drawer__backdrop" data-iss-close></div>
+  <div class="ds-drawer__panel" role="dialog" aria-modal="true" aria-labelledby="iss-detail-title">
+    <div class="ds-drawer__head">
+      <div class="ds-drawer__head-main">
+        <h2 class="ds-drawer__title" id="iss-detail-title">&nbsp;</h2>
+        <p class="ds-drawer__sub" id="iss-detail-sub"></p>
+      </div>
+      <button type="button" class="ds-drawer__x" data-iss-close aria-label="Close">&times;</button>
+    </div>
+    <div class="ds-drawer__body">
+      <div id="iss-detail-loading" class="iss-loading">Loading…</div>
+      <div id="iss-detail-content" hidden>
+        <div class="iss-detail-badges" id="iss-detail-badges"></div>
+
+        {% if is_admin_queue %}
+        <p class="iss-detail-reporter" id="iss-detail-reporter"></p>
+        {% endif %}
+
+        <div class="iss-detail-body" id="iss-detail-body"></div>
+
+        <h3 class="iss-section-title">Attached automatically</h3>
+        <dl class="iss-context" id="iss-detail-context"></dl>
+        <div id="iss-detail-errors"></div>
+
+        <div id="iss-detail-screenshot-wrap" hidden>
+          <h3 class="iss-section-title">Screenshot</h3>
+          <img id="iss-detail-screenshot" class="iss-screenshot" alt="Screenshot attached to this report">
+        </div>
+
+        {% if is_admin_queue %}
+        <div id="iss-resolved-banner" class="iss-resolved-banner" hidden></div>
+        <div id="iss-resolve-box" class="iss-resolve">
+          <h3 class="iss-section-title">Resolve</h3>
+          {{ ds.drawer_field(id="iss-resolve-note", label="Resolution note", type="textarea",
+                              placeholder="What fixed it, or why it's closed.", optional=True,
+                              attrs='maxlength="4000" rows="2"') }}
+          {{ ds.button('Resolve', variant='primary', id='iss-resolve-btn') }}
+        </div>
+        {% endif %}
+
+        <h3 class="iss-section-title">Comments</h3>
+        <div class="iss-comments" id="iss-comments"></div>
+
+        <div class="iss-reply">
+          {% if is_admin_queue %}
+          {{ ds.drawer_field(id="iss-comment-body", label="Reply", type="textarea",
+                              placeholder="Reply to the reporter…", attrs='maxlength="8000" rows="3"') }}
+          {{ ds.button('Send reply', variant='secondary', id='iss-comment-submit') }}
+          {% else %}
+          {{ ds.drawer_field(id="iss-comment-body", label="Add a comment", type="textarea",
+                              placeholder="Add more detail, or answer a question…", attrs='maxlength="8000" rows="3"') }}
+          {{ ds.button('Post comment', variant='secondary', id='iss-comment-submit') }}
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

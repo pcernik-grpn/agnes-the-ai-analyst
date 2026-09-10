@@ -47,13 +47,18 @@
    All five surfaces here are hidden by DEFAULT since the admin cleanup and
    their routes redirect home when the flag is off, so failing closed is also
    the truthful direction: a row rendered past a missing flag would be a link
-   to a redirect. #}
+   to a redirect. `can_report_issue` is the sixth — off by a different cause
+   (the A3 PG-first ratchet: issue reports are Postgres-only, `src.
+   repositories.use_pg()`) but the same consequence, so it reads the same
+   here: hidden until true, and `/admin/issues` redirects home when it is
+   not. #}
 {% set _nav_flags = {
      'can_studio': can_studio | default(false),
      'can_news': can_news | default(false),
      'can_knowledge_digests': can_knowledge_digests | default(false),
      'can_contribute_skill': can_contribute_skill | default(false),
      'can_store_moderation': can_store_moderation | default(false),
+     'can_report_issue': can_report_issue | default(false),
    } %}
 {# The head is a page-level heading that also answers "which instance am I
    changing": under the rail this column is the primary navigation of the page

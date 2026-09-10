@@ -7307,6 +7307,29 @@ async def me_memory_mining(
     return templates.TemplateResponse(request, "me_memory_mining.html", _chrome_ctx(request, user))
 
 
+@router.get("/me/issues", response_class=HTMLResponse)
+async def me_issues_page(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """A reporter's own "Report a problem" filings — step 3 of the issue-
+    reporting design, pulled forward on its own (see
+    docs/superpowers/specs/2026-09-09-issue-reporting-step1-design.md).
+
+    The page itself is a static shell: list, filter and detail are all
+    fetched client-side from the EXISTING JSON API (``GET /api/issues/mine``,
+    ``GET /api/issues/{id}``, ``POST /api/issues/{id}/comments``) by
+    ``issue_pages.js`` — no new REST surface. Gated the same way the rail's
+    "Report a problem" button and dialog are: issue reports are a
+    Postgres-only table pair (A3 PG-first ratchet), so a DuckDB-backed
+    instance redirects home rather than rendering a page that fetches a
+    501 on load.
+    """
+    if not _issue_reporting_available():
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "me_issues.html", _chrome_ctx(request, user))
+
+
 @router.get("/admin/store/lint", response_class=HTMLResponse)
 async def store_lint_admin_page(
     request: Request,
@@ -7348,6 +7371,28 @@ async def store_lint_admin_page(
             "include_dismissed": include_dismissed,
         },
     )
+
+
+@router.get("/admin/issues", response_class=HTMLResponse)
+async def admin_issues_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The issue-report queue across every reporter — step 3 of the issue-
+    reporting design, pulled forward on its own (see ``/me/issues`` above and
+    docs/superpowers/specs/2026-09-09-issue-reporting-step1-design.md).
+
+    Same static-shell shape as ``/me/issues``: list, filter, detail, reply
+    and resolve all run against the EXISTING JSON API (``GET
+    /api/admin/issues``, ``GET /api/issues/{id}``, ``POST
+    /api/issues/{id}/comments``, ``POST /api/admin/issues/{id}/resolve``) via
+    ``issue_pages.js`` in its admin mode — no new REST surface. Same
+    Postgres-only gate as ``/me/issues``: a DuckDB-backed instance redirects
+    home rather than rendering a queue that would 501 on load.
+    """
+    if not _issue_reporting_available():
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "admin_issues.html", _chrome_ctx(request, user))
 
 
 @router.get("/admin/studio", response_class=HTMLResponse)

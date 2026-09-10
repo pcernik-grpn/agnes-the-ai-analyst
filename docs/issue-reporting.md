@@ -5,11 +5,11 @@ missing, or a question — from wherever they are in Agnes, with the context a
 tracker needs (page, session, version, recent client errors, an optional
 screenshot) attached automatically instead of re-typed into a Slack thread.
 
-This is step 1 of a three-step effort. Step 1 (this document) is: file,
-store, look up your own reports, and mirror a summary to an operator's chat
-channel. Later steps add a support agent that tries to help first, dedicated
-`/me/issues` and `/admin/issues` web pages, and status/comments flowing back
-from an external tracker. See "What comes next" below.
+This is step 1 of a three-step effort — file, store, look up your own
+reports, and mirror a summary to an operator's chat channel — plus the
+`/me/issues` and `/admin/issues` web pages pulled forward from step 3. Later
+steps add a support agent that tries to help first, and status/comments
+flowing back from an external tracker. See "What comes next" below.
 
 **Requires the Postgres app-state backend.** Issue reports are stored in a
 Postgres-only table pair (`issue_reports`, `issue_comments` — the A3
@@ -69,6 +69,14 @@ caller who never attaches one never downloads it.
 
 ## Looking up your own reports
 
+**`/me/issues`** lists every report you've filed — status, replies and age
+at a glance — with a filter for open/resolved/all. Opening one shows the
+body, the auto-captured context rendered readably (page, version, browser,
+chat session, recent client errors), the screenshot when there is one, the
+comment thread, and a box to add a comment. It is a static page: everything
+on it comes from the same JSON API the CLI and MCP tools use below, fetched
+client-side — there is no separate web-only endpoint.
+
 ```bash
 agnes issue report "Tables render raw markdown while streaming" \
     --kind bug --body "During streaming I see raw | and --- until the answer completes." \
@@ -95,8 +103,12 @@ admin's reply) on those issues; an admin sees every row. Server-side only
 
 ## The admin queue
 
-Step 1 ships a CLI/MCP-only admin queue — no dedicated `/admin/issues` web
-page yet (see "What comes next"):
+**`/admin/issues`** ("Content" in the sidebar) lists every report across
+every reporter — the same shape as `/me/issues` plus who filed it. Opening
+one adds a reply box and a **Resolve** action with an optional note; a
+second Resolve on an already-closed report surfaces the exact 409 message
+("#42 was already resolved by X at T") rather than a generic failure. Same
+CLI and MCP surface underneath:
 
 ```bash
 agnes admin issue list [--status open|resolved|all] [--limit N] [--json]
@@ -140,11 +152,11 @@ Named here so nobody accidentally re-designs them as part of step 1:
 - **Step 2** — a `support` agent profile, opened from the dialog with the
   captured context already loaded, that tries to help before a human has
   to; the dialog grows an "Ask the support agent first" path.
-- **Step 3** — dedicated `/me/issues` and `/admin/issues` web pages, an
-  unread badge, comments and status flowing back from an external tracker
-  (e.g. Linear or Jira) via webhook, and the existing `semantic_feedback`
-  ("that answer looked wrong") mechanism folded in as `kind='wrong_answer'`
-  with its old routes kept as aliases.
+- **Step 3** — the `/me/issues` and `/admin/issues` web pages shipped early
+  (above); still open: an unread badge, comments and status flowing back
+  from an external tracker (e.g. Linear or Jira) via webhook, and the
+  existing `semantic_feedback` ("that answer looked wrong") mechanism
+  folded in as `kind='wrong_answer'` with its old routes kept as aliases.
 
 ## See also
 

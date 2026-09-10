@@ -449,6 +449,9 @@
           {% endif %}
           { label: 'Flea submissions',            hint: 'admin · g r',  href: '/admin/store/submissions' },
           { label: 'Prompts',                     hint: 'admin',        href: '/admin/prompts' },
+          {% if can_report_issue %}
+          { label: 'Issue reports',               hint: 'admin',        href: '/admin/issues' },
+          {% endif %}
           { label: '— User-facing —',             hint: 'separator',    href: null },
           { label: 'Catalog',                     hint: 'user',         href: '/catalog' },
           { label: 'Catalog · Browse',            hint: 'user',         href: '/catalog#browse' },
@@ -458,6 +461,9 @@
           { label: 'Memory mining (my consent)',  hint: 'privacy',      href: '/me/memory-mining' },
           { label: 'Marketplace',                 hint: 'user',         href: '/marketplace' },
           { label: 'Activity (mine)',             hint: 'user',         href: '/me/activity' },
+          {% if can_report_issue %}
+          { label: 'My reports',                  hint: 'user',         href: '/me/issues' },
+          {% endif %}
           {% if can_agent_profiles %}
           { label: 'My agents',                   hint: 'user',         href: '/agents' },
           {% endif %}
