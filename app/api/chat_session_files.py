@@ -112,29 +112,40 @@ _ENGINE_LISTING_FAILURE_LOGGED: OrderedDict[str, None] = OrderedDict()
 _ENGINE_LISTING_FAILURE_LOGGED_MAX = 512
 
 
-#: What we have LEARNED about an engine's files channel, keyed by its base
-#: URL. `supported` answers "does this engine expose a files channel", and a
-#: session without a sandbox cannot answer it — an engine predating the
-#: sandbox-file routes is unsupported whether or not this particular chat
-#: has spawned one. So the no-sandbox branch reports what the engine last
-#: demonstrated rather than guessing from session state.
-#:
-#: Only a chat that HAS a sandbox produces evidence: `_list_engine_files`
-#: runs solely on those, so a `None` listing there is the engine declining
-#: the channel for a chat it can see. A legacy chat id 400ing at the root
-#: never reaches here, which is why that case cannot brand the whole engine
-#: unsupported.
-_ENGINE_FILES_CHANNEL: dict[str, bool] = {}
-
-
-def _engine_channel_seen(base_url: str, *, supported: bool) -> None:
-    _ENGINE_FILES_CHANNEL[base_url] = supported
-
-
-def _engine_channel_believed_supported(base_url: str) -> bool:
-    """Optimistic until the engine has shown otherwise: an instance that has
-    never listed files yet should not accuse its engine of being too old."""
-    return _ENGINE_FILES_CHANNEL.get(base_url, True)
+# There used to be a per-base-URL memo here, fed by "a chat that HAS a
+# sandbox got a `None` listing ⇒ the engine lacks the files channel". It was
+# wrong: a legacy `chat_<hex>` session (minted before the instance's
+# provider switched to `kai-agent`) carries a `sandbox_id` too —
+# `KaiEngineProvider._handle` mints a (dead) handle for a malformed legacy
+# id, and the manager persists every spawned handle before the engine ever
+# creates a chat — so "this chat has a sandbox" does not mean "this `None`
+# is the ENGINE speaking about itself". It can just as easily be that one
+# chat's id, or a chat the engine has never heard of, neither of which says
+# anything about the engine's capability. One legacy chat 400ing at its
+# root used to brand the whole engine unsupported and hand every later,
+# unrelated sandboxless chat a false "upgrade your engine" warning.
+#
+# The engine's own 404 body for an unknown chat happens to be a distinct,
+# structured shape today (`{"error": {"type": "KaiError", ...}}`), which
+# looks like it could discriminate "this chat" from "this engine" without
+# relying on `sandbox_id` at all. It was deliberately not used for that:
+# sniffing an error body to prove a NEGATIVE is the same mistake relocated
+# one layer down — a future engine version that changes that shape (with no
+# reason to know this client depends on it) would misclassify a plain
+# "chat not found" as "route absent" and reintroduce this exact bug class
+# under a discriminator that looked sound today.
+#
+# The asymmetry is the actual fix: a successful listing PROVES the channel
+# exists; no failure — 400, 404, malformed id, unknown chat, or a genuinely
+# missing route — proves it does not, because nothing here can tell those
+# apart with certainty. So capability is only ever recorded in the direction
+# that can be proven, which means there is nothing left worth caching: the
+# unproven state and the "prove it" default below are the same value
+# (`True`), so a memo that could only ever agree with its own default would
+# just be a second mechanism for one fact. See `list_session_files` for what
+# an individual chat's own request still answers when IT has a sandbox and
+# ITS OWN listing fails — that per-request answer is unaffected by any of
+# this and never was the bug.
 
 
 def _engine_listing_recovered(chat_id: str) -> None:
@@ -345,8 +356,15 @@ class SessionFilesResponse(BaseModel):
     #: Where the listing came from: "host" (docker session dir) or "engine"
     #: (the kai-agent engine's remote sandbox).
     source: str = "host"
-    #: False when the session's files live in an engine sandbox the connected
-    #: engine does not expose (no files channel for this chat).
+    #: False when THIS request's engine listing came back empty-handed (a
+    #: chat id the engine could not serve, or a route it does not have) —
+    #: scoped to this one response, never a claim about the engine in
+    #: general. True is the default for everything else, including a chat
+    #: with no sandbox yet: nothing available before a sandbox exists can
+    #: prove the negative, so absence of proof is reported as no warning,
+    #: not as proof of the positive either. See the block comment near
+    #: ``_ENGINE_LISTING_FAILURE_LOGGED`` for why no cross-chat memo backs
+    #: this value.
     supported: bool = True
 
 
@@ -753,26 +771,28 @@ async def list_session_files(
     has never seen — every such poll used to land a "chat not found" 404 on
     the engine's own log for no reason. The answer is the same shape a 404
     from the engine gives today, just without the round trip.
+
+    ``supported`` in that no-sandbox answer is always ``True`` — not a claim
+    that this engine is known to expose the files channel, but the honest
+    absence of a claim that it does not. Nothing available before a sandbox
+    exists can establish the negative (see the block comment above
+    ``_ENGINE_LISTING_FAILURE_LOGGED``), so the drawer shows "no files here
+    yet" rather than an unearned "upgrade your engine" warning. A genuinely
+    outdated engine still surfaces that warning honestly once THIS chat has
+    its own sandbox and its own listing fails — see ``_list_engine_files``.
     """
     user, session = _owned_session_and_row_or_404(request, chat_id, user)
     cfg = _chat_config(request)
     harvested = _harvested_entries(chat_id)
     if _files_source(cfg) == "engine":
         if not getattr(session, "sandbox_id", None):
-            # `supported` answers "does this engine expose a files channel",
-            # not "are there files". A chat that has not spawned a sandbox
-            # yet establishes nothing about the engine, and the drawer
-            # renders supported=False as an operator-facing "upgrade your
-            # engine" warning — the wrong sentence for a conversation the
-            # reader opened five seconds ago. Empty and supported says what
-            # is actually true: no files here yet.
+            # Still validate the engine URL: a provider misconfiguration
+            # (kai-agent with no kai_agent_url) is a fixed fact about this
+            # instance, not a capability guess, and must surface even before
+            # any chat has a sandbox.
+            _engine_base_url(cfg)
             return _merge_harvested(
-                SessionFilesResponse(
-                    files=[],
-                    truncated=False,
-                    source="engine",
-                    supported=_engine_channel_believed_supported(_engine_base_url(cfg)),
-                ),
+                SessionFilesResponse(files=[], truncated=False, source="engine", supported=True),
                 harvested,
             )
         try:
@@ -823,9 +843,12 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
         transport=_ENGINE_TRANSPORT,
     )
     if listing is None:
-        # This chat HAS a sandbox (the caller gates on that), so the engine
-        # declining a chat it can see is evidence about the engine itself.
-        _engine_channel_seen(_engine_base_url(cfg), supported=False)
+        # This chat's own listing came back empty-handed — a malformed or
+        # unknown chat id, or a genuinely absent route, and this call cannot
+        # tell those apart (see the comment above `_ENGINE_LISTING_FAILURE_
+        # LOGGED`). `supported=False` here is scoped to THIS response only:
+        # it is never written anywhere the no-sandbox branch (or any other
+        # chat) could read it back as evidence about the engine itself.
         return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
     entries, truncated = listing
     files: list[SessionFileEntry] = []
@@ -840,7 +863,6 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
     # Engine listings carry no mtime to sort by, but the deliverables-first
     # promise holds: outputs/ ahead of everything, then stable by path.
     files.sort(key=lambda f: (not f.path.startswith(_OUTPUTS_PREFIX), f.path))
-    _engine_channel_seen(_engine_base_url(cfg), supported=True)
     return SessionFilesResponse(files=files, truncated=truncated, source="engine", supported=True)
 
 

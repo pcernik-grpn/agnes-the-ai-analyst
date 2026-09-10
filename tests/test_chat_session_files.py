@@ -89,19 +89,22 @@ def _make_app(
 
 @pytest.fixture(autouse=True)
 def _isolate_module_level_engine_state():
-    """Both memos in `chat_session_files` are process-scoped by design — the
-    engine's capability and which chat has already logged a traceback outlive
-    a single request. That makes them leak between tests: one case exercising
-    an engine that declines the files channel would otherwise decide what a
-    later, unrelated case sees. Cleared per test so each states its own
-    premise.
+    """`_ENGINE_LISTING_FAILURE_LOGGED` is process-scoped by design — which
+    chat has already logged a traceback outlives a single request. That makes
+    it leak between tests: one case exercising a failing listing would
+    otherwise decide what a later, unrelated case sees. Cleared per test so
+    each states its own premise.
+
+    (There used to be a second memo here — an engine capability cache keyed
+    by base URL — removed because it could be poisoned by one chat's
+    session-specific failure and then mislead every other chat on the same
+    engine; see the block comment above `_ENGINE_LISTING_FAILURE_LOGGED` in
+    `chat_session_files.py`.)
     """
     from app.api import chat_session_files as mod
 
-    mod._ENGINE_FILES_CHANNEL.clear()
     mod._ENGINE_LISTING_FAILURE_LOGGED.clear()
     yield
-    mod._ENGINE_FILES_CHANNEL.clear()
     mod._ENGINE_LISTING_FAILURE_LOGGED.clear()
 
 
@@ -357,9 +360,12 @@ def test_list_under_kai_agent_skips_the_engine_when_no_sandbox_exists_yet(
     assert body["source"] == "engine"
     # Supported, not unsupported: the drawer renders supported=False as an
     # "upgrade your engine" warning, the wrong sentence for a chat the
-    # reader opened seconds ago. Nothing here says the channel is absent.
-    # Optimistic only because this instance has never seen its engine
-    # decline the channel — see the capability-memo test below.
+    # reader opened seconds ago. Nothing here says the channel is absent —
+    # and nothing here EVER could, since this chat has no sandbox to test
+    # with. `True` is not a claim that the channel is proven; it is the
+    # honest absence of a claim that it is not — see
+    # test_a_legacy_chats_engine_failure_does_not_poison_a_later_sandboxless_chat
+    # below for why this can never be downgraded by another chat's failure.
     assert body["supported"] is True
 
 
@@ -848,22 +854,48 @@ def test_raw_enforces_containment_and_ownership(data_dir: Path, session_dir: Pat
     assert other.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "chart.png"}).status_code == 404
 
 
-def test_a_sandboxless_chat_reports_what_the_engine_last_demonstrated(tmp_path, monkeypatch):
-    """`supported` is a claim about the ENGINE, not about this session. A
-    chat with no sandbox cannot establish capability, so the answer mirrors
-    what the engine last showed: once it declined the channel for a chat it
-    could see, a later sandboxless chat must not quietly report the channel
-    as fine and hide the drawer's upgrade guidance."""
-    from app.api import chat_session_files as mod
+def test_a_legacy_chats_engine_failure_does_not_poison_a_later_sandboxless_chat(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug a prior version of this fix had: a legacy ``chat_<hex>``
+    session (minted before the instance's provider switched to
+    ``kai-agent``) carries a ``sandbox_id`` too — ``KaiEngineProvider.
+    _handle`` mints a (dead) handle for a malformed legacy id, and the
+    manager persists every spawned handle before the engine ever creates a
+    chat. So this chat's listing DOES reach the engine and DOES 400 at the
+    root — evidence about that one chat's id, never about the engine. A
+    second, unrelated chat on the SAME engine that has not spawned a sandbox
+    yet must report the same optimistic ``supported=True`` it always would,
+    regardless of what the legacy chat's own request just answered — there
+    must be no shared, poisonable state between them."""
+    import httpx
 
-    monkeypatch.setattr(mod, "_ENGINE_FILES_CHANNEL", {}, raising=False)
-    base = "http://engine"
-    assert mod._engine_channel_believed_supported(base) is True
-    mod._engine_channel_seen(base, supported=False)
-    assert mod._engine_channel_believed_supported(base) is False
-    # …and it recovers: an engine that starts serving files is supported again.
-    mod._engine_channel_seen(base, supported=True)
-    assert mod._engine_channel_believed_supported(base) is True
+    from app.api import chat_session_files as mod
+    from app.api import kai
+
+    legacy_chat_id = "chat_deadbeef00"
+    fresh_chat_id = "0b8a1c9e-7d2f-4e5a-9c3b-1f2e3d4c5b6a"
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        # The engine's real behavior for a malformed legacy id: 400 at the
+        # listing root, well-formed error body and all.
+        return httpx.Response(400, json={"error": {"type": "KaiError", "message": "invalid chat id"}})
+
+    monkeypatch.setattr(mod, "_ENGINE_TRANSPORT", httpx.MockTransport(_handler))
+    monkeypatch.setattr(kai, "mint_engine_session_token", lambda email, chat_id: ("jwt", 0))
+    app = _make_app(
+        data_dir=data_dir,
+        chat_config=_KAI_CONFIG,
+        sessions={legacy_chat_id: TEST_USER["email"], fresh_chat_id: TEST_USER["email"]},
+        sandbox_ids={legacy_chat_id: f"kai-engine:{legacy_chat_id}", fresh_chat_id: None},
+    )
+    client = TestClient(app)
+
+    legacy = client.get(f"/api/chat/sessions/{legacy_chat_id}/files").json()
+    assert legacy["supported"] is False  # honest about THIS chat's own failed listing
+
+    fresh = client.get(f"/api/chat/sessions/{fresh_chat_id}/files").json()
+    assert fresh["supported"] is True  # unaffected by the legacy chat's failure
 
 
 def test_traceback_suppression_lifts_after_a_recovery(monkeypatch):
