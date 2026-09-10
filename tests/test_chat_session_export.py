@@ -335,6 +335,31 @@ class TestExportChatSessionJsonl:
         events = resp2.json()["events"]
         assert events
 
+    def test_export_includes_messages_past_the_page_size(self, seeded_app, tmp_path, monkeypatch):
+        """``list_messages`` defaults to a 500-row page, oldest-first: a
+        chat with more messages than that must not be silently truncated to
+        the first page, or the export's mtime says "current" while the
+        newest messages are unreachable through the admin transcript
+        viewer. Shrinks the paging window rather than seeding 500+ real
+        rows -- the truncation bug reproduces at any page size."""
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        monkeypatch.setattr("app.chat.session_export._EXPORT_PAGE_SIZE", 3)
+        from src.repositories import chat_message_repo, chat_session_repo
+
+        s = chat_session_repo().create_session(user_email="analyst@test.com", surface=Surface.WEB)
+        n_messages = 7  # more than double the shrunk page size, incl. a non-full final page
+        for i in range(n_messages):
+            chat_message_repo().append_message(session_id=s.id, role="user", content=f"message {i}")
+
+        result = export_chat_session_jsonl(s.id)
+
+        assert result is not None
+        lines = result.read_text().splitlines()
+        assert len(lines) == n_messages
+        texts = [json.loads(line)["message"]["content"][0]["text"] for line in lines]
+        # oldest-first, nothing dropped, nothing reordered.
+        assert texts == [f"message {i}" for i in range(n_messages)]
+
 
 class TestSessionPipelineSweep:
     def test_sweep_exports_without_explicit_call(self, seeded_app, tmp_path, monkeypatch):
@@ -395,6 +420,80 @@ class TestIsChatExportStale:
         f = tmp_path / "f.jsonl"
         f.write_text("x")
         assert is_chat_export_stale(f, datetime.now(UTC) + timedelta(hours=1))
+
+
+class TestExportRaceWithConcurrentInsert:
+    """The writer reads messages, then replaces the file -- a message
+    committed in that window is absent from the file even though it is
+    OLDER than the moment the file finished being written. If the file's
+    mtime were left at that write-completion instant, the missed message
+    would be permanently invisible to ``is_chat_export_stale``: newer than
+    "now" minus the write duration is still older than "now". The export
+    must instead stamp the file's mtime to the newest message it actually
+    included, so a raced-in message -- necessarily newer than that
+    watermark -- is caught on the very next staleness check."""
+
+    def test_message_committed_mid_export_is_missing_but_detected_stale(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat import session_export
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        from src.repositories import chat_message_repo, chat_session_repo
+
+        real_list_all = session_export._list_all_chat_messages
+
+        def _racy_list_all(chat_id_, repo):
+            # A second request commits a new message right after this
+            # export already fetched its message list, but before the
+            # file below gets written and replaced.
+            messages = real_list_all(chat_id_, repo)
+            chat_message_repo().append_message(session_id=chat_id_, role="user", content="raced in mid-export")
+            return messages
+
+        monkeypatch.setattr(session_export, "_list_all_chat_messages", _racy_list_all)
+
+        result = session_export.export_chat_session_jsonl(chat_id)
+
+        assert result is not None
+        # The raced-in message lost the race against this export's read --
+        # a reader opening the file right now would not see it.
+        assert "raced in mid-export" not in result.read_text()
+
+        session = chat_session_repo().get_session(chat_id)
+        assert session_export.is_chat_export_stale(result, session.last_message_at)
+
+    def test_ensure_current_heals_a_transcript_that_raced_a_write(self, seeded_app, tmp_path, monkeypatch):
+        """End-to-end: the same race, but observed through the admin-facing
+        entry point -- a stale export (even one whose mtime postdates the
+        write) is re-exported and the previously-missing message appears."""
+        from app.chat import session_export
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        from src.repositories import chat_message_repo
+
+        real_list_all = session_export._list_all_chat_messages
+
+        def _racy_list_all(chat_id_, repo):
+            messages = real_list_all(chat_id_, repo)
+            chat_message_repo().append_message(session_id=chat_id_, role="user", content="raced in mid-export")
+            return messages
+
+        monkeypatch.setattr(session_export, "_list_all_chat_messages", _racy_list_all)
+        first = session_export.export_chat_session_jsonl(chat_id)
+        assert first is not None
+        assert "raced in mid-export" not in first.read_text()
+
+        # Un-patch: a later call reads whatever is really in the DB now,
+        # including the message the race above committed.
+        monkeypatch.setattr(session_export, "_list_all_chat_messages", real_list_all)
+
+        freshness = session_export.ensure_chat_transcript_current(chat_id)
+
+        assert freshness.path is not None
+        assert "raced in mid-export" in freshness.path.read_text()
 
 
 class TestOnDemandTranscriptFreshness:

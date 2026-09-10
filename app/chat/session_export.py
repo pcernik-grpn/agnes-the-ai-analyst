@@ -66,9 +66,63 @@ logger = logging.getLogger(__name__)
 # effect.
 _DEFAULT_SESSION_DATA_DIR = "/data/user_sessions"
 
+# ``list_messages`` (both chat_message repo backends) defaults its own
+# ``limit`` to 500 and returns oldest-first -- calling it once and taking
+# that page as "the conversation" silently truncated any chat past 500
+# messages: the export got a current mtime while missing the newest tail,
+# so ``is_chat_export_stale`` reported it fresh forever. This is the page
+# size ``_list_all_chat_messages`` pages through with, not a cap.
+_EXPORT_PAGE_SIZE = 500
+
 
 def _session_data_dir() -> Path:
     return Path(os.environ.get("SESSION_DATA_DIR", _DEFAULT_SESSION_DATA_DIR))
+
+
+def _list_all_chat_messages(chat_id: str, repo: Any) -> list[ChatMessage]:
+    """Every message for ``chat_id``, oldest-first -- paging through
+    ``repo.list_messages`` rather than trusting its single-call default
+    limit. Cursors on the previous page's last id (the same ``after_id``
+    contract ``list_messages`` already offers callers that want to resume a
+    partial read), so a page exactly ``_EXPORT_PAGE_SIZE`` long is followed
+    by one more call to confirm there is nothing after it."""
+    messages: list[ChatMessage] = []
+    after_id: str | None = None
+    while True:
+        page = repo.list_messages(chat_id, after_id=after_id, limit=_EXPORT_PAGE_SIZE)
+        if not page:
+            break
+        messages.extend(page)
+        after_id = page[-1].id
+        if len(page) < _EXPORT_PAGE_SIZE:
+            break
+    return messages
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Normalize a possibly-naive datetime to UTC-aware. DuckDB returns
+    naive ``TIMESTAMP`` values for ``created_at`` even though every write
+    path stores UTC (see the identical note on
+    ``services/session_pipeline/runner.py::_as_utc``); Postgres rows are
+    already aware. Treating naive as already-UTC matches every other read
+    of this column."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def _export_watermark(messages: list[ChatMessage]) -> datetime:
+    """The timestamp :func:`export_chat_session_jsonl` stamps onto the
+    written file's mtime: the newest ``created_at`` actually present among
+    *messages* -- i.e. exactly what the file's content can vouch for.
+
+    Using the file's real write-time ``os.replace`` mtime here instead
+    would race a message committed between the read above and the replace
+    below: that message is absent from the file but older than "now", so
+    ``is_chat_export_stale`` could never see the gap. Stamping the
+    watermark of what was actually read means a message that lands mid-export
+    is simply newer than the file's mtime and is caught on the very next
+    staleness check, rather than presumed exported forever."""
+    newest = max((m.created_at for m in messages if m.created_at is not None), default=None)
+    return _as_utc(newest) if newest is not None else datetime.now(UTC)
 
 
 def _result_to_content(result: Any) -> Any:
@@ -250,11 +304,22 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
         failure must never break the kill/archive request that triggered
         it).
 
+    Reads EVERY message via :func:`_list_all_chat_messages` (paging past
+    ``list_messages``'s own 500-row default), never a single truncated
+    page — a chat past that many messages must not silently lose its tail.
+
     Idempotent: re-exporting an unchanged session overwrites the file with
     identical content; the session pipeline's hash-based dedup
     (``services/session_pipeline/lib.compute_file_hash``) treats that as
     already-processed, so a repeat call from the sweep costs one write and
     no reprocessing.
+
+    The written file's mtime is stamped to :func:`_export_watermark` of the
+    messages actually read — NOT left at the wall-clock time the write
+    completed — so a message committed between the read above and the
+    ``os.replace`` below (present in neither) is newer than the stamped
+    mtime and :func:`is_chat_export_stale` catches the gap on the very next
+    check, rather than trusting a file that quietly missed it.
     """
     if not feature_enabled("sessions", "include_chat", env_var="AGNES_SESSIONS_INCLUDE_CHAT", default=True):
         return None
@@ -268,7 +333,7 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
         owner = users_repo().get_by_email(session.user_email)
         if not owner:
             return None
-        messages = chat_message_repo().list_messages(chat_id)
+        messages = _list_all_chat_messages(chat_id, chat_message_repo())
     except RequiresPostgresBackend:
         return None
     except Exception:
@@ -282,6 +347,7 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     if not turns:
         return None
 
+    watermark = _export_watermark(messages)
     target_dir = _session_data_dir() / owner["id"]
     target = target_dir / f"chat-{chat_id}.jsonl"
     tmp = target.with_name(target.name + ".tmp")
@@ -292,6 +358,8 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
                 fh.write(json.dumps(turn, default=str))
                 fh.write("\n")
         os.replace(tmp, target)
+        watermark_ts = watermark.timestamp()
+        os.utime(target, (watermark_ts, watermark_ts))
     except OSError:
         logger.warning("chat session export: write failed for %s", chat_id, exc_info=True)
         return None
@@ -319,6 +387,15 @@ def is_chat_export_stale(existing_path: Path | None, last_message_at: datetime |
     ``last_message_at=None`` (a session with no messages yet) is never
     stale: there is nothing to export, so re-checking on every call would
     be pointless work for a session that will never produce a file.
+
+    ``existing_path``'s mtime is trusted as a proxy for "newest message
+    this file's content can vouch for" — which only holds because
+    :func:`export_chat_session_jsonl` stamps it to
+    :func:`_export_watermark` of what it actually wrote, not to the
+    wall-clock instant the write completed. A message committed between
+    that function's read and its ``os.replace`` is therefore newer than
+    the stamped mtime even though the write finished after the message was
+    committed, and shows up as stale here on the very next call.
     """
     if last_message_at is None:
         return False
