@@ -203,3 +203,57 @@ class TestTheDrawerIsReachableByAssistiveTech:
             Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "_issue_detail_drawer.html"
         ).read_text(encoding="utf-8")
         assert 'aria-hidden="true"' in drawer
+
+
+class TestEveryAsyncPathIsGuarded:
+    """Responses may arrive out of order; none may touch a drawer or table
+    that has moved on. The list, the detail fetch, and both actions all pin
+    the generation they were started under (#2402)."""
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "issue_pages.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_list_ignores_an_overtaken_response(self):
+        src = self._source()
+        assert "var generation = ++listGeneration;" in src
+        assert "generation !== listGeneration" in src
+
+    def test_comment_and_resolve_pin_the_issue_and_the_opening(self):
+        """Both used to read `currentDetailId` in their callbacks, so a
+        response landing after the user switched reports wrote into the wrong
+        drawer — while the server had correctly stored it on the original."""
+        src = self._source()
+        assert src.count("var issueId = currentDetailId;") == 2
+        assert src.count("var generation = detailGeneration;") == 2
+        # the request itself must address the pinned id, not the live one
+        assert 'encodeURIComponent(currentDetailId) + "/comments"' not in src
+        assert 'encodeURIComponent(currentDetailId) + "/resolve"' not in src
+
+    def test_a_dropped_connection_never_strands_a_spinner(self):
+        """`getJson` rejects on transport failure rather than returning a
+        status, so every caller needs a rejection path or the loading state
+        outlives the failure."""
+        src = self._source()
+        assert src.count(".catch(function () {") >= 4
+        assert "Couldn't load reports — check your connection." in src
+        assert "The report could not be fetched" in src
+
+
+class TestTheDialogForgetsAFailedAttempt:
+    """The global Escape handler hides the dialog without calling this
+    module's `close()`, so state only that function cleared came back on the
+    next open (#2402)."""
+
+    def test_open_clears_the_fallback_and_any_inline_display(self):
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "issue_report.js").read_text(
+            encoding="utf-8"
+        )
+        open_body = src[src.index("function open()") : src.index("function close()")]
+        assert "fallback.hidden = true" in open_body
+        assert 'dlg.style.display = ""' in open_body

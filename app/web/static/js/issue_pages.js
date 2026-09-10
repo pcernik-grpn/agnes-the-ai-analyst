@@ -48,6 +48,11 @@
   //: open and on close, so a response is only ever applied to the opening
   //: that asked for it.
   var detailGeneration = 0;
+  //: Same idea for the list. Clicking Resolved then Open starts two fetches;
+  //: responses need not arrive in request order, so without this the older
+  //: one could repaint the table while the newer filter stays highlighted —
+  //: a view that silently contradicts the selected status (#2402).
+  var listGeneration = 0;
   // The full row last rendered in the drawer, `comments` included — kept so
   // a resolve response (which carries no `comments` key: it's `repo.get()`,
   // not the `GET /api/issues/{id}` shape) can be MERGED onto it rather than
@@ -144,7 +149,9 @@
     empty.hidden = true;
     wrap.hidden = true;
     var url = LIST_URL + "?status=" + encodeURIComponent(state.status) + "&limit=200";
+    var generation = ++listGeneration;
     getJson(url).then(function (res) {
+      if (generation !== listGeneration) return;
       loading.hidden = true;
       if (res.status !== 200) {
         toast("warn", detailMessage(res.body, "Couldn't load reports."));
@@ -161,6 +168,14 @@
         tbody.appendChild(renderRow(row));
       });
       wrap.hidden = false;
+    }).catch(function () {
+      // `getJson` turns a malformed BODY into {status, body: null} but lets a
+      // transport failure reject. Without this the spinner outlived the
+      // failure and the page stayed blank until a reload (#2402).
+      if (generation !== listGeneration) return;
+      loading.hidden = true;
+      empty.hidden = false;
+      toast("warn", "Couldn't load reports — check your connection.");
     });
   }
 
@@ -232,6 +247,14 @@
       content.hidden = false;
       currentDetailRow = res.body;
       renderDetail(currentDetailRow);
+    }).catch(function () {
+      // Transport failure: `getJson` rejects rather than returning a status,
+      // so without this the drawer sat on "Loading…" for good (#2402).
+      if (generation !== detailGeneration) return;
+      loading.hidden = true;
+      document.getElementById("iss-detail-title").textContent = "Couldn't load";
+      document.getElementById("iss-detail-sub").textContent =
+        "The report could not be fetched — check your connection and try again.";
     });
   }
 
@@ -379,6 +402,12 @@
 
   function submitComment() {
     if (!currentDetailId) return;
+    // Pin the report AND the opening: the callback below touches the live
+    // drawer, so a response arriving after the user switched reports would
+    // otherwise append A's comment into B's thread and bump B's reply count
+    // (#2402). The server stored it correctly either way — this is the view.
+    var issueId = currentDetailId;
+    var generation = detailGeneration;
     var box = document.getElementById("iss-comment-body");
     var body = (box.value || "").trim();
     if (!body) {
@@ -387,8 +416,9 @@
     }
     var btn = document.getElementById("iss-comment-submit");
     btn.disabled = true;
-    postJson("/api/issues/" + encodeURIComponent(currentDetailId) + "/comments", { body: body })
+    postJson("/api/issues/" + encodeURIComponent(issueId) + "/comments", { body: body })
       .then(function (res) {
+        if (generation !== detailGeneration) return;
         btn.disabled = false;
         if (res.status !== 201) {
           toast("warn", detailMessage(res.body, "Couldn't post the comment."));
@@ -399,9 +429,10 @@
         if (empty) empty.remove();
         document.getElementById("iss-comments").appendChild(renderComment(res.body));
         if (currentDetailRow) currentDetailRow.comments = (currentDetailRow.comments || []).concat([res.body]);
-        bumpReplyCount(currentDetailId);
+        bumpReplyCount(issueId);
       })
       .catch(function () {
+        if (generation !== detailGeneration) return;
         btn.disabled = false;
         toast("warn", "Couldn't post the comment.");
       });
@@ -423,13 +454,25 @@
 
   function submitResolve() {
     if (!currentDetailId || !IS_ADMIN) return;
+    // Pinned for the same reason as submitComment: the callback re-renders
+    // the live drawer, so a response landing after the admin moved on would
+    // stamp A's resolved state onto B's panel (#2402).
+    var issueId = currentDetailId;
+    var generation = detailGeneration;
     var note = document.getElementById("iss-resolve-note");
     var btn = document.getElementById("iss-resolve-btn");
     btn.disabled = true;
-    postJson("/api/admin/issues/" + encodeURIComponent(currentDetailId) + "/resolve", {
+    postJson("/api/admin/issues/" + encodeURIComponent(issueId) + "/resolve", {
       resolution_note: (note.value || "").trim() || null,
     })
       .then(function (res) {
+        if (generation !== detailGeneration) {
+          // The drawer moved on. The resolve DID happen, so refresh the list
+          // to reflect it — just do not touch the panel now showing another
+          // report.
+          loadList();
+          return;
+        }
         btn.disabled = false;
         if (res.status !== 200) {
           // The 409 body carries the useful, specific sentence ("#42 was
@@ -447,6 +490,7 @@
         toast("ok", "Resolved #" + res.body.number + ".");
       })
       .catch(function () {
+        if (generation !== detailGeneration) return;
         btn.disabled = false;
         toast("warn", "Couldn't resolve this report.");
       });

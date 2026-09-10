@@ -103,6 +103,15 @@
     version().then(function (v) {
       renderChips(envelope(v));
       dlg.style.removeProperty("display"); // clear a leftover Esc-close inline style
+      // Reset what only `close()` used to clear. The GLOBAL Escape handler in
+      // _app_scripts.html hides this dialog by inline display + removing
+      // `is-open`; it cannot call this module's private close(), so a failed
+      // submission's fallback text survived and reappeared under the fresh
+      // form on the next open (#2402). Clearing it here covers every way the
+      // dialog can have been dismissed.
+      var fallback = document.getElementById("issue-fallback");
+      if (fallback) fallback.hidden = true;
+      dlg.style.display = "";
       dlg.classList.add("is-open");
       var title = document.getElementById("issue-title");
       if (title) title.focus();

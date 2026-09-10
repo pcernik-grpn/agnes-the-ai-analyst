@@ -32,6 +32,9 @@ KINDS = ("bug", "wrong_answer", "request", "question", "other")
 _CLIENT_HEADER = {"X-Agnes-Client": "cli"}
 _ISSUES_PATH = "/api/issues"
 _MINE_PATH = "/api/issues/mine"
+#: Mirrors `_MAX_SCREENSHOT_BYTES` in app/api/issues.py — checked client-side
+#: so an oversized file is refused before it is read, not after.
+_MAX_SCREENSHOT_BYTES = 3 * 1024 * 1024
 
 
 def _fail(resp) -> None:
@@ -159,6 +162,17 @@ def report(
     row = resp.json()
 
     if screenshot is not None:
+        # Check the size BEFORE reading. Typer only proves the path exists, so
+        # a mistakenly chosen disk image would be pulled entirely into memory
+        # just to be refused by the server's 3 MiB cap a moment later (#2402).
+        size = screenshot.stat().st_size
+        if size > _MAX_SCREENSHOT_BYTES:
+            typer.echo(
+                f"{screenshot.name} is {size / 1024 / 1024:.1f} MB — the limit is 3 MB. "
+                "Attach a smaller image, or file the report without one.",
+                err=True,
+            )
+            raise typer.Exit(2)
         data = screenshot.read_bytes()
         put = api_put(
             f"{_ISSUES_PATH}/{row['id']}/screenshot",
