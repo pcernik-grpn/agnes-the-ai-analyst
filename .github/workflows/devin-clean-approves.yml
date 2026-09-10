@@ -241,11 +241,16 @@ jobs:
                 # pages are read (one page could hide Devin's event behind a hundred
                 # newer ones from other workflows), like the reviews above.
                 # The lookup's failure must be VISIBLE (a missing `statuses: read` made
-                # it silently read as "Devin never analysed this head" once); it still
-                # fails closed — an empty witness keeps the findings open.
+                # it silently read as "Devin never analysed this head" once) and it must
+                # fail CLOSED: `gh api --paginate` streams each page as it completes, so
+                # a failure on a later page leaves earlier events in the output — an
+                # older `success` could then outvote a newer `pending` the failed page
+                # held. Any non-zero exit therefore discards everything it returned.
                 status_err=$(mktemp)
-                statuses_json=$(gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" --jq '.[] | @json' 2>"$status_err" || true)
-                if [ -s "$status_err" ]; then echo "#$n: commit status lookup for ${head:0:9} failed: $(tr '\n' ' ' < "$status_err")"; fi
+                if ! statuses_json=$(gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" --jq '.[] | @json' 2>"$status_err"); then
+                  echo "#$n: commit status lookup for ${head:0:9} failed, ignoring any partial pages: $(tr '\n' ' ' < "$status_err")"
+                  statuses_json=""
+                fi
                 rm -f "$status_err"
                 analysed_at=$(printf '%s\n' "$statuses_json" \
                   | jq -rs '[.[] | select(.context == "Devin Review"
