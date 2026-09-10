@@ -1,4 +1,13 @@
 :8080 {
+	# Access log — the same one the single-node Caddyfile carries, for the
+	# same reason: `log` is site-scoped, so a request served by this block
+	# leaves no record unless the block asks for one. JSON to stdout, one
+	# line per request; Caddy redacts the Authorization header itself.
+	log {
+		output stdout
+		format json
+	}
+
 	# Gateway-role paths (chat HA — see docs/DEPLOYMENT.md -> "Multi-replica
 	# chat HA" -> the LB routing rule). Only Role.GATEWAY processes run a
 	# ChatManager, so the chat WS + session lifecycle REST, the

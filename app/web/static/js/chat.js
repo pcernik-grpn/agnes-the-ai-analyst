@@ -321,6 +321,40 @@ const WS_CLOSE_REJECTED = new Set([4404]);
 // caller's. Anything else — 408/429, a 5xx, a refused connection — is the
 // transient case retrying exists for.
 const WS_MINT_FATAL_STATUS = new Set([401, 403, 404]);
+
+/** A 401 anywhere in the chat path means the BROWSER'S SESSION is gone, not
+ *  that chat is broken — and the two need opposite reactions from the reader.
+ *  Rendering the raw status left them with "Could not start chat: 401" and
+ *  nothing to do; the actual fix was to sign in again, which nobody has a
+ *  reason to guess from a number.
+ *
+ *  Says what happened, then goes to the login they need, carrying the page
+ *  they were on in `?next=` so signing in returns them here instead of the
+ *  dashboard.
+ *
+ *  403 is the OTHER half and must NOT be answered the same way. That caller
+ *  IS signed in — `require_chat_access` refuses them because their group's
+ *  grant on chat was revoked or never made. Sending them to a login they will
+ *  pass and bounce straight off again is a loop that hides the real cause, so
+ *  403 gets its own sentence, naming who can undo it, and stays on the page.
+ *
+ *  Returns true when it handled the error, so a caller can skip its generic
+ *  branch — and false for every other failure, which is still a real chat
+ *  error and must keep its own message. */
+function handleExpiredSession(err) {
+  const status = err && err.status;
+  if (status === 403) {
+    setStatus("You do not have access to chat — ask an administrator to grant it.", "error");
+    return true;
+  }
+  if (status !== 401) return false;
+  setStatus("Your session expired — taking you to sign in\u2026", "error");
+  const next = encodeURIComponent(location.pathname + location.search);
+  // A beat before navigating: the sentence above is the only explanation the
+  // reader gets, and a redirect fired in the same tick renders it unread.
+  setTimeout(() => { location.href = `/login?next=${next}`; }, 1200);
+  return true;
+}
 let _wsReconnectAttempts = 0;
 let _wsReconnectTimer = null;
 // Invalidates a recovery already past its `setTimeout`. Clearing the timer
@@ -2888,7 +2922,7 @@ function _renderAgentSelectMenu(filter) {
       // value, and the slugless default entry must post the plain create.
       newChat(a.slug || undefined).catch((err) => {
         console.error("chat: could not start a session as agent", err);
-        if (window.appToast) {
+        if (!handleExpiredSession(err) && window.appToast) {
           window.appToast({ kind: requestErrorTone(err.status, err.code || err.message), msg: _agentStartMessage(err) });
         }
       });
@@ -3121,10 +3155,25 @@ async function loadAndRenderHistory(chatId) {
     if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
   } catch (err) {
     if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
-    setStatus(`Could not load history: ${err.message}`, "warn");
+    // Same split as every other entry path: a signed-out reader gets the
+    // login, not a warning about history they cannot reach either way.
+    const authHandled = handleExpiredSession(err);
+    if (!authHandled) {
+      setStatus(`Could not load history: ${err.message}`, "warn");
+    }
     // #1973: the outcome is the caller's to act on — a RESTORE that cannot
     // read its own history must show an error, not the empty-state hero.
-    return { ok: false, error: err.message, count: 0 };
+    //
+    // `authHandled` is what stops the caller overwriting the sentence just
+    // written: a 401 is mid-redirect and its explanation is the only thing
+    // the reader gets to read before the page goes, and a 403 is a grant
+    // they lack, not the "deleted, archived, or someone else's" that
+    // `_renderRestoreFailure` would claim (Devin Review on 8906f735).
+    // The STATUS travels with the flag: the caller has to tell the two
+    // handled cases apart. A 401 is mid-redirect and the page is about to be
+    // replaced, so it must be left exactly as it is; a 403 stays, and a
+    // caller that treats it the same way leaves the reader on a blank chat.
+    return { ok: false, error: err.message, count: 0, authHandled, authStatus: err && err.status };
   }
   if (history.length === 0) {
     // A conversation with an agent opens with that agent introducing itself —
@@ -3236,7 +3285,18 @@ function scrollToLatestMessage() {
  *  Leaves the page in a usable pre-conversation state: no session pointer, no
  *  socket, the dashboard back, the dead id out of the URL so a reload does not
  *  re-run the same failure. */
-function _renderRestoreFailure(detail) {
+/** Put the page back to a usable, sessionless state after a restore that
+ *  cannot proceed.
+ *
+ *  Factored out because there are now TWO such endings — the conversation
+ *  could not be READ (`_renderRestoreFailure`) and the reader is not allowed
+ *  to read it (`_renderAccessDeniedRestore`) — and they differ only in what
+ *  they SAY. Everything below is what makes the page usable again, and the
+ *  two must not drift apart: leaving any of it out is what left a denied
+ *  restore on a blank chat with the inaccessible id still current, the
+ *  `?session=` URL still pointing at it, its row still lit in the sidebar and
+ *  the capability panel still hidden (Devin Review on 9526b6e4). */
+function _clearInaccessibleRestore() {
   if (ws) { ws.close(); ws = null; }
   currentChatId = null;
   _syncSessionUrl(null);
@@ -3246,6 +3306,31 @@ function _renderRestoreFailure(detail) {
   const host = $("chat-messages");
   if (host) host.innerHTML = "";
   showCapabilities();
+}
+
+/** A deep-linked restore the reader is not permitted to open (403).
+ *
+ *  Terminal HERE, unlike a 401: no redirect is coming — signing in again
+ *  cannot conjure a grant — so this is the reader's final state and it has to
+ *  be a page they can use. Says what `_renderRestoreFailure` must not say
+ *  ("deleted, or belongs to someone else" is wrong and alarming when the
+ *  truth is a missing grant), and re-states the sentence
+ *  `handleExpiredSession` already set so this state reads the same however it
+ *  was reached. */
+function _renderAccessDeniedRestore() {
+  _clearInaccessibleRestore();
+  renderSystemNote(
+    "You do not have access to that conversation. Nothing was lost from it — " +
+      "ask an administrator to grant you chat access, then open it again. " +
+      "This is a new chat in the meantime.",
+    "error",
+  );
+  setStatus("You do not have access to chat — ask an administrator to grant it.", "error");
+  showToast("You do not have access to that conversation.", "error", { durationMs: 6000 });
+}
+
+function _renderRestoreFailure(detail) {
+  _clearInaccessibleRestore();
   renderSystemNote(
     "That conversation could not be opened — it may have been deleted, or it " +
       "belongs to someone else. Nothing was lost from it; this is a new chat." +
@@ -3386,7 +3471,17 @@ async function openSession(chatId, wsUrlOverride, { restoring = false, reconnect
   // rather than dropping the reader on the "Ask anything" hero with the
   // conversation they asked for silently missing (#1973).
   if (restoring && !hydrated.ok) {
-    _renderRestoreFailure(hydrated.error);
+    // An auth failure has already been explained accurately by
+    // `handleExpiredSession`; every ORDINARY restore failure (404, a 5xx)
+    // still gets the panel, which is the case it was written for.
+    if (!hydrated.authHandled) {
+      _renderRestoreFailure(hydrated.error);
+    } else if (hydrated.authStatus !== 401) {
+      // Handled, but nothing is coming to replace the page: a 403 is the
+      // reader's final state here, so it needs the cleanup too or the
+      // inaccessible session stays current over an empty transcript.
+      _renderAccessDeniedRestore();
+    }
     return;
   }
   // A recovery nobody asked for must not cost the reader their transcript.
@@ -3424,6 +3519,10 @@ async function openSession(chatId, wsUrlOverride, { restoring = false, reconnect
       // review). Keep the transcript, the id and the URL, and say it is
       // retryable: sending a message re-mints a ticket via ensureWsReady,
       // and so does a reload of this same URL.
+      // An expired login cannot be retried by sending another message, which
+      // is what the resume copy tells the reader to do — so it is handled
+      // first and the retryable-failure panel is skipped.
+      if (handleExpiredSession(err)) return;
       _renderResumeFailure(err.message);
       return;
     }
@@ -7328,7 +7427,12 @@ async function submitUserMessage(text) {
     // mid-send. The session is new; the conversation is not.
     _markConversationStarted();
   } catch (err) {
-    setStatus(`Could not start chat: ${err.message}`, "error");
+    // An expired login is not a broken chat — it gets its own sentence and a
+    // way out. The composer restore below still runs either way: the turn
+    // never started, so the text belongs to the reader whichever it was.
+    if (!handleExpiredSession(err)) {
+      setStatus(`Could not start chat: ${err.message}`, "error");
+    }
     showCapabilities();
     // Step 1 cleared the composer optimistically, but no turn ever started:
     // give the text back rather than destroying what they typed. A chat
@@ -7539,7 +7643,9 @@ async function startNewChatFromGesture() {
     _endToolGroup();
     showCapabilities();
     setThreadTitle(null);
-    setStatus(chatErrorCopy(err.message, err.code || "session_create_failed"), "error");
+    if (!handleExpiredSession(err)) {
+      setStatus(chatErrorCopy(err.message, err.code || "session_create_failed"), "error");
+    }
   }
 }
 
@@ -9808,7 +9914,7 @@ const ChatAttachments = (() => {
     hideCapabilities();
     newChat(_agentSlug).catch((err) => {
       console.error("chat: could not start a session as agent", err);
-      if (window.appToast) {
+      if (!handleExpiredSession(err) && window.appToast) {
         window.appToast({ kind: requestErrorTone(err.status, err.code || err.message), msg: _agentStartMessage(err) });
       }
       // Put the page back. The dashboard was hidden one line up in anticipation
