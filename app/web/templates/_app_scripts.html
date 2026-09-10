@@ -1,3 +1,20 @@
+    <!-- Client diagnostics ring buffer — window.onerror / unhandledrejection /
+         a fetch() wrapper recording non-2xx responses, last 20 entries kept
+         in memory only. Loaded FIRST and non-deferred so it is installed
+         before any later script (including the rest of this file) can throw
+         or fetch — a handler wired after the fact misses everything that
+         already happened. Feeds the "Report a problem" dialog's auto-
+         attached context (issue_report.js); nothing is sent anywhere until
+         that dialog submits. See app/web/static/js/client_diag.js.
+
+         Gated on `can_report_issue` for the same reason the dialog is: on an
+         instance where reporting is unavailable (DuckDB app-state backend)
+         there is nothing that could ever read the buffer, so wrapping every
+         `fetch` on every page would be instrumentation with no consumer
+         (#2402). The flag comes from `_chrome_ctx`; a page
+         rendered without it simply does not load the script, which is the
+         same outcome as the dialog not rendering. -->
+    {% if can_report_issue %}<script src="{{ static_url('js/client_diag.js') }}"></script>{% endif %}
     <!-- Cache-buster URLs for /static assets that a plain <script src> or
          hardcoded fetch() can't run through static_url() (external file, or
          a lazy runtime fetch/import) — so VersionedStaticFiles' immutable
@@ -9,6 +26,10 @@
       window._agLucideSpriteUrl = "{{ static_url('vendor/lucide-sprite.svg') }}";
       window._agMermaidUrl = "{{ static_url('vendor/mermaid.min.js') }}";
       window._agTourUrl = "{{ static_url('js/tour.js') }}";
+      // html-to-image (1.11.11, ~19 KB) — same lazy-load contract as mermaid
+      // above: only fetched by issue_report.js when a report includes a
+      // screenshot, so a caller who never files one never pays for it.
+      window._agHtmlToImageUrl = "{{ static_url('vendor/html-to-image.min.js') }}";
       {# The onboarding kill switch (features.onboarding_enabled), read by
          tour.js's entry points and chat_onboarding.js's checklist. Stamped
          HERE because this partial is included from both base.html and
@@ -69,6 +90,13 @@
          event handlers (click/change/keydown/DOMContentLoaded) — never at
          top-level parse time — by which point the globals are defined. -->
     <script src="{{ static_url('js/modal.js') }}"></script>
+    <!-- "Report a problem" dialog (#issue-dialog, rendered from
+         _issue_dialog.html when can_report_issue). Deferred — the dialog is
+         opened from a click, never at parse time — and a no-op on any page
+         where the partial did not render (DuckDB app-state backend, or a
+         base.html page that never includes it). See
+         app/web/static/js/issue_report.js. -->
+    <script src="{{ static_url('js/issue_report.js') }}" defer></script>
     <!-- Shared confirm-and-retry for the connection-repoint 409. Loaded here,
          not per page, because all four surfaces that write a data_source
          connection need it and only one of them owns a dialog. Depends on
@@ -432,6 +460,9 @@
           {% endif %}
           { label: 'Flea submissions',            hint: 'admin · g r',  href: '/admin/store/submissions' },
           { label: 'Prompts',                     hint: 'admin',        href: '/admin/prompts' },
+          {% if can_report_issue %}
+          { label: 'Issue reports',               hint: 'admin',        href: '/admin/issues' },
+          {% endif %}
           { label: '— User-facing —',             hint: 'separator',    href: null },
           { label: 'Catalog',                     hint: 'user',         href: '/catalog' },
           { label: 'Catalog · Browse',            hint: 'user',         href: '/catalog#browse' },
@@ -441,6 +472,9 @@
           { label: 'Memory mining (my consent)',  hint: 'privacy',      href: '/me/memory-mining' },
           { label: 'Marketplace',                 hint: 'user',         href: '/marketplace' },
           { label: 'Activity (mine)',             hint: 'user',         href: '/me/activity' },
+          {% if can_report_issue %}
+          { label: 'My reports',                  hint: 'user',         href: '/me/issues' },
+          {% endif %}
           {% if can_agent_profiles %}
           { label: 'My agents',                   hint: 'user',         href: '/agents' },
           {% endif %}

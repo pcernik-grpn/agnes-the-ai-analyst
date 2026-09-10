@@ -365,6 +365,18 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "gloss": "Plugins, skills and agents awaiting review",
                 "match": ["/admin/store/submissions"],
             },
+            # Conditional on the A3 PG-first ratchet, not on a feature flag an
+            # admin set: issue reports (issue_reports/issue_comments) are a
+            # Postgres-only table pair, so the route itself redirects home on
+            # a DuckDB-backed instance (`can_report_issue` = `use_pg()`, same
+            # gate as the rail's "Report a problem" button).
+            {
+                "label": "Issue reports",
+                "href": "/admin/issues",
+                "gloss": "Bugs, wrong answers and requests filed from inside the product",
+                "match": ["/admin/issues"],
+                "when": "can_report_issue",
+            },
             # Conditional too, on the SAME flag as the Studio row below: the
             # route reads `get_studio_enabled()` and redirects home when it is
             # off, so an unconditional row here would have shipped a link to

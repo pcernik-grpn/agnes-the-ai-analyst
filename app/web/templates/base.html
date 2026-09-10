@@ -47,6 +47,15 @@
     {# Shared stack card styles — drives /catalog + /memory Browse/My Stack
        cards (matches marketplace.html .mp-card visual language). #}
     <link rel="stylesheet" href="{{ static_url('css/stack_card.css') }}">
+    {# "Report a problem" dialog — same gate and same two sheets as
+       base_ds.html. This legacy base still renders `_app_rail.html`, which
+       carries the report button, so it must carry the dialog too: without it
+       the button rendered on every page extending this layout and clicking it
+       did nothing (#2402). #}
+    {% if can_report_issue %}
+    <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+    <link rel="stylesheet" href="{{ static_url('css/issue_dialog.css') }}">
+    {% endif %}
     {# Rail chrome (ui_layout=rail) + paper component skin
        (data-theme=paper) — attribute-scoped, inert for default
        topnav/blue instances. Mirrors base_ds.html. #}
@@ -85,6 +94,13 @@
        (`_app_header.html`) was retired in Wave 0 (2026-08); rail is the
        only layout now. #}
     {% include '_app_rail.html' %}
+
+    {# The dialog the rail's "Report a problem" button opens. Mirrors
+       base_ds.html; see the stylesheet note above for why this legacy base
+       needs it. #}
+    {% if can_report_issue %}
+    {% include '_issue_dialog.html' %}
+    {% endif %}
 
     {# `layout` block: pages opt out of the narrow .container wrap by overriding
        this entire block (e.g. dashboard.html renders its own full-width <main

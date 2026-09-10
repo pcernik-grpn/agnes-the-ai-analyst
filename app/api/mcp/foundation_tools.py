@@ -637,6 +637,22 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "flag_semantic_issue",
     "semantic_feedback_list",
     "semantic_feedback_resolve",
+    # Issue reporting (step 1, docs/superpowers/specs/2026-09-09-issue-
+    # reporting-step1-design.md) — "report a problem" from any surface, with
+    # page/session/version context attached automatically. `report_issue` and
+    # `list_my_issues`/`get_issue`/`issue_comment` are any signed-in caller's
+    # own reports — same reasoning as `flag_semantic_issue` above: whoever
+    # hit the problem is the one who can describe it. `issue_queue_list`/
+    # `issue_reply`/`issue_resolve` are the admin side of the same queue.
+    # Triple-surface with /api/issues* + /api/admin/issues* + `agnes issue …`
+    # / `agnes admin issue …`.
+    "report_issue",
+    "list_my_issues",
+    "get_issue",
+    "issue_comment",
+    "issue_queue_list",
+    "issue_reply",
+    "issue_resolve",
     # Maintained digests (K4, #799) — admin CRUD, triple-surface with
     # /api/admin/knowledge-digests* + `agnes admin digest`.
     "admin_knowledge_digests_list",
@@ -3758,6 +3774,215 @@ def register_foundation_tools(
                 f"{base_url}/api/admin/semantic-feedback/{feedback_id}/resolve",
                 json={"resolution_note": resolution_note or None},
                 headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    # -- issue reporting (step 1) --------------------------------------
+    # docs/superpowers/specs/2026-09-09-issue-reporting-step1-design.md.
+    # Every call carries `X-Agnes-Client: mcp` so the server records
+    # `source_surface="mcp"` on a new report — same signal the CLI sends,
+    # different header value, both merged with the caller's own auth headers
+    # (never replacing them).
+    _ISSUE_HEADERS = {"X-Agnes-Client": "mcp"}
+
+    def _issue_ref(issue_id: str) -> str:
+        """Normalize `#42` / `42` / `iss_…` into a safe URL path segment.
+
+        The `#` the tool docstrings invite a caller to type starts a URI
+        fragment, so interpolating it raw truncated the path and the server
+        saw no id at all (#2402). Percent-encoding what is
+        left also keeps a stray `/` or `?` from re-shaping the request.
+        """
+        from urllib.parse import quote
+
+        return quote(str(issue_id).strip().lstrip("#"), safe="")
+
+    @tool(read_only=False, idempotent=False)
+    async def report_issue(
+        title: str,
+        body: str | None = None,
+        kind: str = "bug",
+        page_url: str | None = None,
+        context: dict | None = None,
+    ) -> dict:
+        """Report a problem — a bug, a wrong answer, something missing, or something unclear.
+
+        Any signed-in caller. The report is stored in this instance and a
+        summary is mirrored to the operator's channel when one is configured.
+        Attach what you know in ``context`` (query, table, tool that failed);
+        never file silently on the user's behalf — offer, then call.
+
+        Args:
+            title: One line, what is wrong (≤200 chars).
+            body: What happened (≤8000 chars).
+            kind: bug | wrong_answer | request | question | other.
+            page_url: Page or object the problem is about.
+            context: Free-form JSON; string values are capped at 300 chars
+                server-side.
+
+        Mirrors ``POST /api/issues`` and ``agnes issue report``.
+
+        Requires the Postgres app-state backend (a DuckDB instance answers
+        ``501 requires_postgres_backend``).
+        """
+        payload = {
+            k: v
+            for k, v in {
+                "title": title,
+                "body": body,
+                "kind": kind,
+                "page_url": page_url,
+                "context": context,
+            }.items()
+            if v is not None
+        }
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/issues",
+                json=payload,
+                headers={**headers_fn(), **_ISSUE_HEADERS},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def list_my_issues(status: str = "open", limit: int = 50) -> dict:
+        """List the caller's own issue reports, scoped server-side to the caller.
+
+        Args:
+            status: open | resolved | all.
+            limit: Max rows to return.
+
+        Mirrors ``GET /api/issues/mine`` and ``agnes issue list``; an admin
+        sees every reporter's queue with ``issue_queue_list``.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/issues/mine",
+                params={"status": status, "limit": limit},
+                headers={**headers_fn(), **_ISSUE_HEADERS},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return ensure_output_size(r.json(), "list_my_issues", hint="lower `limit` or filter by status")
+
+    @tool(read_only=True)
+    async def get_issue(issue_id: str) -> dict:
+        """One issue report and its comments — a caller's own report, or any
+        report at all when the caller is an admin.
+
+        Args:
+            issue_id: The issue id (``iss_…``), or its number (``42``/``#42``).
+
+        Mirrors ``GET /api/issues/{issue_id}`` and ``agnes issue show``.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/issues/{_issue_ref(issue_id)}",
+                headers={**headers_fn(), **_ISSUE_HEADERS},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def issue_comment(issue_id: str, body: str) -> dict:
+        """Add a comment to an issue report you filed (or, as admin, any report).
+
+        Args:
+            issue_id: The issue id, or its number.
+            body: The comment text (≤8000 chars).
+
+        Mirrors ``POST /api/issues/{issue_id}/comments`` and ``agnes issue comment``.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/issues/{_issue_ref(issue_id)}/comments",
+                json={"body": body},
+                headers={**headers_fn(), **_ISSUE_HEADERS},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def issue_queue_list(status: str = "open", limit: int = 100) -> dict:
+        """List every issue report, across every reporter (admin only).
+
+        Args:
+            status: open | resolved | all.
+            limit: Max rows to return.
+
+        Mirrors ``GET /api/admin/issues`` and ``agnes admin issue list``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/issues",
+                params={"status": status, "limit": limit},
+                headers={**headers_fn(), **_ISSUE_HEADERS},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return ensure_output_size(r.json(), "issue_queue_list", hint="lower `limit` or filter by status")
+
+    @tool(read_only=False)
+    async def issue_reply(issue_id: str, body: str) -> dict:
+        """Reply on an issue report, as the admin working the queue.
+
+        The SAME owner-or-admin endpoint as ``issue_comment``, offered under
+        the triager's name so the admin queue reads as one set of tools. It
+        is not an extra authorization gate and never was: the server decides
+        ``author_kind`` from the caller, so a reporter calling this on their
+        own report simply leaves an ordinary reporter comment. Calling it on
+        somebody else's report is what requires admin — and that is enforced
+        by the endpoint, not by which of the two tool names you picked
+        (#2402, which flagged the docstring's "admin only"
+        as a promise the tool could not keep).
+
+        Args:
+            issue_id: The issue id, or its number (``42`` or ``#42``).
+            body: The reply text (≤8000 chars).
+
+        Mirrors ``POST /api/issues/{issue_id}/comments`` and ``agnes admin issue reply``.
+
+        Requires the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/issues/{_issue_ref(issue_id)}/comments",
+                json={"body": body},
+                headers={**headers_fn(), **_ISSUE_HEADERS},
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def issue_resolve(issue_id: str, resolution_note: str | None = None) -> dict:
+        """Mark an issue report resolved, with an optional note (admin only).
+
+        Args:
+            issue_id: The issue id, or its number.
+            resolution_note: What was done about it — stored on the report,
+                so the reporter (and the next admin) can see the answer.
+
+        Mirrors ``POST /api/admin/issues/{issue_id}/resolve`` and
+        ``agnes admin issue resolve``. A report already resolved answers
+        ``409 already_resolved`` — the first resolver's note is not
+        overwritten by a second call.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/issues/{_issue_ref(issue_id)}/resolve",
+                json={"resolution_note": resolution_note},
+                headers={**headers_fn(), **_ISSUE_HEADERS},
                 timeout=30,
             )
             _raise_for_status_with_detail(r)

@@ -1534,6 +1534,23 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a table's schema + sample values for the no-SQL policy builder.",
     ),
+    # -- issue reports (app/api/issues.py) ----------------------------------
+    # "Report a problem" from any surface; the record stays in the instance.
+    "issue.report": AuditEvent("issue.report", "mutation", "A user filed an issue report"),
+    "issue.screenshot": AuditEvent(
+        "issue.screenshot", "mutation", "The reporter attached a page screenshot to an issue"
+    ),
+    "issue.comment": AuditEvent("issue.comment", "mutation", "A reporter or admin commented on an issue"),
+    "issue.resolved": AuditEvent("issue.resolved", "mutation", "An admin resolved an issue"),
+    # Reads that return somebody's words. A reporter paging their OWN list is
+    # ui_support noise, but an admin opening the queue or a single report is
+    # reading another person's report body, their identity and the page they
+    # were on — the cross-user read CONTRIBUTING.md wants on the record
+    # (#2402).
+    "issue.queue_read": AuditEvent(
+        "issue.queue_read", "read", "An admin read the issue-report queue across every reporter"
+    ),
+    "issue.read": AuditEvent("issue.read", "read", "An issue report and its comments were read"),
     # -- 2026-09-08 LLM observability design §3.6 — the effective content-export
     # policy is written once at startup so the decision is in the trail.
     # Written by src/observability/content_policy.py with no actor: nobody

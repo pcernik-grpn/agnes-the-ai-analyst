@@ -726,6 +726,16 @@ telegram:
 notifications:
   alert_webhook_url: ""
 
+# --- Issue reporting (optional) ---
+# Where "Report a problem" (web), `agnes issue report` and the report_issue
+# MCP tool mirror a one-message summary: an incoming webhook that accepts
+# {"text": "..."} (Slack, Mattermost, Google Chat, Discord). The report is
+# always stored in the instance; this is the copy for the team's channel.
+# Env override: AGNES_ISSUES_WEBHOOK_URL. Requires the Postgres app-state
+# backend.
+issues:
+  webhook_url: ""
+
 # --- Jira integration (optional) ---
 # NOT configured here. connectors/jira/service.py reads JIRA_* environment
 # variables directly (os.environ) — there is no instance.yaml wiring for this

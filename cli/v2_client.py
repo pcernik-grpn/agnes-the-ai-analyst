@@ -59,16 +59,16 @@ def _raise_for_status(r: httpx.Response) -> None:
         raise V2ClientError(status_code=r.status_code, body=_parse_error_body(r))
 
 
-def api_get_json(path: str, **params) -> dict:
+def api_get_json(path: str, *, headers: dict | None = None, **params) -> dict:
     url = f"{get_server_url().rstrip('/')}{path}"
-    r = httpx.get(url, headers=_headers(), params=params or None, timeout=30)
+    r = httpx.get(url, headers={**_headers(), **(headers or {})}, params=params or None, timeout=30)
     _raise_for_status(r)
     return r.json()
 
 
-def api_post_json(path: str, payload: dict) -> dict:
+def api_post_json(path: str, payload: dict, *, headers: dict | None = None) -> dict:
     url = f"{get_server_url().rstrip('/')}{path}"
-    r = httpx.post(url, json=payload, headers=_headers(), timeout=120)
+    r = httpx.post(url, json=payload, headers={**_headers(), **(headers or {})}, timeout=120)
     _raise_for_status(r)
     return r.json()
 

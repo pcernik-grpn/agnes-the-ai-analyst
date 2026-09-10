@@ -21,6 +21,9 @@ Using the platform to analyze data.
 - [`metrics/`](metrics/) — canonical business-metric definitions (YAML)
 - [`semantic-layer.md`](semantic-layer.md) — Apache Ossie documents as the canonical semantic layer: sources, adapters, ownership, export
 - [`HEADLESS_USAGE.md`](HEADLESS_USAGE.md) — PAT auth for CI / headless clients
+- [`issue-reporting.md`](issue-reporting.md) — "Report a problem": what the
+  web dialog attaches automatically, privacy, `agnes issue …` /
+  `agnes admin issue …` CLI, MCP tools, and the operator webhook mirror
 - [`../clients/macos/README.md`](../clients/macos/README.md) — Marketplace-first
   macOS desktop MVP with local CLI-path/version health
 

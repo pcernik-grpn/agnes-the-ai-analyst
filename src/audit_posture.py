@@ -755,6 +755,11 @@ POSTURE: dict[str, str] = {
     # not the emitter.
     "POST /admin/view-as": "view_as.start",
     "POST /admin/view-as/exit": "view_as.end",
+    # -- app.api.issues (issue reporting, step 1) -------------------------
+    "POST /api/issues": "issue.report",
+    "PUT /api/issues/{issue_id}/screenshot": "issue.screenshot",
+    "POST /api/issues/{issue_id}/comments": "issue.comment",
+    "POST /api/admin/issues/{issue_id}/resolve": "issue.resolved",
 }
 
 
@@ -1389,6 +1394,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/groups": "exempt:ui_support",
     "GET /admin/groups/{group_id}": "exempt:ui_support",
     "GET /admin/initial-workspace": "exempt:ui_support",
+    # Renders a static shell; list/detail/reply/resolve all run client-side
+    # against the ALREADY-declared /api/issues* and /api/admin/issues* routes
+    # above, which carry their own posture.
+    "GET /admin/issues": "exempt:ui_support",
     "GET /admin/knowledge-digests": "exempt:ui_support",
     "GET /admin/linked-apps": "exempt:ui_support",
     "GET /admin/linked-apps/new": "exempt:ui_support",
@@ -1481,6 +1490,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /me/ai-connector": "exempt:ui_support",
     "GET /me/connections": "exempt:ui_support",
     "GET /me/cowork": "exempt:ui_support",
+    # Renders a static shell; list/detail/comment all run client-side against
+    # the ALREADY-declared /api/issues* routes above, which carry their own
+    # posture (GET /api/issues/mine, GET /api/issues/{issue_id}, …).
+    "GET /me/issues": "exempt:ui_support",
     "GET /me/mcp": "exempt:ui_support",
     "GET /me/memory-mining": "exempt:ui_support",
     "GET /me/profile": "exempt:ui_support",
@@ -1504,6 +1517,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /stack": "exempt:ui_support",
     "GET /store/examples": "exempt:ui_support",
     "GET /store/new": "exempt:ui_support",
+    # -- app.api.issues (issue reporting, step 1) -------------------------
+    "GET /api/admin/issues": "issue.queue_read",
+    "GET /api/issues/mine": "exempt:ui_support",
+    "GET /api/issues/{issue_id}": "issue.read",
+    "GET /api/issues/{issue_id}/screenshot": "issue.read",
     "GET /{full_path:path}": "exempt:ui_support",
 }
 
@@ -1873,6 +1891,16 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "agnes_data_app_refresh": "mcp.tool_call",
     "agnes_data_app_close": "mcp.tool_call",
     "agnes_data_app_credentials": "exempt:ui_support",
+    # Issue reporting (step 1, docs/superpowers/specs/2026-09-09-issue-
+    # reporting-step1-design.md) -- same actions as the REST routes each
+    # tool self-calls (app/api/issues.py, catalog entries added by Task 2).
+    "report_issue": "issue.report",
+    "list_my_issues": "exempt:ui_support",
+    "get_issue": "issue.read",
+    "issue_comment": "issue.comment",
+    "issue_queue_list": "issue.queue_read",
+    "issue_reply": "issue.comment",
+    "issue_resolve": "issue.resolved",
 }
 
 # Slack (`/agnes`, `/agnes-new`, `/agnes-status`) and Telegram (`/start`,

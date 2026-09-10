@@ -337,6 +337,70 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
             "edges_skipped_missing_endpoint": "Edges not written because their src/dst fact was gone by INSERT time — a race between concurrent extraction passes, never a producer mistake.",
         },
     ),
+    # Postgres-only, same reasoning as `agnes_turns` above: `issue_reports` /
+    # `issue_comments` (issue reporting, step 1) landed after the A3 freeze
+    # (Alembic revision 0114, no `src/db.py` ladder step), so they exist on
+    # Postgres alone.
+    InternalTable(
+        registry_id="agnes_issues",
+        source_table="issue_reports",
+        filter_column="created_by",
+        filter_kind="user_id",
+        display_name="My issue reports",
+        description=(
+            "Problems, wrong answers, missing things and questions reported through "
+            "'Report a problem', `agnes issue report` or the report_issue tool. "
+            "Own rows only — a reporter sees the issues they filed; admins see all. "
+            "Inside a chat sandbox this table is empty by design — an agent's "
+            "restricted identity matches no reporter; use the report_issue / "
+            "list_my_issues tools there instead. "
+            "Server-side only (Postgres backend); not synced by agnes pull."
+        ),
+        column_descriptions={
+            "id": "Issue id (iss_…); every command also accepts the number.",
+            "number": "Human id shown as #N.",
+            "title": "One-line summary as typed by the reporter.",
+            "body": "What happened, as typed by the reporter (may be empty).",
+            "kind": "bug | wrong_answer | request | question | other.",
+            "status": "open | resolved.",
+            "created_by": "Reporter's user id (the row filter).",
+            "created_by_email": "Reporter's email for display.",
+            "source_surface": "web | cli | mcp — where the report was filed from.",
+            "page_url": "Page the reporter was on (web) or the URL they passed (cli/mcp).",
+            "context_json": "Auto-captured context as JSON text: app version, commit, browser, chat session id, recent client errors.",
+            "screenshot_path": "Relative path of the PNG when one was attached; fetch it via GET /api/issues/{id}/screenshot.",
+            "created_at": "When it was filed.",
+            "updated_at": "Last change of any field.",
+            "last_activity_at": "Last comment or status change — the column to sort by for 'what is new'.",
+            "resolved_at": "When an admin resolved it.",
+            "resolved_by": "Admin who resolved it.",
+            "resolution_note": "What the admin wrote when resolving.",
+            "webhook_delivered_at": "When the operator webhook accepted the summary; NULL means not configured or delivery failed.",
+        },
+    ),
+    InternalTable(
+        registry_id="agnes_issue_comments",
+        source_table="issue_comments",
+        filter_column="issue_owner_id",
+        filter_kind="user_id",
+        display_name="Comments on my issue reports",
+        description=(
+            "Public replies on issue reports — by the reporter or an admin. Own rows only: "
+            "Empty inside a chat sandbox for the same reason as `agnes_issues`. "
+            "a reporter sees every comment on the issues they filed; admins see all. "
+            "Server-side only (Postgres backend); not synced by agnes pull."
+        ),
+        column_descriptions={
+            "id": "Comment id (isc_…).",
+            "issue_id": "The issue this comment belongs to (join to agnes_issues.id).",
+            "issue_owner_id": "Reporter's user id, copied from the issue (the row filter).",
+            "author_id": "Who wrote it (user id).",
+            "author_email": "Who wrote it (email).",
+            "author_kind": "reporter | admin.",
+            "body": "The comment text.",
+            "created_at": "When it was written.",
+        },
+    ),
     # Postgres-only, same reasoning as `agnes_turns`/`agnes_extraction_runs`/
     # `agnes_facts_ingest_runs` above: `llm_calls` landed after the A3 freeze
     # (Alembic revision 0117, no `src/db.py` ladder step), so it exists on
@@ -647,7 +711,7 @@ def find_internal_refs(sql: str) -> list[str]:
 _PG_MATERIALIZE_ROW_CAP = 1_000_000
 
 
-def _select_list_with_json_as_text(source_table: str, physical_columns: "list[str] | None") -> str:
+def _select_list_with_json_as_text(source_table: str, physical_columns: list[str] | None) -> str:
     """Column list for ``SELECT <list> FROM source_table`` that casts every
     JSON-family column (per the SQLAlchemy model's declared type) to text.
 
@@ -720,7 +784,7 @@ def _materialized_internal_duckdb(refs, user, is_admin):
     because the filter is applied during materialisation, a user CTE that
     shadows an ``agnes_*`` alias still reads only the caller's rows.
     """
-    import pandas as pd  # noqa: F401 — referenced by name in the DuckDB scan
+    import pandas as pd
 
     from src.db import _open_duckdb
     from src.db_pg import get_engine

@@ -2397,6 +2397,124 @@ class TestViewAsSmoke:
         assert r.status_code == 403, r.text
 
 
+# ---------------------------------------------------------------------------
+# Issue reports (issue reporting step 1) — PG-only per the A3 ratchet
+# ---------------------------------------------------------------------------
+
+_ISSUE_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def _assert_issue_501(r):
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend", r.text
+
+
+class TestIssueReportsSmoke:
+    """Every issue route answers on Postgres and fails clean on DuckDB.
+
+    Asserted per backend, never as ``in (200, 501)``: the report channel is
+    open to any signed-in caller, the queue and resolve are admin-only, and a
+    DuckDB-backed instance must answer the TYPED 501 before it ever validates
+    a body — a raw 500 or a 422 would be a different bug wearing the same
+    colour. Behaviour depth (ownership 404, PNG magic bytes, webhook mirror,
+    number sequence) lives in tests/db_pg/test_issues_api_pg.py.
+    """
+
+    COVERED_ROUTES = {
+        "POST /api/issues",
+        "GET /api/issues/mine",
+        "GET /api/issues/{issue_id}",
+        "POST /api/issues/{issue_id}/comments",
+        "PUT /api/issues/{issue_id}/screenshot",
+        "GET /api/issues/{issue_id}/screenshot",
+        "GET /api/admin/issues",
+        "POST /api/admin/issues/{issue_id}/resolve",
+    }
+
+    def _file(self, s, title="Smoke: tables render raw while streaming"):
+        return s["client"].post(
+            "/api/issues",
+            json={"title": title, "body": "smoke", "kind": "bug", "page_url": "/chat"},
+            headers=_analyst_headers(s),
+        )
+
+    def test_report_and_mine(self, seeded_app_both):
+        s = seeded_app_both
+        r = self._file(s)
+        if s["backend"] != "pg":
+            _assert_issue_501(r)
+            _assert_issue_501(s["client"].get("/api/issues/mine", headers=_analyst_headers(s)))
+            return
+        assert r.status_code == 201, r.text
+        row = r.json()
+        assert row["status"] == "open" and row["kind"] == "bug" and isinstance(row["number"], int)
+        mine = s["client"].get("/api/issues/mine", headers=_analyst_headers(s))
+        assert mine.status_code == 200, mine.text
+        body = mine.json()
+        assert set(body) == {"data", "count", "truncated"}
+        assert any(x["id"] == row["id"] for x in body["data"])
+
+    def test_show_and_comment(self, seeded_app_both):
+        s = seeded_app_both
+        if s["backend"] != "pg":
+            _assert_issue_501(s["client"].get("/api/issues/iss_x", headers=_analyst_headers(s)))
+            _assert_issue_501(
+                s["client"].post("/api/issues/iss_x/comments", json={"body": "more"}, headers=_analyst_headers(s))
+            )
+            return
+        row = self._file(s).json()
+        c = s["client"].post(
+            f"/api/issues/{row['id']}/comments", json={"body": "more detail"}, headers=_analyst_headers(s)
+        )
+        assert c.status_code == 201, c.text
+        assert c.json()["author_kind"] == "reporter"
+        show = s["client"].get(f"/api/issues/{row['number']}", headers=_analyst_headers(s))
+        assert show.status_code == 200, show.text
+        assert [x["body"] for x in show.json()["comments"]] == ["more detail"]
+        # an admin reads any issue; a reply by the admin is tagged as such
+        assert s["client"].get(f"/api/issues/{row['id']}", headers=_admin_headers(s)).status_code == 200
+        reply = s["client"].post(f"/api/issues/{row['id']}/comments", json={"body": "on it"}, headers=_admin_headers(s))
+        assert reply.status_code == 201 and reply.json()["author_kind"] == "admin", reply.text
+
+    def test_screenshot_roundtrip(self, seeded_app_both, tmp_path, monkeypatch):
+        s = seeded_app_both
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        png_headers = {**_analyst_headers(s), "Content-Type": "image/png"}
+        if s["backend"] != "pg":
+            _assert_issue_501(s["client"].put("/api/issues/iss_x/screenshot", content=_ISSUE_PNG, headers=png_headers))
+            _assert_issue_501(s["client"].get("/api/issues/iss_x/screenshot", headers=_analyst_headers(s)))
+            return
+        row = self._file(s).json()
+        put = s["client"].put(f"/api/issues/{row['id']}/screenshot", content=_ISSUE_PNG, headers=png_headers)
+        assert put.status_code == 204, put.text
+        got = s["client"].get(f"/api/issues/{row['id']}/screenshot", headers=_analyst_headers(s))
+        assert got.status_code == 200, got.text
+        assert got.headers["content-type"].startswith("image/png")
+        assert got.content == _ISSUE_PNG
+
+    def test_admin_queue_and_resolve(self, seeded_app_both):
+        s = seeded_app_both
+        # the gate answers before the backend does, on both backends
+        assert s["client"].get("/api/admin/issues", headers=_analyst_headers(s)).status_code == 403
+        assert (
+            s["client"].post("/api/admin/issues/iss_x/resolve", json={}, headers=_analyst_headers(s)).status_code == 403
+        )
+        if s["backend"] != "pg":
+            _assert_issue_501(s["client"].get("/api/admin/issues", headers=_admin_headers(s)))
+            _assert_issue_501(s["client"].post("/api/admin/issues/iss_x/resolve", json={}, headers=_admin_headers(s)))
+            return
+        row = self._file(s).json()
+        queue = s["client"].get("/api/admin/issues", headers=_admin_headers(s))
+        assert queue.status_code == 200, queue.text
+        assert any(x["id"] == row["id"] for x in queue.json()["data"])
+        done = s["client"].post(
+            f"/api/admin/issues/{row['id']}/resolve", json={"resolution_note": "fixed"}, headers=_admin_headers(s)
+        )
+        assert done.status_code == 200 and done.json()["status"] == "resolved", done.text
+        again = s["client"].post(f"/api/admin/issues/{row['id']}/resolve", json={}, headers=_admin_headers(s))
+        assert again.status_code == 409 and again.json()["detail"]["error"] == "already_resolved", again.text
+
+
 KNOWN_UNTESTED = {
     # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
     # admin-gated, behaviorally covered outside this parameter-free smoke
@@ -2899,6 +3017,7 @@ KNOWN_UNTESTED = {
     "GET /admin/telemetry",
     "GET /admin/tokens",
     "GET /admin/usage",
+    "GET /admin/issues",  # queue page shell; rendering + admin gate in tests/test_issue_pages.py
     "GET /admin/users",
     "GET /admin/users/{user_id}",
     "GET /admin/workspace-prompt",
@@ -2969,6 +3088,7 @@ KNOWN_UNTESTED = {
     "GET /me/ai-connector",
     "GET /me/connections",  # per-user MCP connect page tested in tests/test_me_connections_page.py
     "GET /me/cowork",
+    "GET /me/issues",  # reporter page shell; rendering + PG gate in tests/test_issue_pages.py
     "GET /me/mcp",
     "GET /me/profile",
     "GET /me/stats",

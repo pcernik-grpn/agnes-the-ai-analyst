@@ -82,6 +82,11 @@ user sees there, and when to send them.
 - `/me/connections` — the user's own data-source and MCP connections.
 - `/me/activity` — their personal activity feed.
 - `/me/memory-mining` — opt in/out of memory mining over their sessions.
+- `/me/issues` — the reports they've filed with "Report a problem" (rail foot
+  button or account menu): status, replies and age at a glance, and a detail
+  view with the auto-captured context, the screenshot when there is one, and
+  the comment thread to follow up on. "Where did my bug report go?" → here.
+  Same gate as the button itself — only on a Postgres-backed instance.
 - `/mcp-connect` — mint a token and connect an external AI client over MCP.
 - `/how-it-works` — the product explainer; owns the "connect an AI client"
   walkthrough and links the setup pages.

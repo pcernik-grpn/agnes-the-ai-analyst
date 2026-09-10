@@ -47,6 +47,22 @@ web UI works on a fresh deployment without an offline asset pipeline.
   single-file vendoring cannot serve. This build ends with
   `globalThis["mermaid"] = …`, so a plain script tag is enough.
 
+## html-to-image.min.js
+
+- **Project:** [html-to-image](https://github.com/bubkoo/html-to-image) — DOM-to-image renderer (SVG `<foreignObject>`, so the browser itself paints modern CSS)
+- **Version:** 1.11.11
+- **License:** MIT
+- **Source:** https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.11/html-to-image.min.js
+- **Used in:** `app/web/static/js/issue_report.js` (the "Report a problem"
+  dialog's optional screenshot). Lazy-loaded — only fetched the first time a
+  report is filed with the screenshot checkbox on, via
+  `window._agHtmlToImageUrl` (stamped in `_app_scripts.html`, same
+  cache-buster pattern as `_agMermaidUrl`), same reasoning as mermaid.min.js
+  below: a caller who never attaches a screenshot never downloads it.
+  Chosen over html2canvas: the paper skin's `color-mix()` colors come back
+  from `getComputedStyle` as `color(srgb …)`, which html2canvas 1.4.1 cannot
+  parse ("unsupported color function"), so it failed on every page.
+
 ## lucide-sprite.svg
 
 - **Project:** [Lucide](https://lucide.dev) — icon set
@@ -78,6 +94,7 @@ curl -sSL -o marked.min.js  https://cdn.jsdelivr.net/npm/marked@<VER>/marked.min
 curl -sSL -o highlight.min.js  https://cdnjs.cloudflare.com/ajax/libs/highlight.js/<VER>/highlight.min.js
 curl -sSL -o highlight.min.css https://cdnjs.cloudflare.com/ajax/libs/highlight.js/<VER>/styles/github.min.css
 curl -sSL -o mermaid.min.js https://cdn.jsdelivr.net/npm/mermaid@<VER>/dist/mermaid.min.js
+curl -sSL -o html-to-image.min.js https://cdnjs.cloudflare.com/ajax/libs/html-to-image/<VER>/html-to-image.min.js
 ```
 
 Then update the version numbers above in the same commit.

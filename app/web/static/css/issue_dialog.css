@@ -1,0 +1,115 @@
+/* "Report a problem" dialog (#issue-dialog, app/web/templates/_issue_dialog.html).
+ *
+ * Structure — .modal-backdrop / .modal-card / .modal-actions — comes from
+ * style-custom.css, the same rules every other modal in the app uses; this
+ * file styles only what is specific to THIS dialog's content: the kind
+ * picker, the auto-attached chips, and the network-failure fallback. --ds-*
+ * tokens only (design-system contract).
+ */
+
+.issue-dialog__card {
+    /* A little wider than the shared 440px .modal-card default — four kind
+       pills plus a title field want more room than the confirm/prompt
+       dialogs modal.js renders. */
+    max-width: 480px;
+    max-height: 88vh;
+    overflow-y: auto;
+}
+
+/* ── Kind picker ─────────────────────────────────────────────────────────
+   Plain radio inputs, not a shared segmented-strip macro: the existing
+   `ds.segmented_strip` variants are dark-surface only (os-tabs/mode-tabs),
+   and this is one small, dialog-local control — not a second design-system
+   component to maintain. */
+.issue-dialog__kinds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 4px 0 16px;
+}
+
+.issue-dialog__kind {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-pill);
+    font-size: 12.5px;
+    color: var(--ds-text-secondary);
+    cursor: pointer;
+    user-select: none;
+}
+
+.issue-dialog__kind:has(input:checked) {
+    border-color: var(--ds-primary);
+    color: var(--ds-primary-dark);
+    background: var(--ds-surface-sunken);
+    font-weight: 600;
+}
+
+.issue-dialog__kind input[type="radio"] {
+    /* The pill itself IS the visible control; the native radio stays for
+       keyboard/screen-reader semantics, sized down rather than hidden so
+       focus is still visibly indicated on it. */
+    width: 13px;
+    height: 13px;
+    accent-color: var(--ds-primary);
+}
+
+/* ── Attached-automatically chips ────────────────────────────────────── */
+.issue-dialog__attached {
+    margin: 4px 0 16px;
+}
+
+.issue-dialog__attached-label {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ds-text-secondary);
+}
+
+.issue-dialog__chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.issue-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: var(--ds-radius-pill);
+    background: var(--ds-surface-sunken);
+    color: var(--ds-text-muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+/* ── Network-failure fallback ────────────────────────────────────────── */
+.issue-dialog__fallback {
+    margin: 4px 0 16px;
+    padding: 10px 12px;
+    border: 1px solid var(--ds-accent-warn-line);
+    border-radius: 8px;
+    background: var(--ds-accent-warn-bg);
+}
+
+.issue-dialog__fallback p {
+    margin: 0 0 8px;
+    font-size: 12.5px;
+    color: var(--ds-text-secondary);
+}
+
+.issue-dialog__fallback textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px;
+    border: 1px solid var(--ds-border);
+    border-radius: 6px;
+    padding: 8px;
+    background: var(--ds-surface);
+    color: var(--ds-text-primary);
+    resize: vertical;
+}

@@ -19,7 +19,7 @@ deployment runs on.
 from __future__ import annotations
 
 import logging
-from typing import Collection, Optional
+from collections.abc import Collection
 
 from connectors.internal.access import INTERNAL_TABLES, InternalTable
 from src.repositories import data_packages_repo, table_registry_repo, use_pg
@@ -36,10 +36,19 @@ logger = logging.getLogger(__name__)
 #: ``extraction_runs`` (Alembic ``0094_extraction_runs``) and
 #: ``facts_ingest_runs`` (Alembic ``0078_facts_ingest_runs``) are the same
 #: story — both are PG-only app-state tables added after the freeze.
-#: ``llm_calls`` (Alembic ``0117_llm_observability``, design 2026-09-08) is
-#: the same story too — the LLM observability ledger.
+#: ``agnes_issues`` / ``agnes_issue_comments`` (issue reporting, step 1;
+#: Alembic ``0119_issue_reports``) and ``agnes_llm_calls`` (Alembic
+#: ``0117_llm_observability``, design 2026-09-08 — the LLM observability
+#: ledger) are the same story too.
 PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset(
-    {"agnes_turns", "agnes_extraction_runs", "agnes_facts_ingest_runs", "agnes_llm_calls"}
+    {
+        "agnes_turns",
+        "agnes_extraction_runs",
+        "agnes_facts_ingest_runs",
+        "agnes_llm_calls",
+        "agnes_issues",
+        "agnes_issue_comments",
+    }
 )
 
 #: Stable identity of the seeded package that carries the internal tables.
@@ -61,7 +70,7 @@ USAGE_PACKAGE_DESCRIPTION = (
 # these tables never enter `agnes pull` manifests.
 USAGE_PACKAGE_LONG_DESCRIPTION = (
     "Self-service usage analytics over your own Agnes activity, plus (admins "
-    "only) the extraction pipelines' own operational history. Seven tables: "
+    "only) the extraction pipelines' own operational history. Nine tables: "
     "`agnes_sessions` (one row per Claude Code or chat session — activity "
     "counters plus summed input/output/cache tokens), `agnes_turns` (one row "
     "per assistant turn with exact token usage incl. prompt cache; "
@@ -70,19 +79,24 @@ USAGE_PACKAGE_LONG_DESCRIPTION = (
     "trail of your actions), `agnes_llm_calls` (one row per LLM call across "
     "every workload — chat, agent API, builders, extraction, corporate "
     "memory — with token counts and the USD cost as priced at write time; "
-    "Postgres-backed instances only), `agnes_extraction_runs` (one row per "
-    "built-in extraction/crawl run — status, progress, LLM token usage; "
-    "Postgres-backed instances only) and `agnes_facts_ingest_runs` (one row "
-    "per fact-graph ingest batch, including the real LLM spend ledger; "
-    "Postgres-backed instances only). The first five are filtered to YOUR "
-    "rows — admins see everyone. The last two are admin/operator data, not a "
-    "per-user table: they carry no row for anyone (not even an admin's own "
-    "activity) unless the caller is an admin, because a run belongs to a "
-    "connection or a set of collections, never to a person. All seven tables "
-    'are server-side only: query them with `agnes query "SELECT …"` '
-    "(auto-routes to the server); they never appear in `agnes pull` and "
-    "have no local parquet. New activity is visible within seconds of a "
-    "session upload or chat turn."
+    "Postgres-backed instances only), `agnes_issues` (one row per problem, "
+    "wrong answer, missing thing or question you reported through 'Report a "
+    "problem', `agnes issue report` or the report_issue tool; Postgres-"
+    "backed instances only), `agnes_issue_comments` (public replies on your "
+    "issue reports, from you or an admin; Postgres-backed instances only), "
+    "`agnes_extraction_runs` (one row per built-in extraction/crawl run — "
+    "status, progress, LLM token usage; Postgres-backed instances only) and "
+    "`agnes_facts_ingest_runs` (one row per fact-graph ingest batch, "
+    "including the real LLM spend ledger; Postgres-backed instances only). "
+    "The first seven are filtered to YOUR rows — admins see everyone. The "
+    "last two are admin/operator data, not a per-user table: they carry no "
+    "row for anyone (not even an admin's own activity) unless the caller is "
+    "an admin, because a run belongs to a connection or a set of "
+    "collections, never to a person. All nine tables are server-side only: "
+    'query them with `agnes query "SELECT …"` (auto-routes to the server); '
+    "they never appear in `agnes pull` and have no local parquet. New "
+    "activity is visible within seconds of a session upload, chat turn or "
+    "issue report."
 )
 USAGE_PACKAGE_WHEN_TO_USE = [
     "Analyzing your own token spend — by day, model, session, or turn",
@@ -104,8 +118,10 @@ USAGE_PACKAGE_EXAMPLE_QUESTIONS = [
     "What share of my input tokens was served from the prompt cache?",
     "Which tools error most often in my sessions?",
     "Admin: what did the last SharePoint extraction run actually spend on LLM tokens?",
+    "What issues have I reported that are still open?",
+    "What changed on my issue #42 since yesterday?",
 ]
-USAGE_PACKAGE_TAGS = ["usage", "tokens", "telemetry", "audit", "extraction", "facts"]
+USAGE_PACKAGE_TAGS = ["usage", "tokens", "telemetry", "audit", "extraction", "facts", "issues"]
 
 
 def internal_table_available(table_id: str) -> bool:
@@ -214,7 +230,7 @@ def ensure_internal_tables_registered() -> set[str]:
     return newly_registered
 
 
-def ensure_internal_package_seeded(*, newly_registered: Optional[Collection[str]] = None) -> None:
+def ensure_internal_package_seeded(*, newly_registered: Collection[str] | None = None) -> None:
     """Seed the ``agnes-usage`` data package that carries the internal tables.
 
     Call right after :func:`ensure_internal_tables_registered` — the junction
@@ -250,6 +266,22 @@ def ensure_internal_package_seeded(*, newly_registered: Optional[Collection[str]
     Default ``newly_registered=None`` means "reconcile nothing" — the safe
     direction: a caller with no information adds no members rather than
     resurrecting removed ones.
+
+    **The package's PROSE is written once, at creation, and then drifts.**
+    Membership reconciles; ``description`` / ``long_description`` / tags /
+    example questions do not. An instance created before a release that adds
+    an internal table gains the table as a member but keeps the older wording,
+    so its description can under-count the tables it now carries (raised by
+    #2402 for ``agnes_issues``/``agnes_issue_comments``).
+
+    That is deliberate, and it is the fifth "never" of the four above: those
+    fields are admin-editable (``PATCH /api/admin/data-packages/{id}``), so a
+    refresh on every boot would silently overwrite whatever an admin wrote.
+    Fixing it properly needs a way to tell "still the text we shipped" from
+    "an admin rewrote this" — provenance this table does not record today.
+    Until it does, the accurate wording ships to new instances and existing
+    ones keep theirs; the table LIST an agent sees is always correct because
+    it comes from membership, never from the prose.
 
     Never fatal: any failure is logged and startup continues without the
     package (the tables stay registered, only ungranted).
@@ -295,7 +327,7 @@ def ensure_internal_package_seeded(*, newly_registered: Optional[Collection[str]
         )
 
 
-def _create_usage_package(repo) -> Optional[str]:
+def _create_usage_package(repo) -> str | None:
     """Create the package, tolerating a lost slug race.
 
     Role-split deployments boot api / gateway / worker against one database at

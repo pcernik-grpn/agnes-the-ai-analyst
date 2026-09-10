@@ -48,6 +48,16 @@ def remote_table_hint(table: str, *, surface: str = "cli") -> str:
     )
 
 
+def issue_not_found_hint() -> str:
+    """Hint for a `404 issue_not_found` from `agnes issue show|comment` (or the
+    `get_issue`/`issue_comment` MCP tools). Deliberately one wording for both
+    causes — the id is wrong, or it names someone else's report (the API
+    returns 404, not 403, for the second case; see `app/api/issues.py`'s
+    `_owned_or_admin`) — so a hint can never be used to probe for an id's
+    existence."""
+    return "Not found. List your reports: agnes issue list   ·   admins: agnes admin issue list"
+
+
 def sharepoint_connection_not_found_hint(connection_id: str) -> str:
     """Hint for a `404 connection_not_found` from an `agnes admin sharepoint
     <connection_id> ...` subcommand — the id is wrong, or it names a
@@ -81,7 +91,7 @@ def facts_not_found_hint(subject_id: str, *, surface: str = "cli") -> str:
     return base + " Check the id with `agnes facts search <type>`, or ask an admin whether `facts` is enabled here."
 
 
-def row_scope_note(row_scope: "dict | None") -> "str | None":
+def row_scope_note(row_scope: dict | None) -> str | None:
     """Render the `[scope]` disclosure line (table access policies §10) for
     an already-parsed ``row_scope`` envelope
     (``src/access_policy.py::row_scope_payload``), or ``None`` if absent.
@@ -103,7 +113,7 @@ def row_scope_note(row_scope: "dict | None") -> "str | None":
     return f"[scope] {note}"
 
 
-def row_scope_note_from_header(header_value: "str | None") -> "str | None":
+def row_scope_note_from_header(header_value: str | None) -> str | None:
     """Same disclosure line as :func:`row_scope_note`, for a caller that only
     has the raw ``X-Agnes-Row-Scope`` response header.
 

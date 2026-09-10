@@ -40,6 +40,7 @@ from src.models.fact_collection_stats import (
 )
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
 from src.models.facts_llm_cache import FactsLlmCache
+from src.models.issue_reports import IssueComment, IssueReport
 from src.models.jobs import Job
 from src.models.knowledge import (
     KnowledgeContradiction,
@@ -168,6 +169,8 @@ __all__ = [
     "IdempotencyKey",
     "IngestRun",
     "InstanceTemplate",
+    "IssueComment",
+    "IssueReport",
     "Job",
     "KnowledgeContradiction",
     "KnowledgeDigest",

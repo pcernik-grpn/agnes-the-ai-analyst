@@ -16,6 +16,7 @@ from cli.commands.admin_data_package import admin_data_package_app
 from cli.commands.admin_digest import admin_digest_app
 from cli.commands.admin_doctor import doctor_app as admin_doctor_app
 from cli.commands.admin_facts import admin_facts_app
+from cli.commands.admin_issue import admin_issue_app
 from cli.commands.admin_jobs import admin_jobs_app
 from cli.commands.admin_knowledge_packaging import packaging_app as admin_knowledge_packaging_app
 from cli.commands.admin_marketplace import admin_marketplace_app
@@ -27,10 +28,10 @@ from cli.commands.admin_semantic import admin_semantic_app
 from cli.commands.admin_semantic_layer import admin_semantic_layer_app
 from cli.commands.admin_semantic_model import admin_semantic_model_app
 from cli.commands.admin_semantic_source import admin_semantic_source_app
+from cli.commands.admin_service_account import service_account_app as admin_service_account_app
 from cli.commands.admin_sessions import sessions_app as admin_sessions_app
 from cli.commands.admin_sharepoint import admin_sharepoint_app
 from cli.commands.admin_skills import admin_skills_app
-from cli.commands.admin_service_account import service_account_app as admin_service_account_app
 from cli.commands.admin_sso import admin_sso_app
 from cli.commands.admin_store import admin_store_app
 from cli.commands.admin_usage import app as admin_usage_app
@@ -102,6 +103,7 @@ admin_app.add_typer(admin_skills_app, name="skill", help="Contributed skills man
 admin_app.add_typer(admin_jobs_app, name="jobs", help="Job queue admin (wave-2B worker runtime)")
 admin_app.add_typer(admin_analytics_app, name="analytics", help="DuckLake analytics-backend migration (wave-2G)")
 admin_app.add_typer(admin_facts_app, name="facts", help="Fact-graph maintenance (TCRD-296 synthesis E.21)")
+admin_app.add_typer(admin_issue_app, name="issue", help="Issue reports from users: the queue, replies, resolution")
 admin_app.add_typer(
     admin_conversations_app,
     name="conversations",
@@ -995,8 +997,7 @@ def table_policy_show(
             state = entry.get("state")
             flag = "  <-- broken, see docs/table-access-policies.md" if state in ("empty", "never_synced") else ""
             typer.echo(
-                f"    {entry.get('mapping_table')}: {state} "
-                f"(last_sync: {entry.get('last_sync') or 'never'}){flag}"
+                f"    {entry.get('mapping_table')}: {state} (last_sync: {entry.get('last_sync') or 'never'}){flag}"
             )
     typer.echo("  sql:")
     for line in sql.splitlines():
@@ -1186,9 +1187,7 @@ def _render_policy_preview_matrix(table_id: str, body: dict) -> None:
     if union_coverage is not None:
         typer.echo(f"  union coverage: {union_coverage:.0%}")
     if body.get("no_op"):
-        typer.echo(
-            "  WARNING: every persona sees the whole table and the union is 100% — this policy is a NO-OP."
-        )
+        typer.echo("  WARNING: every persona sees the whole table and the union is 100% — this policy is a NO-OP.")
 
     overlap = body.get("pairwise_overlap") or []
     if overlap:
