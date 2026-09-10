@@ -142,3 +142,32 @@ def test_feedback_css_block_exists_and_uses_only_tokens():
     assert "var(--primary)" not in block
     for token in ("--ds-surface-dim", "--ds-text-primary", "--ds-primary", "--ds-border", "--ds-surface"):
         assert token in block
+
+
+def test_a_rateable_answers_action_row_does_not_hide_behind_a_hover():
+    """The thumbs are a signal the product ASKS people for, so they must be
+    findable without a hover: `.msg-actions` (timestamp + copy) is
+    `opacity: 0` until `.msg:hover`, a touch screen has no hover at all, and
+    a rating nobody can see is a rating nobody gives.
+    """
+    css = _read(CHAT_CSS)
+    rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+    visible_without_hover = [
+        sel.strip()
+        for sel, body in rules
+        # `is-selected` is the sibling rule that keeps a row visible once a
+        # verdict was PICKED — it cannot make the thumbs findable in the
+        # first place, so it does not count here.
+        if (
+            ".msg-actions" in sel
+            and ".msg-feedback" in sel
+            and ":hover" not in sel
+            and "is-selected" not in sel
+            and "opacity: 1" in body
+        )
+    ]
+    assert visible_without_hover, (
+        "no rule keeps a rateable answer's actions row visible without a hover — "
+        "the thumbs render but stay invisible until the pointer is over the bubble"
+    )
+

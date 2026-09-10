@@ -690,6 +690,13 @@ body.chat-page-body main { margin: 0; padding: 0; }
 .msg-user .msg-actions:focus-within { pointer-events: auto; }
 .msg:hover .msg-actions,
 .msg-actions:focus-within { opacity: 1; }
+/* ...except on an answer that can be rated. The thumbs are a signal the
+   product ASKS people for, and the reveal-on-hover the timestamp and the
+   copy button are happy with makes them findable only by accident: a
+   pointer has to be over the bubble, and a touch screen has no hover at
+   all, so on a phone they never appeared. The row stays muted (its own
+   colour is unchanged); it simply no longer waits to be discovered. */
+.msg-assistant .msg-actions:has(.msg-feedback) { opacity: 1; }
 /* While the model is streaming, keep the actions hidden — a half-
    written turn has no stable content to copy. */
 .msg.is-streaming .msg-actions { display: none; }
