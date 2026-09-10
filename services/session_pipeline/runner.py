@@ -125,11 +125,21 @@ def _sweep_chat_session_exports(effective_dir: Path, *, limit: int = 200) -> int
     """Bounded pre-scan: export any recently-active chat session whose
     messages are newer than its already-exported jsonl's mtime (or that has
     no exported file yet) — F4, audit-full-coverage plan Task 8. Runs once
-    at the top of every ``run_processor()`` call (i.e. once per processor
-    per scheduler tick); cheap even called that often since the candidate
-    query is capped at *limit* most-recently-active sessions and each one's
-    own mtime check skips anything already current. No-ops (no repo call at
-    all) when ``sessions.include_chat`` is off.
+    at the top of every ``run_processor()`` call — i.e. once per processor
+    per scheduler tick, so with several processors this sweep repeats
+    within a single tick and every session below is checked more than once.
+
+    That repetition is only affordable while the per-session check stays
+    cheap, which is a live constraint and not a given: the candidate query
+    is capped at *limit* most-recently-active sessions, and each one's
+    check must decide "already current" without reading the transcript
+    itself. It does — ``is_chat_export_stale`` compares a small sidecar and
+    re-reads the jsonl only when the file has actually changed underneath
+    it (``app/chat/session_export.py::_transcript_identity``). Anything
+    that makes that check read or hash every transcript in full turns this
+    into *limit* × processors full file reads per tick.
+
+    No-ops (no repo call at all) when ``sessions.include_chat`` is off.
 
     Returns the number of sessions actually (re-)exported, for the caller's
     log line.

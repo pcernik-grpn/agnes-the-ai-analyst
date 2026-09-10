@@ -1140,6 +1140,42 @@ class TestOnDemandTranscriptFreshness:
         texts = [e.get("text") or "" for e in body["events"] if e.get("kind") == "text"]
         assert not any("landed mid-export" in t for t in texts)  # ...and it really is behind
 
+    def test_a_message_landing_before_the_file_check_is_not_certified(self, seeded_app, tmp_path, monkeypatch):
+        """The session row is read before the owner lookup and the file
+        check. A message committed inside THAT window leaves the existing
+        export matching a snapshot that is already out of date — the fast
+        path used to certify it without ever looking again."""
+        import src.repositories as repos
+        from src.repositories import chat_message_repo, chat_session_repo
+
+        session_dir = tmp_path / "user_sessions"
+        monkeypatch.setenv("SESSION_DATA_DIR", str(session_dir))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        assert export_chat_session_jsonl(chat_id) is not None
+        stale_snapshot = chat_session_repo().get_session(chat_id)
+
+        # ...and now a message lands, invisible to that snapshot.
+        chat_message_repo().append_message(session_id=chat_id, role="user", content="landed pre-check")
+
+        real_repo = chat_session_repo()
+        calls = {"n": 0}
+
+        class _SnapshotThenTruth:
+            def get_session(self, cid):
+                calls["n"] += 1
+                return stale_snapshot if calls["n"] == 1 else real_repo.get_session(cid)
+
+        monkeypatch.setattr(repos, "chat_session_repo", lambda: _SnapshotThenTruth())
+
+        resp = self._get_transcript(seeded_app, "analyst1", f"chat-{chat_id}.jsonl")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        texts = [e.get("text") or "" for e in body["events"] if e.get("kind") == "text"]
+        # Not merely flagged behind — brought current, which is the point.
+        assert any("landed pre-check" in t for t in texts), texts
+        assert body["freshness"] == {"verified": True}
+
     def test_non_chat_filename_keeps_the_plain_404(self, seeded_app, tmp_path, monkeypatch):
         """A legacy CLI-collector filename never matches the ``chat-*``
         pattern, so it never triggers the chat lookaside at all -- the
@@ -1204,6 +1240,93 @@ def test_a_failed_session_lookup_is_not_reported_as_a_missing_session(monkeypatc
     freshness = mod.ensure_chat_transcript_current("11111111-1111-1111-1111-111111111111")
     assert freshness.lookup_failed is True
     assert freshness.session_found is False
+
+
+def _session(chat_id):
+    from src.repositories import chat_session_repo
+
+    return chat_session_repo().get_session(chat_id)
+
+
+class TestDigestCheckIsNotPaidOnEveryTick:
+    """The digest pairs a watermark with its transcript, but reading and
+    hashing a whole jsonl on every check is real cost: the sweep runs this
+    over up to 200 recently-active sessions on every processor tick. The
+    sidecar therefore also records what the file looked like when it was
+    hashed, so an unchanged file skips the hash."""
+
+    def _export(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        target = export_chat_session_jsonl(chat_id)
+        assert target is not None
+        return chat_id, target
+
+    def test_an_unchanged_transcript_is_not_rehashed(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat import session_export as mod
+
+        chat_id, target = self._export(tmp_path, monkeypatch)
+        session = _session(chat_id)
+
+        def _must_not_hash(_content):
+            raise AssertionError("hashed an unchanged transcript")
+
+        monkeypatch.setattr(mod, "_content_digest", _must_not_hash)
+        assert not mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
+
+    def test_a_transcript_replaced_under_its_sidecar_is_still_caught(self, seeded_app, tmp_path, monkeypatch):
+        """The identity token may only SAVE the hash, never replace it: a
+        file swapped under its sidecar has a different identity, so the
+        digest runs and the mismatch reports stale."""
+        from app.chat import session_export as mod
+
+        chat_id, target = self._export(tmp_path, monkeypatch)
+        session = _session(chat_id)
+        assert not mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
+
+        target.write_text(target.read_text() + json.dumps({"type": "user", "message": {}}) + "\n")
+
+        assert mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
+
+    def test_a_sidecar_without_an_identity_still_verifies_by_digest(self, seeded_app, tmp_path, monkeypatch):
+        """A sidecar written before the identity existed falls back to the
+        hash rather than trusting the pair blindly."""
+        from app.chat import session_export as mod
+
+        chat_id, target = self._export(tmp_path, monkeypatch)
+        session = _session(chat_id)
+        payload = json.loads(mod._watermark_path(target).read_text())
+        payload.pop("content_size")
+        payload.pop("content_mtime_ns")
+        mod._watermark_path(target).write_text(json.dumps(payload))
+
+        assert mod._read_export_watermark(target).content_identity is None
+        assert not mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
+        target.write_text("tampered\n")
+        assert mod.is_chat_export_stale(target, session.last_message_at, session.message_count)
+
+
+class TestExportDoesNotPublishBackwards:
+    """os.replace orders nothing. A slower writer that read fewer messages
+    can still land last and replace a newer transcript with a coherent,
+    older one -- leaving the request that just certified the newer file
+    serving the older."""
+
+    def test_a_shorter_snapshot_does_not_replace_a_longer_export(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat import session_export as mod
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+        target = export_chat_session_jsonl(chat_id)
+        assert target is not None
+        current = target.read_text()
+
+        # A writer whose read predates the second message tries to publish.
+        read_all = mod._list_all_chat_messages
+        monkeypatch.setattr(mod, "_list_all_chat_messages", lambda cid, repo: read_all(cid, repo)[:1])
+
+        assert mod.export_chat_session_jsonl(chat_id) == target
+        assert target.read_text() == current  # the newer transcript survives
 
 
 class TestTranscriptErrorSurfacesPairUp:
