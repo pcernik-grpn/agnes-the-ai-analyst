@@ -556,6 +556,49 @@ def test_anthropic_proxy_api_key_mode_injects_x_api_key(broker_app, monkeypatch)
     assert "authorization" not in h
 
 
+def test_anthropic_proxy_never_asks_upstream_for_an_encoding_it_cannot_decode(broker_app, monkeypatch):
+    """The in-sandbox SDK asks for Brotli; this forward must not pass that on.
+
+    The proxy strips `content-encoding` from the response
+    (`_FORWARDED_RESPONSE_HEADERS`) and hands the caller `resp.content`
+    verbatim, so whatever it forwards has to be DECODED — and httpx decodes
+    only what its own decoder table covers, which in this image is gzip and
+    deflate. Forwarding the SDK's `br` therefore left every non-streaming
+    completion opaque to the sandbox AND to `parse_usage`, so a real billed
+    call reached the `llm_calls` ledger as 0 tokens / $0.00.
+    """
+    import app.api.broker as broker_mod
+
+    # httpx's own table — the point of the assertion is the RELATION between
+    # what we ask for and what this client can decode, not one literal value.
+    from httpx._decoders import SUPPORTED_DECODERS
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static-KEY")
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _HeaderCapturingClient)
+    _HeaderCapturingClient._captured = {}
+    tok = ticket_repo().mint("chat_accept_encoding", "main", ttl_seconds=60)
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}", "accept-encoding": "br, gzip, deflate"},
+                content=b'{"model":"x"}',
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200
+    captured = _HeaderCapturingClient._captured
+    # Exactly ONE Accept-Encoding leaves here: a surviving lowercase copy of
+    # the caller's would ride out beside ours as a second header of the same
+    # name, and the provider would honour whichever it read first.
+    assert [k for k in captured if k.lower() == "accept-encoding"] == ["Accept-Encoding"]
+    asked = {t.strip().lower() for t in _lower_keys(captured)["accept-encoding"].split(",")}
+    assert "br" not in asked
+    assert asked <= set(SUPPORTED_DECODERS), f"asked upstream for an encoding httpx cannot decode: {asked}"
+
+
 def test_anthropic_proxy_workload_identity_injects_bearer_not_key(broker_app, monkeypatch):
     """AC-2: workload_identity mode injects a federated Bearer token + the oauth
     beta header, and sends NO static x-api-key."""
