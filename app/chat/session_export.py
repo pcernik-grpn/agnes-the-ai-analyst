@@ -45,6 +45,7 @@ Called from four places, all best-effort (never raises):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -133,19 +134,45 @@ class ExportWatermark:
 
     last_message_at: datetime
     messages: int | None
+    #: SHA-256 of the exported jsonl these two values describe -- see
+    #: :func:`_content_digest`. ``None`` on a sidecar written before it
+    #: existed, which :func:`is_chat_export_stale` cannot verify and so
+    #: treats exactly as it treats a missing sidecar.
+    content_sha256: str | None = None
 
 
-def _export_watermark(messages: list[ChatMessage]) -> ExportWatermark:
-    """The newest ``created_at`` actually present among *messages*, and how
-    many there were -- i.e. exactly what the exported file's content can
-    vouch for. Recorded alongside the file by
-    :func:`_write_export_watermark` and read back by
+def _content_digest(content: str) -> str:
+    """SHA-256 of an exported jsonl's exact bytes -- the token that PAIRS a
+    watermark with the transcript it describes.
+
+    The two are separate files, so each ``os.replace`` is atomic but the
+    pair is not: two overlapping writers can leave writer A's older
+    transcript beside writer B's newer watermark, and a watermark claiming
+    coverage the transcript next to it does not have is worse than no
+    watermark at all -- it reports the session current forever. Recording
+    the digest makes that pairing checkable, so a mismatched pair is simply
+    stale and the next export heals it. The content is its own generation
+    id; any other one would have to be embedded in the jsonl, whose shape
+    the session pipeline consumes.
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _export_watermark(messages: list[ChatMessage], content: str) -> ExportWatermark:
+    """The newest ``created_at`` actually present among *messages*, how many
+    there were, and the digest of the *content* those two values describe --
+    i.e. exactly what the exported file can vouch for. Recorded alongside
+    the file by :func:`_write_export_watermark` and read back by
     :func:`is_chat_export_stale`, deliberately NOT via the file's own mtime
-    (see that function's docstring for why the two must stay separate)."""
+    (see that function's docstring for why the two must stay separate).
+
+    *content* is taken here, next to the values it belongs with, so a
+    watermark can never be built without the transcript it vouches for."""
     newest = max((m.created_at for m in messages if m.created_at is not None), default=None)
     return ExportWatermark(
         last_message_at=_as_utc(newest) if newest is not None else datetime.now(UTC),
         messages=len(messages),
+        content_sha256=_content_digest(content),
     )
 
 
@@ -166,9 +193,11 @@ def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
 
     Written as a JSON object rather than the bare ISO timestamp this
     sidecar used to hold, because the timestamp alone cannot see a tie
-    (see :class:`ExportWatermark`). :func:`_read_export_watermark` still
-    reads the old shape, so an instance upgrading in place keeps its
-    existing exports instead of re-exporting every session at once.
+    (see :class:`ExportWatermark`) and neither half can tell whether the
+    transcript beside it is the one it describes (see
+    :func:`_content_digest`). :func:`_read_export_watermark` still reads the
+    old shape, so an instance upgrading in place keeps its existing exports
+    instead of re-exporting every session at once.
     """
     _atomic_write_text(
         _watermark_path(target),
@@ -176,6 +205,7 @@ def _write_export_watermark(target: Path, watermark: ExportWatermark) -> None:
             {
                 "last_message_at": watermark.last_message_at.isoformat(),
                 "messages": watermark.messages,
+                "content_sha256": watermark.content_sha256,
             }
         ),
     )
@@ -208,9 +238,11 @@ def _read_export_watermark(target: Path) -> ExportWatermark | None:
         if not isinstance(raw, str):
             return None
         try:
+            digest = payload.get("content_sha256")
             return ExportWatermark(
                 last_message_at=_as_utc(datetime.fromisoformat(raw)),
                 messages=count if isinstance(count, int) else None,
+                content_sha256=digest if isinstance(digest, str) else None,
             )
         except ValueError:
             return None
@@ -481,10 +513,13 @@ def export_chat_session_jsonl(chat_id: str) -> Path | None:
     if not turns:
         return None
 
-    watermark = _export_watermark(messages)
     target_dir = _session_data_dir() / owner["id"]
     target = target_dir / f"chat-{chat_id}.jsonl"
     content = "".join(json.dumps(turn, default=str) + "\n" for turn in turns)
+    # Built from the content as well as the messages, so the sidecar is
+    # pinned to THIS transcript and an overlapping writer cannot leave its
+    # newer watermark vouching for our older bytes -- see `_content_digest`.
+    watermark = _export_watermark(messages, content)
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(target, content)
@@ -555,6 +590,20 @@ def is_chat_export_stale(
         return True
     watermark = _read_export_watermark(existing_path)
     if watermark is None:
+        return True
+    # The pair has to belong together. Each file is replaced atomically, the
+    # PAIR is not, so two overlapping writers can leave one writer's
+    # transcript beside the other's watermark -- and a watermark vouching
+    # for content that is not there reports the session current forever.
+    # Verify rather than serialize: a mismatch is simply stale, and the next
+    # export heals it. A sidecar predating the digest cannot be checked and
+    # is treated exactly like a missing one, for the reason given above.
+    if watermark.content_sha256 is None:
+        return True
+    try:
+        if _content_digest(existing_path.read_text(encoding="utf-8")) != watermark.content_sha256:
+            return True
+    except OSError:
         return True
     if _as_utc(last_message_at) > watermark.last_message_at:
         return True

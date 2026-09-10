@@ -538,6 +538,27 @@ class TestConcurrentExportsNeverInterleave:
             json.loads(line)
 
 
+def _stamp_watermark(f, last_message_at, messages):
+    """Write a sidecar that legitimately PAIRS with ``f``'s current content.
+
+    Hand-built watermarks have to carry the digest of the transcript they
+    sit beside, or :func:`session_export.is_chat_export_stale` reports the
+    pair unverifiable (which is the whole point of the digest -- see
+    ``session_export._content_digest``). Every test below that wants a
+    *valid* watermark goes through here; a test about an INVALID pair
+    writes the sidecar itself."""
+    from app.chat import session_export
+
+    session_export._write_export_watermark(
+        f,
+        session_export.ExportWatermark(
+            last_message_at,
+            messages=messages,
+            content_sha256=session_export._content_digest(f.read_text(encoding="utf-8")),
+        ),
+    )
+
+
 class TestIsChatExportStale:
     """The one staleness rule shared by the periodic sweep and the
     on-demand admin transcript viewer. Coverage is read from the sidecar
@@ -553,21 +574,15 @@ class TestIsChatExportStale:
         assert not is_chat_export_stale(tmp_path / "nope.jsonl", None)
 
     def test_watermark_at_or_after_last_message_is_current(self, tmp_path):
-        from app.chat import session_export
-
         f = tmp_path / "f.jsonl"
         f.write_text("x")
-        session_export._write_export_watermark(f, session_export.ExportWatermark(datetime.now(UTC), messages=1))
+        _stamp_watermark(f, datetime.now(UTC), messages=1)
         assert not is_chat_export_stale(f, datetime.now(UTC) - timedelta(hours=1))
 
     def test_watermark_before_last_message_is_stale(self, tmp_path):
-        from app.chat import session_export
-
         f = tmp_path / "f.jsonl"
         f.write_text("x")
-        session_export._write_export_watermark(
-            f, session_export.ExportWatermark(datetime.now(UTC) - timedelta(hours=2), messages=1)
-        )
+        _stamp_watermark(f, datetime.now(UTC) - timedelta(hours=2), messages=1)
         assert is_chat_export_stale(f, datetime.now(UTC) + timedelta(hours=1))
 
     def test_file_present_without_a_watermark_sidecar_is_stale(self, tmp_path):
@@ -587,12 +602,10 @@ class TestIsChatExportStale:
         correctly read as current once its watermark covers the message."""
         import os
 
-        from app.chat import session_export
-
         f = tmp_path / "f.jsonl"
         f.write_text("x")
         last_message_at = datetime.now(UTC) - timedelta(hours=1)
-        session_export._write_export_watermark(f, session_export.ExportWatermark(last_message_at, messages=1))
+        _stamp_watermark(f, last_message_at, messages=1)
         old = (datetime.now(UTC) - timedelta(days=30)).timestamp()
         os.utime(f, (old, old))
         assert not is_chat_export_stale(f, last_message_at)
@@ -606,12 +619,10 @@ class TestWatermarkTieBreaking:
     also records how many messages the file contains."""
 
     def test_a_message_tied_on_timestamp_is_stale_not_current(self, tmp_path):
-        from app.chat import session_export
-
         f = tmp_path / "f.jsonl"
         f.write_text("x")
         tied = datetime.now(UTC)
-        session_export._write_export_watermark(f, session_export.ExportWatermark(tied, messages=2))
+        _stamp_watermark(f, tied, messages=2)
 
         # Same instant, one more row than we wrote: the tie.
         assert is_chat_export_stale(f, tied, 3)
@@ -621,18 +632,21 @@ class TestWatermarkTieBreaking:
     def test_a_count_that_drifted_low_does_not_re_export_forever(self, tmp_path):
         """`>`, never `!=` -- a count below what we wrote must not put the
         sweep into a re-export loop on every tick."""
-        from app.chat import session_export
-
         f = tmp_path / "f.jsonl"
         f.write_text("x")
         tied = datetime.now(UTC)
-        session_export._write_export_watermark(f, session_export.ExportWatermark(tied, messages=5))
+        _stamp_watermark(f, tied, messages=5)
 
         assert not is_chat_export_stale(f, tied, 3)
 
     def test_a_pre_count_sidecar_still_reads_as_a_timestamp(self, tmp_path):
-        """An export written before the count existed keeps working on the
-        timestamp half rather than re-exporting every session at once."""
+        """The older bare-timestamp sidecar shape still PARSES -- the
+        timestamp half survives the read, so nothing downstream has to
+        special-case it. It cannot CERTIFY the file, though: with no
+        content digest it has no way to say whether the transcript beside
+        it is the one it describes, which is the unverifiable case
+        :func:`is_chat_export_stale` resolves as stale (see
+        ``session_export._content_digest``)."""
         from app.chat import session_export
 
         f = tmp_path / "f.jsonl"
@@ -640,9 +654,12 @@ class TestWatermarkTieBreaking:
         written = datetime.now(UTC) - timedelta(hours=1)
         session_export._watermark_path(f).write_text(written.isoformat(), encoding="utf-8")
 
-        assert session_export._read_export_watermark(f).messages is None
-        assert not is_chat_export_stale(f, written, 7)  # count unknown -> cannot claim the tie
-        assert is_chat_export_stale(f, datetime.now(UTC), 7)
+        parsed = session_export._read_export_watermark(f)
+        assert parsed.last_message_at == written
+        assert parsed.messages is None
+        assert parsed.content_sha256 is None
+
+        assert is_chat_export_stale(f, written, 7)
 
     def test_a_corrupt_sidecar_is_stale_rather_than_trusted(self, tmp_path):
         from app.chat import session_export
@@ -653,6 +670,108 @@ class TestWatermarkTieBreaking:
 
         assert session_export._read_export_watermark(f) is None
         assert is_chat_export_stale(f, datetime.now(UTC), 1)
+
+
+class TestWatermarkIsPairedToItsTranscript:
+    """The transcript and its sidecar are two files. Each ``os.replace`` is
+    atomic; the PAIR is not, and nothing serializes the three writers that
+    can export the same session (the sweep, a teardown hook, the on-demand
+    viewer). Two overlapping exports can therefore publish writer A's older
+    transcript beside writer B's newer watermark -- and a watermark
+    vouching for coverage the file next to it does not have is worse than
+    no watermark at all: the strict ``>`` never fires, the count matches
+    the one B wrote, and the session reads as current forever with A's
+    truncated content on disk.
+
+    The sidecar carries a SHA-256 of the transcript it describes, so a pair
+    that does not belong together is simply stale and the next export heals
+    it. Detection, not locking: no inter-process lock, and no change to the
+    jsonl shape ``services/session_pipeline/lib.parse_jsonl`` consumes."""
+
+    def test_an_export_records_the_digest_of_what_it_actually_wrote(self, seeded_app, tmp_path, monkeypatch):
+        from app.chat import session_export
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        result = session_export.export_chat_session_jsonl(chat_id)
+
+        assert result is not None
+        watermark = session_export._read_export_watermark(result)
+        assert watermark.content_sha256 == session_export._content_digest(result.read_text(encoding="utf-8"))
+
+    def test_a_watermark_left_beside_another_writers_transcript_is_stale(self, tmp_path):
+        """The interleaved pair, built directly: B's watermark (newer
+        timestamp, higher count -- everything the old check looked at says
+        "current") sitting on top of A's shorter transcript."""
+        f = tmp_path / "f.jsonl"
+        writer_b_content = '{"turn": 1}\n{"turn": 2}\n'
+        f.write_text(writer_b_content, encoding="utf-8")
+        newest = datetime.now(UTC)
+        _stamp_watermark(f, newest, messages=2)
+
+        # Sanity: the pair as published is current.
+        assert not is_chat_export_stale(f, newest, 2)
+
+        # Now writer A's `os.replace` lands last, after B's sidecar.
+        f.write_text('{"turn": 1}\n', encoding="utf-8")
+
+        assert is_chat_export_stale(f, newest, 2)
+
+    def test_the_reverse_interleaving_is_stale_too(self, tmp_path):
+        """A's older sidecar landing last, on top of B's fuller transcript.
+        Harmless in itself -- but it must not read as verified either, or
+        the check would be trusting a sidecar it cannot tie to the file."""
+        f = tmp_path / "f.jsonl"
+        f.write_text('{"turn": 1}\n', encoding="utf-8")
+        older = datetime.now(UTC) - timedelta(hours=1)
+        _stamp_watermark(f, older, messages=1)
+        f.write_text('{"turn": 1}\n{"turn": 2}\n', encoding="utf-8")
+
+        assert is_chat_export_stale(f, older, 1)
+
+    def test_a_sidecar_carrying_no_digest_cannot_certify_the_file(self, tmp_path):
+        """A JSON sidecar of the pre-digest shape: both halves present and
+        agreeing, still unverifiable. Treated exactly like a missing
+        sidecar -- one extra re-export, never a file trusted with no way
+        to tie the watermark to its bytes."""
+        from app.chat import session_export
+
+        f = tmp_path / "f.jsonl"
+        f.write_text("x")
+        written = datetime.now(UTC)
+        session_export._watermark_path(f).write_text(
+            json.dumps({"last_message_at": written.isoformat(), "messages": 3}), encoding="utf-8"
+        )
+
+        assert session_export._read_export_watermark(f).content_sha256 is None
+        assert is_chat_export_stale(f, written, 3)
+
+    def test_the_next_export_heals_a_mismatched_pair(self, seeded_app, tmp_path, monkeypatch):
+        """End-to-end: the interleaving above, then the ordinary on-demand
+        refresh. A mismatch only ever costs one re-export."""
+        from app.chat import session_export
+
+        monkeypatch.setenv("SESSION_DATA_DIR", str(tmp_path / "user_sessions"))
+        chat_id = TestExportChatSessionJsonl._seed_chat_session("analyst@test.com")
+
+        published = session_export.export_chat_session_jsonl(chat_id)
+        assert published is not None
+        good = published.read_text(encoding="utf-8")
+
+        # An older writer's transcript lands after the current sidecar.
+        published.write_text(good.splitlines(keepends=True)[0], encoding="utf-8")
+        assert published.read_text(encoding="utf-8") != good
+
+        freshness = session_export.ensure_chat_transcript_current(chat_id)
+
+        assert freshness.path is not None
+        assert freshness.path.read_text(encoding="utf-8") == good
+        # And the healed pair is verified again, not stale on every tick.
+        from src.repositories import chat_session_repo
+
+        session = chat_session_repo().get_session(chat_id)
+        assert not is_chat_export_stale(freshness.path, session.last_message_at, session.message_count)
 
 
 class TestExportRaceWithConcurrentInsert:
