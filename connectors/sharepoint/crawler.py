@@ -7566,8 +7566,8 @@ def _predates_remainder_scope_fix(shard: Dict[str, Any]) -> bool:
     ``remainder`` shard in it at all, which the label check waved straight
     through; reusing it, or re-running it by index, crawled the entire drive
     per scope — this predicate's own incident, reached by the other door
-    (Devin Review on #2321). So for a folder scope NO shard may target the
-    drive root, whatever it is called."""
+    (2026-09-10 review finding on #2321). So for a folder scope NO shard may
+    target the drive root, whatever it is called."""
     if _scope_kind(str(shard.get("scope_id") or "")) != "folder":
         return False
     return any(t.get("root_item_id") is None for t in shard.get("targets") or ())

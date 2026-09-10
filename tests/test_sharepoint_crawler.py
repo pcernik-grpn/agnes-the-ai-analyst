@@ -8868,8 +8868,8 @@ class TestStalePersistedPlanNeverReusedAcrossTheRemainderScopeFix(TestShardScope
         stale plan with NO shard labelled "remainder" in it at all, and a
         staleness check keyed on that label waved it straight through —
         reusing it crawled the entire drive for that scope, which is the
-        incident this class exists to stop, reached by the other door (Devin
-        Review on #2321).
+        incident this class exists to stop, reached by the other door
+        (2026-09-10 review finding on #2321).
         """
         runs, jobs, store = self._install_env(monkeypatch, target_docs=100)
         seen = _install_graph(monkeypatch, self._multi_folder_handler(folder_scope_root_item_id="01FOLDERID"))
