@@ -26,3 +26,11 @@
   `close_operational_db` — which had no handshake at all — and
   `close_singleton_connections`) interrupts and bounded-waits on whatever is
   in flight instead of closing the parent connection out from under it.
+  Admitting a new child statement and beginning to close a singleton parent
+  are also mutually exclusive now, so a close can no longer land in the gap
+  between taking a cursor and publishing it — where the cursor is invisible to
+  the drain — and close the parent out from under a statement that is about to
+  run. Execution stays outside that handshake, exactly as it stays outside the
+  singleton lock, and every acquisition of it is bounded: a publisher skips
+  its best-effort tick rather than wait for a close, and a close proceeds
+  rather than wait indefinitely for a publisher.

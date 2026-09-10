@@ -61,6 +61,15 @@ export: publish the cursor, and let every close path interrupt + bounded-wait
 on it. Reachability is not hypothetical, it is the same loop
 (`app/main.py::_state_checkpoint_loop`, the FIRST task the lifespan cancels)
 and a 7 s statement against a 10 s default budget.
+
+**Publishing is not enough by itself** (fourth class below): a publisher takes
+its cursor under `_system_db_lock`, releases the lock, and only then registers,
+so between those two steps the cursor is invisible to the handshake — a close
+landing there samples an empty registry, decides nothing is in flight, and
+closes the parent out from under a statement that is about to run. Admitting a
+new child statement and beginning a close are therefore mutually exclusive,
+with execution deliberately left outside that region: putting it inside would
+only move the stall from the request path to the shutdown path.
 """
 
 from __future__ import annotations
@@ -176,9 +185,17 @@ def _assert_reader_unblocked_during_checkpoint(monkeypatch, conn_attr: str, chec
 
     cp = threading.Thread(target=run_checkpoint, name="checkpoint")
     pr = threading.Thread(target=run_probe, name="probe")
+    admission_free = False
     cp.start()
     try:
         assert entered.wait(timeout=_JOIN_TIMEOUT_S), "CHECKPOINT never started executing"
+        # The publication handshake has to be released before execution too.
+        # It is the lock every close path takes, so holding it across a
+        # multi-second WAL flush would move #2352's stall one lock over:
+        # requests would stay fast and shutdown would park for the flush.
+        admission_free = dbmod._singleton_child_admission_lock.acquire(blocking=False)
+        if admission_free:
+            dbmod._singleton_child_admission_lock.release()
         pr.start()
         pr.join(timeout=_JOIN_TIMEOUT_S)
         still_parked = not release.is_set()
@@ -197,6 +214,12 @@ def _assert_reader_unblocked_during_checkpoint(monkeypatch, conn_attr: str, chec
         f"singleton accessor was still blocked {_JOIN_TIMEOUT_S:.0f}s into the statement. "
         "Take the cursor under the lock and execute outside it, as "
         "refresh_rolling_snapshot does."
+    )
+    assert admission_free, (
+        f"{checkpoint_fn.__name__} held _singleton_child_admission_lock across "
+        "execute('CHECKPOINT'): publishing the cursor belongs inside that handshake, "
+        "executing on it does not — a close path would otherwise wait out the whole "
+        "WAL flush before it could even start interrupting."
     )
     assert "probe_error" not in result, result.get("probe_error")
     assert "checkpoint_error" not in result, result.get("checkpoint_error")
@@ -528,3 +551,187 @@ class TestAnAbandonedCheckpointCursorIsNotClosedOutFromUnder:
 
         assert dbmod._inflight_cursors_idle.is_set()
         assert dbmod.interrupt_inflight_singleton_statements(caller="test") is True
+
+
+#: How long the publication-window driver below waits for a close path to race
+#: into the window on its own before it releases the parked publisher. Only the
+#: UNPROTECTED ordering can get in there, and when it does the parent's own
+#: `close()` releases the gate causally — so this bound is never what decides a
+#: red run. With the handshake in place the close is barred, this elapses, and
+#: the publisher proceeds; comfortably inside the close path's own
+#: `_INFLIGHT_STATEMENT_INTERRUPT_TIMEOUT_S` budget, which is what keeps that
+#: close from giving up and closing the parent anyway.
+_PUBLICATION_WINDOW_GRACE_S = 0.75
+
+
+class _PublicationWindowHarness:
+    """A fake singleton that parks a publisher between `cursor()` and publish.
+
+    A different window from `_BlockedCheckpointHarness` above: there the
+    statement is already published and in flight, here the publisher is
+    committed to a parent and holds (or is about to hold) a child cursor it has
+    NOT registered yet. A close path that samples `_inflight_cursors` in that
+    instant finds it empty, concludes nothing is in flight, and closes the
+    parent — and the publisher then starts a statement on a child of a closed
+    connection: the exact hazard the #1294 handshake exists to prevent,
+    reintroduced through a narrower window.
+
+    The parent's `close()` releases the gate itself, so the unprotected
+    interleaving is causal rather than timing-dependent — the publisher resumes
+    *because* the parent was closed, which is what makes the flag it records
+    decisive rather than a coin flip on a loaded runner.
+    """
+
+    def __init__(self, real_conn):
+        self.cursor_requested = threading.Event()
+        self.release_cursor = threading.Event()
+        self.parent_closed = threading.Event()
+        self.statement_reached = threading.Event()
+        self.interrupted = threading.Event()
+        #: Sampled by the child cursor as it starts its FIRST statement. Only
+        #: the first: a publisher whose statements span several blocks (the
+        #: rolling-snapshot export) issues a second one after being
+        #: interrupted, and by then the close it already handed off to has
+        #: legitimately closed the parent.
+        self.parent_was_closed_on_execute: bool | None = None
+        harness = self
+
+        class _Cursor:
+            def __init__(self, inner):
+                self._c = inner
+
+            def execute(self, sql, *a, **kw):
+                text = str(sql).lstrip().upper()
+                if "CHECKPOINT" in text or text.startswith("EXPORT"):
+                    if harness.parent_was_closed_on_execute is None:
+                        harness.parent_was_closed_on_execute = harness.parent_closed.is_set()
+                    harness.statement_reached.set()
+                    harness.interrupted.wait(timeout=_JOIN_TIMEOUT_S)
+                    raise RuntimeError("interrupted")
+                return self._c.execute(sql, *a, **kw)
+
+            def interrupt(self):
+                harness.interrupted.set()
+
+            def close(self):
+                return None
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        class _Conn:
+            def cursor(self):
+                harness.cursor_requested.set()
+                # THE WINDOW: a publisher has committed to this parent and has
+                # published nothing yet.
+                harness.release_cursor.wait(timeout=_JOIN_TIMEOUT_S)
+                return _Cursor(real_conn.cursor())
+
+            def execute(self, sql, *a, **kw):
+                # A close path's own final CHECKPOINT, on the parent — not
+                # what is under test here.
+                return None
+
+            def close(self):
+                harness.parent_closed.set()
+                harness.release_cursor.set()
+
+        self.conn = _Conn()
+
+
+def _drive_a_close_into_the_publication_window(monkeypatch, conn_attr, publisher_fn, close_fn):
+    """Park `publisher_fn` in the cursor-taken-but-unpublished window, then run
+    `close_fn` into it.
+
+    The invariant asserted: no child statement may START executing after its
+    parent connection has been closed. Publishing the cursor is not enough on
+    its own — publication has to be mutually exclusive with the start of a
+    close, or the close simply walks through the gap before it.
+    """
+    real = getattr(dbmod, conn_attr)
+    assert real is not None, f"{conn_attr} singleton is not open"
+    harness = _PublicationWindowHarness(real)
+    monkeypatch.setattr(dbmod, conn_attr, harness.conn)
+
+    result: dict[str, object] = {}
+
+    def run_publisher():
+        try:
+            result["published"] = publisher_fn()
+        except BaseException as exc:  # pragma: no cover - surfaced via assertions
+            result["publisher_error"] = exc
+
+    publisher = threading.Thread(target=run_publisher, name="publisher")
+    closer = threading.Thread(target=close_fn, name="closer")
+    raced: bool | None = None
+    publisher.start()
+    try:
+        assert harness.cursor_requested.wait(timeout=_JOIN_TIMEOUT_S), "the publisher never asked for a cursor"
+        closer.start()
+        # A close path that is NOT barred from the window gets all the way
+        # through in milliseconds and releases the gate from its own close();
+        # a barred one is still waiting, well inside its interrupt budget, so
+        # release the publisher ourselves.
+        harness.parent_closed.wait(timeout=_PUBLICATION_WINDOW_GRACE_S)
+        harness.release_cursor.set()
+        assert harness.statement_reached.wait(timeout=_JOIN_TIMEOUT_S), (
+            "the publisher never reached execute() — the window was not driven and the assertion below would be vacuous"
+        )
+        # Sampled INSIDE the try and BEFORE the safety net below sets anything:
+        # what has to keep this False is the handshake, not the teardown.
+        raced = harness.parent_was_closed_on_execute
+    finally:
+        harness.release_cursor.set()
+        harness.interrupted.set()  # never leave the publisher parked on a failure
+        publisher.join(timeout=_JOIN_TIMEOUT_S)
+        if closer.is_alive():
+            closer.join(timeout=_JOIN_TIMEOUT_S)
+
+    assert "publisher_error" not in result, result.get("publisher_error")
+    assert raced is False, (
+        f"{publisher_fn.__name__} started a statement on a child cursor AFTER "
+        f"{close_fn.__name__} had already closed the parent connection. The cursor is taken "
+        "under _system_db_lock, the lock is released, and only THEN published — so a close "
+        "landing in that gap finds _inflight_cursors empty and closes straight through it. "
+        "Make taking + publishing the cursor mutually exclusive with the start of a close, "
+        "while execution stays outside that region (#1294, #2352)."
+    )
+    assert not publisher.is_alive(), "the publisher thread must unwind"
+    assert not closer.is_alive(), f"{close_fn.__name__} never returned"
+
+
+class TestNoCloseLandsBetweenCursorAndPublication:
+    """#1294's contract at the moment publication has not happened yet.
+
+    The class above pins the handoff for a statement already in flight. These
+    pin the narrower gap in front of it: between taking the child cursor and
+    registering it, the cursor is invisible to every close path, so a close
+    that lands there closes the parent out from under a statement that is about
+    to run. All three registry publishers are driven, because all three take
+    their cursor the same way.
+    """
+
+    def test_close_system_db_cannot_land_between_cursor_and_publication(self, system_db, monkeypatch):
+        _drive_a_close_into_the_publication_window(
+            monkeypatch, "_system_db_conn", checkpoint_system_db, dbmod.close_system_db
+        )
+
+    def test_close_operational_db_cannot_land_between_cursor_and_publication(self, system_db, monkeypatch):
+        """Same gap on the operational singleton — the only arm of the
+        checkpoint loop that does anything on a Postgres app-state instance."""
+        get_operational_db().close()
+        _drive_a_close_into_the_publication_window(
+            monkeypatch, "_operational_db_conn", checkpoint_operational_db, dbmod.close_operational_db
+        )
+
+    def test_the_rolling_snapshot_export_shares_the_protection(self, system_db, monkeypatch):
+        """The export is the third publisher and takes its cursor identically
+        (#1294 wrote the pattern the CHECKPOINTs then copied), so whatever
+        closes the gap has to cover it too."""
+
+        def refresh_snapshot():
+            return dbmod.refresh_rolling_snapshot(force=True)
+
+        _drive_a_close_into_the_publication_window(
+            monkeypatch, "_system_db_conn", refresh_snapshot, dbmod.close_system_db
+        )
