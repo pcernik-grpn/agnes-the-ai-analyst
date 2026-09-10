@@ -87,6 +87,24 @@ def _make_app(
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolate_module_level_engine_state():
+    """Both memos in `chat_session_files` are process-scoped by design — the
+    engine's capability and which chat has already logged a traceback outlive
+    a single request. That makes them leak between tests: one case exercising
+    an engine that declines the files channel would otherwise decide what a
+    later, unrelated case sees. Cleared per test so each states its own
+    premise.
+    """
+    from app.api import chat_session_files as mod
+
+    mod._ENGINE_FILES_CHANNEL.clear()
+    mod._ENGINE_LISTING_FAILURE_LOGGED.clear()
+    yield
+    mod._ENGINE_FILES_CHANNEL.clear()
+    mod._ENGINE_LISTING_FAILURE_LOGGED.clear()
+
+
 @pytest.fixture
 def data_dir(tmp_path: Path) -> Path:
     d = tmp_path / "data"
@@ -340,6 +358,8 @@ def test_list_under_kai_agent_skips_the_engine_when_no_sandbox_exists_yet(
     # Supported, not unsupported: the drawer renders supported=False as an
     # "upgrade your engine" warning, the wrong sentence for a chat the
     # reader opened seconds ago. Nothing here says the channel is absent.
+    # Optimistic only because this instance has never seen its engine
+    # decline the channel — see the capability-memo test below.
     assert body["supported"] is True
 
 
@@ -826,3 +846,36 @@ def test_raw_enforces_containment_and_ownership(data_dir: Path, session_dir: Pat
 
     other = TestClient(_make_app(data_dir=data_dir, sessions={CHAT_ID: OTHER_USER["email"]}))
     assert other.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "chart.png"}).status_code == 404
+
+
+def test_a_sandboxless_chat_reports_what_the_engine_last_demonstrated(tmp_path, monkeypatch):
+    """`supported` is a claim about the ENGINE, not about this session. A
+    chat with no sandbox cannot establish capability, so the answer mirrors
+    what the engine last showed: once it declined the channel for a chat it
+    could see, a later sandboxless chat must not quietly report the channel
+    as fine and hide the drawer's upgrade guidance."""
+    from app.api import chat_session_files as mod
+
+    monkeypatch.setattr(mod, "_ENGINE_FILES_CHANNEL", {}, raising=False)
+    base = "http://engine"
+    assert mod._engine_channel_believed_supported(base) is True
+    mod._engine_channel_seen(base, supported=False)
+    assert mod._engine_channel_believed_supported(base) is False
+    # …and it recovers: an engine that starts serving files is supported again.
+    mod._engine_channel_seen(base, supported=True)
+    assert mod._engine_channel_believed_supported(base) is True
+
+
+def test_traceback_suppression_lifts_after_a_recovery(monkeypatch):
+    """fail → success → fail must log the stack twice. Without the reset the
+    first outage silenced every later one for the life of the process, and
+    nothing pinned that, so the suppression could quietly become permanent
+    again."""
+    from app.api import chat_session_files as mod
+
+    monkeypatch.setattr(mod, "_ENGINE_LISTING_FAILURE_LOGGED", type(mod._ENGINE_LISTING_FAILURE_LOGGED)())
+    chat = "11111111-1111-1111-1111-111111111111"
+    assert mod._first_engine_listing_failure(chat) is True
+    assert mod._first_engine_listing_failure(chat) is False
+    mod._engine_listing_recovered(chat)
+    assert mod._first_engine_listing_failure(chat) is True

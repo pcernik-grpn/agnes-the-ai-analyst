@@ -21,6 +21,6 @@
 - The `kai-agent` development stub now mirrors the real engine's `400` for a
   malformed chat id on its sandbox file routes, so this class of drift is
   caught by the stub-paired end-to-end tests rather than only live.
-- A chat that has not spawned a sandbox yet reports its files channel as supported and simply empty. It briefly reported the channel as unsupported, which the drawer renders as an "upgrade your engine" warning rather than "no files here yet".
+- A chat that has not spawned a sandbox reports the files channel as the engine last demonstrated it, rather than guessing from session state: optimistic until this engine has actually declined the channel for a chat it could see, unsupported afterwards. Reporting it unsupported outright made the drawer show an "upgrade your engine" warning for a conversation opened seconds ago; reporting it supported outright hid that warning on an engine that genuinely predates the file routes.
 - A `400` on a subdirectory during the listing walk surfaces instead of being skipped. Only the root's 400 means "no files channel for this chat"; treating a child's the same way dropped that directory's files from an answer that still called itself complete.
 - The traceback suppression clears once a chat's listing succeeds, so a later unrelated outage still logs its stack.

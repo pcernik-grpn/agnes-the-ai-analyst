@@ -112,6 +112,31 @@ _ENGINE_LISTING_FAILURE_LOGGED: OrderedDict[str, None] = OrderedDict()
 _ENGINE_LISTING_FAILURE_LOGGED_MAX = 512
 
 
+#: What we have LEARNED about an engine's files channel, keyed by its base
+#: URL. `supported` answers "does this engine expose a files channel", and a
+#: session without a sandbox cannot answer it — an engine predating the
+#: sandbox-file routes is unsupported whether or not this particular chat
+#: has spawned one. So the no-sandbox branch reports what the engine last
+#: demonstrated rather than guessing from session state.
+#:
+#: Only a chat that HAS a sandbox produces evidence: `_list_engine_files`
+#: runs solely on those, so a `None` listing there is the engine declining
+#: the channel for a chat it can see. A legacy chat id 400ing at the root
+#: never reaches here, which is why that case cannot brand the whole engine
+#: unsupported.
+_ENGINE_FILES_CHANNEL: dict[str, bool] = {}
+
+
+def _engine_channel_seen(base_url: str, *, supported: bool) -> None:
+    _ENGINE_FILES_CHANNEL[base_url] = supported
+
+
+def _engine_channel_believed_supported(base_url: str) -> bool:
+    """Optimistic until the engine has shown otherwise: an instance that has
+    never listed files yet should not accuse its engine of being too old."""
+    return _ENGINE_FILES_CHANNEL.get(base_url, True)
+
+
 def _engine_listing_recovered(chat_id: str) -> None:
     """Forget ``chat_id``'s suppression after a listing succeeds.
 
@@ -742,7 +767,12 @@ async def list_session_files(
             # reader opened five seconds ago. Empty and supported says what
             # is actually true: no files here yet.
             return _merge_harvested(
-                SessionFilesResponse(files=[], truncated=False, source="engine", supported=True),
+                SessionFilesResponse(
+                    files=[],
+                    truncated=False,
+                    source="engine",
+                    supported=_engine_channel_believed_supported(_engine_base_url(cfg)),
+                ),
                 harvested,
             )
         try:
@@ -793,6 +823,9 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
         transport=_ENGINE_TRANSPORT,
     )
     if listing is None:
+        # This chat HAS a sandbox (the caller gates on that), so the engine
+        # declining a chat it can see is evidence about the engine itself.
+        _engine_channel_seen(_engine_base_url(cfg), supported=False)
         return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
     entries, truncated = listing
     files: list[SessionFileEntry] = []
@@ -807,6 +840,7 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
     # Engine listings carry no mtime to sort by, but the deliverables-first
     # promise holds: outputs/ ahead of everything, then stable by path.
     files.sort(key=lambda f: (not f.path.startswith(_OUTPUTS_PREFIX), f.path))
+    _engine_channel_seen(_engine_base_url(cfg), supported=True)
     return SessionFilesResponse(files=files, truncated=truncated, source="engine", supported=True)
 
 
