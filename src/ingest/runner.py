@@ -80,7 +80,7 @@ def _chunk_embed_store(corpus_id: str, file_id: str, source) -> tuple[int, bool]
     return n, embedded
 
 
-def ingest_file(file_id: str, *, preloaded_text: str | None = None) -> str:
+def ingest_file(file_id: str, *, preloaded_text: str | None = None, image_count: int = 0) -> str:
     """Ingest one uploaded file. Returns the final ``processing_status``.
 
     ``preloaded_text`` lets a caller that already holds the document's TEXT
@@ -95,6 +95,18 @@ def ingest_file(file_id: str, *, preloaded_text: str | None = None) -> str:
     caller's preloaded text for any other extension is ignored and the
     normal disk read runs, since e.g. the HTML branch still needs
     ``_strip_html`` applied.
+
+    ``image_count`` is the SAME ``src.ingest.convert.ConvertResult.
+    image_count`` a disk-read ``extract_text`` call would have picked up on
+    its own office branch — but a ``preloaded_text`` caller converted the
+    document itself, BEFORE this function ever sees it, so there is no
+    ``ExtractResult`` here to carry that count unless the caller hands it
+    over explicitly (live finding 2026-09-09: the SharePoint crawl's
+    preloaded-text path recorded ``image_count: 0`` on every document,
+    even one whose disclosed-image markdown was sitting right there in
+    ``preloaded_text``). Ignored for every other branch — they build their
+    own ``ExtractResult`` via ``extract_text``, which already carries its
+    own count.
     """
     cf_repo = corpus_files_repo()
     row = cf_repo.get(file_id)
@@ -179,7 +191,7 @@ def ingest_file(file_id: str, *, preloaded_text: str | None = None) -> str:
         # `_strip_html`), so a mismatched `preloaded_text` there is ignored
         # rather than risking un-transformed content reaching storage.
         if preloaded_text is not None and (ext in _PLAIN_EXTS or ext == ""):
-            result: ExtractResult | str = ExtractResult(full_text=preloaded_text)
+            result: ExtractResult | str = ExtractResult(full_text=preloaded_text, image_count=image_count)
         else:
             result = extract_text(storage_path, file_type)
         # 0 for every non-office reader (plain text, HTML, .eml, .epub, PDF)

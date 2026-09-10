@@ -14,3 +14,13 @@
   file's own status detail also records the total image count. No OCR or
   image understanding is added — this only makes the loss visible and
   locatable.
+- A crawled SharePoint document's status detail now records its own image
+  count too — it previously always read `0` on that path, even when the
+  indexed text carried real `[image N of TOTAL …]` disclosures, because the
+  crawl converts the file before handing it to the shared ingest step.
+- A PowerPoint slide with its own title keeps its slide number in the
+  disclosure (`slide 4`) instead of losing it to that title once the title
+  became a section heading in the converted text.
+- An HTML document's ordinary, un-lost relative image reference (e.g.
+  `<img src="logo.jpg">`) is no longer mistaken for a dropped PowerPoint
+  picture and rewritten into a false "not indexed" disclosure.

@@ -447,6 +447,29 @@ def test_html_routes_to_markitdown(tmp_path):
     assert "EMEA grew." in result.markdown
 
 
+def test_html_relative_image_is_not_falsely_disclosed_as_lost(tmp_path):
+    """markitdown converts ``<img src="logo.jpg">`` to ``![Logo](logo.jpg)``
+    — the IDENTICAL bare-filename shape python-pptx's OWN lost-picture
+    placeholder uses (see the module docstring's "Embedded pictures"
+    section). Nothing was dropped here: the image reference is exactly what
+    the source HTML said, and this document never showed a PowerPoint
+    slide-number marker at all. Rewriting it into "not indexed" would be a
+    FALSE disclosure — live finding 2026-09-09, the regression this test
+    guards."""
+    path = tmp_path / "page.html"
+    path.write_text(
+        '<html><body><h1>Quarterly</h1><img src="logo.jpg" alt="Logo"><p>EMEA grew.</p></body></html>',
+        encoding="utf-8",
+    )
+
+    result = convert_to_markdown(path, "text/html")
+
+    assert result.engine == "markitdown"
+    assert result.image_count == 0
+    assert "![Logo](logo.jpg)" in result.markdown
+    assert "not indexed" not in result.markdown
+
+
 # ------------------------------------------------------- legacy office (LibreOffice)
 
 
@@ -1661,6 +1684,13 @@ def test_disclose_image_placeholders_is_a_noop_on_plain_text():
 
 
 def test_disclose_image_placeholders_mixed_docx_and_pptx_shapes_in_one_pass():
+    """A synthetic mix of both marker shapes in one pass — exercises both
+    regex branches, not a realistic single document (a real one is either
+    pptx-with-jpg-names or docx-with-base64, never both). Once a slide
+    marker has been seen, it wins over ANY later heading for every image
+    after it, including a base64 (docx-shaped) one — see
+    ``test_disclose_image_placeholders_slide_number_wins_over_a_later_heading``
+    for the realistic single-slide case this generalizes."""
     from src.ingest.convert import _disclose_image_placeholders
 
     text = "<!-- Slide number: 1 -->\n![](Picture3.jpg)\n# A Heading\n![alt text](data:image/jpeg;base64...)\n"
@@ -1671,18 +1701,84 @@ def test_disclose_image_placeholders_mixed_docx_and_pptx_shapes_in_one_pass():
     assert "Picture3.jpg" not in rewritten
     assert "base64" not in rewritten
     assert "[image 1 of 2 in this document — not indexed, slide 1]" in rewritten
-    assert '[image 2 of 2 in this document — not indexed, in section "A Heading"]' in rewritten
+    assert "[image 2 of 2 in this document — not indexed, slide 1]" in rewritten
+    assert "in section" not in rewritten
     # the slide/heading markers themselves are preserved verbatim — only the
     # image markdown is rewritten
     assert "<!-- Slide number: 1 -->" in rewritten
     assert "# A Heading" in rewritten
 
 
+def test_disclose_image_placeholders_slide_number_wins_over_a_later_heading():
+    """A pptx slide's own title becomes a ``#`` heading right after that
+    slide's number comment (see the module docstring) — a titled slide must
+    keep its own slide number, never fall back to "in section <title>" just
+    because the heading was the more RECENT marker (live finding
+    2026-09-09: this exact ordering lost the slide number)."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 4 -->\n# Architecture\n![](Picture1.jpg)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    assert "[image 1 of 1 in this document — not indexed, slide 4]" in rewritten
+    assert "in section" not in rewritten
+
+
+def test_disclose_image_placeholders_new_slide_resets_a_stale_heading():
+    """A heading tracked on one slide must not leak onto the NEXT slide's
+    own images once a new slide marker has been seen — the slide number
+    still wins regardless, but the reset keeps the two pieces of state
+    honest independently of that priority."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "<!-- Slide number: 1 -->\n# First Slide\n<!-- Slide number: 2 -->\n![](Picture1.jpg)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    assert "[image 1 of 1 in this document — not indexed, slide 2]" in rewritten
+    assert "First Slide" not in rewritten.split("[image")[-1]
+
+
+def test_disclose_image_placeholders_word_heading_untouched_by_the_slide_gate():
+    """A Word document never emits a slide-number comment at all — the
+    heading-tracking path (unchanged by the slide/heading split) is what a
+    docx picture's location still comes from."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "# Q3 Notes\n\n![](data:image/png;base64...)\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 1
+    assert '[image 1 of 1 in this document — not indexed, in section "Q3 Notes"]' in rewritten
+
+
+def test_disclose_image_placeholders_bare_jpg_name_without_a_slide_marker_is_left_alone():
+    """The bare ``name.jpg`` shape is markitdown's OWN pptx lost-picture
+    convention, but the identical markdown is also what an ordinary,
+    un-lost HTML relative image reference converts to (see
+    ``test_html_relative_image_is_not_falsely_disclosed_as_lost``). Without
+    a PowerPoint slide-number marker anywhere in the document, this is not a
+    lost picture — left completely unchanged, not counted (live finding
+    2026-09-09)."""
+    from src.ingest.convert import _disclose_image_placeholders
+
+    text = "# Quarterly\n\n![Logo](logo.jpg)\n\nEMEA grew.\n"
+
+    rewritten, count = _disclose_image_placeholders(text)
+
+    assert count == 0
+    assert rewritten == text
+
+
 def test_disclose_image_placeholders_truncates_a_very_long_heading():
     from src.ingest.convert import _disclose_image_placeholders
 
     heading_text = "x" * 200
-    text = f"# {heading_text}\n![](Picture1.jpg)\n"
+    text = f"# {heading_text}\n![](data:image/png;base64...)\n"
 
     rewritten, count = _disclose_image_placeholders(text)
 

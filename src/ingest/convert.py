@@ -584,15 +584,29 @@ _IMAGE_DISCLOSURE_ENGINES = frozenset({ENGINE_MARKITDOWN, ENGINE_LIBREOFFICE_MAR
 #: overlap between branches and no nested quantifiers, so this stays
 #: linear-time over arbitrarily large converted text regardless of input
 #: shape (see ``.claude/skills/agnes-conventions/references/security.md``
-#: §5). The pptx branch matches only ``.jpg`` — not a speculative "any image
-#: extension" — because that suffix is hard-coded in markitdown's own
-#: ``_pptx_converter.py`` (``filename = re.sub(r"\W", "", shape.name) +
-#: ".jpg"``, verified against the installed version); matching what the
-#: pinned dependency actually emits, not what it theoretically could.
+#: §5). The pptx branch (``jpgname``) matches only ``.jpg`` — not a
+#: speculative "any image extension" — because that suffix is hard-coded in
+#: markitdown's own ``_pptx_converter.py`` (``filename = re.sub(r"\W", "",
+#: shape.name) + ".jpg"``, verified against the installed version); matching
+#: what the pinned dependency actually emits, not what it theoretically
+#: could.
+#:
+#: ``b64`` and ``jpgname`` are separate named groups, not one alternative,
+#: because they carry a DIFFERENT trust level: the base64 shape only ever
+#: comes from mammoth's own truncation of a real embedded picture (never a
+#: real base64 payload — see the module docstring), so a match is always a
+#: genuine loss, while the bare ``name.jpg`` shape is ALSO exactly what
+#: markitdown emits for an ordinary, un-lost relative image reference inside
+#: an HTML document it converts (``<img src="logo.jpg">`` ->
+#: ``![Logo](logo.jpg)`` — ``ENGINE_MARKITDOWN`` covers HTML too). Nothing in
+#: the regex itself can tell those two apart; :func:`_disclose_image_
+#: placeholders` gates ``jpgname`` at runtime on the document actually being
+#: a PowerPoint conversion (live finding 2026-09-09 — see that function).
 _IMAGE_MARKER_RE = re.compile(
     r"<!--\s*Slide number:\s*(?P<slide>\d+)\s*-->"
     r"|^#{1,6}[ \t]+(?P<heading>[^\n]+)$"
-    r"|!\[[^\]]*\]\((?:data:[\w./+-]*;base64\.\.\.|\w+\.jpg)\)",
+    r"|!\[[^\]]*\]\((?P<b64>data:[\w./+-]*;base64\.\.\.)\)"
+    r"|!\[[^\]]*\]\((?P<jpgname>\w+\.jpg)\)",
     re.MULTILINE,
 )
 
@@ -608,45 +622,82 @@ def _disclose_image_placeholders(text: str) -> tuple[str, int]:
     replaced and why.
 
     Walks :data:`_IMAGE_MARKER_RE`'s matches in document order exactly once,
-    tracking the MOST RECENTLY seen slide number (pptx) or heading (docx) as
-    a single "current location" — the same slide-number comments and heading
-    lines markitdown already emitted in ``text``, never a second parse of the
-    source document. Recency, not a fixed slide-over-heading priority: a
-    pptx slide's own title becomes a ``#`` heading in markitdown's output
-    too, and that heading always follows the SAME slide's own number
-    comment, so "most recent" already picks the slide (the more precise
-    pointer) for every image on it without special-casing the two shapes
-    against each other. An image before the first slide/heading marker gets
-    no location clause at all — still a stable, document-scoped ordinal,
-    just without a "where" to add.
+    tracking the most recently seen slide number (pptx) and heading (docx)
+    as TWO SEPARATE pieces of state — never one "most recent wins" location,
+    because a pptx slide's own title becomes a ``#`` heading in markitdown's
+    output right after that slide's own number comment: if a single most-
+    recent value tracked both shapes, that heading would silently overwrite
+    the (more precise) slide number for every image on the same slide (live
+    finding 2026-09-09). The slide number, once seen, always wins for a
+    ``jpgname`` (pptx) placeholder; a ``b64`` (docx) placeholder only ever
+    appears in a document that never emits a slide marker at all, so it
+    falls straight through to the heading, exactly as before. A NEW slide
+    marker resets the heading, so a stale title from a previous slide (or
+    from before the first one) can never leak onto this slide's images
+    either. An image before the first slide/heading marker gets no location
+    clause at all — still a stable, document-scoped ordinal, just without a
+    "where" to add.
+
+    ``jpgname`` matches (see :data:`_IMAGE_MARKER_RE`) are additionally
+    gated on the document having shown at least one slide-number marker
+    ANYWHERE — the signal that this is genuinely a PowerPoint conversion,
+    not an HTML (or other markitdown) document whose own ordinary,
+    un-lost relative image reference happens to render as the identical
+    ``![alt](name.jpg)`` markdown shape. Without a slide marker in sight, a
+    ``jpgname`` match is left untouched: not rewritten, not counted — it was
+    never actually lost.
 
     Returns ``(rewritten_text, image_count)``. ``image_count`` is ``0`` and
     ``text`` is returned UNCHANGED (not even copied) when there is nothing to
-    rewrite — the common case, and every document with no embedded pictures.
+    rewrite — the common case, and every document with no embedded pictures
+    (or, on an HTML document, no genuine picture loss to disclose).
     """
     matches = list(_IMAGE_MARKER_RE.finditer(text))
-    total = sum(1 for m in matches if m.group("slide") is None and m.group("heading") is None)
+    saw_slide_marker = any(m.group("slide") is not None for m in matches)
+
+    def _is_disclosable_image(m: re.Match[str]) -> bool:
+        if m.group("slide") is not None or m.group("heading") is not None:
+            return False
+        if m.group("jpgname") is not None and not saw_slide_marker:
+            return False  # an ordinary HTML image link, not a lost picture
+        return True
+
+    total = sum(1 for m in matches if _is_disclosable_image(m))
     if total == 0:
         return text, 0
 
     out: list[str] = []
     last_end = 0
-    current_location: str | None = None
+    current_slide: str | None = None
+    current_heading: str | None = None
     ordinal = 0
     for m in matches:
         out.append(text[last_end : m.start()])
         last_end = m.end()
         if m.group("slide") is not None:
-            current_location = f"slide {m.group('slide')}"
+            current_slide = m.group("slide")
+            current_heading = None
             out.append(m.group(0))
             continue
         if m.group("heading") is not None:
             heading_text = m.group("heading").strip()[:_MAX_LOCATION_HEADING_CHARS].replace("[", "(").replace("]", ")")
-            current_location = f'in section "{heading_text}"'
+            current_heading = heading_text
             out.append(m.group(0))
             continue
-        # An image marker: neither the slide nor the heading branch matched.
+        if m.group("jpgname") is not None and not saw_slide_marker:
+            # Not a lost picture — see `saw_slide_marker` above. Left as
+            # markitdown emitted it.
+            out.append(m.group(0))
+            continue
+        # An image marker: neither the slide nor the heading branch matched,
+        # and it is not a filtered-out HTML jpg link.
         ordinal += 1
+        if current_slide is not None:
+            current_location: str | None = f"slide {current_slide}"
+        elif current_heading is not None:
+            current_location = f'in section "{current_heading}"'
+        else:
+            current_location = None
         location = f", {current_location}" if current_location else ""
         out.append(f"[image {ordinal} of {total} in this document — not indexed{location}]")
     out.append(text[last_end:])

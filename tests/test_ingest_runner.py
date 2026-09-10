@@ -133,6 +133,31 @@ def test_ingest_uses_preloaded_text_and_skips_the_disk_re_read(e2e_env, tmp_path
     assert chunks[0]["text"] == "already-converted markdown body"
 
 
+def test_ingest_preloaded_text_records_the_callers_image_count(e2e_env, tmp_path):
+    """The SharePoint crawl converts BEFORE calling `ingest_file` (see
+    `test_ingest_uses_preloaded_text_and_skips_the_disk_re_read`), so this
+    function has no `ExtractResult` of its own to carry `image_count` off —
+    only the caller (`_Ingestor.ingest`) knows how many embedded pictures
+    `convert_to_markdown` already disclosed in the preloaded text. Without
+    threading it through explicitly, `processing_detail.image_count` stayed
+    `0` for every crawled document, no matter how many `[image N of TOTAL
+    ... not indexed]` markers the text itself carried (live finding
+    2026-09-09)."""
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_files_repo
+
+    corpus_id = _new_corpus("ing-preloaded-images")
+    missing_path = str(tmp_path / "does-not-exist.md")
+    file_id = _add_file(corpus_id, "deck.md", "md", missing_path)
+
+    markdown = "# Slide 1\n\n[image 1 of 2 in this document — not indexed, slide 1]\n"
+    status = ingest_file(file_id, preloaded_text=markdown, image_count=2)
+
+    assert status == "indexed"
+    row = corpus_files_repo().get(file_id)
+    assert row["processing_detail"]["image_count"] == 2
+
+
 def test_ingest_image_stays_pending_for_vision_slice(e2e_env, tmp_path, monkeypatch):
     from src.ingest import vision
 
