@@ -170,4 +170,3 @@ def test_a_rateable_answers_action_row_does_not_hide_behind_a_hover():
         "no rule keeps a rateable answer's actions row visible without a hover — "
         "the thumbs render but stay invisible until the pointer is over the bubble"
     )
-
