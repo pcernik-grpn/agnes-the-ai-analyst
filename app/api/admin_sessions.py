@@ -477,6 +477,17 @@ def _chat_transcript_not_found_detail(freshness: ChatTranscriptFreshness) -> dic
     actually exists. See ``ensure_chat_transcript_current``'s docstring for
     what each ``freshness`` field means.
     """
+    if freshness.lookup_failed:
+        # We never established whether this session exists, so we must not
+        # say it does not — the id may be perfectly good and the store down.
+        return {
+            "error": "session_lookup_failed",
+            "hint": (
+                "The session store did not answer, so this is not a statement "
+                "about the id. Retry; if it persists, check the server logs "
+                "for the lookup failure."
+            ),
+        }
     if not freshness.session_found:
         return {
             "error": "session_not_found",
@@ -535,8 +546,13 @@ def transcript(
         session_dir, path = _resolve_session_target(username, session_file)
     except HTTPException as exc:
         if exc.status_code == 404 and chat_freshness is not None:
+            # 404 says "this does not exist". When the session store never
+            # answered we cannot say that, so a lookup failure goes out as a
+            # retryable 503 instead — the caller should come back, not go
+            # hunting for a typo in a correct id.
+            status = 503 if chat_freshness.lookup_failed else 404
             raise HTTPException(
-                status_code=404,
+                status_code=status,
                 detail=_chat_transcript_not_found_detail(chat_freshness),
             ) from exc
         raise

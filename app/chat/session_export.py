@@ -499,6 +499,9 @@ class ChatTranscriptFreshness:
     ``path`` is the current, on-disk export when one exists or was just
     created; ``None`` otherwise. The remaining fields say why not:
     ``session_found=False`` means the chat id itself doesn't resolve;
+    ``lookup_failed=True`` means we never got to find out — the session
+    store raised — and must never be reported as a missing session, which
+    would tell an admin to check an id that may well be correct;
     ``export_disabled=True`` means ``sessions.include_chat`` is off (the
     session may well have messages, but this instance never materializes
     them to disk); ``message_count``/``last_message_at`` describe a
@@ -508,6 +511,7 @@ class ChatTranscriptFreshness:
 
     path: Path | None
     session_found: bool
+    lookup_failed: bool
     export_disabled: bool
     message_count: int
     last_message_at: datetime | None
@@ -534,16 +538,23 @@ def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
 
     from src.repositories import chat_session_repo, users_repo
 
+    lookup_failed = False
     try:
         session = chat_session_repo().get_session(chat_id)
     except Exception:
+        # A store that raised is not a store that answered "no such row".
+        # Collapsing the two tells an admin to check an id while the real
+        # problem is the database, and it is the reader who then wastes the
+        # next ten minutes.
         logger.warning("chat transcript freshness: session lookup failed for %s", chat_id, exc_info=True)
         session = None
+        lookup_failed = True
 
     if session is None:
         return ChatTranscriptFreshness(
             path=None,
             session_found=False,
+            lookup_failed=lookup_failed,
             export_disabled=export_disabled,
             message_count=0,
             last_message_at=None,
@@ -552,6 +563,7 @@ def ensure_chat_transcript_current(chat_id: str) -> ChatTranscriptFreshness:
     freshness = ChatTranscriptFreshness(
         path=None,
         session_found=True,
+        lookup_failed=False,
         export_disabled=export_disabled,
         message_count=session.message_count or 0,
         last_message_at=session.last_message_at,

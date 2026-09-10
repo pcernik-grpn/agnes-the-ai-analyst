@@ -919,3 +919,23 @@ class TestEnsureChatTranscriptCurrent:
         assert freshness.export_disabled is False
         assert freshness.path is not None
         assert freshness.path.is_file()
+
+
+def test_a_failed_session_lookup_is_not_reported_as_a_missing_session(monkeypatch):
+    """A store that raised is not a store that answered "no such row".
+    Collapsing the two told an admin to check an id while the real problem
+    was the database — the same confident-wrong-answer shape this PR removes
+    elsewhere."""
+    from app.chat import session_export as mod
+
+    class _Boom:
+        def get_session(self, chat_id):
+            raise RuntimeError("session store unavailable")
+
+    monkeypatch.setattr(mod, "_session_data_dir", lambda: Path("/nonexistent"), raising=False)
+    import src.repositories as repos
+
+    monkeypatch.setattr(repos, "chat_session_repo", lambda: _Boom())
+    freshness = mod.ensure_chat_transcript_current("11111111-1111-1111-1111-111111111111")
+    assert freshness.lookup_failed is True
+    assert freshness.session_found is False

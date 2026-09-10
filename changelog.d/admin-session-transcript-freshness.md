@@ -8,3 +8,4 @@
 
 ### Internal
 - The periodic chat-session export sweep (`services/session_pipeline/runner.py::_sweep_chat_session_exports`) and the new on-demand check now share one staleness definition (`app/chat/session_export.py::is_chat_export_stale`) instead of two independent mtime comparisons.
+- A session lookup that fails is no longer reported as a missing session. The store raising and the store answering "no such row" used to collapse into the same `session_not_found` 404, which sent an admin hunting for a typo in a correct id while the database was the problem; it now answers a retryable `session_lookup_failed` 503.
